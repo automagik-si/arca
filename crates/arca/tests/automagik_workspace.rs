@@ -657,6 +657,7 @@ fn the_shipped_template_is_a_virtual_machine_with_its_script_its_secrets_and_pin
     assert_eq!(template.image, "images:debian/13/cloud");
     assert_eq!(template.digest, None);
     let limits = template.limits.as_ref().expect("limits");
+    assert_eq!(limits.memory_hotplug, Some(false));
     assert_eq!(
         (
             limits.cpu.as_deref(),

@@ -4,6 +4,17 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 
 ## Unreleased
 
+Virtual-machine templates may set the boolean `limits.memoryHotplug`; the Automagik workspace template sets it to
+`false`, so growing its memory needs a config change and a restart. Status and list show the recorded value inside
+`limits`. A VM created before this release keeps its record and is not changed; the pin applies to VMs created
+from this release on. VM update (rebuild) and reconfigure remain refused. Records carrying `memoryHotplug` are one
+more reason downgrading below this release is not supported once a service was created or written.
+
+`service_list` and `service_status` rows add `id`, `uuid`, `createdAt`, `startedAt`, `limits`, and `data.volume`;
+the stable `id` survives service rebuilds and kernel restarts. Service records gain an `id` at creation or their
+next normal write; releases up to 0.35.0 cannot read such a record and show the service as failed or not found.
+Downgrading below this release is therefore not supported once a service was created or written.
+
 ## 0.35.0 (2026-11-16)
 
 A config PATCH whose answer times out or is lost reads the object back to settle its intent. A read that still shows
@@ -44,6 +55,12 @@ with a template fallback for services made before this change.
 
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
+
+`arca token mint --tenant <id>` binds a token to one tenant. Omitted tenant arguments resolve to that tenant;
+other tenants and node-wide operations outside a small read/proposal allowlist are refused. Scope, tools and
+service limits still apply, and proposals are checked before saving. Bare service names become tenant-local.
+Tokens without the new line keep their current behavior. Older releases skip an unknown tenant-bound token,
+or refuse the directory if they predate unknown-line skipping; revoke these tokens before that downgrade.
 
 `instance_move` now moves a stopped virtual machine, where every virtual machine was refused before. It stays stopped:
 nothing starts or stops it here, its copy is made once and started on the target, and the move counts only once the

@@ -333,6 +333,36 @@ fn owner_approval(key: &common::SkKey, name: &str) -> String {
 }
 
 #[test]
+fn the_shipped_automagik_workspace_create_pins_memory() {
+    let rig = Rig::bridged(&["br0"], None);
+    let shipped = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../templates");
+    let template =
+        serde_json::from_slice(&fs::read(shipped.join("automagik-workspace.json")).unwrap())
+            .unwrap();
+    rig.template("automagik-workspace", template);
+    fs::copy(
+        shipped.join("automagik-workspace.sh"),
+        rig.dir.join("templates/automagik-workspace.sh"),
+    )
+    .unwrap();
+    rig.call("service_create", json!({"name":"ws1", "template":"automagik-workspace",
+        "settings":{"publicUrl":"https://workspace.example.org", "repoUrl":"https://github.com/example/project"}}))
+        .expect("the workspace is created stopped");
+    let instance = rig
+        .get(&format!("/1.0/instances/ws1?project={PROJECT}"))
+        .unwrap();
+    assert_eq!(instance["config"]["limits.memory.hotplug"], "false");
+    let request: Value = rig
+        .fake
+        .service_requests()
+        .into_iter()
+        .find(|request| request.method == "POST" && request.path.starts_with("/1.0/instances?"))
+        .map(|request| serde_json::from_slice(&request.body).unwrap())
+        .unwrap();
+    assert_eq!(request["config"]["limits.memory.hotplug"], "false");
+}
+
+#[test]
 fn unsupported_vm_io_limits_undo_the_failed_start_on_both_network_kinds() {
     for bridged in [false, true] {
         let rig = if bridged {
@@ -550,15 +580,39 @@ fn a_vm_is_created_with_its_type_devices_and_limits_and_no_network_is_created_or
 
     // List, status and logs work.
     // The list reads no live state, and a machine on a host bridge has its address nowhere else: its row says so.
-    let listed = rig.call("service_list", json!({})).expect("list");
+    let mut listed = rig.call("service_list", json!({})).expect("list");
+    let mut status = rig
+        .call("service_status", json!({"name":"ws1"}))
+        .expect("status");
+    assert_eq!(
+        listed["services"][0]["id"].as_str(),
+        Some(
+            record
+                .id
+                .as_deref()
+                .expect("the new service record has an id")
+        ),
+        "the bridged row carries its record's id"
+    );
+    assert!(listed["services"][0]["createdAt"].is_string());
+    // Compare the six additive observations with each other, then every legacy field with the create answer.
+    for key in ["id", "uuid", "createdAt", "startedAt", "limits", "data"] {
+        let listed_value = listed["services"][0]
+            .as_object_mut()
+            .expect("the listed service")
+            .remove(key)
+            .unwrap_or_else(|| panic!("service_list omitted {key}"));
+        let status_value = status
+            .as_object_mut()
+            .expect("the service status")
+            .remove(key)
+            .unwrap_or_else(|| panic!("service_status omitted {key}"));
+        assert_eq!(listed_value, status_value, "{key}: list and status agree");
+    }
     let mut row = created.clone();
     row["ipv4In"] = json!("state");
     assert_eq!(listed["services"], json!([row]));
-    assert_eq!(
-        rig.call("service_status", json!({"name":"ws1"}))
-            .expect("status"),
-        created
-    );
+    assert_eq!(status, created);
     rig.fake
         .set_console_log(PROJECT, "ws1", "booted\nlogin: \n");
     assert_eq!(
@@ -1266,3 +1320,6 @@ fn a_proposal_this_node_is_sure_to_refuse_is_refused_when_proposed_and_an_omitte
 
 #[path = "services/mixed.rs"]
 mod mixed;
+
+#[path = "services/memory_hotplug.rs"]
+mod memory_hotplug;

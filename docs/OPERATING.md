@@ -113,7 +113,7 @@ node takes a new token after `arca token reload` or a restart.
 | `arca link remove [--] <name> [--config <file>]` | removes every peer with that name through the running link, or from disk when stopped | `{ "removed": <count> }` as JSON |
 | `arca call <verb> [--config <file>] [--token-file <file>]`, with `--args <json>` or `--args-file <file>`; `arca call` alone lists the verbs | one tool call against the local node | the verb's result, as JSON |
 | `arca call --peer <name> <verb> [--config <file>] --token-file <file>`, with `--args <json>` or `--args-file <file>` | one tool call through a paired peer. The token is sent to the peer, so it is one the peer minted and `--token-file` is always named: this node's own token is never sent by default | the verb's result, as JSON |
-| `arca token mint --scope <s> --id <id> --out <file> [--tools <comma list>] [--services <comma list>] [--expires <span or time>]` with `--config <file>`, `--hash-dir <dir>` or neither (the config every command finds) | nothing | the id and scope, and the services and expiry when given |
+| `arca token mint --scope <s> --id <id> --out <file> [--tools <comma list>] [--tenant <id>] [--services <comma list>] [--expires <span or time>]` with `--config <file>`, `--hash-dir <dir>` or neither (the config every command finds) | nothing | the id and scope, and the tenant, services and expiry when given |
 | `arca token revoke <id>` with `--config <file>`, `--hash-dir <dir>` or neither (the config every command finds) | the token's hash file | the id and `revoked: true` |
 | `arca token reload [--config <file>]` | the pid file and the reload record in the state directory, and `/proc` | one line: `reloaded: the node on this config (pid <n>) read its tokens again and holds <k> token(s)`. It exits non-zero, with the reason on stderr, when no node runs on the config, when the node could not read its token directory, or when it cannot tell |
 | `arca shim --upstream <socket> --listen <socket> --log <file> [--log-max-bytes <n>]` | forwards GET, refuses the rest | the shim summary, on SIGTERM; the summary so far on stderr, on SIGUSR1 |
@@ -700,6 +700,33 @@ directory. **A release before this one refuses the whole token directory when it
 `by=`**: on such a downgrade the node starts with no token at all. Before downgrading past this release, revoke every
 token minted with `--services` or `--expires` (`grep -l -E '^(services|expires|by)=' <hashDir>/*.hash` lists them).
 
+### Tenant-bound tokens
+
+`arca token mint --tenant <id>` adds `tenant=<id>` to the hash file. The id is eight lowercase base32 characters
+(`a-z`, `2-7`). An admin token cannot be bound to a tenant. Minting needs no connection to Incus; the tenant must exist
+when a call uses it.
+
+For this token, omitting a verb's `tenant` selects the bound tenant. Stating the same tenant is accepted; another is
+refused with `OutsideTokenTenant` before a handler, relay or approval runs. A token without `tenant=` keeps its current
+default: omitted `tenant` means the node's own project. With `--tenant`, bare names in `--services` are tenant-local;
+`<id>/<service>` is also accepted for that same tenant. Names from another tenant and duplicate names after resolution
+are refused. The file and mint answer spell these service limits as `<id>/<service>`.
+
+The token reaches the tenant-aware service, instance and snapshot verbs, plus `deploy_confirm`, `deploy_rollback` and `deploy_remove`,
+within its scope, tool list and service list. Of the verbs without `tenant`, only `arca_status`, `tenant_list`, `tenant_status`, `tenant_usage` and
+`action_propose` are available. The tenant list contains only its own row; status and usage default an omitted `id` to its own and refuse another.
+A proposal resolves its inner arguments and checks the action's tenant, scope, tools and services before saving it.
+Every other node verb, including `node_metrics` and `watch_report`, is refused. Every linked-node argument and every
+GET and POST route outside `/mcp` is refused too. The tool list applies these same limits. No binding gives an approval or a standing grant.
+
+A token handed down by a bound parent must bind to the same tenant and remain within the parent's other limits.
+An unbound parent may hand down a bound child when that child's resolved services are within its own list.
+A release that skips unknown token lines leaves a token with an unknown `tenant=` line out. A release from before
+unknown-line skipping refuses the whole token directory on that line. Tenant-bound hash files may use up to 8 KiB;
+unbound files keep the 4 KiB limit. The mint checks the exact serialized size before writing either file and refuses
+combinations of tools and services that exceed the file's budget. An older reader with a 4 KiB limit refuses the whole
+directory for a larger file even if it skips unknown lines. Revoke bound tokens before downgrading to either reader.
+
 ### Modes and the umask
 
 **The token directory must be mode 0700 or 0500.** The server refuses any directory with a group or other write bit, and it
@@ -845,6 +872,13 @@ images and vendored npm lockfile. Five of them, `workspace-vm`, `github-runner-p
 `gitlab-runner-pool-large` and `automagik-workspace`, are
 virtual machines (see "Bridged nodes and virtual machines", "Mixed nodes", "A pool of GitHub Actions runners", "A pool
 of GitLab runners" and "An Automagik workspace in its own virtual machine").
+
+`service_list` and `service_status` rows include a stable `id`, the journal's instance `uuid`, RFC 3339 UTC
+`createdAt` and `startedAt` timestamps, recorded resource `limits`, and the service's own `data.volume`.
+The `id` survives rebuilds and kernel restarts; older records derive it on reads and save it on their next normal
+write. `startedAt` is null when it is unknown or the service never started.
+
+Do not downgrade below this release once a service was created or written: older releases cannot read a record that carries an `id`.
 
 **Templates an earlier release installed.** A release may change a shipped template: up to 0.12.0, for one, the
 shipped `postgres-autopg` template declared `POSTGRES_PASSWORD` and did not make it, so a create came up stopped
@@ -5662,6 +5696,14 @@ A template is a virtual machine when its `kind` is `virtual-machine`:
 `image` is `images:<alias>` (the public images server, with an optional `digest` fingerprint) or `local:<alias>`
 (an image in the service project's own store, with an optional `digest` that pins it; see "A local image may be
 pinned" above).
+
+`limits` may also set `memoryHotplug` to a boolean, only for a `virtual-machine` template. When set, the create sends
+`limits.memory.hotplug` as `"true"` or `"false"`; when omitted, the record and create carry no new key. The shipped
+Automagik workspace sets it to `false`: growing its memory needs a config change and a restart. Status and list show
+`limits.memoryHotplug` when the record has it. Existing VMs keep their records and are not changed; VM update
+(rebuild) and reconfigure remain refused.
+Incus without the `limits_memory_hotplug` API extension (introduced in Incus 6.15) refuses this create with an unknown-key error.
+
 `limits` must set both `cpu` and `memory`, and `rootSize` is required; all three follow the size rules above. A
 virtual-machine template may also set `description` and `autostart`, and `ports` with `provides` when a container is
 to link to it: a link opens the port in the managed service network's ACL, so a template with `ports` is refused on a
@@ -7382,6 +7424,9 @@ arca-gitlab-pool: totals jobs_now=3 of 6 jobs_done=161 jobs_failed=12 runners=2 
 A node may hold tenants: each is one restricted Incus project of its own, on the node's managed service network, with its
 own caps and its own block of addresses. The node's own project, `arcak-svc`, stays the node owner's. The rules are 61 to
 67 of `docs/OWNERSHIP.md`.
+
+A tenant-bound token can work only in its bound tenant; omitting `tenant` selects that tenant. Tokens without a
+binding keep the node project as their default. See "Tenant-bound tokens" for the verbs they may reach.
 
 `kernel.tenants` turns it on. Without the key the node behaves exactly as before, and every tenant verb, and every verb
 given a `tenant`, answers "this node has no tenants". The key needs `kernel.serviceCidr` and is refused beside

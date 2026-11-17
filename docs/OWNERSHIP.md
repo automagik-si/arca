@@ -1272,7 +1272,12 @@ in `crates/arca/tests/tenants/deploys.rs` (`sync_front` in `crates/arca/src/tena
 `crates/arca-netproject/src/tenant.rs`.
 
 **Rule 65.** A verb given `tenant` acts in that tenant's project and sees nothing outside it; a verb given none sees
-nothing of any tenant. A tenant's service is the entry `t-<id>-service-<name>`, so two tenants and the node may each
+nothing of any tenant. A tenant-bound token resolves an omitted tenant to its own before the verb runs, refuses another
+tenant, and reaches only the reviewed tenant allowlist. Its scope, tools and services narrow that list further;
+proposals check their inner action before saving it. Only its own tenant is returned by tenant reads. Linked-node
+arguments and GET and POST routes outside `/mcp` are refused. Tokens without a binding retain their existing behavior.
+Source for the token boundary: `crates/arca-api/src/tenant.rs`, `crates/arca-mcp/src/jsonrpc.rs` and
+`crates/arca-mcp/tests/tenant_tokens.rs`. A tenant's service is the entry `t-<id>-service-<name>`, so two tenants and the node may each
 hold one of a name. A database inside a tenant is a service too: the postgres service template, linked with
 `service_connect`. The `postgres_*` verbs act in the node's own project only and refuse a `tenant` in those words,
 before anything is written. Its Incus instance is named

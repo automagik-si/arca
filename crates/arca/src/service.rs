@@ -70,6 +70,12 @@ pub struct Limits {
     pub cpu: Option<String>,
     #[serde(default)]
     pub memory: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_memory_hotplug"
+    )]
+    pub memory_hotplug: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk_read: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -78,6 +84,13 @@ pub struct Limits {
     pub ingress: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub egress: Option<String>,
+}
+
+// An omitted field keeps older records unchanged; a present value must be a boolean, including in templates.
+fn deserialize_memory_hotplug<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<bool>, D::Error> {
+    bool::deserialize(deserializer).map(Some)
 }
 
 impl Limits {
@@ -397,6 +410,9 @@ const SETTINGS_MAX: usize = 16 * 1024;
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ServiceConfig {
+    /// Issued once at create. Older records derive their identity until their next normal write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     pub name: String,
     pub template: String,
     pub instance: String,
@@ -503,6 +519,68 @@ pub struct ServiceConfig {
     /// The connector kind named by its template. Older records fall back to their template.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connector: Option<String>,
+}
+
+pub(crate) fn fresh_id() -> Result<String, getrandom::Error> {
+    let mut bytes = [0; 16];
+    getrandom::fill(&mut bytes)?;
+    Ok(format!("svc_{}", hex_id(&bytes)))
+}
+
+/// A legacy record's identity depends on its node and creation, never a mutable instance UUID.
+pub(crate) fn legacy_id(public: &[u8; 32], entry: &str, created: u64) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(b"arca.service.legacy-id.v1\0");
+    hash.update(arca_kernel::identity::NodeId::of_public(public).0);
+    hash.update((entry.len() as u64).to_be_bytes());
+    hash.update(entry.as_bytes());
+    hash.update(created.to_be_bytes());
+    format!("svc_{}", hex_id(&hash.finalize()[..16]))
+}
+
+fn hex_id(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[cfg(test)]
+mod identity_observation_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_identity_is_separated_by_node_entry_and_creation_time() {
+        let id = legacy_id(&[1; 32], "service-app", 42);
+        assert_eq!(id, "svc_ccd12e4feb19a626dd8b998a5a6e9b0f");
+        assert_eq!(id, legacy_id(&[1; 32], "service-app", 42));
+        assert_ne!(id, legacy_id(&[2; 32], "service-app", 42));
+        assert_ne!(id, legacy_id(&[1; 32], "service-other", 42));
+        assert_ne!(id, legacy_id(&[1; 32], "service-app", 43));
+        assert_eq!(id.len(), 36);
+    }
+
+    #[test]
+    fn start_observation_normalizes_offsets_preserves_fractions_and_refuses_invalid_times() {
+        for (text, expected) in [
+            ("2026-11-01T15:34:56+03:00", Some("2026-11-01T12:34:56Z")),
+            (
+                "2026-11-01T09:34:56.123456789-03:00",
+                Some("2026-11-01T12:34:56.123456789Z"),
+            ),
+            ("2026-11-01T12:34:56Z", Some("2026-11-01T12:34:56Z")),
+            ("0001-01-01T00:00:00Z", None),
+            ("2026-02-30T12:34:56Z", None),
+            ("2026-11-01T12:34:56+24:00", None),
+            ("2026-11-01T12:34:56.Z", None),
+            ("not-a-time", None),
+        ] {
+            assert_eq!(
+                started_at(&json!({"last_used_at": text})).as_deref(),
+                expected,
+                "{text}"
+            );
+        }
+        assert_eq!(started_at(&json!({})), None);
+    }
 }
 
 /// An image digest and the version Automagik published it as.
@@ -737,6 +815,9 @@ fn vm_config(cfg: &ServiceConfig) -> Map<String, Value> {
         }
         if let Some(memory) = &limits.memory {
             config.insert("limits.memory".into(), json!(memory));
+        }
+        if let Some(hotplug) = limits.memory_hotplug {
+            config.insert("limits.memory.hotplug".into(), json!(hotplug.to_string()));
         }
     }
     if cfg.autostart {
@@ -2012,6 +2093,15 @@ fn validate_template(template: &Template, dir: &Path) -> Result<(), TemplateErro
     }
     if template.is_vm() {
         return validate_vm_template(template);
+    }
+    if template
+        .limits
+        .as_ref()
+        .is_some_and(|limits| limits.memory_hotplug.is_some())
+    {
+        return Err(TemplateError::refused(format!(
+            "template {name}: limits.memoryHotplug is only for a virtual-machine template"
+        )));
     }
     if template.kind != "oci" && template.kind != "system" {
         return Err(TemplateError::refused(format!(
@@ -3950,6 +4040,67 @@ pub fn base_image(row: &Value) -> Option<&str> {
         .filter(|image| image.len() == 64 && image.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
+/// Add explicit null observations when a row has no service record.
+pub(crate) fn without_record(mut view: Value) -> Value {
+    for key in ["id", "uuid", "createdAt", "startedAt", "limits", "data"] {
+        view[key] = Value::Null;
+    }
+    view
+}
+
+/// The instance's last start, normalized to UTC; Incus's zero time means never started.
+pub(crate) fn started_at(row: &Value) -> Option<String> {
+    let text = row["last_used_at"].as_str()?;
+    if !text.is_ascii() {
+        return None;
+    }
+    let (moment, offset) = if let Some(moment) = text.strip_suffix('Z') {
+        (moment, 0)
+    } else {
+        let at = text.len().checked_sub(6)?;
+        let (moment, zone) = text.split_at(at);
+        let sign = match zone.as_bytes()[0] {
+            b'+' => 1i64,
+            b'-' => -1,
+            _ => return None,
+        };
+        if zone.as_bytes()[3] != b':' {
+            return None;
+        }
+        if !zone[1..3]
+            .bytes()
+            .chain(zone[4..6].bytes())
+            .all(|b| b.is_ascii_digit())
+        {
+            return None;
+        }
+        let hours = zone[1..3].parse::<u32>().ok()?;
+        let minutes = zone[4..6].parse::<u32>().ok()?;
+        if hours > 23 || minutes > 59 {
+            return None;
+        }
+        (moment, sign * i64::from(hours * 3600 + minutes * 60))
+    };
+    let (whole, fraction) = match moment.split_once('.') {
+        Some((whole, fraction))
+            if !fraction.is_empty()
+                && fraction.len() <= 9
+                && fraction.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            (whole, Some(fraction))
+        }
+        Some(_) => return None,
+        None => (moment, None),
+    };
+    let seconds = arca_mcp::auth::parse_rfc3339(&format!("{whole}Z"))?;
+    let seconds = u64::try_from(i64::try_from(seconds).ok()?.checked_sub(offset)?).ok()?;
+    let utc = arca_mcp::auth::format_rfc3339(seconds);
+    Some(match fraction {
+        Some(fraction) => format!("{}.{fraction}Z", utc.strip_suffix('Z')?),
+        None => utc,
+    })
+}
+
 /// A project instance with no service record.
 pub fn unknown_view(row: &Value) -> Option<Value> {
     let name = row["name"].as_str()?;
@@ -3962,7 +4113,7 @@ pub fn unknown_view(row: &Value) -> Option<Value> {
         .flat_map(|devices| devices.values())
         .find_map(|device| device["ipv4.address"].as_str())
         .unwrap_or("");
-    Some(json!({
+    Some(without_record(json!({
         "name": name,
         "template": "",
         "state": "unknown",
@@ -3971,7 +4122,7 @@ pub fn unknown_view(row: &Value) -> Option<Value> {
         "links": [],
         "published": null,
         "lanPort": null
-    }))
+    })))
 }
 
 /// A marked instance without a readable record: listed as failed and left alone.
@@ -3983,7 +4134,7 @@ pub fn failed_view(row: &Value) -> Option<Value> {
     let ipv4 = row["devices"]["eth0"]["ipv4.address"]
         .as_str()
         .unwrap_or("");
-    Some(json!({
+    Some(without_record(json!({
         "name": name,
         "template": row["config"][TEMPLATE_KEY].as_str().unwrap_or(""),
         "state": "failed",
@@ -3992,7 +4143,7 @@ pub fn failed_view(row: &Value) -> Option<Value> {
         "links": [],
         "published": null,
         "lanPort": null
-    }))
+    })))
 }
 
 /// The service rows of a project listing.

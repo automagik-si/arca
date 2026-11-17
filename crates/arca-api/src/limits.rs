@@ -95,6 +95,26 @@ impl ServiceLimit {
             .any(|(t, s)| t.as_deref() == tenant && s == service)
     }
 
+    /// Resolve bare names inside a tenant, refusing another tenant and duplicate names after resolution.
+    pub fn in_tenant(&self, tenant: &str) -> Option<ServiceLimit> {
+        if !tenant_id_ok(tenant) {
+            return None;
+        }
+        let mut entries = Vec::with_capacity(self.entries.len());
+        for (named, service) in &self.entries {
+            if named.as_deref().is_some_and(|named| named != tenant) {
+                return None;
+            }
+            let entry = (Some(tenant.to_string()), service.clone());
+            if entries.contains(&entry) {
+                return None;
+            }
+            entries.push(entry);
+        }
+        entries.sort();
+        Some(ServiceLimit { entries })
+    }
+
     /// Whether every service of this list is on `wider` too.
     pub fn within(&self, wider: &ServiceLimit) -> bool {
         self.entries
@@ -132,7 +152,7 @@ fn tenant_of_project(project: &str) -> Option<&str> {
 }
 
 /// A tenant id: eight characters of lowercase base32 (`a-z`, `2-7`), as `arca_kernel::ownership::tenant_id_ok`.
-fn tenant_id_ok(id: &str) -> bool {
+pub fn tenant_id_ok(id: &str) -> bool {
     id.len() == 8
         && id
             .bytes()

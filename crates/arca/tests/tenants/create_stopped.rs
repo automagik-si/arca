@@ -379,7 +379,7 @@ fn assert_first_start_held_everything(rig: &Rig, tenant: Option<&str>, started: 
 fn started_and_template_stopped_creates_are_the_same_with_start_left_out_or_true() {
     // The same creates on two nodes, one naming `start: true` and one leaving it out: a container and a virtual
     // machine that start, a container and a virtual machine their template stops, and a container in a tenant's
-    // deploy. None of them makes a secret, so the two nodes hold the same bytes.
+    // deploy. Apart from independently issued service IDs, the two nodes hold the same bytes.
     let run = |start: Option<bool>| {
         let rig = rig();
         let mut answers = Vec::new();
@@ -449,7 +449,16 @@ fn started_and_template_stopped_creates_are_the_same_with_start_left_out_or_true
     assert_eq!(left_out.1.1, named.1.1, "every write and its config keys");
     assert_eq!(left_out.1.2, named.1.2, "every request's body");
     assert_eq!(left_out.1.3, named.1.3, "the effect journal");
-    assert_eq!(left_out.2, named.2, "the records");
+    assert_eq!(left_out.2.len(), named.2.len());
+    for (left, right) in left_out.2.iter().zip(&named.2) {
+        assert_ne!(
+            left["id"], right["id"],
+            "independent creates have distinct IDs"
+        );
+        let mut expected = left.clone();
+        expected["id"] = right["id"].clone();
+        assert_eq!(&expected, right, "every other record field");
+    }
     assert_eq!(left_out.3, named.3, "the deploy journal");
 }
 
@@ -593,7 +602,7 @@ fn only_an_explicit_start_false_leaves_boot_autostart_out_and_a_create_made_agai
                 .get("boot.autostart")
                 .is_none()
         );
-        // Nothing else differs: the same requests, the same bodies but for that key, the same record but for that field.
+        // Apart from independently issued IDs, only autostart differs in these records and create bodies.
         let mut without_key = forced.3.clone();
         without_key["config"]
             .as_object_mut()
@@ -601,6 +610,11 @@ fn only_an_explicit_start_false_leaves_boot_autostart_out_and_a_create_made_agai
             .remove("boot.autostart");
         assert_eq!(without_key, asked.3, "{name}: the create body");
         let mut record = forced.2.clone();
+        assert_ne!(
+            record["id"], asked.2["id"],
+            "independent creates have distinct IDs"
+        );
+        record["id"] = asked.2["id"].clone();
         record["autostart"] = json!(false);
         assert_eq!(record, asked.2, "{name}: the record");
         let (forced_log, asked_log) = (everything(&forced.0), everything(&asked.0));

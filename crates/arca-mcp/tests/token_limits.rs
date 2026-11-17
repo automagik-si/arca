@@ -37,6 +37,7 @@ fn services(text: &str) -> Option<ServiceLimit> {
 
 fn limits(list: Option<&str>, expires: Option<u64>, by: Option<&str>) -> Limits {
     Limits {
+        tenant: None,
         services: list.and_then(services),
         expires,
         by: by.map(str::to_string),
@@ -513,6 +514,7 @@ impl GetHandler for Page {
 
 fn view(name: &str, links: &[&str]) -> Value {
     json!({
+        "id": null, "uuid": null, "createdAt": null, "startedAt": null, "limits": null, "data": null,
         "name": name,
         "template": "nats",
         "state": "running",

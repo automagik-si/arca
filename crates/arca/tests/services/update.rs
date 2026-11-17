@@ -161,10 +161,38 @@ fn an_update_rebuilds_from_the_new_digest_keeps_the_data_and_records_the_digest(
     let up = Arc::new(AtomicBool::new(true));
     let rig = rig(&up);
     let before = instance(&rig);
+    let identity = rig
+        .entries()
+        .iter()
+        .find(|e| e.id.0 == "service-app")
+        .unwrap()
+        .config["id"]
+        .clone();
+    assert!(identity.as_str().is_some_and(|id| id.starts_with("svc_")));
 
     let done = update(&rig, json!({ "name": "app", "digest": NEW })).expect("update");
     assert_eq!(done["updated"], true);
     assert_eq!(done["digest"], NEW);
+    assert_eq!(
+        rig.entries()
+            .iter()
+            .find(|e| e.id.0 == "service-app")
+            .unwrap()
+            .config["id"],
+        identity
+    );
+    let persisted: Value =
+        serde_json::from_slice(&fs::read(rig.dir.join(arca::desired_store::STATE_FILE)).unwrap())
+            .unwrap();
+    assert_eq!(
+        persisted["current"]["document"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["id"] == "service-app")
+            .unwrap()["config"]["id"],
+        identity
+    );
     let snapshot = done["snapshot"].as_str().expect("a snapshot").to_string();
     assert!(snapshot.starts_with("pre-update-"));
 

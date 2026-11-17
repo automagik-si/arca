@@ -1,0 +1,810 @@
+{
+  "service_list": {
+    "additionalProperties": false,
+    "properties": {
+      "services": {
+        "items": {
+          "additionalProperties": false,
+          "properties": {
+            "address": {
+              "description": "Present only on a recorded program: the address it was recorded with.",
+              "maxLength": 300,
+              "type": "string"
+            },
+            "createdAt": {
+              "description": "Creation time from the service record, in RFC 3339 UTC. Null without a service record.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "data": {
+              "additionalProperties": false,
+              "description": "The service's own data volume, read-only. Its volume is null without a data disk; data is null without a service record.",
+              "properties": {
+                "volume": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "volume"
+              ],
+              "type": [
+                "object",
+                "null"
+              ]
+            },
+            "destinations": {
+              "description": "Present only on a service that may reach a private address through this node: each address and the one tcp port open on it, as this node's config (kernel.serviceDestinations) named them when the owner approved the create. Every other private address stays closed to the service. service_status also answers ready for each and, when it is false, problem.",
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "address": {
+                    "description": "One IPv4 address in a private range or the tailnet range, outside the service subnet.",
+                    "maxLength": 15,
+                    "type": "string"
+                  },
+                  "port": {
+                    "description": "The one tcp port open on that address.",
+                    "maximum": 65535,
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  "problem": {
+                    "description": "service_status only, when ready is false: what does not stand as recorded.",
+                    "maxLength": 300,
+                    "type": "string"
+                  },
+                  "ready": {
+                    "description": "service_status only: the network rules Incus holds for the service are the ones its record gives, and the address is not one of the node's own.",
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "address",
+                  "port"
+                ],
+                "type": "object"
+              },
+              "maxItems": 4,
+              "type": "array"
+            },
+            "follow": {
+              "description": "service_status only, on a container made from Automagik's server image by digest: whether the node moves it to Automagik's newest published server image by itself. service_update with follow sets it.",
+              "type": "boolean"
+            },
+            "health": {
+              "description": "Present only on a recorded program recorded with one: the name of a tool it answers, a label.",
+              "maxLength": 64,
+              "type": "string"
+            },
+            "id": {
+              "description": "The service's stable identity, issued at creation and kept through rebuilds. Older records derive it from this node, their entry and creation time until their next normal write. Null without a service record.",
+              "pattern": "^svc_[0-9a-f]{32}$",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "ipv4": {
+              "description": "Its fixed address on the service bridge, from its record. A virtual machine on a host bridge takes its address from that network and has none in its record: service_list leaves this empty and sets ipv4In, and service_status reads it from the running machine's live state. Empty with neither ipv4In nor ipv4Problem: the guest reports no address for that card now (it is down, or the guest's agent does not answer); what the guest reports, it can set.",
+              "maxLength": 15,
+              "type": "string"
+            },
+            "ipv4In": {
+              "const": "state",
+              "description": "service_list only, on a virtual machine on a host bridge: its address is not in its record and exists only in its live state, which the list does not read. service_status of it reads it.",
+              "type": "string"
+            },
+            "ipv4Problem": {
+              "description": "service_status only, on a running virtual machine on a host bridge whose live state could not be read: why, in words. ipv4 is then empty because it was not read, and every other field is as usual.",
+              "maxLength": 400,
+              "type": "string"
+            },
+            "kernelAccess": {
+              "additionalProperties": false,
+              "description": "Present only on a service whose template declares kernelAccess: the service can call this node's kernel from inside its instance, at http://127.0.0.1:<port>/mcp, with whatever token it is given. service_status also answers ready and, when it is false, problem.",
+              "properties": {
+                "connect": {
+                  "description": "The path of the socket on the host its device connects to: the node's listen.services as it was when the service was created.",
+                  "maxLength": 100,
+                  "type": "string"
+                },
+                "port": {
+                  "description": "The port inside the instance, on its loopback.",
+                  "maximum": 65535,
+                  "minimum": 1024,
+                  "type": "integer"
+                },
+                "problem": {
+                  "description": "service_status only, when ready is false: what does not stand as recorded.",
+                  "maxLength": 512,
+                  "type": "string"
+                },
+                "ready": {
+                  "description": "service_status only: whether the instance carries the device as Arca made it and this server's listen.services is still the socket it connects to.",
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "port",
+                "connect"
+              ],
+              "type": "object"
+            },
+            "kind": {
+              "const": "host-program",
+              "description": "Present only on a program this node records and does not manage (external_add): host-program.",
+              "type": "string"
+            },
+            "lanPort": {
+              "anyOf": [
+                {
+                  "maximum": 65535,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Its host port when the template has a lan proxy, or null."
+            },
+            "limits": {
+              "additionalProperties": false,
+              "description": "Typed resource limits from the service record. Null when none are recorded.",
+              "properties": {
+                "cpu": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "diskRead": {
+                  "type": "string"
+                },
+                "diskWrite": {
+                  "type": "string"
+                },
+                "egress": {
+                  "type": "string"
+                },
+                "ingress": {
+                  "type": "string"
+                },
+                "memory": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "memoryHotplug": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "cpu",
+                "memory"
+              ],
+              "type": [
+                "object",
+                "null"
+              ]
+            },
+            "links": {
+              "description": "The services it is linked to, as a consumer, and the port each link opens.",
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "port": {
+                    "maximum": 65535,
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  "to": {
+                    "maxLength": 40,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "to",
+                  "port"
+                ],
+                "type": "object"
+              },
+              "maxItems": 64,
+              "type": "array"
+            },
+            "managed": {
+              "const": false,
+              "description": "Present only on a recorded program: false. Arca does not start, stop, update, publish or remove it.",
+              "type": "boolean"
+            },
+            "name": {
+              "maxLength": 40,
+              "type": "string"
+            },
+            "noNewPrivileges": {
+              "const": true,
+              "description": "Present, and true, only on a container that runs with no-new-privileges: a setuid or setcap binary inside it cannot raise privileges. It comes from the template's noNewPrivileges and is kept in the service's record.",
+              "type": "boolean"
+            },
+            "note": {
+              "description": "Present when there is something to know about how this row was read: on a node that only looks, an instance of the service project that this node holds no record of is shown as it is and marked \"not recorded by this node\".",
+              "maxLength": 200,
+              "type": "string"
+            },
+            "ports": {
+              "description": "The ports it listens on; a link opens the first.",
+              "items": {
+                "maximum": 65535,
+                "minimum": 1,
+                "type": "integer"
+              },
+              "maxItems": 16,
+              "type": "array"
+            },
+            "privatePort": {
+              "additionalProperties": false,
+              "description": "Present only on a service created with a private port: the one host address its port listens on, and the port, as the owner approved them. Not on any other address of the node. service_status also answers ready and, when it is false, problem.",
+              "properties": {
+                "address": {
+                  "type": "string"
+                },
+                "port": {
+                  "maximum": 65535,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "problem": {
+                  "description": "service_status only: what is wrong, when ready is false.",
+                  "type": "string"
+                },
+                "ready": {
+                  "description": "service_status only: its instance carries the proxy device as Arca made it, and this host holds the address.",
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "address",
+                "port"
+              ],
+              "type": "object"
+            },
+            "published": {
+              "anyOf": [
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "node": {
+                      "maxLength": 63,
+                      "type": "string"
+                    },
+                    "port": {
+                      "const": 8443,
+                      "type": "number"
+                    },
+                    "reach": {
+                      "const": "tailnet",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "reach",
+                    "node",
+                    "port"
+                  ],
+                  "type": "object"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Its dash on the tailnet (service_publish), or null."
+            },
+            "recorded": {
+              "const": true,
+              "description": "Present only on a recorded program: true. The node holds a record of it, and nothing more.",
+              "type": "boolean"
+            },
+            "startedAt": {
+              "description": "The instance's last_used_at from Incus, in RFC 3339 UTC. Null if it never started, the time is unavailable, or there is no service record.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "state": {
+              "description": "failed: Incus reports an error, or its instance is gone; unknown: an instance droidd did not create, which it leaves alone. For a recorded program: recorded in service_list, where nothing is asked of it; up or down in service_status, by one TCP connect to its address.",
+              "enum": [
+                "creating",
+                "running",
+                "stopped",
+                "failed",
+                "unknown",
+                "recorded",
+                "up",
+                "down"
+              ],
+              "type": "string"
+            },
+            "template": {
+              "description": "Its template (empty for an instance droidd did not create).",
+              "maxLength": 40,
+              "type": "string"
+            },
+            "update": {
+              "additionalProperties": false,
+              "description": "The version the service runs beside the one its template, as installed on this node, names now. Both come from this node's own records and files: no registry is asked. service_list carries it only when the two differ, with state alone; service_status carries it for every service whose own version is known (a container made from an image by digest, or a virtual machine whose template names its version's setting in update.pin). Two digests carry no order: differs says the template names another version, never which one is newer. A container made from an image by digest moves to another digest with service_update; a virtual machine's only way to the template's version is service_remove and service_create.",
+              "properties": {
+                "pin": {
+                  "description": "service_status only: the version the service was created with, an image by digest.",
+                  "maxLength": 512,
+                  "type": "string"
+                },
+                "problem": {
+                  "description": "service_status only, when state is unknown: why the installed template cannot say.",
+                  "maxLength": 512,
+                  "type": "string"
+                },
+                "state": {
+                  "description": "same: the installed template names the version the service runs. differs: it names another one. unknown: the template is not installed any more, cannot be used, or is of another kind now.",
+                  "enum": [
+                    "same",
+                    "differs",
+                    "unknown"
+                  ],
+                  "type": "string"
+                },
+                "templatePin": {
+                  "description": "service_status only: the version the installed template names now.",
+                  "maxLength": 512,
+                  "type": "string"
+                }
+              },
+              "required": [
+                "state"
+              ],
+              "type": "object"
+            },
+            "uuid": {
+              "description": "The instance UUID recorded by the effect journal, never taken from a fresh listing. Null when no instance identity is recorded.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "name",
+            "template",
+            "state",
+            "ipv4",
+            "ports",
+            "links",
+            "published",
+            "lanPort",
+            "createdAt",
+            "data",
+            "id",
+            "limits",
+            "startedAt",
+            "uuid"
+          ],
+          "type": "object"
+        },
+        "maxItems": 256,
+        "type": "array"
+      }
+    },
+    "required": [
+      "services"
+    ],
+    "type": "object"
+  },
+  "service_status": {
+    "additionalProperties": false,
+    "properties": {
+      "address": {
+        "description": "Present only on a recorded program: the address it was recorded with.",
+        "maxLength": 300,
+        "type": "string"
+      },
+      "baseImage": {
+        "description": "The fingerprint (SHA-256) of the image its instance was created from, as Incus recorded it. Absent when Incus recorded none.",
+        "maxLength": 64,
+        "type": "string"
+      },
+      "createdAt": {
+        "description": "Creation time from the service record, in RFC 3339 UTC. Null without a service record.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "data": {
+        "additionalProperties": false,
+        "description": "The service's own data volume, read-only. Its volume is null without a data disk; data is null without a service record.",
+        "properties": {
+          "volume": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "volume"
+        ],
+        "type": [
+          "object",
+          "null"
+        ]
+      },
+      "destinations": {
+        "description": "Present only on a service that may reach a private address through this node: each address and the one tcp port open on it, as this node's config (kernel.serviceDestinations) named them when the owner approved the create. Every other private address stays closed to the service. service_status also answers ready for each and, when it is false, problem.",
+        "items": {
+          "additionalProperties": false,
+          "properties": {
+            "address": {
+              "description": "One IPv4 address in a private range or the tailnet range, outside the service subnet.",
+              "maxLength": 15,
+              "type": "string"
+            },
+            "port": {
+              "description": "The one tcp port open on that address.",
+              "maximum": 65535,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "problem": {
+              "description": "service_status only, when ready is false: what does not stand as recorded.",
+              "maxLength": 300,
+              "type": "string"
+            },
+            "ready": {
+              "description": "service_status only: the network rules Incus holds for the service are the ones its record gives, and the address is not one of the node's own.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "address",
+            "port"
+          ],
+          "type": "object"
+        },
+        "maxItems": 4,
+        "type": "array"
+      },
+      "follow": {
+        "description": "service_status only, on a container made from Automagik's server image by digest: whether the node moves it to Automagik's newest published server image by itself. service_update with follow sets it.",
+        "type": "boolean"
+      },
+      "health": {
+        "description": "Present only on a recorded program recorded with one: the name of a tool it answers, a label.",
+        "maxLength": 64,
+        "type": "string"
+      },
+      "id": {
+        "description": "The service's stable identity, issued at creation and kept through rebuilds. Older records derive it from this node, their entry and creation time until their next normal write. Null without a service record.",
+        "pattern": "^svc_[0-9a-f]{32}$",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "ipv4": {
+        "description": "Its fixed address on the service bridge, from its record. A virtual machine on a host bridge takes its address from that network and has none in its record: service_list leaves this empty and sets ipv4In, and service_status reads it from the running machine's live state. Empty with neither ipv4In nor ipv4Problem: the guest reports no address for that card now (it is down, or the guest's agent does not answer); what the guest reports, it can set.",
+        "maxLength": 15,
+        "type": "string"
+      },
+      "ipv4In": {
+        "const": "state",
+        "description": "service_list only, on a virtual machine on a host bridge: its address is not in its record and exists only in its live state, which the list does not read. service_status of it reads it.",
+        "type": "string"
+      },
+      "ipv4Problem": {
+        "description": "service_status only, on a running virtual machine on a host bridge whose live state could not be read: why, in words. ipv4 is then empty because it was not read, and every other field is as usual.",
+        "maxLength": 400,
+        "type": "string"
+      },
+      "kernelAccess": {
+        "additionalProperties": false,
+        "description": "Present only on a service whose template declares kernelAccess: the service can call this node's kernel from inside its instance, at http://127.0.0.1:<port>/mcp, with whatever token it is given. service_status also answers ready and, when it is false, problem.",
+        "properties": {
+          "connect": {
+            "description": "The path of the socket on the host its device connects to: the node's listen.services as it was when the service was created.",
+            "maxLength": 100,
+            "type": "string"
+          },
+          "port": {
+            "description": "The port inside the instance, on its loopback.",
+            "maximum": 65535,
+            "minimum": 1024,
+            "type": "integer"
+          },
+          "problem": {
+            "description": "service_status only, when ready is false: what does not stand as recorded.",
+            "maxLength": 512,
+            "type": "string"
+          },
+          "ready": {
+            "description": "service_status only: whether the instance carries the device as Arca made it and this server's listen.services is still the socket it connects to.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "port",
+          "connect"
+        ],
+        "type": "object"
+      },
+      "kind": {
+        "const": "host-program",
+        "description": "Present only on a program this node records and does not manage (external_add): host-program.",
+        "type": "string"
+      },
+      "lanPort": {
+        "anyOf": [
+          {
+            "maximum": 65535,
+            "minimum": 1,
+            "type": "integer"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "description": "Its host port when the template has a lan proxy, or null."
+      },
+      "limits": {
+        "additionalProperties": false,
+        "description": "Typed resource limits from the service record. Null when none are recorded.",
+        "properties": {
+          "cpu": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "diskRead": {
+            "type": "string"
+          },
+          "diskWrite": {
+            "type": "string"
+          },
+          "egress": {
+            "type": "string"
+          },
+          "ingress": {
+            "type": "string"
+          },
+          "memory": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "memoryHotplug": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "cpu",
+          "memory"
+        ],
+        "type": [
+          "object",
+          "null"
+        ]
+      },
+      "links": {
+        "description": "The services it is linked to, as a consumer, and the port each link opens.",
+        "items": {
+          "additionalProperties": false,
+          "properties": {
+            "port": {
+              "maximum": 65535,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "to": {
+              "maxLength": 40,
+              "type": "string"
+            }
+          },
+          "required": [
+            "to",
+            "port"
+          ],
+          "type": "object"
+        },
+        "maxItems": 64,
+        "type": "array"
+      },
+      "managed": {
+        "const": false,
+        "description": "Present only on a recorded program: false. Arca does not start, stop, update, publish or remove it.",
+        "type": "boolean"
+      },
+      "name": {
+        "maxLength": 40,
+        "type": "string"
+      },
+      "noNewPrivileges": {
+        "const": true,
+        "description": "Present, and true, only on a container that runs with no-new-privileges: a setuid or setcap binary inside it cannot raise privileges. It comes from the template's noNewPrivileges and is kept in the service's record.",
+        "type": "boolean"
+      },
+      "note": {
+        "description": "Present when there is something to know about how this row was read: on a node that only looks, an instance of the service project that this node holds no record of is shown as it is and marked \"not recorded by this node\".",
+        "maxLength": 200,
+        "type": "string"
+      },
+      "ports": {
+        "description": "The ports it listens on; a link opens the first.",
+        "items": {
+          "maximum": 65535,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "maxItems": 16,
+        "type": "array"
+      },
+      "privatePort": {
+        "additionalProperties": false,
+        "description": "Present only on a service created with a private port: the one host address its port listens on, and the port, as the owner approved them. Not on any other address of the node. service_status also answers ready and, when it is false, problem.",
+        "properties": {
+          "address": {
+            "type": "string"
+          },
+          "port": {
+            "maximum": 65535,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "problem": {
+            "description": "service_status only: what is wrong, when ready is false.",
+            "type": "string"
+          },
+          "ready": {
+            "description": "service_status only: its instance carries the proxy device as Arca made it, and this host holds the address.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "address",
+          "port"
+        ],
+        "type": "object"
+      },
+      "published": {
+        "anyOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "node": {
+                "maxLength": 63,
+                "type": "string"
+              },
+              "port": {
+                "const": 8443,
+                "type": "number"
+              },
+              "reach": {
+                "const": "tailnet",
+                "type": "string"
+              }
+            },
+            "required": [
+              "reach",
+              "node",
+              "port"
+            ],
+            "type": "object"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "description": "Its dash on the tailnet (service_publish), or null."
+      },
+      "recorded": {
+        "const": true,
+        "description": "Present only on a recorded program: true. The node holds a record of it, and nothing more.",
+        "type": "boolean"
+      },
+      "settings": {
+        "description": "The virtual machine guest settings, when present, with the recorded template limits under limits when an I/O cap is set. Limits describe the create configuration, not measured throughput. Never a secret.",
+        "type": "object"
+      },
+      "startedAt": {
+        "description": "The instance's last_used_at from Incus, in RFC 3339 UTC. Null if it never started, the time is unavailable, or there is no service record.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "state": {
+        "description": "failed: Incus reports an error, or its instance is gone; unknown: an instance droidd did not create, which it leaves alone. For a recorded program: recorded in service_list, where nothing is asked of it; up or down in service_status, by one TCP connect to its address.",
+        "enum": [
+          "creating",
+          "running",
+          "stopped",
+          "failed",
+          "unknown",
+          "recorded",
+          "up",
+          "down"
+        ],
+        "type": "string"
+      },
+      "template": {
+        "description": "Its template (empty for an instance droidd did not create).",
+        "maxLength": 40,
+        "type": "string"
+      },
+      "update": {
+        "additionalProperties": false,
+        "description": "The version the service runs beside the one its template, as installed on this node, names now. Both come from this node's own records and files: no registry is asked. service_list carries it only when the two differ, with state alone; service_status carries it for every service whose own version is known (a container made from an image by digest, or a virtual machine whose template names its version's setting in update.pin). Two digests carry no order: differs says the template names another version, never which one is newer. A container made from an image by digest moves to another digest with service_update; a virtual machine's only way to the template's version is service_remove and service_create.",
+        "properties": {
+          "pin": {
+            "description": "service_status only: the version the service was created with, an image by digest.",
+            "maxLength": 512,
+            "type": "string"
+          },
+          "problem": {
+            "description": "service_status only, when state is unknown: why the installed template cannot say.",
+            "maxLength": 512,
+            "type": "string"
+          },
+          "state": {
+            "description": "same: the installed template names the version the service runs. differs: it names another one. unknown: the template is not installed any more, cannot be used, or is of another kind now.",
+            "enum": [
+              "same",
+              "differs",
+              "unknown"
+            ],
+            "type": "string"
+          },
+          "templatePin": {
+            "description": "service_status only: the version the installed template names now.",
+            "maxLength": 512,
+            "type": "string"
+          }
+        },
+        "required": [
+          "state"
+        ],
+        "type": "object"
+      },
+      "uuid": {
+        "description": "The instance UUID recorded by the effect journal, never taken from a fresh listing. Null when no instance identity is recorded.",
+        "type": [
+          "string",
+          "null"
+        ]
+      }
+    },
+    "required": [
+      "name",
+      "template",
+      "state",
+      "ipv4",
+      "ports",
+      "links",
+      "published",
+      "lanPort",
+      "createdAt",
+      "data",
+      "id",
+      "limits",
+      "startedAt",
+      "uuid"
+    ],
+    "type": "object"
+  }
+}

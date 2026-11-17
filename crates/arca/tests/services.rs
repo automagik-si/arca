@@ -788,15 +788,29 @@ fn service_create_list_status_round_trip() {
     assert_eq!(created["published"], Value::Null);
     assert_eq!(created["lanPort"], Value::Null);
     assert_eq!(created["run"], "memory");
-    let listed = rig.call("service_list", json!({})).expect("list");
+    let mut listed = rig.call("service_list", json!({})).expect("list");
+    assert_eq!(listed["services"][0]["limits"], Value::Null);
+    assert_eq!(listed["services"][0]["data"], json!({"volume": null}));
+    for key in ["id", "uuid", "createdAt", "startedAt", "limits", "data"] {
+        assert!(
+            listed["services"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove(key)
+                .is_some()
+        );
+    }
     let mut row = created.clone();
     row.as_object_mut()
         .expect("the create's answer")
         .remove("run");
     assert_eq!(listed["services"], json!([row]));
-    let status = rig
+    let mut status = rig
         .call("service_status", json!({"name":"nats"}))
         .expect("status");
+    for key in ["id", "uuid", "createdAt", "startedAt", "limits", "data"] {
+        assert!(status.as_object_mut().unwrap().remove(key).is_some());
+    }
     // The status is the create's view, with the version the service runs beside the one its template names: the
     // same here, so the listing above carries no such key.
     let mut expected = row.clone();

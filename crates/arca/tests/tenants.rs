@@ -1,5 +1,7 @@
 //! Tenants against a fake Incus: two tenants beside the node's own project. Nothing here touches a live host.
 mod common;
+#[path = "tenants/status_fields.rs"]
+mod status_fields;
 
 #[path = "tenants/container_options.rs"]
 mod container_options;
@@ -567,3 +569,6 @@ fn a_tenant_create_reads_the_instances_with_their_live_state_and_a_tenant_list_d
         "the list read live state"
     );
 }
+
+#[path = "tenants/token_binding.rs"]
+mod token_binding;

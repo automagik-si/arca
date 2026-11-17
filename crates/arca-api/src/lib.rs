@@ -6,6 +6,7 @@ pub mod compat;
 pub mod limits;
 pub mod openrpc;
 pub mod refusals;
+pub mod tenant;
 pub mod verbs;
 
 pub use check::{closest, conforms, unknown_field};
