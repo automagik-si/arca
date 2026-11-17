@@ -480,7 +480,8 @@ fn an_approved_import_writes_one_key_and_makes_the_adopted_record() {
             fields.remove("createdAt"),
             Some(json!(arca::handlers::iso_utc(NOW)))
         );
-        for key in ["limits", "startedAt", "uuid"] {
+        assert_eq!(fields.remove("uuid"), Some(json!(UUID)));
+        for key in ["limits", "startedAt"] {
             assert_eq!(fields.remove(key), Some(Value::Null), "{key}");
         }
         assert_eq!(fields.remove("data"), Some(json!({"volume": null})));

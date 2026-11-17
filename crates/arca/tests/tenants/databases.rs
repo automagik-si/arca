@@ -456,17 +456,14 @@ fn a_template_changed_between_the_card_and_the_approval_refuses_the_create() {
     assert!(!has_entry(&rig, "service-orders"));
     assert!(!password_file(&rig, "orders").exists());
     assert_eq!(rig.fake().writes().len(), writes, "Incus was not written");
-    // A missing template uses the service create's refusal on an approved run. A new proposal still gives the
-    // database's own installation guidance, as it did before.
+    // Approved runs retain the database's installation guidance when its template has been removed.
     let proposal = propose(&rig, json!({ "name": "orders" })).expect("a new proposal");
     fs::remove_file(&path).expect("the template is removed");
     let (code, message) = refusal(approve(&rig, &proposal));
-    assert_eq!(code, "not_found");
-    assert_eq!(
-        message,
-        "no template postgres-autopg (templates/postgres-autopg.json)"
-    );
+    assert_eq!(code, "refused");
+    assert!(message.contains("`arca templates install`"));
     let (_, again) = refusal(propose(&rig, json!({ "name": "orders" })));
+    assert_eq!(message, again);
     assert_eq!(
         again,
         "this node has no postgres-autopg template (templates/postgres-autopg.json in its state directory), and its config names no kernel.postgresImage: a database is made from one of the two. `arca templates install` puts the template Arca ships there"
@@ -1018,7 +1015,7 @@ fn approved_databases_with_kernel_access_or_a_private_port_show_the_service_rows
 fn replace_create_handlers(rig: &mut Rig, cfg: Arc<NodeConfig>) {
     let time: arca::handlers::Clock = Arc::new(|| NOW);
     let services = service_handlers(rig.kernel.clone(), time.clone(), cfg.clone());
-    let create = arca::handlers::service_create_handler(&services).expect("create");
+    let create = arca::handlers::service_create_handler(&services);
     rig.handlers.extend(services);
     rig.handlers
         .extend(postgres_handlers(rig.kernel.clone(), time, cfg, create));

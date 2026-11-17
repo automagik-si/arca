@@ -2,7 +2,7 @@
 //! method takes `&mut self`, so the verbs reach the kernel through one lock, and no two calls run at once.
 
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -55,6 +55,7 @@ pub(crate) enum BindingCommitFailure {
 /// The kernel of one node: its desired-state store, its reconciler, the approval verifier for delete plans, and the inert
 /// action proposals an owner may approve with a passkey.
 pub struct Kernel {
+    state_dir: PathBuf,
     store: DesiredStore,
     applied_seq: AppliedSeq,
     reconciler: Reconciler<FileJournal>,
@@ -228,6 +229,7 @@ impl Kernel {
         let applied_seq = AppliedSeq::default();
         applied_seq.publish(store.applied().map(|applied| applied.seq));
         Ok(Kernel {
+            state_dir: state_dir.to_path_buf(),
             store,
             applied_seq,
             reconciler,
@@ -280,7 +282,18 @@ impl Kernel {
     ) -> Value {
         let mut view = crate::service::view(config, live);
         view["id"] = json!(self.service_id(entry, config));
-        view["uuid"] = json!(self.service_uuid(entry, &config.instance));
+        let uuid = self.service_uuid(entry, &config.instance).or_else(|| {
+            if !config.adopted || config.instance != config.name {
+                return None;
+            }
+            // Imports create no class-B effect. Use their recorded identity in this same project, never the listing.
+            crate::adoptions::AdoptionRecord::open(&self.state_dir)
+                .ok()?
+                .imported(&config.name)
+                .filter(|import| import.project == config.project)
+                .map(|import| import.uuid)
+        });
+        view["uuid"] = json!(uuid);
         view["createdAt"] = json!(crate::handlers::iso_utc(config.created));
         view["startedAt"] = json!(live.and_then(crate::service::started_at));
         view["labels"] = crate::handlers::service_labels::view(live);
@@ -1054,6 +1067,8 @@ impl Kernel {
                     });
                 entry.config["id"] =
                     json!(self.service_id(&entry.id, previous.as_ref().unwrap_or(&config)));
+                entry.digest =
+                    Digest::of(arca_kernel::canon::canonical_json(&entry.config)?.as_bytes());
             }
         }
         let signed = self.store.propose(changes, now_ms)?;

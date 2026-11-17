@@ -22,6 +22,10 @@ The page reuses connector rows for up to 15 seconds, and a successful passkey si
 `reach_disconnect` needs an approved erasing card: it unlinks and removes the connector and its state volume. Remove
 the machine's remaining entry in Tailscale's admin page yourself.
 
+An imported service's `service_status` and `service_list` row now shows the uuid its import recorded, instead of
+`null`. An approved database run whose template is missing now answers `refused` with the `arca templates install`
+hint, instead of `not_found`.
+
 ## 0.36.0 (2026-11-17)
 
 An owner-approved `instance_start` card now starts an instance inside a tenant even when the proposing token's tool

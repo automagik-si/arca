@@ -15,6 +15,8 @@
 //!
 //! The tests need `bash`, `jq` and the usual core utilities on the machine that runs them. The token is made here.
 
+mod common;
+
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
@@ -2647,3 +2649,109 @@ fn git_at(dir: &Path, args: &[&str]) -> String {
 
 #[path = "automagik_workspace/checkout.rs"]
 mod checkout;
+
+#[test]
+fn the_shipped_automagik_workspace_create_pins_memory() {
+    use arca::{config::NodeConfig, handlers::service_handlers, kernel::Kernel, service::Service};
+    use arca_incus::{FakeIncus, FakeState};
+    use arca_netproject::PROJECT;
+    use arca_providers::incus::{Family, IncusProvider};
+    use arca_reconcile::PluginSet;
+    use std::sync::{Arc, Mutex};
+
+    for bridged in [false, true] {
+        let scratch = common::Scratch::new("ws");
+        let fake = FakeIncus::start(
+            &scratch.dir,
+            FakeState {
+                server: json!({}),
+                projects: vec![],
+                instances: vec![],
+                networks: vec![],
+                pools: vec![],
+            },
+        )
+        .unwrap();
+        fake.add_profile(
+            "default",
+            json!({"name":"default","config":{},"devices":{
+                "root":{"type":"disk","pool":"pool1","path":"/"}
+            }}),
+        );
+        let limits = json!({"virtualMachines":4,"cpu":8,"memory":"16GiB","disk":"80GiB"});
+        let mut kernel_config = json!({"projects":[PROJECT],"droiddProjects":["other"]});
+        if bridged {
+            kernel_config["bridged"] = json!({"bridges":["br0"],"pool":"vmpool","limits":limits});
+        } else {
+            kernel_config["serviceCidr"] = json!("192.0.2.0/24");
+            kernel_config["vmLimits"] = limits;
+        }
+        let cfg: NodeConfig = serde_json::from_value(json!({
+            "stateDir":scratch.dir,"incus":{"socket":fake.socket()},
+            "listen":{"unix":scratch.path("arca.sock")},
+            "tokens":{"hashDir":scratch.path("tokens")},"kernel":kernel_config
+        }))
+        .unwrap();
+        arca::config::check(&cfg).unwrap();
+        let mut plugins = PluginSet::new();
+        plugins.add::<arca_netproject::NetProject>().unwrap();
+        plugins.add::<arca_netproject::BridgedProject>().unwrap();
+        plugins.add::<Service>().unwrap();
+        let socket = fake.socket().to_path_buf();
+        let secrets = scratch.path("secrets");
+        let key = common::SkKey::from_seed(9);
+        let kernel = Arc::new(Mutex::new(
+            Kernel::open(
+                &scratch.dir,
+                common::node_key_at(&scratch.dir),
+                plugins,
+                common::verifier_for(&scratch, &[&key], "service"),
+                common::HOST.into(),
+                None,
+                move |retained| {
+                    Ok(Box::new(
+                        IncusProvider::new(
+                            socket,
+                            Family {
+                                projects: vec![PROJECT.into()],
+                                scratch: false,
+                                droidd_projects: vec!["other".into()],
+                                reserved_cidrs: vec![],
+                            },
+                            secrets,
+                            retained,
+                        )
+                        .unwrap(),
+                    ))
+                },
+                common::NOW,
+            )
+            .unwrap(),
+        ));
+        let templates = scratch.path("templates");
+        fs::create_dir(&templates).unwrap();
+        let shipped = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../templates");
+        for name in ["automagik-workspace.json", "automagik-workspace.sh"] {
+            fs::copy(shipped.join(name), templates.join(name)).unwrap();
+        }
+        let handlers = service_handlers(kernel, Arc::new(|| common::NOW), Arc::new(cfg));
+        let create = &handlers
+            .iter()
+            .find(|(verb, _)| *verb == "service_create")
+            .unwrap()
+            .1;
+        create.call(json!({"name":"ws1","template":"automagik-workspace",
+            "settings":{"publicUrl":"https://workspace.example.org","repoUrl":"https://github.com/example/project"}}),
+            &common::caller(arca_api::Scope::Doctor)).expect("the workspace is created stopped");
+        let instance =
+            common::get(&fake, &format!("/1.0/instances/ws1?project={PROJECT}")).unwrap();
+        assert_eq!(instance["config"]["limits.memory.hotplug"], "false");
+        let request: Value = fake
+            .service_requests()
+            .into_iter()
+            .find(|request| request.method == "POST" && request.path.starts_with("/1.0/instances?"))
+            .map(|request| serde_json::from_slice(&request.body).unwrap())
+            .unwrap();
+        assert_eq!(request["config"]["limits.memory.hotplug"], "false");
+    }
+}

@@ -72,7 +72,7 @@ fn handlers_of(
         kernel.clone(),
         Arc::new(|| NOW),
         cfg,
-        arca::handlers::service_create_handler(&services).unwrap(),
+        arca::handlers::service_create_handler(&services),
     )
 }
 impl Rig {
