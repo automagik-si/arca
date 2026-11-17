@@ -398,7 +398,10 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
                 .prepare(
                     &json!({
                         "name": "orders", "template": "postgres-autopg", "image": TEST_PG_IMAGE,
-                        "templateDigest": "ab".repeat(32)
+                        "templateDigest": "ab".repeat(32),
+                        "kernelAccess": { "port": 7461 },
+                        "privatePort": { "address": "198.51.100.7", "port": 7422 },
+                        "destinations": [{ "address": "10.20.30.40", "port": 443 }]
                     }),
                     None,
                 )
@@ -820,9 +823,15 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
                 (_, "bridge") => "Host bridge",
                 (_, "mac") => "MAC address",
                 (ActionKind::ServiceCreate, "start") => "Start",
-                (ActionKind::ServiceCreate, "kernelAccess") => "Kernel access",
-                (ActionKind::ServiceCreate, "privatePort") => "Private port",
-                (ActionKind::ServiceCreate, "destinations") => "Private network",
+                (ActionKind::ServiceCreate | ActionKind::PostgresCreate, "kernelAccess") => {
+                    "Kernel access"
+                }
+                (ActionKind::ServiceCreate | ActionKind::PostgresCreate, "privatePort") => {
+                    "Private port"
+                }
+                (ActionKind::ServiceCreate | ActionKind::PostgresCreate, "destinations") => {
+                    "Private network"
+                }
                 (_, "templateDigest") => "Template content",
                 (ActionKind::ServiceCreate, "registry") => "Registry",
                 (ActionKind::ServiceCreate, "digest") => "Digest",

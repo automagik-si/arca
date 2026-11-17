@@ -84,8 +84,7 @@ fn propose(rig: &Rig, args: Value) -> Result<Value, CallError> {
     )
 }
 
-/// Approves a waiting proposal with the owner's passkey and runs it, as the approval page does.
-fn approve(rig: &Rig, proposal: &Value) -> Result<Value, CallError> {
+fn approval_args(rig: &Rig, proposal: &Value) -> Value {
     let id = proposal["id"].as_str().expect("the proposal's id");
     let action = proposal["action"].as_str().expect("its action");
     let digest = proposal["argsDigest"].as_str().expect("its digest");
@@ -93,18 +92,76 @@ fn approve(rig: &Rig, proposal: &Value) -> Result<Value, CallError> {
     let statement =
         arca::handlers::action_statement("node1", id, action, digest, rig.now(), &nonce)
             .expect("the statement");
-    let approval = common::approve_statement(&rig.key, &statement);
-    let approved = arca::handlers::approve_action(
-        &mut rig.kernel.lock().expect("kernel"),
-        &json!({ "plan": id, "approval": approval }),
-        rig.now(),
-    )?;
+    json!({ "plan": id, "approval": common::approve_statement(&rig.key, &statement) })
+}
+
+fn grant(rig: &Rig, proposal: &Value) -> arca::kernel::ApprovedAction {
+    let args = approval_args(rig, proposal);
+    arca::handlers::approve_action(&mut rig.kernel.lock().expect("kernel"), &args, rig.now())
+        .expect("the owner's approval")
+}
+
+fn executor(rig: &Rig) -> ActionExecutor {
     ActionExecutor::new(
         rig.handlers
             .iter()
             .map(|(verb, handler)| (*verb, Arc::clone(handler))),
     )
-    .run(&approved.action, &approved.args, &approved.grant)
+}
+
+/// Approves a waiting proposal with the owner's passkey and runs it, as the approval page does.
+fn approve(rig: &Rig, proposal: &Value) -> Result<Value, CallError> {
+    let approved = grant(rig, proposal);
+    execute(rig, &approved)
+}
+
+fn execute(rig: &Rig, approved: &arca::kernel::ApprovedAction) -> Result<Value, CallError> {
+    executor(rig).run(&approved.action, &approved.args, &approved.grant)
+}
+
+fn owner_run(rig: &Rig, proposal: &Value) -> Result<Value, CallError> {
+    arca::handlers::run_approved_action(
+        &rig.kernel,
+        &executor(rig),
+        &approval_args(rig, proposal),
+        rig.now(),
+    )
+}
+
+struct RecordingCaller {
+    inner: Arc<dyn ToolHandler>,
+    callers: Arc<Mutex<Vec<Caller>>>,
+}
+
+impl ToolHandler for RecordingCaller {
+    fn call(&self, args: Value, caller: &Caller) -> Result<Value, CallError> {
+        self.callers.lock().expect("callers").push(caller.clone());
+        self.inner.call(args, caller)
+    }
+}
+
+fn record_callers(rig: &mut Rig, verb: &'static str, callers: &Arc<Mutex<Vec<Caller>>>) {
+    let inner = rig.handlers[verb].clone();
+    rig.handlers.insert(
+        verb,
+        Arc::new(RecordingCaller {
+            inner,
+            callers: callers.clone(),
+        }),
+    );
+}
+
+fn proposal_events(rig: &Rig, id: &Value) -> Vec<Value> {
+    fs::read_to_string(rig.dir.join("action-proposals.jsonl"))
+        .expect("proposal journal")
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("event"))
+        .filter(|event| event["id"] == *id)
+        .map(|mut event| {
+            event.as_object_mut().expect("event").remove("id");
+            event
+        })
+        .collect()
 }
 
 fn password_file(rig: &Rig, name: &str) -> std::path::PathBuf {
@@ -116,6 +173,54 @@ fn password_file(rig: &Rig, name: &str) -> std::path::PathBuf {
 
 fn has_entry(rig: &Rig, id: &str) -> bool {
     rig.entries().iter().any(|entry| entry.id.0 == id)
+}
+
+#[test]
+fn an_approved_database_with_private_destinations_shows_them_and_runs_as_the_approved_caller() {
+    let mut cfg = kernel(None);
+    cfg["serviceDestinations"] = json!([
+        { "service": "orders", "address": "10.20.30.42", "port": 443 }
+    ]);
+    let mut rig = Rig::with_kernel(cfg, empty_state());
+    install_templates(&rig);
+    let callers = Arc::new(Mutex::new(Vec::new()));
+    record_callers(&mut rig, "postgres_create", &callers);
+    record_callers(&mut rig, "service_create", &callers);
+    let proposal = propose(&rig, json!({ "name": "orders" })).expect("the proposal");
+    owner_run(&rig, &proposal).expect("the owner-approved database runs");
+    assert!(has_entry(&rig, "service-orders"));
+    assert_eq!(
+        proposal["args"]["destinations"],
+        json!([{ "address": "10.20.30.42", "port": 443 }])
+    );
+    let service_rows = arca::action_proposal::ActionKind::ServiceCreate.details(&proposal["args"]);
+    let network = service_rows
+        .iter()
+        .find(|row| row.label == "Private network")
+        .expect("the service row");
+    assert!(
+        proposal["details"]
+            .as_array()
+            .expect("rows")
+            .iter()
+            .any(|row| { row["label"] == network.label && row["value"] == network.value })
+    );
+    let service = rig.call("action_propose", json!({
+        "action": "service_create", "args": { "name": "bills", "template": DATABASE_TEMPLATE }
+    })).expect("the service proposal");
+    owner_run(&rig, &service).expect("the approved service");
+    let callers = callers.lock().expect("callers");
+    assert_eq!(callers.len(), 2);
+    assert_eq!(
+        callers[0], callers[1],
+        "both approved verbs keep the same caller"
+    );
+    assert_eq!(callers[0].token_id, arca_mcp::auth::APPROVED_ACTION_ID);
+    assert_eq!(callers[0].scope, Scope::Operator);
+    let events = proposal_events(&rig, &proposal["id"]);
+    assert_eq!(events, proposal_events(&rig, &service["id"]));
+    assert_eq!(events.last().expect("result")["event"], "result");
+    assert_eq!(events.last().expect("result")["ok"], true);
 }
 
 fn instance(rig: &Rig, name: &str) -> Option<Value> {
@@ -342,9 +447,7 @@ fn a_template_changed_between_the_card_and_the_approval_refuses_the_create() {
     assert_eq!(code, "refused");
     assert_eq!(
         message,
-        format!(
-            "image: a call cannot choose an image. This node makes a database from its postgres-autopg template, which names {now} now. A proposal that names another was made before the template changed: nothing was created, propose it again"
-        )
+        "the template postgres-autopg on this node is not the one this create names: it was changed or installed again since the card was shown, or the call states an image or a template content of its own. Nothing was created; propose it again"
     );
     assert!(
         !message.contains(&shown),
@@ -353,18 +456,21 @@ fn a_template_changed_between_the_card_and_the_approval_refuses_the_create() {
     assert!(!has_entry(&rig, "service-orders"));
     assert!(!password_file(&rig, "orders").exists());
     assert_eq!(rig.fake().writes().len(), writes, "Incus was not written");
-    // A template that is gone refuses too, and says what puts it back.
+    // A missing template uses the service create's refusal on an approved run. A new proposal still gives the
+    // database's own installation guidance, as it did before.
     let proposal = propose(&rig, json!({ "name": "orders" })).expect("a new proposal");
     fs::remove_file(&path).expect("the template is removed");
     let (code, message) = refusal(approve(&rig, &proposal));
-    assert_eq!(code, "refused");
+    assert_eq!(code, "not_found");
     assert_eq!(
         message,
+        "no template postgres-autopg (templates/postgres-autopg.json)"
+    );
+    let (_, again) = refusal(propose(&rig, json!({ "name": "orders" })));
+    assert_eq!(
+        again,
         "this node has no postgres-autopg template (templates/postgres-autopg.json in its state directory), and its config names no kernel.postgresImage: a database is made from one of the two. `arca templates install` puts the template Arca ships there"
     );
-    // Without the template nothing is proposed either: the owner is never shown a card for it.
-    let (_, again) = refusal(propose(&rig, json!({ "name": "orders" })));
-    assert_eq!(again, message);
     assert!(!has_entry(&rig, "service-orders"));
     assert!(!password_file(&rig, "orders").exists());
 }
@@ -825,4 +931,356 @@ fn a_node_whose_config_sets_up_no_services_refuses_a_database_in_those_words() {
     }
     assert!(!password_file(&rig, "orders").exists());
     assert!(!has_entry(&rig, "service-orders"));
+}
+
+/// A synthetic node whose database has exactly one of the three facts that needs owner approval.
+fn with_fact(fact: &str) -> Rig {
+    let mut cfg = kernel(None);
+    if fact == "destinations" {
+        cfg["serviceDestinations"] = json!([
+            { "service": "orders", "address": "10.20.30.42", "port": 443 }
+        ]);
+    }
+    if fact == "privatePort" {
+        cfg["serviceListenAddresses"] = json!(["198.51.100.7"]);
+    }
+    let rig = Rig::with_node(
+        cfg,
+        json!({ "services": "/run/arca/services.sock" }),
+        empty_state(),
+    );
+    install_templates(&rig);
+    match fact {
+        "kernelAccess" => edit_database_template(&rig, |template| {
+            template["kernelAccess"] = json!({ "port": 7461 })
+        }),
+        "privatePort" => {
+            rig.fake().set_host_interfaces(vec![(
+                "eth1".into(),
+                vec!["198.51.100.7".parse().expect("IP")],
+            )]);
+            edit_database_template(&rig, |template| {
+                template["privatePort"] = json!({ "port": 5432 })
+            });
+        }
+        "destinations" => {}
+        _ => panic!("unknown fixture fact"),
+    }
+    rig
+}
+
+#[test]
+fn approved_databases_with_kernel_access_or_a_private_port_show_the_service_rows_and_run() {
+    for (fact, label) in [
+        ("kernelAccess", "Kernel access"),
+        ("privatePort", "Private port"),
+    ] {
+        let rig = with_fact(fact);
+        let proposal = propose(&rig, json!({ "name": "orders" })).expect("database proposal");
+        let rows = arca::action_proposal::ActionKind::ServiceCreate.details(&proposal["args"]);
+        let expected = rows
+            .iter()
+            .find(|row| row.label == label)
+            .expect("the service's row");
+        assert!(
+            proposal["details"]
+                .as_array()
+                .expect("rows")
+                .iter()
+                .any(|row| { row["label"] == expected.label && row["value"] == expected.value }),
+            "{proposal}"
+        );
+        let digest =
+            arca::action_proposal::action_args_digest("postgres_create", &proposal["args"])
+                .expect("digest");
+        assert_eq!(proposal["argsDigest"], digest);
+        approve(&rig, &proposal).expect("approved database runs");
+        let record = rig.entry("service-orders");
+        if fact == "kernelAccess" {
+            assert_eq!(record[fact]["port"], proposal["args"][fact]["port"]);
+            assert_eq!(record[fact]["connect"], "/run/arca/services.sock");
+        } else {
+            assert_eq!(record[fact], proposal["args"][fact]);
+        }
+        let live = instance(&rig, "orders").expect("instance");
+        assert!(
+            live["devices"]
+                .get(if fact == "kernelAccess" {
+                    "kernel"
+                } else {
+                    "private"
+                })
+                .is_some()
+        );
+    }
+}
+
+fn replace_create_handlers(rig: &mut Rig, cfg: Arc<NodeConfig>) {
+    let time: arca::handlers::Clock = Arc::new(|| NOW);
+    let services = service_handlers(rig.kernel.clone(), time.clone(), cfg.clone());
+    let create = arca::handlers::service_create_handler(&services).expect("create");
+    rig.handlers.extend(services);
+    rig.handlers
+        .extend(postgres_handlers(rig.kernel.clone(), time, cfg, create));
+}
+
+#[test]
+fn changed_database_facts_refuse_before_writes_with_the_service_refusal_and_leave_the_grant_spent()
+{
+    for change in [
+        "destinations",
+        "removed-destinations",
+        "new-destinations",
+        "template",
+        "image",
+        "kernelAccess",
+        "privatePort",
+    ] {
+        let fact = match change {
+            "kernelAccess" | "privatePort" => change,
+            _ => "destinations",
+        };
+        let mut rig = if change == "new-destinations" {
+            clean()
+        } else {
+            with_fact(fact)
+        };
+        let database = propose(&rig, json!({ "name": "orders" })).expect("database proposal");
+        // The comparison is to an independently approved service card, not a copied refusal string.
+        let service = rig.call("action_propose", json!({
+            "action": "service_create", "args": { "name": "orders", "template": DATABASE_TEMPLATE }
+        })).expect("service proposal");
+        let database = grant(&rig, &database);
+        let service = grant(&rig, &service);
+        let template_path = rig.dir.join("templates/postgres-autopg.json");
+        let original = fs::read_to_string(&template_path).expect("template");
+        match change {
+            "destinations" | "removed-destinations" | "new-destinations" => {
+                let mut cfg = (*rig.cfg).clone();
+                if change == "destinations" {
+                    cfg.kernel.service_destinations[0].port = 8443;
+                } else if change == "removed-destinations" {
+                    cfg.kernel.service_destinations.clear();
+                } else {
+                    cfg.kernel
+                        .service_destinations
+                        .push(arca::config::ServiceDestination {
+                            service: "orders".into(),
+                            address: "10.20.30.42".into(),
+                            port: 443,
+                        });
+                }
+                replace_create_handlers(&mut rig, Arc::new(cfg));
+            }
+            "template" => {
+                edit_database_template(&rig, |template| template["env"]["EDITED"] = json!("yes"))
+            }
+            "image" => edit_database_template(&rig, |template| {
+                template["digest"] = json!(format!("sha256:{}", "d".repeat(64)))
+            }),
+            "kernelAccess" => edit_database_template(&rig, |template| {
+                template["kernelAccess"]["port"] = json!(7462)
+            }),
+            "privatePort" => edit_database_template(&rig, |template| {
+                template["privatePort"]["port"] = json!(5433);
+                template["ports"] = json!([5432, 5433]);
+            }),
+            _ => unreachable!(),
+        }
+        let writes = rig.fake().writes();
+        let entries = rig.entries();
+        let expected = execute(&rig, &service).expect_err("changed service facts");
+        let actual = execute(&rig, &database).expect_err("changed database facts");
+        assert_eq!(actual, expected, "{change}");
+        assert_eq!(rig.entries(), entries, "{change}");
+        assert_eq!(rig.fake().writes(), writes, "{change}");
+        assert!(!password_file(&rig, "orders").exists(), "{change}");
+        // Restoring every fact does not make a consumed grant reusable.
+        fs::write(&template_path, original).expect("restore template");
+        let cfg = rig.cfg.clone();
+        replace_create_handlers(&mut rig, cfg);
+        let (code, message) = refusal(execute(&rig, &database));
+        assert_eq!(
+            (code.as_str(), message.as_str()),
+            (
+                "NotApproved",
+                "this action runs only from an approved proposal"
+            ),
+            "{change}"
+        );
+        assert_eq!(rig.fake().writes(), writes, "{change}");
+    }
+}
+
+#[test]
+fn made_up_replayed_differently_bound_and_other_verb_grants_create_no_database() {
+    let rig = clean();
+    let proposal = propose(&rig, json!({ "name": "orders" })).expect("proposal");
+    let approved = grant(&rig, &proposal);
+    let service = rig.call("action_propose", json!({
+        "action": "service_create", "args": { "name": "orders", "template": DATABASE_TEMPLATE }
+    })).expect("service proposal");
+    let service = grant(&rig, &service);
+    let writes = rig.fake().writes();
+    let mut changed = approved.args.clone();
+    changed["name"] = json!("bills");
+    for result in [
+        executor(&rig).run("postgres_create", &approved.args, "made-up"),
+        executor(&rig).run("postgres_create", &changed, &approved.grant),
+        executor(&rig).run("postgres_create", &approved.args, &service.grant),
+    ] {
+        let (code, message) = refusal(result);
+        assert_eq!(
+            (code.as_str(), message.as_str()),
+            (
+                "NotApproved",
+                "this action runs only from an approved proposal"
+            )
+        );
+        assert_eq!(rig.fake().writes(), writes);
+        assert!(!has_entry(&rig, "service-orders"));
+        assert!(!has_entry(&rig, "service-bills"));
+    }
+    execute(&rig, &approved).expect("the untouched original grant still works once");
+    let writes = rig.fake().writes();
+    let (code, message) = refusal(execute(&rig, &approved));
+    assert_eq!(
+        (code.as_str(), message.as_str()),
+        (
+            "NotApproved",
+            "this action runs only from an approved proposal"
+        )
+    );
+    assert_eq!(rig.fake().writes(), writes);
+}
+
+#[test]
+fn a_direct_database_with_private_destinations_still_needs_a_card_in_the_same_words() {
+    let rig = with_fact("destinations");
+    let writes = rig.fake().writes();
+    let expected = "this node's config lets the service orders reach 10.20.30.42 on tcp port 443 through this node (kernel.serviceDestinations), so its create runs only from a proposal the owner approved: propose it with action_propose, and the owner's card shows the address";
+    let (code, message) = refusal(rig.call("postgres_create", json!({ "name": "orders" })));
+    assert_eq!((code.as_str(), message.as_str()), ("NotApproved", expected));
+    assert_eq!(rig.fake().writes(), writes);
+    assert!(!has_entry(&rig, "service-orders"));
+    assert!(!password_file(&rig, "orders").exists());
+}
+
+#[test]
+fn an_ordinary_approved_database_sends_the_direct_creates_same_incus_requests() {
+    let direct = clean();
+    let approved = clean();
+    // Fix the otherwise randomly generated password so the actual instance bodies can be compared byte for byte.
+    for rig in [&direct, &approved] {
+        let file = password_file(rig, "orders");
+        fs::create_dir_all(file.parent().expect("directory")).expect("secrets");
+        for dir in [
+            rig.dir.join("secrets"),
+            file.parent().expect("directory").to_path_buf(),
+        ] {
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).expect("0700");
+        }
+        fs::write(&file, "synthetic-stored-password").expect("stored password");
+        fs::set_permissions(file, fs::Permissions::from_mode(0o600)).expect("0600");
+    }
+    direct
+        .call("postgres_create", json!({ "name": "orders" }))
+        .expect("direct create");
+    let proposal = propose(&approved, json!({ "name": "orders" })).expect("proposal");
+    approve(&approved, &proposal).expect("approved create");
+    assert_eq!(direct.fake().requests(), approved.fake().requests());
+    assert_eq!(direct.fake().writes(), approved.fake().writes());
+    assert_eq!(
+        serde_json::to_vec(&instance(&direct, "orders")).expect("direct body"),
+        serde_json::to_vec(&instance(&approved, "orders")).expect("approved body"),
+    );
+    assert_eq!(
+        direct.entry("service-orders"),
+        approved.entry("service-orders")
+    );
+}
+
+#[test]
+fn service_limited_and_tenant_bound_tokens_cannot_propose_a_database_to_escape_their_names() {
+    let rig = clean();
+    let tokens = rig.dir.join("limited-tokens");
+    fs::create_dir(&tokens).expect("token directory");
+    fs::set_permissions(&tokens, fs::Permissions::from_mode(0o700)).expect("0700");
+    let server = Arc::new(
+        arca_mcp::Server::new(
+            arca_api::verbs(),
+            arca_mcp::TokenStore::load(&tokens).expect("store"),
+        )
+        .handle("action_propose", rig.handlers["action_propose"].clone()),
+    );
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    for names in ["orders", "bills", "aaaaaaaa/orders"] {
+        let caller = Caller {
+            token_id: "limited-proposer".into(),
+            scope: Scope::Operator,
+            tools: None,
+            limits: arca_mcp::Limits {
+                services: arca_api::limits::ServiceLimit::parse(names),
+                ..Default::default()
+            },
+        };
+        for args in [
+            json!({ "name": "orders" }),
+            json!({ "name": "orders", "tenant": A }),
+        ] {
+            let request = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
+                "name": "action_propose", "arguments": { "action": "postgres_create", "args": args }
+            }});
+            let reply = runtime
+                .block_on(arca_mcp::jsonrpc::dispatch(
+                    &server,
+                    &caller,
+                    &Default::default(),
+                    &serde_json::to_vec(&request).expect("request"),
+                ))
+                .expect("dispatch")
+                .expect("reply");
+            assert_eq!(
+                reply.body["error"]["data"]["refusal"],
+                arca_api::limits::OUTSIDE_SERVICES,
+                "{}",
+                reply.body
+            );
+        }
+    }
+    assert!(
+        rig.kernel
+            .lock()
+            .expect("kernel")
+            .action_proposals()
+            .is_empty()
+    );
+    assert!(rig.fake().writes().is_empty());
+}
+
+#[test]
+fn a_configured_image_keeps_its_create_but_never_accepts_a_bad_execution_grant() {
+    let rig = configured();
+    let writes = rig.fake().writes();
+    let (code, message) = refusal(rig.call(
+        "postgres_create",
+        json!({ "name": "orders", "approval": "made-up" }),
+    ));
+    assert_eq!(
+        (code.as_str(), message.as_str()),
+        (
+            "NotApproved",
+            "this action runs only from an approved proposal"
+        )
+    );
+    assert_eq!(rig.fake().writes(), writes);
+    let proposal = propose(&rig, json!({ "name": "orders" })).expect("proposal");
+    let approved = grant(&rig, &proposal);
+    execute(&rig, &approved).expect("configured image create");
+    assert!(has_entry(&rig, "postgres-orders"));
+    assert!(!has_entry(&rig, "service-orders"));
+    let writes = rig.fake().writes();
+    let (code, _) = refusal(execute(&rig, &approved));
+    assert_eq!(code, "NotApproved");
+    assert_eq!(rig.fake().writes(), writes);
 }

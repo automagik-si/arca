@@ -2957,6 +2957,7 @@ impl ActionExecutor {
         if matches!(
             action,
             "service_create"
+                | "postgres_create"
                 | "service_remove"
                 | "service_update"
                 | "service_reconfigure"
@@ -5274,15 +5275,81 @@ fn stopped_because(start: bool, template: Option<String>) -> String {
 /// Why a fixed MAC is refused on the managed service network.
 const MANAGED_MAC: &str = "mac: a virtual machine on the managed service network has its address reserved by Arca, so it takes no fixed MAC; mac is for a host bridge";
 
-/// The `service_create` handler among `handlers`, as [`postgres_handlers`] takes it.
-pub fn service_create_handler(
-    handlers: &[(&'static str, Arc<dyn ToolHandler>)],
-) -> Option<Arc<dyn ToolHandler>> {
-    handlers
-        .iter()
-        .find(|(verb, _)| *verb == "service_create")
-        .map(|(_, handler)| Arc::clone(handler))
+/// The service handlers and their typed create entry. Only the ordinary `ToolHandler` entries are registered on
+/// the wire; the typed entry stays in the node's database handler.
+pub struct ServiceHandlers {
+    handlers: Vec<(&'static str, Arc<dyn ToolHandler>)>,
+    create: ServiceCreateHandler,
 }
+
+impl std::ops::Deref for ServiceHandlers {
+    type Target = [(&'static str, Arc<dyn ToolHandler>)];
+
+    fn deref(&self) -> &Self::Target {
+        &self.handlers
+    }
+}
+
+impl IntoIterator for ServiceHandlers {
+    type Item = (&'static str, Arc<dyn ToolHandler>);
+    type IntoIter = std::vec::IntoIter<Self::Item>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.handlers.into_iter()
+    }
+}
+
+/// An opaque handle to this node's service create. Its approved entry is private and takes a spent database grant's
+/// proof, never an argument or a property of the caller. It is not a tool and cannot be registered as one.
+#[derive(Clone)]
+pub struct ServiceCreateHandler(Arc<ServiceHandler>);
+
+/// The typed `service_create` entry made with these handlers, as [`postgres_handlers`] takes it.
+pub fn service_create_handler(handlers: &ServiceHandlers) -> Option<ServiceCreateHandler> {
+    Some(handlers.create.clone())
+}
+
+// This module's private field prevents even the other handlers from constructing the proof. The only constructor
+// consumes a grant for postgres_create and its exact arguments. There is no Clone, Default or deserialization path.
+mod approved_database {
+    use super::*;
+
+    pub(super) struct ApprovedDatabase {
+        args: Value,
+    }
+
+    impl ApprovedDatabase {
+        pub(super) fn consume(
+            kernel: &Mutex<Kernel>,
+            args: &Value,
+        ) -> Result<Option<Self>, CallError> {
+            let Some(grant) = args.get("approval") else {
+                return Ok(None);
+            };
+            let spent = grant.as_str().is_some_and(|grant| {
+                lock(kernel)
+                    .map(|mut kernel| kernel.consume_action_grant("postgres_create", args, grant))
+                    .unwrap_or(false)
+            });
+            if !spent {
+                return Err(CallError::Refused {
+                    code: "NotApproved".into(),
+                    message: "this action runs only from an approved proposal".into(),
+                });
+            }
+            let mut args = args.clone();
+            args.as_object_mut()
+                .ok_or_else(internal)?
+                .remove("approval");
+            Ok(Some(Self { args }))
+        }
+
+        pub(super) fn args(&self) -> &Value {
+            &self.args
+        }
+    }
+}
+use approved_database::ApprovedDatabase;
 
 /// The database verbs. `service_create` is the node's own `service_create` handler ([`service_handlers`]): on a node
 /// whose config names no `kernel.postgresImage`, `postgres_create` makes the service that handler makes from the
@@ -5291,7 +5358,7 @@ pub fn postgres_handlers(
     kernel: Arc<Mutex<Kernel>>,
     clock: Clock,
     cfg: Arc<NodeConfig>,
-    service_create: Arc<dyn ToolHandler>,
+    service_create: ServiceCreateHandler,
 ) -> Vec<(&'static str, Arc<dyn ToolHandler>)> {
     // Serialize secret/document transactions without blocking other kernel users during I/O.
     // One gate for every handler that picks an address or a block: the kernel's own.
@@ -5325,7 +5392,13 @@ struct PostgresHandler {
     clock: Clock,
     cfg: Arc<NodeConfig>,
     writes: Arc<Mutex<()>>,
-    service_create: Arc<dyn ToolHandler>,
+    service_create: ServiceCreateHandler,
+}
+
+/// A direct call's checked image and content, or the one-shot proof of the owner's database card.
+enum DatabaseCreate<'a> {
+    Direct { image: &'a str, digest: &'a str },
+    Approved(ApprovedDatabase),
 }
 
 /// Where a new database's image comes from. It is never the call's to choose.
@@ -5517,10 +5590,55 @@ fn enrich_postgres_create(
         &template,
         payload.get("tenant").is_some(),
     ));
+    let destinations = destinations_for(
+        cfg,
+        payload["name"].as_str().unwrap_or_default(),
+        false,
+        None,
+    )?;
+    if payload
+        .get("destinations")
+        .is_some_and(|given| destinations.is_empty() || *given != json!(destinations))
+    {
+        return Err(destinations_mismatch(
+            payload["name"].as_str().unwrap_or_default(),
+            &destinations,
+            false,
+        ));
+    }
+    let access =
+        kernel_access_for(cfg, &template, false, None)?.map(|(port, _)| kernel_access_arg(port));
+    if payload
+        .get("kernelAccess")
+        .is_some_and(|given| Some(given) != access.as_ref())
+    {
+        return Err(kernel_access_mismatch(&template));
+    }
+    let hosts = template
+        .private_port
+        .as_ref()
+        .and_then(|_| host_observation(&UnixIncus::new(cfg.incus.socket.clone())).ok());
+    let private = private_port_for(
+        cfg,
+        &template,
+        false,
+        payload.get("privatePort"),
+        hosts.as_ref(),
+        None,
+    )?;
     let mut payload = payload.clone();
     payload["template"] = json!(crate::service::DATABASE_TEMPLATE);
     payload["image"] = json!(image);
     payload["templateDigest"] = json!(digest);
+    if !destinations.is_empty() {
+        payload["destinations"] = json!(destinations);
+    }
+    if let Some(access) = access {
+        payload["kernelAccess"] = access;
+    }
+    if let Some(private) = private {
+        payload["privatePort"] = private_port_arg(&private);
+    }
     Ok(payload)
 }
 
@@ -5564,8 +5682,7 @@ impl PostgresHandler {
         &self,
         args: &Value,
         caller: &Caller,
-        image: &str,
-        digest: &str,
+        source: DatabaseCreate<'_>,
     ) -> Result<Value, CallError> {
         if !caller.allows_tool("service_create") {
             return Err(service_refused(format!(
@@ -5578,15 +5695,21 @@ impl PostgresHandler {
             return Err(pg_invalid("invalid database or consumer name"));
         }
         database_name_free(lock(&self.kernel)?.entries(), &name)?;
-        let made = self.service_create.call(
-            json!({
-                "name": name,
-                "template": crate::service::DATABASE_TEMPLATE,
-                "image": image,
-                "templateDigest": digest
-            }),
-            caller,
-        )?;
+        let made = match source {
+            DatabaseCreate::Approved(proof) => self
+                .service_create
+                .0
+                .create_approved_database(proof, caller)?,
+            DatabaseCreate::Direct { image, digest } => self.service_create.0.call(
+                json!({
+                    "name": name,
+                    "template": crate::service::DATABASE_TEMPLATE,
+                    "image": image,
+                    "templateDigest": digest
+                }),
+                caller,
+            )?,
+        };
         let mut answer = json!({
             "name": name,
             "entry": crate::service::entry_id(None, &name),
@@ -5748,10 +5871,29 @@ impl ToolHandler for PostgresHandler {
         }
         // The image is the node's, never the call's: the one its config names, or else its database template, whose
         // create is the service handler's own and takes the write gate itself.
+        // As for the other approved verbs, spend before work: a later refusal never re-arms this grant. Calls
+        // without one keep their old behavior, including the configured-image create below.
+        let approved = if self.verb == "postgres_create" {
+            ApprovedDatabase::consume(&self.kernel, &args)?
+        } else {
+            None
+        };
+        if self.cfg.kernel.postgres_image.is_none()
+            && let Some(proof) = approved
+        {
+            return self.create_from_template(&args, caller, DatabaseCreate::Approved(proof));
+        }
         let configured_image = if self.verb == "postgres_create" {
             match database_source(&self.cfg, &args)? {
                 DatabaseSource::Template { image, digest, .. } => {
-                    return self.create_from_template(&args, caller, &image, &digest);
+                    return self.create_from_template(
+                        &args,
+                        caller,
+                        DatabaseCreate::Direct {
+                            image: &image,
+                            digest: &digest,
+                        },
+                    );
                 }
                 DatabaseSource::Configured(image) => Some(image),
             }
@@ -6030,7 +6172,7 @@ pub fn service_handlers(
     kernel: Arc<Mutex<Kernel>>,
     clock: Clock,
     cfg: Arc<NodeConfig>,
-) -> Vec<(&'static str, Arc<dyn ToolHandler>)> {
+) -> ServiceHandlers {
     service_handlers_with(kernel, clock, cfg, None)
 }
 
@@ -6051,7 +6193,7 @@ pub fn service_handlers_with(
     clock: Clock,
     cfg: Arc<NodeConfig>,
     functions: Option<Arc<crate::function_run::FunctionRunner>>,
-) -> Vec<(&'static str, Arc<dyn ToolHandler>)> {
+) -> ServiceHandlers {
     service_handlers_updating(
         kernel,
         clock,
@@ -6069,7 +6211,7 @@ pub fn service_handlers_updating(
     cfg: Arc<NodeConfig>,
     functions: Option<Arc<crate::function_run::FunctionRunner>>,
     update: service_update::UpdateOptions,
-) -> Vec<(&'static str, Arc<dyn ToolHandler>)> {
+) -> ServiceHandlers {
     // One gate for every handler that picks an address or a block: the kernel's own.
     let writes = write_gate(&kernel);
     let exec = Arc::new(crate::service_exec::ServiceExec::new(cfg.clone()));
@@ -6078,7 +6220,17 @@ pub fn service_handlers_updating(
     } else {
         &[]
     };
-    [
+    let create = Arc::new(ServiceHandler {
+        verb: "service_create",
+        kernel: kernel.clone(),
+        clock: clock.clone(),
+        cfg: cfg.clone(),
+        writes: writes.clone(),
+        exec: exec.clone(),
+        functions: functions.clone(),
+        update: update.clone(),
+    });
+    let handlers = [
         "service_connect",
         "service_disconnect",
         "service_secret_set",
@@ -6102,16 +6254,20 @@ pub fn service_handlers_updating(
     .map(|verb| {
         (
             verb,
-            Arc::new(ServiceHandler {
-                verb,
-                kernel: kernel.clone(),
-                clock: clock.clone(),
-                cfg: cfg.clone(),
-                writes: writes.clone(),
-                exec: exec.clone(),
-                functions: functions.clone(),
-                update: update.clone(),
-            }) as Arc<dyn ToolHandler>,
+            if verb == "service_create" {
+                create.clone() as Arc<dyn ToolHandler>
+            } else {
+                Arc::new(ServiceHandler {
+                    verb,
+                    kernel: kernel.clone(),
+                    clock: clock.clone(),
+                    cfg: cfg.clone(),
+                    writes: writes.clone(),
+                    exec: exec.clone(),
+                    functions: functions.clone(),
+                    update: update.clone(),
+                }) as Arc<dyn ToolHandler>
+            },
         )
     })
     .chain(["external_add", "external_remove"].into_iter().map(|verb| {
@@ -6132,7 +6288,11 @@ pub fn service_handlers_updating(
         cfg.clone(),
         crate::omni::OmniOptions::default(),
     ))
-    .collect()
+    .collect();
+    ServiceHandlers {
+        handlers,
+        create: ServiceCreateHandler(create),
+    }
 }
 
 /// The three Omni verbs over the service model (`crate::omni`). `options` is the default in a served node; a test
@@ -7520,6 +7680,12 @@ fn service_name(args: &Value) -> Result<String, CallError> {
         .ok_or_else(|| CallError::Invalid("name: expected a service name".into()))
 }
 
+/// The approved entry carries its own bound arguments: no internal call can pair the proof with other arguments.
+enum ServiceCall {
+    Direct(Value),
+    ApprovedDatabase(ApprovedDatabase),
+}
+
 impl ToolHandler for ServiceHandler {
     fn call(&self, args: Value, caller: &Caller) -> Result<Value, CallError> {
         // A program this node only records is the node's own row, read from its record before Incus is asked, and
@@ -7538,7 +7704,7 @@ impl ToolHandler for ServiceHandler {
                 if up { "up" } else { "down" },
             ));
         }
-        let mut answer = self.call_service(args.clone(), caller)?;
+        let mut answer = self.call_service(ServiceCall::Direct(args.clone()), caller)?;
         // The list shows each recorded program as a row of its own kind, beside the services.
         if self.verb == "service_list"
             && args.get("tenant").is_none()
@@ -7557,7 +7723,26 @@ impl ToolHandler for ServiceHandler {
 }
 
 impl ServiceHandler {
-    fn call_service(&self, args: Value, caller: &Caller) -> Result<Value, CallError> {
+    /// Only a consumed postgres_create grant produces this proof. The arguments come from the proof itself,
+    /// with no remapping of the verb's grant to a service grant and no caller-controlled approval flag.
+    fn create_approved_database(
+        &self,
+        proof: ApprovedDatabase,
+        caller: &Caller,
+    ) -> Result<Value, CallError> {
+        if let Some(refusal) =
+            service_external::recorded_refusal(&self.cfg, self.verb, proof.args())
+        {
+            return Err(refusal);
+        }
+        self.call_service(ServiceCall::ApprovedDatabase(proof), caller)
+    }
+
+    fn call_service(&self, call: ServiceCall, caller: &Caller) -> Result<Value, CallError> {
+        let (args, database_approval) = match call {
+            ServiceCall::Direct(args) => (args, None),
+            ServiceCall::ApprovedDatabase(proof) => (proof.args().clone(), Some(proof)),
+        };
         let allowed: &[&str] = match self.verb {
             "service_create" => &[
                 "name",
@@ -7699,25 +7884,26 @@ impl ServiceHandler {
         {
             return Err(only_looks());
         }
-        let preapproved = matches!(
-            self.verb,
-            "service_create"
-                | "service_remove"
-                | "service_update"
-                | "service_reconfigure"
-                | "service_publish"
-                | "service_import"
-                | "service_release"
-                | "function_create"
-                | "function_remove"
-        ) && args
-            .get("approval")
-            .and_then(Value::as_str)
-            .is_some_and(|grant| {
-                lock(&self.kernel)
-                    .map(|mut kernel| kernel.consume_action_grant(self.verb, &args, grant))
-                    .unwrap_or(false)
-            });
+        let preapproved = database_approval.is_some()
+            || matches!(
+                self.verb,
+                "service_create"
+                    | "service_remove"
+                    | "service_update"
+                    | "service_reconfigure"
+                    | "service_publish"
+                    | "service_import"
+                    | "service_release"
+                    | "function_create"
+                    | "function_remove"
+            ) && args
+                .get("approval")
+                .and_then(Value::as_str)
+                .is_some_and(|grant| {
+                    lock(&self.kernel)
+                        .map(|mut kernel| kernel.consume_action_grant(self.verb, &args, grant))
+                        .unwrap_or(false)
+                });
         let _publish = matches!(
             self.verb,
             "service_publish" | "service_unpublish" | "service_remove"
@@ -7737,6 +7923,62 @@ impl ServiceHandler {
                 | "route_remove"
         ) {
             Some(self.writes.lock().map_err(|_| internal())?)
+        } else {
+            None
+        };
+        // Compare every bound fact before even adoption can write a record. Keep this content for the create below:
+        // a concurrent template edit cannot change what is created after this comparison. The normal service guards
+        // still run, using the same functions and refusals, and no token or wire call can select this branch.
+        let database_content = if database_approval.is_some() {
+            let template_name = crate::service::DATABASE_TEMPLATE;
+            let content = crate::service::load_template_content(
+                &self.cfg.state_dir.join("templates"),
+                template_name,
+            )
+            .map_err(service_template_error)?;
+            let template = &content.template;
+            kernel_access_for(
+                &self.cfg,
+                template,
+                false,
+                Some(KernelAccessCall {
+                    stated: args.get("kernelAccess"),
+                    approved: true,
+                }),
+            )?;
+            let hosts = template.private_port.as_ref().and_then(|_| {
+                host_observation(&UnixIncus::new(self.cfg.incus.socket.clone())).ok()
+            });
+            private_port_for(
+                &self.cfg,
+                template,
+                false,
+                args.get("privatePort"),
+                hosts.as_ref(),
+                Some(PrivatePortCall {
+                    stated: args.get("privatePort"),
+                    approved: true,
+                }),
+            )?;
+            if args["template"].as_str() != Some(template_name)
+                || args["image"].as_str() != Some(crate::service::template_image(template).as_str())
+                || args["templateDigest"].as_str() != content.digest.as_deref()
+            {
+                return Err(template_not_the_one_stated(template_name));
+            }
+            if args.get("templateDigest").is_none() {
+                return Err(template_not_bound(template_name));
+            }
+            destinations_for(
+                &self.cfg,
+                args["name"].as_str().unwrap_or_default(),
+                false,
+                Some(DestinationsCall {
+                    stated: args.get("destinations"),
+                    approved: true,
+                }),
+            )?;
+            Some(content)
         } else {
             None
         };
@@ -8381,8 +8623,11 @@ impl ServiceHandler {
                 let templates_dir = self.cfg.state_dir.join("templates");
                 // The template's file and the scripts it names are read once, here. What the call states of them
                 // is compared with this read, and the service is made from this read and no other.
-                let content = crate::service::load_template_content(&templates_dir, template_name)
-                    .map_err(service_template_error)?;
+                let content = match database_content {
+                    Some(content) => content,
+                    None => crate::service::load_template_content(&templates_dir, template_name)
+                        .map_err(service_template_error)?,
+                };
                 // A call that names a digest makes the service from that build of the template's own image, by the
                 // rule service_update moves one by: the source, the record and the image the call is held to are
                 // all at that digest.

@@ -571,27 +571,7 @@ impl ActionKind {
                 if args.get("mac").is_some() {
                     rows.push(row("MAC address", text("mac")));
                 }
-                // The template gives this service access to the kernel. The proposal names it (it is filled in from
-                // the template when the proposal is made), so the approval binds it and the card says it in words.
-                if let Some(port) = args["kernelAccess"]["port"].as_u64() {
-                    rows.push(row("Kernel access", &kernel_access_words(port)));
-                }
-                // The template publishes a port on one host address of this node. The proposal names it (it is filled
-                // in when the proposal is made), so the approval binds it and the card says it.
-                if let (Some(address), Some(port)) = (
-                    args["privatePort"]["address"].as_str(),
-                    args["privatePort"]["port"].as_u64(),
-                ) {
-                    rows.push(row("Private port", &private_port_words(address, port)));
-                }
-                // This node's config lets the service reach a private address. The proposal names it (it is filled
-                // in from the config when the proposal is made), so the approval binds it and the card says it.
-                if args.get("destinations").is_some() {
-                    rows.push(row(
-                        "Private network",
-                        &destinations_words(&args["destinations"]),
-                    ));
-                }
+                rows.extend(service_access_rows(args));
                 // The container's `raw.lxc`, whole (filled in from the template when the proposal is made), and a
                 // plain-words row for each line that may loosen its isolation.
                 if let Some(lines) = args.get("rawLxc") {
@@ -695,6 +675,7 @@ impl ActionKind {
                 // kernel fills it in when the proposal is made), so the card says what the owner gets.
                 if args.get("template").is_some() {
                     rows.push(row("Template", text("template")));
+                    rows.extend(service_access_rows(args));
                     // What the node read from its template when the proposal was made: that it generates the
                     // password, or why the database is created stopped. The card claims neither without it.
                     let generated = gpu_product == Some(DATABASE_PASSWORD_GENERATED);
@@ -1153,20 +1134,22 @@ impl ActionKind {
                 text("project")
             ),
         };
+        let says_service_access = self == Self::ServiceCreate
+            || (self == Self::PostgresCreate && args.get("template").is_some());
         // A service that can call the kernel is named as one.
-        let sentence = if self == Self::ServiceCreate && args.get("kernelAccess").is_some() {
+        let sentence = if says_service_access && args.get("kernelAccess").is_some() {
             format!("{sentence} with access to this node's kernel")
         } else {
             sentence
         };
         // A service with a port on one host address is named as one.
-        let sentence = if self == Self::ServiceCreate && args.get("privatePort").is_some() {
+        let sentence = if says_service_access && args.get("privatePort").is_some() {
             format!("{sentence}, with a port on one of this node's private addresses")
         } else {
             sentence
         };
         // A service that may reach a private address through the node is named as one.
-        let sentence = if self == Self::ServiceCreate && args.get("destinations").is_some() {
+        let sentence = if says_service_access && args.get("destinations").is_some() {
             format!("{sentence}, with a way through this node to a private address")
         } else {
             sentence
@@ -1278,6 +1261,37 @@ impl TenantHeld {
 fn made_words(ms: u64) -> String {
     let iso = crate::handlers::iso_utc(ms);
     format!("{} {} UTC", &iso[..10], &iso[11..16])
+}
+
+/// The access rows shared by service and template-database cards. No facts means no extra row.
+fn service_access_rows(args: &Value) -> Vec<ActionDetail> {
+    let row = |label: &str, value: &str| ActionDetail {
+        label: label.into(),
+        value: value.into(),
+    };
+    let mut rows = Vec::new();
+    // The template gives this service access to the kernel. The proposal names it (it is filled in from
+    // the template when the proposal is made), so the approval binds it and the card says it in words.
+    if let Some(port) = args["kernelAccess"]["port"].as_u64() {
+        rows.push(row("Kernel access", &kernel_access_words(port)));
+    }
+    // The template publishes a port on one host address of this node. The proposal names it (it is filled
+    // in when the proposal is made), so the approval binds it and the card says it.
+    if let (Some(address), Some(port)) = (
+        args["privatePort"]["address"].as_str(),
+        args["privatePort"]["port"].as_u64(),
+    ) {
+        rows.push(row("Private port", &private_port_words(address, port)));
+    }
+    // This node's config lets the service reach a private address. The proposal names it (it is filled
+    // in from the config when the proposal is made), so the approval binds it and the card says it.
+    if args.get("destinations").is_some() {
+        rows.push(row(
+            "Private network",
+            &destinations_words(&args["destinations"]),
+        ));
+    }
+    rows
 }
 
 /// The `Kernel access` row of a `service_create` whose template declares `kernelAccess`, in the owner's words.
