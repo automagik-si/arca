@@ -3,7 +3,7 @@ use super::*;
 use arca_incus::image::{ImageWriter, PropertyUpdate, SOURCE_PROJECT, alias_ok, fingerprint_ok};
 use arca_kernel::{
     desired::Entry,
-    journal::{EffectClass, EffectState},
+    journal::{EffectClass, EffectState, read_journal},
     ownership::{IncusKind, KERNEL_ENTRY_KEY, tenant_entry},
 };
 use serde::{Deserialize, Serialize};
