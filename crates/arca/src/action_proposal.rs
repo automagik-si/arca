@@ -747,14 +747,36 @@ impl ActionKind {
                         rows.push(row("Start", &stopped_words(reason)));
                     }
                 } else {
+                    let port_words = |value: &Value| {
+                        let port = u16::try_from(value["port"].as_u64()?).ok()?;
+                        (port != 0).then(|| format!("port {port}"))
+                    };
+                    let address_words = |value: &Value| {
+                        let address = value["address"].as_str()?;
+                        address.parse::<std::net::IpAddr>().ok()?;
+                        Some(format!("{address} {}", port_words(value)?))
+                    };
                     for (field, label) in [
                         ("destinations", "Private network"),
                         ("kernelAccess", "Kernel access"),
                         ("privatePort", "Private port"),
                     ] {
                         if let Some(value) = args.get(field) {
+                            let asked = match field {
+                                "destinations" => value.as_array().and_then(|values| {
+                                    values
+                                        .iter()
+                                        .map(address_words)
+                                        .collect::<Option<Vec<_>>>()
+                                        .filter(|parts| !parts.is_empty())
+                                        .map(|parts| parts.join(", "))
+                                }),
+                                "kernelAccess" => port_words(value),
+                                _ => address_words(value),
+                            };
                             rows.push(row(label, &format!(
-                                "Requested {field}: {value}. This node makes its database from the configured image and does not use {field}."
+                                "Asked for: {}. Not used: this node makes its database from its configured image.",
+                                asked.as_deref().unwrap_or("a value this card cannot show")
                             )));
                         }
                     }

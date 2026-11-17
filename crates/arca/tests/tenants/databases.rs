@@ -1299,17 +1299,31 @@ fn a_configured_image_database_shows_unused_access_fields_and_keeps_its_create()
         "privatePort": { "address": "198.51.100.7", "port": 7422 }
     });
     let proposal = propose(&rig, args.clone()).expect("proposal");
-    for (field, label) in [
-        ("destinations", "Private network"),
-        ("kernelAccess", "Kernel access"),
-        ("privatePort", "Private port"),
+    for (field, label, words) in [
+        (
+            "destinations",
+            "Private network",
+            "Asked for: 198.51.100.8 port 5432. Not used: this node makes its database from its configured image.",
+        ),
+        (
+            "kernelAccess",
+            "Kernel access",
+            "Asked for: port 7461. Not used: this node makes its database from its configured image.",
+        ),
+        (
+            "privatePort",
+            "Private port",
+            "Asked for: 198.51.100.7 port 7422. Not used: this node makes its database from its configured image.",
+        ),
     ] {
         assert_eq!(proposal["args"][field], args[field]);
-        assert!(proposal["details"].as_array().unwrap().iter().any(|row| {
-            row["label"] == label && row["value"] == format!(
-                "Requested {field}: {}. This node makes its database from the configured image and does not use {field}.", args[field]
-            )
-        }));
+        assert!(
+            proposal["details"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| { row["label"] == label && row["value"] == words })
+        );
     }
     let approved = grant(&rig, &proposal);
     execute(&rig, &approved).expect("configured create");

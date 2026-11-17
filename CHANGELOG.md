@@ -6,10 +6,12 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 
 Connector logs hide more sign-in link remnants while preserving the output of other services.
 
-Connector logs also hide short sign-in identifiers by their login link's host and path.
+Connector logs also hide short sign-in identifiers by their login link's host and path; a word directly after a bare
+login path may now be hidden too.
 
 Database approval cards on nodes with a configured image show requested private destinations, kernel access and
-private ports, and explain that these fields are not used by the configured-image create.
+private ports in plain words, and say that they are not used because this node makes its database from its configured
+image.
 
 ## 0.36.0 (2026-11-17)
 
