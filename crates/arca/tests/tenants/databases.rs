@@ -1194,10 +1194,14 @@ fn an_ordinary_approved_database_sends_the_direct_creates_same_incus_requests() 
         serde_json::to_vec(&instance(&direct, "orders")).expect("direct body"),
         serde_json::to_vec(&instance(&approved, "orders")).expect("approved body"),
     );
-    assert_eq!(
-        direct.entry("service-orders"),
-        approved.entry("service-orders")
-    );
+    // Each create draws its own random service id; everything else in the two records is the same.
+    let [mut direct_entry, mut approved_entry] =
+        [&direct, &approved].map(|rig| rig.entry("service-orders"));
+    for entry in [&mut direct_entry, &mut approved_entry] {
+        let id = entry["id"].take();
+        assert!(id.as_str().is_some_and(|id| id.starts_with("svc_")), "{id}");
+    }
+    assert_eq!(direct_entry, approved_entry);
 }
 
 #[test]
