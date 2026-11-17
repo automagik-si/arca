@@ -4,6 +4,11 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 
 ## Unreleased
 
+`service_list` and `service_status` rows add `id`, `uuid`, `createdAt`, `startedAt`, `limits`, and `data.volume`;
+the stable `id` survives service rebuilds and kernel restarts. Service records gain an `id` at creation or their
+next normal write; releases up to 0.35.0 cannot read such a record and show the service as failed or not found.
+Downgrading below this release is therefore not supported once a service was created or written.
+
 `service_labels_set` merges a service's plain labels, with null removing a key. `service_status` and `service_list`
 rows now include the label map. Writes use ownership checks, If-Match and read-back outside the effect journal;
 uncertain answers carry an explicit code. Label keeping during snapshot rollback is best effort and never prevents

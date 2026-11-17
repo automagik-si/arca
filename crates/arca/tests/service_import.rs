@@ -467,15 +467,27 @@ fn an_approved_import_writes_one_key_and_makes_the_adopted_record() {
         "ports": [5432], "links": [], "published": null, "lanPort": null
     });
     assert_eq!(result["service"], row);
-    assert_eq!(
-        rig.call("service_list", json!({})).expect("list")["services"],
-        json!([row])
-    );
-    assert_eq!(
-        rig.call("service_status", json!({"name":"db1"}))
-            .expect("status"),
-        row
-    );
+    let mut listed = rig.call("service_list", json!({})).expect("list");
+    let mut status = rig
+        .call("service_status", json!({"name":"db1"}))
+        .expect("status");
+    let id_pattern = regex::Regex::new("^svc_[0-9a-f]{32}$").unwrap();
+    for observed in [&mut listed["services"][0], &mut status] {
+        let fields = observed.as_object_mut().expect("a service row");
+        let id = fields.remove("id").expect("the service id");
+        assert!(id_pattern.is_match(id.as_str().expect("a string service id")));
+        assert_eq!(
+            fields.remove("createdAt"),
+            Some(json!(arca::handlers::iso_utc(NOW)))
+        );
+        for key in ["limits", "startedAt", "uuid"] {
+            assert_eq!(fields.remove(key), Some(Value::Null), "{key}");
+        }
+        assert_eq!(fields.remove("data"), Some(json!({"volume": null})));
+        assert_eq!(fields.remove("labels"), Some(json!({})));
+    }
+    assert_eq!(listed["services"], json!([row]));
+    assert_eq!(status, row);
     assert_eq!(
         rig.call("service_logs", json!({"name":"db1","lines":2}))
             .expect("logs")["lines"],

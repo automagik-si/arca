@@ -554,8 +554,19 @@ fn a_vm_is_created_with_its_type_devices_and_limits_and_no_network_is_created_or
     let mut status = rig
         .call("service_status", json!({"name":"ws1"}))
         .expect("status");
-    // Compare additive observations with each other, then every legacy field with the create answer.
+    assert_eq!(
+        listed["services"][0]["id"].as_str(),
+        Some(
+            record
+                .id
+                .as_deref()
+                .expect("the new service record has an id")
+        ),
+        "the bridged row carries its record's id"
+    );
+    assert!(listed["services"][0]["createdAt"].is_string());
     assert_eq!(listed["services"][0]["labels"], json!({}));
+    // Compare the additive observations with each other, then every legacy field with the create answer.
     for key in [
         "id",
         "uuid",
@@ -565,16 +576,17 @@ fn a_vm_is_created_with_its_type_devices_and_limits_and_no_network_is_created_or
         "data",
         "labels",
     ] {
-        let observation = listed["services"][0]
+        let listed_value = listed["services"][0]
             .as_object_mut()
-            .unwrap()
+            .expect("the listed service")
             .remove(key)
-            .expect("observation present");
-        assert_eq!(
-            status.as_object_mut().unwrap().remove(key),
-            Some(observation),
-            "{key}"
-        );
+            .unwrap_or_else(|| panic!("service_list omitted {key}"));
+        let status_value = status
+            .as_object_mut()
+            .expect("the service status")
+            .remove(key)
+            .unwrap_or_else(|| panic!("service_status omitted {key}"));
+        assert_eq!(listed_value, status_value, "{key}: list and status agree");
     }
     let mut row = created.clone();
     row["ipv4In"] = json!("state");

@@ -873,6 +873,13 @@ images and vendored npm lockfile. Five of them, `workspace-vm`, `github-runner-p
 virtual machines (see "Bridged nodes and virtual machines", "Mixed nodes", "A pool of GitHub Actions runners", "A pool
 of GitLab runners" and "An Automagik workspace in its own virtual machine").
 
+`service_list` and `service_status` rows include a stable `id`, the journal's instance `uuid`, RFC 3339 UTC
+`createdAt` and `startedAt` timestamps, recorded resource `limits`, and the service's own `data.volume`.
+The `id` survives rebuilds and kernel restarts; older records derive it on reads and save it on their next normal
+write. `startedAt` is null when it is unknown or the service never started.
+
+Do not downgrade below this release once a service was created or written: older releases cannot read a record that carries an `id`.
+
 `service_labels_set {tenant?, name, labels}` lets a doctor merge plain caller data onto a service; labels are never
 secrets or policy, and do not change boot behavior. A string sets a value (including an empty string), and null removes
 a key. Bounds apply after merging: 128 bytes per key, 4096 bytes per value, 128 keys and 65536 bytes of compact JSON.
