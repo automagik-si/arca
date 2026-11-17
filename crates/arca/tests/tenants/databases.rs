@@ -1288,3 +1288,35 @@ fn a_configured_image_keeps_its_create_but_never_accepts_a_bad_execution_grant()
     assert_eq!(code, "NotApproved");
     assert_eq!(rig.fake().writes(), writes);
 }
+
+#[test]
+fn a_configured_image_database_shows_unused_access_fields_and_keeps_its_create() {
+    let rig = configured();
+    let args = json!({
+        "name": "orders",
+        "destinations": [{ "address": "198.51.100.8", "port": 5432 }],
+        "kernelAccess": { "port": 7461 },
+        "privatePort": { "address": "198.51.100.7", "port": 7422 }
+    });
+    let proposal = propose(&rig, args.clone()).expect("proposal");
+    for (field, label) in [
+        ("destinations", "Private network"),
+        ("kernelAccess", "Kernel access"),
+        ("privatePort", "Private port"),
+    ] {
+        assert_eq!(proposal["args"][field], args[field]);
+        assert!(proposal["details"].as_array().unwrap().iter().any(|row| {
+            row["label"] == label && row["value"] == format!(
+                "Requested {field}: {}. This node makes its database from the configured image and does not use {field}.", args[field]
+            )
+        }));
+    }
+    let approved = grant(&rig, &proposal);
+    execute(&rig, &approved).expect("configured create");
+    let entry = rig.entry("postgres-orders");
+    for field in ["destinations", "kernelAccess", "privatePort"] {
+        assert!(entry.get(field).is_none());
+    }
+    assert_eq!(entry["image"], PG_IMAGE);
+    assert!(!has_entry(&rig, "service-orders"));
+}

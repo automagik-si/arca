@@ -1001,6 +1001,51 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
 }
 
 #[test]
+fn every_argument_of_a_configured_image_database_is_in_details() {
+    let key = SkKey::from_seed(1);
+    let rig = Rig::new("proposal-configured-fields", &key);
+    let fields = [
+        (
+            "destinations",
+            "Private network",
+            json!([{ "address": "198.51.100.8", "port": 5432 }]),
+        ),
+        ("kernelAccess", "Kernel access", json!({ "port": 7461 })),
+        (
+            "privatePort",
+            "Private port",
+            json!({ "address": "198.51.100.7", "port": 7422 }),
+        ),
+    ];
+    for mask in 0..8 {
+        let mut args = json!({ "name": "orders" });
+        let mut expected = json!([
+            { "label": "Database", "value": "orders" },
+            { "label": "Image", "value": TEST_PG_IMAGE }
+        ]);
+        for (index, (field, label, value)) in fields.iter().enumerate() {
+            if mask & (1 << index) != 0 {
+                args[field] = value.clone();
+                expected.as_array_mut().unwrap().push(json!({
+                    "label": label,
+                    "value": format!("Requested {field}: {value}. This node makes its database from the configured image and does not use {field}.")
+                }));
+            }
+        }
+        let proposed = rig
+            .propose("postgres_create", args.clone())
+            .expect("proposal");
+        args["image"] = json!(TEST_PG_IMAGE);
+        assert_eq!(proposed["args"], args);
+        assert_eq!(proposed["details"], expected, "combination {mask}");
+        assert_eq!(
+            proposed["summary"],
+            "Create a Postgres database called orders"
+        );
+    }
+}
+
+#[test]
 fn a_proposed_postgres_create_uses_only_the_configured_pinned_image() {
     let key = SkKey::from_seed(1);
     let rig = Rig::new("proposal-postgres", &key);

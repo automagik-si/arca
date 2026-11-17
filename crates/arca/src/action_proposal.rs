@@ -746,6 +746,18 @@ impl ActionKind {
                     if let Some(reason) = gpu_product.filter(|_| !generated) {
                         rows.push(row("Start", &stopped_words(reason)));
                     }
+                } else {
+                    for (field, label) in [
+                        ("destinations", "Private network"),
+                        ("kernelAccess", "Kernel access"),
+                        ("privatePort", "Private port"),
+                    ] {
+                        if let Some(value) = args.get(field) {
+                            rows.push(row(label, &format!(
+                                "Requested {field}: {value}. This node makes its database from the configured image and does not use {field}."
+                            )));
+                        }
+                    }
                 }
                 rows
             }

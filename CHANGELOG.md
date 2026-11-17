@@ -4,6 +4,13 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 
 ## Unreleased
 
+Connector logs hide more sign-in link remnants while preserving the output of other services.
+
+Connector logs also hide short sign-in identifiers by their login link's host and path.
+
+Database approval cards on nodes with a configured image show requested private destinations, kernel access and
+private ports, and explain that these fields are not used by the configured-image create.
+
 ## 0.36.0 (2026-11-17)
 
 An owner-approved `instance_start` card now starts an instance inside a tenant even when the proposing token's tool

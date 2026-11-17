@@ -253,6 +253,29 @@ pub(crate) fn redact_login_links(text: &str) -> String {
         .into_owned()
 }
 
+fn redact_connector_links(text: &str) -> String {
+    static LINKS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        let gap =
+            r"(?:\x1b(?:\[[0-?]*[ -/]*[@-~]?|\][0-?]*)?|[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]|\r)*";
+        let host = "login.tailscale.com/a/"
+            .chars()
+            .map(|ch| regex::escape(&ch.to_string()))
+            .collect::<Vec<_>>()
+            .join(gap);
+        regex::Regex::new(&format!(
+            r"(?i)(?:[a-z\r]*:?\r*/\r*/)?{host}{gap}[ \t\r\n]*[A-Za-z0-9_-]+(?:\r+[A-Za-z0-9_-]+)*"
+        ))
+        .expect("fixed connector login-link pattern")
+    });
+    static STRINGS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r"(?s)(?:\x1b[PX^_]|[\x{90}\x{98}\x{9e}\x{9f}]).*?(?:\x1b\\|\x{9c})|(?:\x1b\]|\x{9d}).*?(?:\x07|\x1b\\|\x{9c})"
+        ).expect("fixed connector console-string pattern")
+    });
+    let text = STRINGS.replace_all(text, "");
+    LINKS.replace_all(&text, "[sign-in link]").into_owned()
+}
+
 fn clean_console(text: &str) -> String {
     text.split('\n')
         .map(|line| {
@@ -287,7 +310,7 @@ pub(crate) fn connector_log(text: &str, secrets: &[String]) -> (String, service:
             values.push(found["id"].replace('\r', ""));
         }
     }
-    let raw = redact_login_links(&service::redact_blocks(text));
+    let raw = redact_connector_links(&service::redact_blocks(text));
     // Keep the fixed placeholder outside any unfinished terminal escape while rendering it.
     let raw = raw.replace("[sign-in link]", "\u{1b}[0m[sign-in link]");
     let answer = redact_login_links(&clean_console(&raw));
@@ -308,7 +331,7 @@ pub(crate) fn connector_log(text: &str, secrets: &[String]) -> (String, service:
 pub(crate) fn finish_connector_log(text: &str) -> String {
     static REMAINDERS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(
-            r"\[sign-in link\][A-Za-z0-9_-]+|(?i:(?:[a-z]*:?//)?login\.tailscale\.com/a/?)[A-Za-z0-9_-]{8,}"
+            r"\[sign-in link\][\p{Cf}A-Za-z0-9_-]+|(?i:(?:[a-z]*:?//)?login\.tailscale\.com/a/?)[A-Za-z0-9_-]{8,}"
         ).expect("fixed connector-log remainder pattern")
     });
     REMAINDERS.replace_all(text, "[sign-in link]").into_owned()
