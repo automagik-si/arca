@@ -1323,6 +1323,13 @@ content` row are in the card's Details, with the verb, the target and the finger
 node is another one when the owner approves (another image, or an edit of the script that opens the database), the
 create is refused and nothing is made; propose it again. See "What the owner saw is what is created".
 
+When the database's name has private destinations in `kernel.serviceDestinations`, or the node's template declares
+`kernelAccess` or `privatePort`, the card also shows the service card's `Private network`, `Kernel access` or `Private
+port` rows. The proposal binds those facts along with the name, template, image and template content. Approval is
+spent once for `postgres_create`; service creation then checks those facts again before writing anything. A changed
+fact creates nothing and gives the same refusal as a service create; propose it again. A token's direct create without
+a card still answers `NotApproved` when any of these facts applies, even with every tool allowed.
+
 If the template is not installed, the create and the proposal are refused in words that name `arca templates
 install`. An image or a template stated in a call must be exactly the node's own, or the call is refused; the
 refusal never repeats what the caller stated.

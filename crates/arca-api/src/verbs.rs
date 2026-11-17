@@ -4945,8 +4945,9 @@ fn postgres_create_params() -> Value {
 }
 
 fn postgres_create_params_base() -> Value {
-    params(vec![
+    let mut schema = params(vec![
         ("name", true, string_max(31)),
+        ("approval", false, approval_schema()),
         ("image", false, string_max(512)),
         (
             "template",
@@ -4964,7 +4965,13 @@ fn postgres_create_params_base() -> Value {
                 "type": "string"
             }),
         ),
-    ])
+    ]);
+    // These facts have the service create's schema and words: a template database is that service.
+    let service = service_create_params_base();
+    for key in ["destinations", "kernelAccess", "privatePort"] {
+        schema["properties"][key] = service["properties"][key].clone();
+    }
+    schema
 }
 fn postgres_create_result() -> Value {
     result(vec![

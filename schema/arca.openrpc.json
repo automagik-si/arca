@@ -3200,13 +3200,68 @@
                   }
                 ],
                 "properties": {
+                  "destinations": {
+                    "description": "Only for a service this node's config names in kernel.serviceDestinations: exactly the addresses and tcp ports the config names for it. A proposal made with action_propose fills it in from the config, so the owner's approval binds it and the owner's card shows each address; a caller has no need to state it, and cannot state one of its own. Such a service, and everything that runs in it, can reach each address on its one tcp port through this node; every other private address stays closed. A create of such a service runs only from an approved proposal: called directly it is refused with NotApproved. Refused in a tenant and for a virtual machine on a host bridge.",
+                    "items": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "address": {
+                          "maxLength": 15,
+                          "type": "string"
+                        },
+                        "port": {
+                          "maximum": 65535,
+                          "minimum": 1,
+                          "type": "integer"
+                        }
+                      },
+                      "required": [
+                        "address",
+                        "port"
+                      ],
+                      "type": "object"
+                    },
+                    "maxItems": 4,
+                    "type": "array"
+                  },
                   "image": {
                     "maxLength": 512,
                     "type": "string"
                   },
+                  "kernelAccess": {
+                    "additionalProperties": false,
+                    "description": "Only for a template that declares kernelAccess: the template's own kernelAccess. A proposal made with action_propose fills it in from the template, so the owner's approval binds it and the owner's card says it; a caller has no need to state it. Such a service can call this node's kernel from inside its instance, at http://127.0.0.1:<port>/mcp, with whatever token it is given; the token's scope and tool list decide what it may do. A create of such a template runs only from an approved proposal: called directly it is refused with NotApproved. Refused in a tenant, and on a node that sets no listen.services.",
+                    "properties": {
+                      "port": {
+                        "maximum": 65535,
+                        "minimum": 1024,
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "port"
+                    ],
+                    "type": "object"
+                  },
                   "name": {
                     "maxLength": 31,
                     "type": "string"
+                  },
+                  "privatePort": {
+                    "additionalProperties": false,
+                    "description": "Only for a template that declares privatePort: the one host address, one of this node's kernel.serviceListenAddresses, that the template's port listens on, for a peer over a private link. Left out, a node that names exactly one address uses it. A proposal made with action_propose fills in the address and the port, so the owner's approval binds them and the owner's card says them. The proxy listens on that address and on no other, never on every interface, and the service's own network rules do not stand between it and the port. A create of such a template runs only from an approved proposal: called directly it is refused with NotApproved. Refused in a tenant, for a virtual machine, on a node that names no address, and for an address the node does not name or that is not on one of its interfaces.",
+                    "properties": {
+                      "address": {
+                        "maxLength": 15,
+                        "type": "string"
+                      },
+                      "port": {
+                        "maximum": 65535,
+                        "minimum": 1,
+                        "type": "integer"
+                      }
+                    },
+                    "type": "object"
                   },
                   "template": {
                     "description": "Filled in by the node: the template a database is made from when its config names no image (postgres-autopg). A caller leaves it out.",
@@ -5277,11 +5332,88 @@
           }
         },
         {
+          "name": "approval",
+          "required": false,
+          "schema": {
+            "description": "The one-shot execution grant an approved action proposal arms. A direct call carries none that works.",
+            "maxLength": 16384,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        {
+          "name": "destinations",
+          "required": false,
+          "schema": {
+            "description": "Only for a service this node's config names in kernel.serviceDestinations: exactly the addresses and tcp ports the config names for it. A proposal made with action_propose fills it in from the config, so the owner's approval binds it and the owner's card shows each address; a caller has no need to state it, and cannot state one of its own. Such a service, and everything that runs in it, can reach each address on its one tcp port through this node; every other private address stays closed. A create of such a service runs only from an approved proposal: called directly it is refused with NotApproved. Refused in a tenant and for a virtual machine on a host bridge.",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "address": {
+                  "maxLength": 15,
+                  "type": "string"
+                },
+                "port": {
+                  "maximum": 65535,
+                  "minimum": 1,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "address",
+                "port"
+              ],
+              "type": "object"
+            },
+            "maxItems": 4,
+            "type": "array"
+          }
+        },
+        {
           "name": "image",
           "required": false,
           "schema": {
             "maxLength": 512,
             "type": "string"
+          }
+        },
+        {
+          "name": "kernelAccess",
+          "required": false,
+          "schema": {
+            "additionalProperties": false,
+            "description": "Only for a template that declares kernelAccess: the template's own kernelAccess. A proposal made with action_propose fills it in from the template, so the owner's approval binds it and the owner's card says it; a caller has no need to state it. Such a service can call this node's kernel from inside its instance, at http://127.0.0.1:<port>/mcp, with whatever token it is given; the token's scope and tool list decide what it may do. A create of such a template runs only from an approved proposal: called directly it is refused with NotApproved. Refused in a tenant, and on a node that sets no listen.services.",
+            "properties": {
+              "port": {
+                "maximum": 65535,
+                "minimum": 1024,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "port"
+            ],
+            "type": "object"
+          }
+        },
+        {
+          "name": "privatePort",
+          "required": false,
+          "schema": {
+            "additionalProperties": false,
+            "description": "Only for a template that declares privatePort: the one host address, one of this node's kernel.serviceListenAddresses, that the template's port listens on, for a peer over a private link. Left out, a node that names exactly one address uses it. A proposal made with action_propose fills in the address and the port, so the owner's approval binds them and the owner's card says them. The proxy listens on that address and on no other, never on every interface, and the service's own network rules do not stand between it and the port. A create of such a template runs only from an approved proposal: called directly it is refused with NotApproved. Refused in a tenant, for a virtual machine, on a node that names no address, and for an address the node does not name or that is not on one of its interfaces.",
+            "properties": {
+              "address": {
+                "maxLength": 15,
+                "type": "string"
+              },
+              "port": {
+                "maximum": 65535,
+                "minimum": 1,
+                "type": "integer"
+              }
+            },
+            "type": "object"
           }
         },
         {

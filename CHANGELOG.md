@@ -20,6 +20,11 @@ Keyless startup allows 10 minutes for sign-in; connector logs hide the login lin
 shown as `gave-up`. An unreadable Tailscale status is `unknown`, and status reads omit peers to keep large tailnets
 within the output limit. Keys remain separate, through `service_secret_set` and a restart.
 
+A database proposed from the node's `postgres-autopg` template now shows and binds its private destinations, kernel
+access and private port in the same words as a service card. Its approved run spends the database approval once and
+creates the service only while those facts and the template content still match the card. Direct creates still need
+an approved card when any of those three facts applies.
+
 ## 0.35.0 (2026-11-16)
 
 A config PATCH whose answer times out or is lost reads the object back to settle its intent. A read that still shows
