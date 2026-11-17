@@ -304,6 +304,16 @@ pub(crate) fn connector_log(text: &str, secrets: &[String]) -> (String, service:
     (answer, service::values_to_hide(&values))
 }
 
+/// Finish connector redaction after cleaning and value hiding, including adjacent identifier continuations.
+pub(crate) fn finish_connector_log(text: &str) -> String {
+    static REMAINDERS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r"\[sign-in link\][A-Za-z0-9_-]+|(?i:(?:[a-z]*:?//)?login\.tailscale\.com/a/?)[A-Za-z0-9_-]{8,}"
+        ).expect("fixed connector-log remainder pattern")
+    });
+    REMAINDERS.replace_all(text, "[sign-in link]").into_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
