@@ -5762,7 +5762,7 @@ fn service_observation_schema() -> Value {
             "pattern": "^svc_[0-9a-f]{32}$"
         },
         "uuid": {
-            "description": "The instance UUID recorded by the effect journal, never taken from a fresh listing. Null when no instance identity is recorded.",
+            "description": "The instance UUID recorded by the effect or import journal, never taken from a fresh listing. Null when no instance identity is recorded.",
             "type": ["string", "null"]
         },
         "createdAt": {

@@ -835,7 +835,7 @@ pub fn normalize_mac(text: &str) -> Option<String> {
 }
 
 /// The config keys every virtual machine carries: its template, both limits, autostart, and the switch that has the
-/// agent rename the NIC to its device's `name`.
+/// agent rename the NIC to its device's `name`. When recorded, `limits.memory.hotplug` is carried too.
 fn vm_config(cfg: &ServiceConfig) -> Map<String, Value> {
     let mut config = Map::new();
     config.insert(TEMPLATE_KEY.to_string(), json!(cfg.template));

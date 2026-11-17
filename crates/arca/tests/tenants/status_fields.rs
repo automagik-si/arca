@@ -170,12 +170,27 @@ fn legacy_status_id_is_read_only_stable_and_persisted_only_on_its_next_normal_wr
     );
     let mut entry = record(&rig);
     entry.config["follow"] = json!("none");
+    entry.digest = arca_kernel::canon::Digest::of(
+        arca_kernel::canon::canonical_json(&entry.config)
+            .unwrap()
+            .as_bytes(),
+    );
     rig.kernel
         .lock()
         .unwrap()
         .propose(vec![EntryChange::Put(entry)], NOW)
         .unwrap();
     assert_eq!(record(&rig).config["id"], id);
+    let migrated = record(&rig);
+    assert_eq!(
+        migrated.digest,
+        arca_kernel::canon::Digest::of(
+            arca_kernel::canon::canonical_json(&migrated.config)
+                .unwrap()
+                .as_bytes()
+        ),
+        "the migrated record's digest covers its persisted config"
+    );
     assert_eq!(observed(&rig)["id"], id);
     let rig = rig.restart();
     assert_eq!(observed(&rig)["id"], id);

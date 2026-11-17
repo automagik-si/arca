@@ -2980,8 +2980,8 @@ fn action_approval_failure(error: ActionApprovalError) -> CallError {
     }
 }
 
-/// Runs one already approved action through the same handler its gated verb uses. `service_create` gets the random
-/// grant too: a template with kernel access is created only from an approved proposal. The verbs that take an inline approval
+/// Runs one already approved action through the same handler its gated verb uses. `service_create` and `postgres_create`
+/// get the random grant too: a template with kernel access is created only from an approved proposal. The verbs that take an inline approval
 /// (`service_remove`, `service_publish`, the GPU, storage and snapshot verbs, `instance_stop` and `instance_restart`) get
 /// the random grant in that field, and the
 /// handler consumes it, so the owner's real approval is never stored or replayed.
@@ -3255,6 +3255,26 @@ mod tests {
     use arca_providers::INSTANCES_ALL_PROJECTS;
 
     use super::*;
+
+    #[test]
+    fn adoption_observations_leave_identity_for_the_new_record_write() {
+        let row = json!({
+            "name": "sample", "project": arca_netproject::PROJECT,
+            "config": {
+                "user.arca.template": "app", "user.arca.address": "192.0.2.10",
+                "user.arca.ports": ""
+            },
+            "devices": {"eth0": {"ipv4.address": "192.0.2.10"}}
+        });
+        for now in [1, 2] {
+            let config = adopted_config(&row, &[], "192.0.2.0/24", "192.0.2.1", now)
+                .expect("an adoptable row");
+            assert!(
+                config.id.is_none(),
+                "observing a row needs no fresh identity"
+            );
+        }
+    }
 
     #[test]
     fn ontology_direct_calls_validate_id_by_character_count() {
@@ -5369,8 +5389,8 @@ impl IntoIterator for ServiceHandlers {
 pub struct ServiceCreateHandler(Arc<ServiceHandler>);
 
 /// The typed `service_create` entry made with these handlers, as [`postgres_handlers`] takes it.
-pub fn service_create_handler(handlers: &ServiceHandlers) -> Option<ServiceCreateHandler> {
-    Some(handlers.create.clone())
+pub fn service_create_handler(handlers: &ServiceHandlers) -> ServiceCreateHandler {
+    handlers.create.clone()
 }
 
 // This module's private field prevents even the other handlers from constructing the proof. The only constructor
@@ -5520,19 +5540,9 @@ fn database_source(cfg: &NodeConfig, args: &Value) -> Result<DatabaseSource, Cal
     }
     // A database is a container on the managed service network: a node that runs no services refuses in those words.
     service_project(cfg)?;
-    let content = crate::service::load_template_content(
-        &cfg.state_dir.join("templates"),
-        template_name,
-    )
-    .map_err(|error| {
-            if error.not_found {
-                service_refused(format!(
-                    "this node has no {template_name} template (templates/{template_name}.json in its state directory), and its config names no kernel.postgresImage: a database is made from one of the two. `arca templates install` puts the template Arca ships there"
-                ))
-            } else {
-                service_template_error(error)
-            }
-        })?;
+    let content =
+        crate::service::load_template_content(&cfg.state_dir.join("templates"), template_name)
+            .map_err(database_template_error)?;
     let template = &content.template;
     let pin = crate::service::template_pin(template)
         .filter(|_| template.kind == "oci")
@@ -5558,6 +5568,18 @@ fn database_source(cfg: &NodeConfig, args: &Value) -> Result<DatabaseSource, Cal
         digest,
         template: Box::new(content.template),
     })
+}
+
+/// The database's installation guidance applies to direct creates, proposals and approved runs alike.
+fn database_template_error(error: crate::service::TemplateError) -> CallError {
+    if error.not_found {
+        let name = crate::service::DATABASE_TEMPLATE;
+        service_refused(format!(
+            "this node has no {name} template (templates/{name}.json in its state directory), and its config names no kernel.postgresImage: a database is made from one of the two. `arca templates install` puts the template Arca ships there"
+        ))
+    } else {
+        service_template_error(error)
+    }
 }
 
 /// The refusal for an image that is not the one the node's database template names now, `pin`.
@@ -7100,7 +7122,7 @@ pub(crate) fn adopted_config(
         });
     }
     Some(crate::service::ServiceConfig {
-        id: Some(crate::service::fresh_id().ok()?),
+        id: None,
         name: name.to_string(),
         template: template.to_string(),
         instance: name.to_string(),
@@ -7272,6 +7294,10 @@ fn adopt_services(
         config.kernel_access = config
             .kernel_access
             .filter(|link| cfg.kernel_access().as_deref() == Some(link.connect.as_str()));
+        let Ok(identity) = crate::service::fresh_id() else {
+            continue;
+        };
+        config.id = Some(identity);
         changes.push(crate::desired_store::EntryChange::Put(service_entry(
             &id,
             "arca.service",
@@ -8209,7 +8235,7 @@ impl ServiceHandler {
                 &self.cfg.state_dir.join("templates"),
                 template_name,
             )
-            .map_err(service_template_error)?;
+            .map_err(database_template_error)?;
             let template = &content.template;
             kernel_access_for(
                 &self.cfg,

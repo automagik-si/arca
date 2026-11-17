@@ -693,8 +693,7 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
         functions,
     );
     // A database made from the node's template is created by the service handler itself.
-    let service_create = crate::handlers::service_create_handler(&service_handlers)
-        .ok_or_else(|| Failure::Runtime("the service handlers hold no service_create".into()))?;
+    let service_create = crate::handlers::service_create_handler(&service_handlers);
     // The moves to linked hosts: their plans, their runs and their journal. A move a stopped kernel left unfinished is
     // settled in the background from here (recorded as moved when its checks passed, left for the owner when its copy
     // had started, else rolled back). Until it ends in the journal it holds its instances: a new move of one is refused.

@@ -252,8 +252,7 @@ impl Rig {
             }),
         );
         let services = service_handlers(kernel.clone(), time.clone(), cfg.clone());
-        let service_create =
-            arca::handlers::service_create_handler(&services).expect("service_create");
+        let service_create = arca::handlers::service_create_handler(&services);
         let handlers = plan_handlers_served(
             kernel.clone(),
             time.clone(),
