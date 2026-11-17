@@ -19,6 +19,11 @@ fn rig() -> (Rig, common::SkKey) {
         Some("192.0.2.0/24"),
         Some(&key),
     );
+    prepare_edge(&rig);
+    (rig, key)
+}
+
+fn prepare_edge(rig: &Rig) {
     arca::cmd_templates::install_into(&rig.dir.join("templates"), false).unwrap();
     rig.template("edge", json!({"name":"edge","kind":"oci","image":"docker.io/library/example","digest":DIGEST,"ports":[443],"env":{},"lan":{"port":443},"edge":true,"provides":{"env":{"ARCA_EDGE_TARGET":"{{host}}:{{port}}"}}}));
     rig.call("service_create", json!({"name":"edge","template":"edge"}))
@@ -28,7 +33,6 @@ fn rig() -> (Rig, common::SkKey) {
         0,
         "",
     ));
-    (rig, key)
 }
 
 fn proposed(rig: &Rig, args: Value) -> Value {
@@ -36,6 +40,10 @@ fn proposed(rig: &Rig, args: Value) -> Value {
 }
 
 fn try_proposed(rig: &Rig, args: Value) -> Result<Value, CallError> {
+    proposed_action(rig, "reach_connect", args)
+}
+
+fn proposed_action(rig: &Rig, action: &str, args: Value) -> Result<Value, CallError> {
     let plans: HashMap<_, _> = arca::handlers::plan_handlers_served(
         rig.kernel.clone(),
         Arc::new(|| NOW),
@@ -48,7 +56,7 @@ fn try_proposed(rig: &Rig, args: Value) -> Result<Value, CallError> {
     )
     .into_iter()
     .collect();
-    plans["action_propose"].call(json!({"action":"reach_connect","args":args}), &doctor())
+    plans["action_propose"].call(json!({"action":action,"args":args}), &doctor())
 }
 
 fn approved_args(rig: &Rig, key: &common::SkKey, proposal: &Value) -> (Value, String) {
@@ -56,7 +64,7 @@ fn approved_args(rig: &Rig, key: &common::SkKey, proposal: &Value) -> (Value, St
     let statement = arca::handlers::action_statement(
         "node1",
         proposal["id"].as_str().unwrap(),
-        "reach_connect",
+        proposal["action"].as_str().unwrap(),
         proposal["argsDigest"].as_str().unwrap(),
         NOW,
         &format!("{:032x}", NONCE.fetch_add(1, Ordering::SeqCst)),
@@ -97,6 +105,14 @@ fn status(rig: &Rig, state: &str) {
     ];
     rig.fake.script_exec(ExecScript::new(argv.into_iter().map(str::to_string).collect(), 0,
         &json!({"BackendState":state,"AuthURL":LOGIN,"TailscaleIPs":["100.64.0.7"],"Self":{"DNSName":"node.example.ts.net.","HostName":"node"}}).to_string()));
+}
+
+fn edge_reload(rig: &Rig) {
+    rig.fake.script_exec(ExecScript::new(
+        arca_incus::exec::ExecCommand::EdgeReload.argv(),
+        0,
+        "",
+    ));
 }
 
 fn assert_private(rig: &Rig, needle: &str) {
@@ -870,4 +886,287 @@ fn connect_keeps_the_create_namespace_rule_for_recorded_programs() {
         rig.get(&format!("/1.0/instances/node1-ts?project={PROJECT}"))
             .is_none()
     );
+}
+
+#[test]
+fn disconnect_without_approval_preserves_the_connector() {
+    let (rig, key) = rig();
+    connect(&rig, &key, Some("node-ts")).unwrap();
+    assert!(matches!(
+        rig.call("reach_disconnect", json!({"name":"node-ts"})),
+        Err(CallError::Refused { code, .. }) if code == "NotApproved"
+    ));
+    assert!(
+        rig.get(&format!("/1.0/instances/node-ts?project={PROJECT}"))
+            .is_some()
+    );
+}
+
+fn disconnect_args(rig: &Rig, key: &common::SkKey, name: &str) -> Value {
+    let proposal = proposed_action(rig, "reach_disconnect", json!({"name":name})).unwrap();
+    let (mut args, grant) = approved_args(rig, key, &proposal);
+    args["approval"] = json!(grant);
+    args
+}
+
+#[test]
+fn approved_disconnect_restores_the_edge_erases_state_and_allows_the_same_name_again() {
+    let (rig, key) = rig();
+    let file = format!("{PROJECT}/edge:{}", arca_incus::exec::EDGE_CONFIG);
+    rig.template("web", json!({"name":"web","kind":"oci","image":"docker.io/library/example","digest":DIGEST,"ports":[8080],"env":{},"provides":{"env":{"WEB":"{{host}}:{{port}}"}}}));
+    rig.call("service_create", json!({"name":"web","template":"web"}))
+        .unwrap();
+    rig.call("service_connect", json!({"from":"edge","to":"web"}))
+        .unwrap();
+    rig.call(
+        "route_add",
+        json!({"hostname":"app.example.com","instance":"web","port":8080}),
+    )
+    .unwrap();
+    let before = rig.fake.service_files()[&file].clone();
+    let routes = rig.service_config("edge").edge.unwrap().routes;
+    edge_reload(&rig);
+    connect(&rig, &key, Some("node-ts")).unwrap();
+    let volume = format!("/1.0/storage-pools/pool1/volumes/custom/node-ts-data?project={PROJECT}");
+    assert!(rig.get(&volume).is_some());
+    let args = disconnect_args(&rig, &key, "node-ts");
+    edge_reload(&rig);
+    let answer = rig.call("reach_disconnect", args.clone()).unwrap();
+    assert_eq!(answer["removed"], true);
+    assert_eq!(answer["edge"]["name"], "edge");
+    assert_eq!(rig.fake.service_files()[&file], before);
+    let edge = rig.service_config("edge");
+    assert!(edge.incoming.is_empty());
+    assert_eq!(edge.edge.unwrap().routes, routes);
+    assert!(
+        rig.get(&format!("/1.0/instances/node-ts?project={PROJECT}"))
+            .is_none()
+    );
+    assert!(rig.get(&volume).is_none());
+    assert!(
+        matches!(rig.call("reach_disconnect", args.clone()), Err(CallError::Refused {code, ..}) if code == "NotApproved")
+    );
+    edge_reload(&rig);
+    connect(&rig, &key, Some("node-ts")).unwrap();
+    assert!(
+        matches!(rig.call("reach_disconnect", args), Err(CallError::Refused {code, ..}) if code == "NotApproved")
+    );
+    assert!(
+        rig.get(&format!("/1.0/instances/node-ts?project={PROJECT}"))
+            .is_some()
+    );
+}
+
+#[test]
+fn disconnect_rejects_changed_arguments_other_verb_grants_and_ordinary_services() {
+    let (rig, key) = rig();
+    connect(&rig, &key, Some("node-ts")).unwrap();
+    let mut args = disconnect_args(&rig, &key, "node-ts");
+    args["name"] = json!("edge");
+    assert!(
+        matches!(rig.call("reach_disconnect", args), Err(CallError::Refused {code, ..}) if code == "NotApproved")
+    );
+    let proposal = proposed(&rig, json!({"kind":"tailscale","name":"another"}));
+    let (_, grant) = approved_args(&rig, &key, &proposal);
+    assert!(
+        matches!(rig.call("reach_disconnect", json!({"name":"node-ts","approval":grant})), Err(CallError::Refused {code, ..}) if code == "NotApproved")
+    );
+    rig.template("plain", json!({"name":"plain","kind":"oci","image":"docker.io/library/example","digest":DIGEST,"env":{}}));
+    rig.call("service_create", json!({"name":"plain","template":"plain"}))
+        .unwrap();
+    for name in ["edge", "plain"] {
+        let args = disconnect_args(&rig, &key, name);
+        assert!(
+            matches!(rig.call("reach_disconnect", args), Err(CallError::Refused {message, ..}) if message.contains("not a connector"))
+        );
+        assert!(
+            rig.get(&format!("/1.0/instances/{name}?project={PROJECT}"))
+                .is_some()
+        );
+    }
+    assert!(
+        rig.get(&format!("/1.0/instances/edge?project={PROJECT}"))
+            .is_some()
+    );
+    assert!(
+        rig.get(&format!("/1.0/instances/node-ts?project={PROJECT}"))
+            .is_some()
+    );
+}
+
+#[test]
+fn disconnect_removes_a_connector_left_by_a_failed_link() {
+    let (rig, key) = rig();
+    rig.fake.fail_reads("/1.0/instances/edge?", 1, 500);
+    assert!(connect(&rig, &key, Some("node-ts")).is_err());
+    assert!(rig.service_config("node-ts").links.is_empty());
+    let args = disconnect_args(&rig, &key, "node-ts");
+    assert_eq!(
+        rig.call("reach_disconnect", args).unwrap(),
+        json!({"removed":true,"edge":null})
+    );
+    assert!(
+        rig.get(&format!("/1.0/instances/node-ts?project={PROJECT}"))
+            .is_none()
+    );
+    assert!(
+        rig.get(&format!(
+            "/1.0/storage-pools/pool1/volumes/custom/node-ts-data?project={PROJECT}"
+        ))
+        .is_none()
+    );
+}
+
+fn page_request(
+    socket: &std::path::Path,
+    method: &str,
+    path: &str,
+    body: Value,
+) -> (u16, String, Value) {
+    use std::io::{Read, Write};
+    let body = body.to_string();
+    let mut stream = std::os::unix::net::UnixStream::connect(socket).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(20)))
+        .unwrap();
+    write!(stream, "{method} {path} HTTP/1.1\r\nHost: localhost\r\nOrigin: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", webauthn::ORIGIN, body.len()).unwrap();
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw).unwrap();
+    let (head, body) = raw.split_once("\r\n\r\n").unwrap();
+    (
+        head.split_whitespace().nth(1).unwrap().parse().unwrap(),
+        head.to_string(),
+        serde_json::from_str(body).unwrap_or(Value::Null),
+    )
+}
+
+#[test]
+fn page_reads_real_connector_status_only_after_passkey_and_never_records_the_link() {
+    use arca::approve_page::{DesktopDisplay, Page};
+    use webauthn::{Assert, SoftPasskey};
+    let ssh = common::SkKey::from_seed(71);
+    let key = SoftPasskey::from_seed(5);
+    let owner = common::Scratch::new("reach-page-owner");
+    let verifier = common::verifier_with_passkeys(
+        &owner,
+        &[&ssh],
+        &key.line(arca_approval::ARCA_NAMESPACE),
+        "reach-page",
+    );
+    let mut rig = Rig::with_verifier(
+        FakeState {
+            server: json!({}),
+            projects: vec![],
+            instances: vec![],
+            networks: vec![],
+            pools: vec![("pool1".into(), json!({}))],
+        },
+        vec![PROJECT.into()],
+        Some("192.0.2.0/24"),
+        Some(verifier),
+        None,
+    );
+    prepare_edge(&rig);
+    let (handlers, reads) = arca::handlers::service_handlers_with_reach(
+        rig.kernel.clone(),
+        Arc::new(|| NOW),
+        rig.cfg.clone(),
+        None,
+        Default::default(),
+    );
+    rig.handlers = handlers.into_iter().collect();
+    status(&rig, "NeedsLogin");
+    connect(&rig, &ssh, Some("node-ts")).unwrap();
+    let logs = Arc::new(Mutex::new(Vec::new()));
+    let captured = logs.clone();
+    let page = Page::new(
+        webauthn::ORIGIN.into(),
+        rig.kernel.clone(),
+        Arc::new(|| NOW),
+        rig.dir.clone(),
+        Arc::new(DesktopDisplay),
+    )
+    .with_reach(reads)
+    .with_log(Arc::new(move |line| {
+        captured.lock().unwrap().push(line.to_string())
+    }));
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let socket = rig.dir.join("reach.sock");
+    let served = socket.clone();
+    let router = page.router(false);
+    runtime.spawn(async move {
+        arca_mcp::serve_unix(router, &served).await.unwrap();
+    });
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !socket.exists() {
+        assert!(std::time::Instant::now() < until);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    rig.fake.script_exec(ExecScript::new(
+        arca_incus::exec::ExecCommand::ConnectorStatus.argv(),
+        0,
+        &json!({"BackendState":"NeedsLogin","AuthURL":LOGIN,"AuthKey":KEY}).to_string(),
+    ));
+    let request = |method, path, body| page_request(&socket, method, path, body);
+    let (code, _, rows) = request("GET", "/approve/reach", json!({}));
+    assert_eq!(code, 200);
+    assert_eq!(rows["connectors"][0]["state"], "waiting-sign-in");
+    assert!(!rows.to_string().contains(LOGIN));
+    assert!(!rows.to_string().contains(KEY));
+    let (_, _, mut pending) = request("POST", "/approve/reach/sign-in", json!({"name":"node-ts"}));
+    assert!(pending.get("signInUrl").is_none());
+    let proof = key.proof_value(&Assert::over(
+        arca_approval::ARCA_NAMESPACE,
+        pending["statement"].as_str().unwrap().as_bytes(),
+    ));
+    pending["name"] = json!("node-ts");
+    pending["proof"] = proof;
+    status(&rig, "NeedsLogin");
+    let (code, head, answer) = request("POST", "/approve/reach/sign-in", pending.clone());
+    assert_eq!(code, 200);
+    assert!(
+        head.to_ascii_lowercase()
+            .contains("cache-control: no-store")
+    );
+    assert_eq!(answer, json!({"signInUrl":LOGIN}));
+    assert_eq!(request("POST", "/approve/reach/sign-in", pending).0, 403);
+    status(&rig, "Running");
+    let (_, _, mut pending) = request("POST", "/approve/reach/sign-in", json!({"name":"node-ts"}));
+    pending["proof"] = key.proof_value(&Assert::over(
+        arca_approval::ARCA_NAMESPACE,
+        pending["statement"].as_str().unwrap().as_bytes(),
+    ));
+    pending["name"] = json!("node-ts");
+    let (code, _, answer) = request("POST", "/approve/reach/sign-in", pending);
+    assert_ne!(code, 200);
+    assert!(!answer.to_string().contains(LOGIN));
+    let audit = fs::read_to_string(rig.dir.join(arca::service_exec::AUDIT_FILE)).unwrap();
+    assert!(
+        audit
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .any(|row| row["token_id"] == arca_mcp::auth::APPROVED_ACTION_ID
+                && row["verb"] == "reach_sign_in")
+    );
+    assert_private(&rig, LOGIN);
+    assert_private(&rig, KEY);
+    assert!(
+        logs.lock()
+            .unwrap()
+            .iter()
+            .all(|line| !line.contains(LOGIN))
+    );
+}
+
+#[test]
+fn approved_disconnect_runs_through_mcp_inside_its_closed_schema() {
+    let (rig, key) = rig();
+    status(&rig, "NeedsLogin");
+    connect(&rig, &key, Some("node-ts")).unwrap();
+    let args = disconnect_args(&rig, &key, "node-ts");
+    let door = external::Door::over(&rig);
+    edge_reload(&rig);
+    assert_eq!(door.call("reach_disconnect", args), "ok");
+    assert_eq!(door.call("reach_list", json!({})), "ok");
+    assert_private(&rig, LOGIN);
 }

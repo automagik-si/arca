@@ -12,6 +12,25 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
 
+pub(crate) fn page_reads(
+    kernel: Arc<Mutex<Kernel>>,
+    cfg: Arc<NodeConfig>,
+    exec: Arc<ServiceExec>,
+) -> crate::approve_page::ReachReads {
+    let caller = Caller {
+        token_id: arca_mcp::auth::APPROVED_ACTION_ID.into(),
+        scope: arca_api::Scope::Doctor,
+        tools: None,
+        limits: Default::default(),
+    };
+    let (rows_kernel, rows_cfg, rows_exec, rows_caller) =
+        (kernel.clone(), cfg.clone(), exec.clone(), caller.clone());
+    crate::approve_page::ReachReads {
+        rows: Arc::new(move || reach_rows(&rows_kernel, &rows_cfg, &rows_exec, &rows_caller)),
+        sign_in: Arc::new(move |name| reach_sign_in(&kernel, &cfg, &exec, &caller, name)),
+    }
+}
+
 fn unavailable() -> CallError {
     CallError::Internal("connector state unavailable".into())
 }
@@ -47,11 +66,12 @@ fn read(
     exec: &ServiceExec,
     target: &ExecTarget,
     caller: &Caller,
+    verb: &str,
 ) -> Result<Option<Vec<u8>>, CallError> {
     match exec.run(
         target,
         &caller.token_id,
-        "reach_list",
+        verb,
         &ExecCommand::ConnectorStatus,
         &[],
         None,
@@ -121,7 +141,7 @@ pub(crate) fn reach_rows(
         let mut row = json!({"name":record.name, "kind":kind, "edge":edge, "state":if running {"running"} else {"stopped"}});
         if kind == "tailscale" {
             if running {
-                let bytes = read(exec, &target(kernel, entry, record)?, caller)?;
+                let bytes = read(exec, &target(kernel, entry, record)?, caller, "reach_list")?;
                 // Unreadable status or a missing backend state cannot establish whether sign-in is needed.
                 let status = bytes
                     .as_deref()
@@ -182,14 +202,7 @@ pub(crate) fn reach_rows(
     Ok(rows)
 }
 
-/// Only the next passkey-checked page route will call this; no tool handler returns its result.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the next reach change adds the owner's sign-in page"
-    )
-)]
+/// Only the passkey-checked page route calls this; no tool handler returns its result.
 pub(crate) fn reach_sign_in(
     kernel: &Arc<Mutex<Kernel>>,
     cfg: &NodeConfig,
@@ -212,12 +225,25 @@ pub(crate) fn reach_sign_in(
     struct SignIn {
         #[serde(rename = "AuthURL")]
         url: Option<String>,
+        #[serde(rename = "BackendState")]
+        state: Option<String>,
     }
-    Ok(read(exec, &target(kernel, &entry, &record)?, caller)?
-        .as_deref()
-        .and_then(|bytes| serde_json::from_slice::<SignIn>(bytes).ok())
-        .and_then(|status| status.url)
-        .filter(|url| login_link(url)))
+    Ok(read(
+        exec,
+        &target(kernel, &entry, &record)?,
+        caller,
+        "reach_sign_in",
+    )?
+    .as_deref()
+    .and_then(|bytes| serde_json::from_slice::<SignIn>(bytes).ok())
+    .filter(|status: &SignIn| {
+        status
+            .state
+            .as_deref()
+            .is_some_and(|state| !state.is_empty() && state != "Running")
+    })
+    .and_then(|status| status.url)
+    .filter(|url| login_link(url)))
 }
 
 fn login_link(url: &str) -> bool {
@@ -428,7 +454,7 @@ mod tests {
         fake.script_exec(ExecScript::new(
             ExecCommand::ConnectorStatus.argv(),
             0,
-            &json!({"AuthURL":link,"Unrelated":"ignored"}).to_string(),
+            &json!({"AuthURL":link,"BackendState":"NeedsLogin","Unrelated":"ignored"}).to_string(),
         ));
         assert_eq!(
             reach_sign_in(&kernel, &cfg, &exec, &caller, "node-ts")
@@ -436,10 +462,22 @@ mod tests {
                 .as_deref(),
             Some(link)
         );
+        for state in ["Running", ""] {
+            fake.script_exec(ExecScript::new(
+                ExecCommand::ConnectorStatus.argv(),
+                0,
+                &json!({"BackendState":state,"AuthURL":link}).to_string(),
+            ));
+            assert!(
+                reach_sign_in(&kernel, &cfg, &exec, &caller, "node-ts")
+                    .unwrap()
+                    .is_none()
+            );
+        }
         fake.script_exec(ExecScript::new(
             ExecCommand::ConnectorStatus.argv(),
             0,
-            r#"{"AuthURL":"https://example.com/wrong"}"#,
+            r#"{"BackendState":"NeedsLogin","AuthURL":"https://example.com/wrong"}"#,
         ));
         assert!(
             reach_sign_in(&kernel, &cfg, &exec, &caller, "node-ts")

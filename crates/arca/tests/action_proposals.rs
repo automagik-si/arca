@@ -328,6 +328,7 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
                 json!({ "from": "api", "to": "nats", "tenant": "abcdefgh" })
             }
             ActionKind::PostgresCreate => json!({ "name": "orders" }),
+            ActionKind::ReachDisconnect => json!({"name":"node-ts"}),
             ActionKind::ReachConnect => json!({
                 "kind": "tailscale", "name": "node-ts",
                 "image": format!("ghcr.io/tailscale/tailscale@sha256:{}", "a".repeat(64)),
@@ -2299,7 +2300,7 @@ fn arguments_the_action_does_not_take_are_an_is_error_result_in_words_with_the_n
         .iter()
         .map(|action| action.as_str().expect("a name"))
         .collect();
-    assert_eq!(all.len(), 32);
+    assert_eq!(all.len(), 33);
     assert_eq!(
         failure(json!({ "action": "postgres_creat", "args": { "name": "orders" } })),
         format!(
@@ -2369,5 +2370,22 @@ fn a_field_the_kernel_fills_in_passes_the_door_with_any_value() {
     passes(
         "snapshot_delete",
         json!({ "name": "shop--web--20261030T1200", "pool": "usb1", "kind": "container" }),
+    );
+}
+
+#[test]
+fn reach_disconnect_erases_and_sign_in_is_not_proposable() {
+    assert!(ActionKind::ReachDisconnect.erases(&json!({"name":"node-ts"})));
+    assert!(ActionKind::from_name("reach_sign_in").is_none());
+    let key = SkKey::from_seed(1);
+    let rig = Rig::new("reach-sign-in-not-card", &key);
+    assert!(
+        rig.propose("reach_sign_in", json!({"name":"node-ts"}))
+            .is_err()
+    );
+    assert!(
+        ActionKind::ReachDisconnect
+            .undo_words()
+            .contains("Tailscale's admin page")
     );
 }

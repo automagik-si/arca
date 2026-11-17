@@ -4,6 +4,11 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 
 ## Unreleased
 
+The approval page lists connectors separately from waiting cards. A waiting Tailscale connector has a sign-in button
+that checks the owner's passkey before reading and opening its link. The link is never cached or recorded by Arca.
+`reach_disconnect` needs an approved erasing card: it unlinks and removes the connector and its state volume. Remove
+the machine's remaining entry in Tailscale's admin page yourself.
+
 `reach_connect` creates, links and starts a Tailscale connector after the owner approves a proposal bound to the
 template's image and content digest. `reach_list` shows connector state and tailnet details without the sign-in link.
 Keyless startup allows 10 minutes for sign-in; connector logs hide the login link, and a timed-out connector is

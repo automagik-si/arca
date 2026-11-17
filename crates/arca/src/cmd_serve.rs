@@ -686,11 +686,12 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
         }
     }
     let action_slot = ActionSlot::default();
-    let service_handlers = crate::handlers::service_handlers_with(
+    let (service_handlers, reach_reads) = crate::handlers::service_handlers_with_reach(
         kernel.clone(),
         clock.clone(),
         Arc::new(cfg.clone()),
         functions,
+        crate::handlers::UpdateOptions::default(),
     );
     // A database made from the node's template is created by the service handler itself.
     let service_create = crate::handlers::service_create_handler(&service_handlers)
@@ -876,6 +877,7 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
         )
         .with_canvas_origin(&cfg.canvas_origin)
         .with_actions(actions)
+        .with_reach(reach_reads)
         .with_approval_requests(Arc::clone(&approval_requests))
         .with_linked_hosts(linked_hosts.clone());
         let page = match &peer_sync {

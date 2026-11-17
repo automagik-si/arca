@@ -119,6 +119,7 @@ fn the_table_holds_the_initial_plan_alerts_postgres_and_ontology_verbs_in_order(
             "github_disconnect",
             "os_update",
             "reach_connect",
+            "reach_disconnect",
             "reach_list",
             "route_add",
             "route_remove",
@@ -413,8 +414,9 @@ fn plan_verb_schemas_equal_their_table_rows() {
         ],
     );
 
-    let action_names = [
+    let action_names: &[&str] = &[
         "reach_connect",
+        "reach_disconnect",
         "service_create",
         "service_remove",
         "service_update",
@@ -1592,7 +1594,32 @@ fn postgres_delete_accepts_a_waiting_plan_or_a_settled_removal() {
 
 #[test]
 fn service_wiring_schemas_equal_the_frozen_contract() {
-    let rows: Value = serde_json::from_str(include_str!("fixtures/service-wiring.json")).unwrap();
+    let mut rows: Value =
+        serde_json::from_str(include_str!("fixtures/service-wiring.json")).unwrap();
+    if std::env::var_os("ARCA_UPDATE_SCHEMA").is_some() {
+        let mut names: Vec<String> = rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["name"].as_str().unwrap().to_string())
+            .collect();
+        if !names.iter().any(|name| name == "reach_disconnect") {
+            names.push("reach_disconnect".into());
+        }
+        rows =
+            json!(names.iter().map(|name| {
+            let v = verb(name).unwrap();
+            json!({"name":name, "inputSchema":(v.params)(), "outputSchema":(v.result)()})
+        }).collect::<Vec<_>>());
+        std::fs::write(
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/service-wiring.json"
+            ),
+            pretty(&rows),
+        )
+        .unwrap();
+    }
     for row in rows.as_array().unwrap() {
         let v = verb(row["name"].as_str().unwrap()).unwrap();
         assert_eq!((v.params)(), row["inputSchema"]);
@@ -1735,6 +1762,7 @@ fn every_destructive_verb_takes_an_optional_boolean_confirm_and_no_other_verb_do
             "instance_move",
             "instance_move_finish",
             "github_disconnect",
+            "reach_disconnect",
             "instance_import_undo",
         ]
     );
@@ -1948,7 +1976,7 @@ fn action_propose_describes_the_args_of_every_action_with_an_example_it_takes() 
         .iter()
         .map(|action| action.as_str().expect("a name"))
         .collect();
-    assert_eq!(actions.len(), 32);
+    assert_eq!(actions.len(), 33);
     let args = &params["properties"]["args"];
     assert_eq!(args["type"], json!("object"));
     assert_eq!(args["x-arca-by"], json!("action"));
@@ -2270,10 +2298,15 @@ fn reach_verbs_and_their_proposals_stay_outside_service_limited_tokens() {
             "reach_connect",
             json!({"kind":"tailscale","name":"node-ts"}),
         ),
+        ("reach_disconnect", json!({"name":"node-ts"})),
         ("reach_list", json!({})),
         (
             "action_propose",
             json!({"action":"reach_connect","args":{"kind":"tailscale","name":"node-ts"}}),
+        ),
+        (
+            "action_propose",
+            json!({"action":"reach_disconnect","args":{"name":"node-ts"}}),
         ),
     ] {
         assert!(
@@ -2281,4 +2314,27 @@ fn reach_verbs_and_their_proposals_stay_outside_service_limited_tokens() {
             "{name} reaches the node beyond a token's named services"
         );
     }
+}
+
+#[test]
+fn reach_disconnect_has_a_closed_result_and_doctor_scope() {
+    let v = verb("reach_disconnect").unwrap();
+    assert_eq!(v.min_scope, Scope::Doctor);
+    assert!(v.destructive && v.writes);
+    let schema = (v.result)();
+    assert_eq!(
+        conforms(&schema, &json!({"removed":true,"edge":null})),
+        Ok(())
+    );
+    assert!(
+        conforms(
+            &schema,
+            &json!({"removed":true,"edge":null,"signInUrl":"private"})
+        )
+        .is_err()
+    );
+    assert!(conforms(&schema, &json!({"removed":true})).is_err());
+    assert!(
+        (v.summary_text)(&json!({"removed":true,"edge":null})).contains("Tailscale's admin page")
+    );
 }

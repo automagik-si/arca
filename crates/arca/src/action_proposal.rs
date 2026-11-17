@@ -82,6 +82,7 @@ pub enum ActionKind {
     InstanceMove,
     InstanceMoveFinish,
     ReachConnect,
+    ReachDisconnect,
     RouteAdd,
     RouteRemove,
     InstanceImport,
@@ -145,7 +146,7 @@ fn setting_words(value: &Value) -> String {
 
 impl ActionKind {
     /// Every allowed action, in the order the table documents them.
-    pub const ALL: [ActionKind; 32] = [
+    pub const ALL: [ActionKind; 33] = [
         Self::ServiceCreate,
         Self::ServiceRemove,
         Self::ServiceUpdate,
@@ -174,6 +175,7 @@ impl ActionKind {
         Self::InstanceMove,
         Self::InstanceMoveFinish,
         Self::ReachConnect,
+        Self::ReachDisconnect,
         Self::RouteAdd,
         Self::RouteRemove,
         Self::InstanceImport,
@@ -238,6 +240,9 @@ impl ActionKind {
                 "It cannot be undone: the source instances and their custom volumes are deleted from this host; the moved copies on the target stay."
             }
             Self::ReachConnect => "Ask your assistant to disconnect and remove the connector.",
+            Self::ReachDisconnect => {
+                "It cannot be undone: the connector and its state volume are erased. Remove the machine's remaining entry in Tailscale's admin page yourself."
+            }
             Self::RouteAdd => "Ask your assistant to stop serving the address.",
             Self::RouteRemove => "Ask your assistant to serve the address again.",
             Self::InstanceImport => {
@@ -273,6 +278,7 @@ impl ActionKind {
     pub fn erases(self, args: &Value) -> bool {
         match self {
             Self::ServiceRemove
+            | Self::ReachDisconnect
             | Self::SnapshotDelete
             | Self::TenantRemove
             | Self::DeployRemove
@@ -323,6 +329,7 @@ impl ActionKind {
             Self::InstanceMove => "instance_move",
             Self::InstanceMoveFinish => "instance_move_finish",
             Self::ReachConnect => "reach_connect",
+            Self::ReachDisconnect => "reach_disconnect",
             Self::RouteAdd => "route_add",
             Self::RouteRemove => "route_remove",
             Self::InstanceImport => "instance_import",
@@ -638,7 +645,9 @@ impl ActionKind {
                 }
                 rows
             }
-            Self::ServiceRemove | Self::ServiceUnpublish => vec![row("Name", text("name"))],
+            Self::ServiceRemove | Self::ServiceUnpublish | Self::ReachDisconnect => {
+                vec![row("Name", text("name"))]
+            }
             Self::ServiceUpdate => {
                 let mut rows = vec![row("Name", text("name"))];
                 if let Some(follow) = args.get("follow").and_then(Value::as_bool) {
@@ -1152,6 +1161,10 @@ impl ActionKind {
                 text("move")
             ),
             Self::ReachConnect => format!("Connect this node to Tailscale with {}", text("name")),
+            Self::ReachDisconnect => format!(
+                "Disconnect and erase the connector {}. Remove the machine's remaining entry in Tailscale's admin page yourself",
+                text("name")
+            ),
             Self::RouteAdd => format!(
                 "Serve https://{} from the instance {} on port {}",
                 text("hostname").to_ascii_lowercase(),

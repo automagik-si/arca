@@ -6179,7 +6179,15 @@ whose console records containerboot's authentication deadline is `gave-up`; rest
 `stopped`. Every keyless startup allows 10 minutes for sign-in, preserving an
 explicit `TS_BOOT_TIMEOUT`. This is a process deadline, not a known lifetime for the sign-in link. The link never
 appears in a verb's answer, journal or kernel log; connector logs replace it with `[sign-in link]`. The owner page's
-sign-in button is a separate change. Until it is available, use an auth key through the hand path below.
+Tailscale section has a **Sign in to Tailscale** button beside each waiting connector. Tap it and use your owner's
+passkey: Arca reads the link then and opens it for you. Open it only yourself: nothing ties the link to you. Once signed
+in, the row says **Connected** with the tailnet name. A machine signed in by a person expires after 180 days unless you
+turn off expiry in Tailscale's admin page.
+
+To disconnect, propose `reach_disconnect` with `{"name":"node-ts"}` and approve its card with your passkey. This unlinks
+the connector from the edge, removes it and erases its state volume, including a connector whose initial link failed.
+It leaves the edge's routes alone. Arca does not tell Tailscale: remove the machine's remaining entry in Tailscale's
+admin page yourself. You can then connect again with the same name.
 
 A key never goes into a proposal: set `TS_AUTHKEY` with `service_secret_set` and restart the connector. Status fields
 and timeout detection follow Tailscale 1.104.7's source and tolerate missing fields; the pinned image's actual output,

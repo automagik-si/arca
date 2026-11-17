@@ -2517,6 +2517,7 @@
                       "action": {
                         "enum": [
                           "reach_connect",
+                          "reach_disconnect",
                           "service_create",
                           "service_remove",
                           "service_update",
@@ -2658,6 +2659,7 @@
           "schema": {
             "enum": [
               "reach_connect",
+              "reach_disconnect",
               "service_create",
               "service_remove",
               "service_update",
@@ -2731,6 +2733,31 @@
                   "kind"
                 ],
                 "title": "reach_connect",
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The args of reach_disconnect: Unlink a connector from its edge, then remove it and erase its state volume. Runs only from an approved action proposal with the owner's passkey. Does not tell Tailscale: remove the machine's remaining entry in Tailscale's admin page yourself. Example: {\"name\":\"node-ts\"}",
+                "examples": [
+                  {
+                    "name": "node-ts"
+                  }
+                ],
+                "properties": {
+                  "confirm": {
+                    "description": "Optional. Absent or true: the call runs as without it. False: the call is refused, nothing changes and no approval is spent. It is never part of what an approval binds.",
+                    "type": "boolean"
+                  },
+                  "name": {
+                    "description": "The service name (1-40 of a-z, 0-9 and inner \"-\", starting with a letter).",
+                    "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "name"
+                ],
+                "title": "reach_disconnect",
                 "type": "object"
               },
               {
@@ -4263,6 +4290,7 @@
             "action": {
               "enum": [
                 "reach_connect",
+                "reach_disconnect",
                 "service_create",
                 "service_remove",
                 "service_update",
@@ -4769,6 +4797,7 @@
             "action": {
               "enum": [
                 "reach_connect",
+                "reach_disconnect",
                 "service_create",
                 "service_remove",
                 "service_update",
@@ -15293,6 +15322,95 @@
         }
       },
       "summary": "Create a Tailscale connector, link it to this node's edge and start it. Runs only from an approved action proposal; the card binds the template's image and content digest. Takes no key: an optional key is set with service_secret_set and the connector restarted. Returns the connector's state, never its sign-in link.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
+      "x-arca-scope": "doctor",
+      "x-arca-writes": true
+    },
+    {
+      "name": "reach_disconnect",
+      "params": [
+        {
+          "name": "approval",
+          "required": true,
+          "schema": {
+            "description": "The one-shot grant of the approved action proposal.",
+            "maxLength": 16384,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        {
+          "name": "name",
+          "required": true,
+          "schema": {
+            "description": "The service name (1-40 of a-z, 0-9 and inner \"-\", starting with a letter).",
+            "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "confirm",
+          "required": false,
+          "schema": {
+            "description": "Optional. Absent or true: the call runs as without it. False: the call is refused, nothing changes and no approval is spent. It is never part of what an approval binds.",
+            "type": "boolean"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "additionalProperties": false,
+          "properties": {
+            "edge": {
+              "anyOf": [
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "applied": {
+                      "description": "Whether the edge took its new config file.",
+                      "type": "boolean"
+                    },
+                    "name": {
+                      "description": "The edge service.",
+                      "type": "string"
+                    },
+                    "note": {
+                      "description": "What the edge did, in words, when it is not simply done.",
+                      "type": "string"
+                    },
+                    "reloaded": {
+                      "description": "Whether Caddy was reloaded with it; false when the edge is not running.",
+                      "type": "boolean"
+                    }
+                  },
+                  "required": [
+                    "name",
+                    "applied",
+                    "reloaded"
+                  ],
+                  "type": "object"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "removed": {
+              "const": true,
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "removed",
+            "edge"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "Unlink a connector from its edge, then remove it and erase its state volume. Runs only from an approved action proposal with the owner's passkey. Does not tell Tailscale: remove the machine's remaining entry in Tailscale's admin page yourself.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
       "x-arca-read-only-hint": false,
