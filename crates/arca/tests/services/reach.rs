@@ -525,7 +525,7 @@ fn logs_privacy_every_link_offset() {
     assert_eq!(cases.len(), 343);
     let (rig, key) = rig();
     connect(&rig, &key, Some("node-ts")).unwrap();
-    let mut histogram = BTreeMap::new();
+    let mut histogram = std::collections::BTreeMap::new();
     let mut failures = Vec::new();
     for (label, raw) in &cases {
         let lines = privacy_log_lines(&rig, "node-ts", raw);
