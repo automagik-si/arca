@@ -1170,3 +1170,6 @@ fn approved_disconnect_runs_through_mcp_inside_its_closed_schema() {
     assert_eq!(door.call("reach_list", json!({})), "ok");
     assert_private(&rig, LOGIN);
 }
+
+#[path = "reach_reads.rs"]
+mod page_reads;
