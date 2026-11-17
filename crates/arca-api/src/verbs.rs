@@ -5658,6 +5658,7 @@ fn service_observation_schema() -> Value {
             "additionalProperties": false,
             "properties": {
                 "cpu": {"type": ["string", "null"]}, "memory": {"type": ["string", "null"]},
+                "memoryHotplug": {"type": "boolean"},
                 "diskRead": {"type": "string"}, "diskWrite": {"type": "string"},
                 "ingress": {"type": "string"}, "egress": {"type": "string"}
             },

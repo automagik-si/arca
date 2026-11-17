@@ -4,6 +4,12 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 
 ## Unreleased
 
+Virtual-machine templates may set the boolean `limits.memoryHotplug`; the Automagik workspace template sets it to
+`false`, so growing its memory needs a config change and a restart. Status and list show the recorded value inside
+`limits`. A VM created before this release keeps its record and is not changed; the pin applies to VMs created
+from this release on. VM update (rebuild) and reconfigure remain refused. Records carrying `memoryHotplug` are one
+more reason downgrading below this release is not supported once a service was created or written.
+
 `service_list` and `service_status` rows add `id`, `uuid`, `createdAt`, `startedAt`, `limits`, and `data.volume`;
 the stable `id` survives service rebuilds and kernel restarts. Service records gain an `id` at creation or their
 next normal write; releases up to 0.35.0 cannot read such a record and show the service as failed or not found.

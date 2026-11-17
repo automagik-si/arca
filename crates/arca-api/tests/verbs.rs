@@ -1614,6 +1614,24 @@ fn service_observation_schemas_admit_nullable_identity_times_limits_and_volume_a
         }
         assert_eq!(row["properties"]["limits"]["additionalProperties"], false);
         assert!(conforms(&row["properties"]["limits"], &json!({"cpu": "2", "memory": "1GiB", "diskRead": "10MiB", "diskWrite": "5MiB", "ingress": "20Mbit", "egress": "10Mbit"})).is_ok());
+        for hotplug in [true, false] {
+            assert!(
+                conforms(
+                    &row["properties"]["limits"],
+                    &json!({"cpu":"2", "memory":"4GiB", "memoryHotplug":hotplug})
+                )
+                .is_ok()
+            );
+        }
+        for invalid in [json!(null), json!("false"), json!(0)] {
+            assert!(
+                conforms(
+                    &row["properties"]["limits"],
+                    &json!({"cpu":"2", "memory":"4GiB", "memoryHotplug":invalid})
+                )
+                .is_err()
+            );
+        }
         assert_eq!(row["properties"]["data"]["additionalProperties"], false);
         assert!(conforms(&row["properties"]["id"], &json!("svc_bad")).is_err());
         assert!(

@@ -61,6 +61,11 @@ pub const SHIPPED: &[(&str, &str)] = shipped![
 /// v<previous>:templates/<name> | sha256sum`). A test checks the list against the release tags where the checkout has
 /// them. A hash is of a file exactly as a release shipped it, so an owner's edit never matches one.
 pub const EARLIER: &[(&str, &str)] = &[
+    // 0.35.0: before the workspace disabled memory hotplug.
+    (
+        "automagik-workspace.json",
+        "95e8ebc1b2fe4be6c7d5d42eae97d579ac2fbbc46840cac5c5200b65b827f1b8",
+    ),
     // 0.32.0 to 0.33.0: before the edge provided its target and the Cloudflare template named its connector kind.
     (
         "arca-edge.json",
