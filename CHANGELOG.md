@@ -4,6 +4,26 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 
 ## Unreleased
 
+`service_labels_set` merges a service's plain labels, with null removing a key. `service_status` and `service_list`
+rows now include the label map. Writes use ownership checks, If-Match and read-back outside the effect journal;
+uncertain answers carry an explicit code. Label keeping during snapshot rollback is best effort and never prevents
+the rollback or changes its result.
+Both reads are marked as carrying untrusted text because labels are caller data.
+
+`tenant_image_import` uses an approved card to copy an exact image from the node's store into a tenant and add its
+alias. The card binds source properties and the destination's exact properties and alias state, and shows any
+property replacement explicitly. Completed steps stay in the tenant's store after failure; a new card can finish
+them. There is no import record, automatic rollback or delete. Success and refusal outcomes have closed schemas.
+Repeated completed imports send no Incus writes. No file or remote fetch is accepted. See docs/OPERATING.md.
+
+The approval page lists connectors separately from waiting cards. A waiting Tailscale connector has a sign-in button
+that checks the owner's passkey before reading and opening its link. The link is never cached or recorded by Arca.
+The page reuses connector rows for up to 15 seconds, and a successful passkey sign-in makes its next read fresh.
+`reach_disconnect` needs an approved erasing card: it unlinks and removes the connector and its state volume. Remove
+the machine's remaining entry in Tailscale's admin page yourself.
+
+## 0.36.0 (2026-11-17)
+
 An owner-approved `instance_start` card now starts an instance inside a tenant even when the proposing token's tool
 allowlist omits `instance_start`. Direct tenant starts still require the verb in the token's tool allowlist.
 
@@ -38,23 +58,22 @@ the stable `id` survives service rebuilds and kernel restarts. Service records g
 next normal write; releases up to 0.35.0 cannot read such a record and show the service as failed or not found.
 Downgrading below this release is therefore not supported once a service was created or written.
 
-`service_labels_set` merges a service's plain labels, with null removing a key. `service_status` and `service_list`
-rows now include the label map. Writes use ownership checks, If-Match and read-back outside the effect journal;
-uncertain answers carry an explicit code. Label keeping during snapshot rollback is best effort and never prevents
-the rollback or changes its result.
-Both reads are marked as carrying untrusted text because labels are caller data.
-
-`tenant_image_import` uses an approved card to copy an exact image from the node's store into a tenant and add its
-alias. The card binds source properties and the destination's exact properties and alias state, and shows any
-property replacement explicitly. Completed steps stay in the tenant's store after failure; a new card can finish
-them. There is no import record, automatic rollback or delete. Success and refusal outcomes have closed schemas.
-Repeated completed imports send no Incus writes. No file or remote fetch is accepted. See docs/OPERATING.md.
-
-The approval page lists connectors separately from waiting cards. A waiting Tailscale connector has a sign-in button
-that checks the owner's passkey before reading and opening its link. The link is never cached or recorded by Arca.
-The page reuses connector rows for up to 15 seconds, and a successful passkey sign-in makes its next read fresh.
-`reach_disconnect` needs an approved erasing card: it unlinks and removes the connector and its state volume. Remove
-the machine's remaining entry in Tailscale's admin page yourself.
+- Merge PR 233: journal_list shows service re-binds and watch marks a contested binding
+- Merge PR 235: templates can turn VM memory hotplug off
+- fix(merge): the approved-database parity test sets aside each record's random id
+- fix(services): data.volume reports the recorded data volume after a re-bind
+- Merge PR 232: service status and list rows carry id, uuid, createdAt, startedAt, limits and data
+- Merge PR 236: approved postgres create runs through the template database path
+- fix(merge): the proposal tests count 33 actions
+- fix(merge): the action-name list in the verbs test is a slice
+- fix(merge): ActionKind::ALL counts both service_rebind and reach_connect
+- Merge PR 229: reach connector list and sign-in link masking
+- Merge PR 228 doc fix: the rebind paragraph carries its rule heading, Rule 78 (one line, checked by the ownership-document test at merge)
+- Merge PR 230 follow-up: a non-object candidate reply is skipped, and an import whose record is pending says so
+- Merge PR 228: service_rebind moves a service's binding to another instance through a journalled two-phase change, with a per-service unsaved mark
+- Merge PR 230: a removed instance is never re-adopted, and an approved release clears an adopted record whose instance is gone
+- Merge PR 231: an owner-approved instance_start runs inside its tenant
+- Merge PR 226: a token bound to one tenant reaches only that tenant's routes
 
 ## 0.35.0 (2026-11-16)
 
