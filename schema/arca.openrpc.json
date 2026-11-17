@@ -6525,6 +6525,32 @@
                     "maxLength": 300,
                     "type": "string"
                   },
+                  "createdAt": {
+                    "description": "Creation time from the service record, in RFC 3339 UTC. Null without a service record.",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "data": {
+                    "additionalProperties": false,
+                    "description": "The service's own data volume, read-only. Its volume is null without a data disk; data is null without a service record.",
+                    "properties": {
+                      "volume": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "volume"
+                    ],
+                    "type": [
+                      "object",
+                      "null"
+                    ]
+                  },
                   "destinations": {
                     "description": "Present only on a service that may reach a private address through this node: each address and the one tcp port open on it, as this node's config (kernel.serviceDestinations) named them when the owner approved the create. Every other private address stays closed to the service. service_status also answers ready for each and, when it is false, problem.",
                     "items": {
@@ -6568,6 +6594,14 @@
                     "description": "Present only on a recorded program recorded with one: the name of a tool it answers, a label.",
                     "maxLength": 64,
                     "type": "string"
+                  },
+                  "id": {
+                    "description": "The service's stable identity, issued at creation and kept through rebuilds. Older records derive it from this node, their entry and creation time until their next normal write. Null without a service record.",
+                    "pattern": "^svc_[0-9a-f]{32}$",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
                   },
                   "ipv4": {
                     "description": "Its fixed address on the service bridge, from its record. A virtual machine on a host bridge takes its address from that network and has none in its record: service_list leaves this empty and sets ipv4In, and service_status reads it from the running machine's live state. Empty with neither ipv4In nor ipv4Problem: the guest reports no address for that card now (it is down, or the guest's agent does not answer); what the guest reports, it can set.",
@@ -6632,6 +6666,44 @@
                       }
                     ],
                     "description": "Its host port when the template has a lan proxy, or null."
+                  },
+                  "limits": {
+                    "additionalProperties": false,
+                    "description": "Typed resource limits from the service record. Null when none are recorded.",
+                    "properties": {
+                      "cpu": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "diskRead": {
+                        "type": "string"
+                      },
+                      "diskWrite": {
+                        "type": "string"
+                      },
+                      "egress": {
+                        "type": "string"
+                      },
+                      "ingress": {
+                        "type": "string"
+                      },
+                      "memory": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "cpu",
+                      "memory"
+                    ],
+                    "type": [
+                      "object",
+                      "null"
+                    ]
                   },
                   "links": {
                     "description": "The services it is linked to, as a consumer, and the port each link opens.",
@@ -6749,6 +6821,13 @@
                     "description": "Present only on a recorded program: true. The node holds a record of it, and nothing more.",
                     "type": "boolean"
                   },
+                  "startedAt": {
+                    "description": "The instance's last_used_at from Incus, in RFC 3339 UTC. Null if it never started, the time is unavailable, or there is no service record.",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
                   "state": {
                     "description": "failed: Incus reports an error, or its instance is gone; unknown: an instance droidd did not create, which it leaves alone. For a recorded program: recorded in service_list, where nothing is asked of it; up or down in service_status, by one TCP connect to its address.",
                     "enum": [
@@ -6801,6 +6880,13 @@
                       "state"
                     ],
                     "type": "object"
+                  },
+                  "uuid": {
+                    "description": "The instance UUID recorded by the effect journal, never taken from a fresh listing. Null when no instance identity is recorded.",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
                   }
                 },
                 "required": [
@@ -6811,7 +6897,13 @@
                   "ports",
                   "links",
                   "published",
-                  "lanPort"
+                  "lanPort",
+                  "createdAt",
+                  "data",
+                  "id",
+                  "limits",
+                  "startedAt",
+                  "uuid"
                 ],
                 "type": "object"
               },
@@ -6880,6 +6972,32 @@
               "maxLength": 64,
               "type": "string"
             },
+            "createdAt": {
+              "description": "Creation time from the service record, in RFC 3339 UTC. Null without a service record.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "data": {
+              "additionalProperties": false,
+              "description": "The service's own data volume, read-only. Its volume is null without a data disk; data is null without a service record.",
+              "properties": {
+                "volume": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "volume"
+              ],
+              "type": [
+                "object",
+                "null"
+              ]
+            },
             "destinations": {
               "description": "Present only on a service that may reach a private address through this node: each address and the one tcp port open on it, as this node's config (kernel.serviceDestinations) named them when the owner approved the create. Every other private address stays closed to the service. service_status also answers ready for each and, when it is false, problem.",
               "items": {
@@ -6923,6 +7041,14 @@
               "description": "Present only on a recorded program recorded with one: the name of a tool it answers, a label.",
               "maxLength": 64,
               "type": "string"
+            },
+            "id": {
+              "description": "The service's stable identity, issued at creation and kept through rebuilds. Older records derive it from this node, their entry and creation time until their next normal write. Null without a service record.",
+              "pattern": "^svc_[0-9a-f]{32}$",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "ipv4": {
               "description": "Its fixed address on the service bridge, from its record. A virtual machine on a host bridge takes its address from that network and has none in its record: service_list leaves this empty and sets ipv4In, and service_status reads it from the running machine's live state. Empty with neither ipv4In nor ipv4Problem: the guest reports no address for that card now (it is down, or the guest's agent does not answer); what the guest reports, it can set.",
@@ -6987,6 +7113,44 @@
                 }
               ],
               "description": "Its host port when the template has a lan proxy, or null."
+            },
+            "limits": {
+              "additionalProperties": false,
+              "description": "Typed resource limits from the service record. Null when none are recorded.",
+              "properties": {
+                "cpu": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "diskRead": {
+                  "type": "string"
+                },
+                "diskWrite": {
+                  "type": "string"
+                },
+                "egress": {
+                  "type": "string"
+                },
+                "ingress": {
+                  "type": "string"
+                },
+                "memory": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "cpu",
+                "memory"
+              ],
+              "type": [
+                "object",
+                "null"
+              ]
             },
             "links": {
               "description": "The services it is linked to, as a consumer, and the port each link opens.",
@@ -7108,6 +7272,13 @@
               "description": "The virtual machine guest settings, when present, with the recorded template limits under limits when an I/O cap is set. Limits describe the create configuration, not measured throughput. Never a secret.",
               "type": "object"
             },
+            "startedAt": {
+              "description": "The instance's last_used_at from Incus, in RFC 3339 UTC. Null if it never started, the time is unavailable, or there is no service record.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "state": {
               "description": "failed: Incus reports an error, or its instance is gone; unknown: an instance droidd did not create, which it leaves alone. For a recorded program: recorded in service_list, where nothing is asked of it; up or down in service_status, by one TCP connect to its address.",
               "enum": [
@@ -7160,6 +7331,13 @@
                 "state"
               ],
               "type": "object"
+            },
+            "uuid": {
+              "description": "The instance UUID recorded by the effect journal, never taken from a fresh listing. Null when no instance identity is recorded.",
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           "required": [
@@ -7170,7 +7348,13 @@
             "ports",
             "links",
             "published",
-            "lanPort"
+            "lanPort",
+            "createdAt",
+            "data",
+            "id",
+            "limits",
+            "startedAt",
+            "uuid"
           ],
           "type": "object"
         }

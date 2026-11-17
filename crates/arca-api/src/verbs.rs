@@ -5678,7 +5678,7 @@ fn service_list_params_base() -> Value {
 }
 
 fn service_list_result() -> Value {
-    let mut view = service_view_schema();
+    let mut view = service_observation_schema();
     if let Some(object) = view.as_object_mut() {
         object.remove("description");
     }
@@ -5712,7 +5712,10 @@ fn service_status_params_base() -> Value {
 }
 
 fn service_status_result() -> Value {
-    let mut view = service_view_schema();
+    service_details_schema(service_observation_schema())
+}
+
+fn service_details_schema(mut view: Value) -> Value {
     view["properties"]["settings"] = json!({
         "description": "The virtual machine guest settings, when present, with the recorded template limits under limits when an I/O cap is set. Limits describe the create configuration, not measured throughput. Never a secret.",
         "type": "object"
@@ -5722,6 +5725,53 @@ fn service_status_result() -> Value {
         "maxLength": 64,
         "type": "string"
     });
+    view
+}
+
+/// The additive observations shared by status and list; create and import keep their existing responses.
+fn service_observation_schema() -> Value {
+    let mut view = service_view_schema();
+    let fields = json!({
+        "id": {
+            "description": "The service's stable identity, issued at creation and kept through rebuilds. Older records derive it from this node, their entry and creation time until their next normal write. Null without a service record.",
+            "type": ["string", "null"],
+            "pattern": "^svc_[0-9a-f]{32}$"
+        },
+        "uuid": {
+            "description": "The instance UUID recorded by the effect journal, never taken from a fresh listing. Null when no instance identity is recorded.",
+            "type": ["string", "null"]
+        },
+        "createdAt": {
+            "description": "Creation time from the service record, in RFC 3339 UTC. Null without a service record.",
+            "type": ["string", "null"]
+        },
+        "startedAt": {
+            "description": "The instance's last_used_at from Incus, in RFC 3339 UTC. Null if it never started, the time is unavailable, or there is no service record.",
+            "type": ["string", "null"]
+        },
+        "limits": {
+            "description": "Typed resource limits from the service record. Null when none are recorded.",
+            "type": ["object", "null"],
+            "additionalProperties": false,
+            "properties": {
+                "cpu": {"type": ["string", "null"]}, "memory": {"type": ["string", "null"]},
+                "diskRead": {"type": "string"}, "diskWrite": {"type": "string"},
+                "ingress": {"type": "string"}, "egress": {"type": "string"}
+            },
+            "required": ["cpu", "memory"]
+        },
+        "data": {
+            "description": "The service's own data volume, read-only. Its volume is null without a data disk; data is null without a service record.",
+            "type": ["object", "null"],
+            "additionalProperties": false,
+            "properties": {"volume": {"type": ["string", "null"]}},
+            "required": ["volume"]
+        }
+    });
+    for (name, schema) in fields.as_object().unwrap() {
+        view["properties"][name] = schema.clone();
+        view["required"].as_array_mut().unwrap().push(json!(name));
+    }
     view
 }
 
@@ -5929,7 +5979,7 @@ fn service_import_result() -> Value {
                 "pattern": "^[0-9a-f]{64}$",
                 "type": "string"
             },
-            "service": service_status_result()
+            "service": service_details_schema(service_view_schema())
         },
         "required": ["imported", "preImage", "service"],
         "type": "object"

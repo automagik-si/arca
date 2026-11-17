@@ -1,5 +1,7 @@
 //! Tenants against a fake Incus: two tenants beside the node's own project. Nothing here touches a live host.
 mod common;
+#[path = "tenants/status_fields.rs"]
+mod status_fields;
 
 #[path = "tenants/container_options.rs"]
 mod container_options;
