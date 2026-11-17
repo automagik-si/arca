@@ -1173,3 +1173,80 @@ fn approved_disconnect_runs_through_mcp_inside_its_closed_schema() {
 
 #[path = "reach_reads.rs"]
 mod page_reads;
+
+#[test]
+fn disconnect_restores_every_linked_edges_file_and_keeps_both_route_sets() {
+    let (rig, key) = rig();
+    rig.template("web", json!({"name":"web","kind":"oci","image":"docker.io/library/example","digest":DIGEST,"ports":[8080],"env":{},"provides":{"env":{"WEB":"{{host}}:{{port}}"}}}));
+    rig.call("service_create", json!({"name":"web","template":"web"}))
+        .unwrap();
+    rig.call("service_connect", json!({"from":"edge","to":"web"}))
+        .unwrap();
+    rig.call(
+        "route_add",
+        json!({"hostname":"first.example.com","instance":"web","port":8080}),
+    )
+    .unwrap();
+    let first_routes = rig.service_config("edge").edge.unwrap().routes;
+    assert!(!first_routes.is_empty());
+    let first_file = format!("{PROJECT}/edge:{}", arca_incus::exec::EDGE_CONFIG);
+    let first_before = rig.fake.service_files()[&first_file].clone();
+    rig.call("service_create", json!({"name":"edge2","template":"edge"}))
+        .unwrap();
+    rig.call("service_connect", json!({"from":"edge2","to":"web"}))
+        .unwrap();
+    let mut second = rig
+        .entries()
+        .into_iter()
+        .find(|entry| entry.id.0 == "service-edge2")
+        .unwrap();
+    let mut second_routes = first_routes.clone();
+    second_routes[0].hostname = "second.example.com".into();
+    second.config["edge"]["routes"] = serde_json::to_value(&second_routes).unwrap();
+    rig.kernel
+        .lock()
+        .unwrap()
+        .propose(vec![arca::desired_store::EntryChange::Put(second)], NOW)
+        .unwrap();
+    let second_cfg = rig.service_config("edge2");
+    let initial = arca::route::caddyfile(second_cfg.edge.as_ref().unwrap(), &[]);
+    rig.fake.set_service_file(
+        PROJECT,
+        "edge2",
+        arca_incus::exec::EDGE_CONFIG,
+        initial.as_bytes(),
+    );
+    let second_file = format!("{PROJECT}/edge2:{}", arca_incus::exec::EDGE_CONFIG);
+    let second_before = rig.fake.service_files()[&second_file].clone();
+    edge_reload(&rig);
+    connect(&rig, &key, Some("node-ts")).unwrap();
+    edge_reload(&rig);
+    rig.call("service_connect", json!({"from":"node-ts","to":"edge2"}))
+        .unwrap();
+    let args = disconnect_args(&rig, &key, "node-ts");
+    edge_reload(&rig);
+    edge_reload(&rig);
+    assert_eq!(rig.call("reach_disconnect", args).unwrap()["removed"], true);
+    assert_eq!(
+        rig.fake.service_files()[&first_file],
+        first_before,
+        "first edge file restored"
+    );
+    assert_eq!(
+        rig.fake.service_files()[&second_file],
+        second_before,
+        "second edge file restored"
+    );
+    for (name, routes) in [("edge", first_routes), ("edge2", second_routes)] {
+        let record = rig.service_config(name);
+        assert!(
+            record.incoming.is_empty(),
+            "{name} has no incoming connector grant"
+        );
+        assert_eq!(
+            record.edge.unwrap().routes,
+            routes,
+            "{name} routes unchanged"
+        );
+    }
+}

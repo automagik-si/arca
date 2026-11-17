@@ -1594,32 +1594,7 @@ fn postgres_delete_accepts_a_waiting_plan_or_a_settled_removal() {
 
 #[test]
 fn service_wiring_schemas_equal_the_frozen_contract() {
-    let mut rows: Value =
-        serde_json::from_str(include_str!("fixtures/service-wiring.json")).unwrap();
-    if std::env::var_os("ARCA_UPDATE_SCHEMA").is_some() {
-        let mut names: Vec<String> = rows
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|row| row["name"].as_str().unwrap().to_string())
-            .collect();
-        if !names.iter().any(|name| name == "reach_disconnect") {
-            names.push("reach_disconnect".into());
-        }
-        rows =
-            json!(names.iter().map(|name| {
-            let v = verb(name).unwrap();
-            json!({"name":name, "inputSchema":(v.params)(), "outputSchema":(v.result)()})
-        }).collect::<Vec<_>>());
-        std::fs::write(
-            concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/tests/fixtures/service-wiring.json"
-            ),
-            pretty(&rows),
-        )
-        .unwrap();
-    }
+    let rows: Value = serde_json::from_str(include_str!("fixtures/service-wiring.json")).unwrap();
     for row in rows.as_array().unwrap() {
         let v = verb(row["name"].as_str().unwrap()).unwrap();
         assert_eq!((v.params)(), row["inputSchema"]);
@@ -2336,5 +2311,38 @@ fn reach_disconnect_has_a_closed_result_and_doctor_scope() {
     assert!(conforms(&schema, &json!({"removed":true})).is_err());
     assert!(
         (v.summary_text)(&json!({"removed":true,"edge":null})).contains("Tailscale's admin page")
+    );
+}
+
+#[test]
+fn the_frozen_wiring_contract_covers_exactly_its_named_verbs() {
+    use std::collections::BTreeSet;
+    let rows: Value = serde_json::from_str(include_str!("fixtures/service-wiring.json")).unwrap();
+    let actual: BTreeSet<_> = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["name"].as_str().unwrap())
+        .collect();
+    let expected: BTreeSet<_> = [
+        "service_connect",
+        "service_disconnect",
+        "service_publish",
+        "service_secret_set",
+        "service_unpublish",
+        "reach_connect",
+        "reach_list",
+        "reach_disconnect",
+    ]
+    .into_iter()
+    .collect();
+    let missing: Vec<_> = expected.difference(&actual).copied().collect();
+    let extra: Vec<_> = actual.difference(&expected).copied().collect();
+    assert_eq!(
+        actual,
+        expected,
+        "missing frozen wiring row: {}; unexpected frozen wiring row: {}",
+        missing.join(", "),
+        extra.join(", ")
     );
 }

@@ -393,6 +393,18 @@ impl Door {
 
     /// A `tools/call` through the door: `"ok"`, or what the door said instead.
     pub(crate) fn call(&self, name: &str, arguments: Value) -> String {
+        let reply = self.reply(name, arguments);
+        if reply["result"]["isError"] == json!(false) {
+            return "ok".to_string();
+        }
+        reply["result"]["content"][0]["text"]
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| reply["error"]["message"].to_string())
+    }
+
+    /// The real MCP reply, for tests that inspect a verb's structured result.
+    pub(crate) fn reply(&self, name: &str, arguments: Value) -> Value {
         use std::io::{Read as _, Write as _};
         let body = serde_json::to_vec(&json!({
             "jsonrpc": "2.0", "id": 1, "method": "tools/call",
@@ -417,14 +429,7 @@ impl Door {
             .windows(4)
             .position(|w| w == b"\r\n\r\n")
             .expect("a response head");
-        let reply: Value = serde_json::from_slice(&raw[split + 4..]).expect("a JSON reply");
-        if reply["result"]["isError"] == json!(false) {
-            return "ok".to_string();
-        }
-        reply["result"]["content"][0]["text"]
-            .as_str()
-            .map(str::to_string)
-            .unwrap_or_else(|| reply["error"]["message"].to_string())
+        serde_json::from_slice(&raw[split + 4..]).expect("a JSON reply")
     }
 }
 

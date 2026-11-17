@@ -14,6 +14,10 @@ struct PageRig {
 
 impl PageRig {
     fn new() -> Self {
+        Self::build(false)
+    }
+
+    fn build(extra_row_field: bool) -> Self {
         let ssh = common::SkKey::from_seed(71);
         let key = SoftPasskey::from_seed(5);
         let owner = common::Scratch::new("reach-read-owner");
@@ -40,13 +44,24 @@ impl PageRig {
         let clock = Arc::new(AtomicU64::new(NOW));
         let time = clock.clone();
         let clock_fn: arca::handlers::Clock = Arc::new(move || time.load(Ordering::SeqCst));
-        let (handlers, reads) = arca::handlers::service_handlers_with_reach(
+        let (handlers, mut reads) = arca::handlers::service_handlers_with_reach(
             rig.kernel.clone(),
             clock_fn.clone(),
             rig.cfg.clone(),
             None,
             Default::default(),
         );
+        if extra_row_field {
+            let rows = reads.rows;
+            reads.rows = Arc::new(move || {
+                rows().map(|mut rows| {
+                    for row in &mut rows {
+                        row["futureField"] = json!("not displayed");
+                    }
+                    rows
+                })
+            });
+        }
         rig.handlers = handlers.into_iter().collect();
         status(&rig, "NeedsLogin");
         connect(&rig, &ssh, Some("node-ts")).unwrap();
@@ -269,4 +284,50 @@ fn only_a_successful_sign_in_invalidates_the_rows_inside_the_window() {
     assert_eq!(page.row_audit(), (2, 2));
     assert_private(&page.rig, LOGIN);
     assert_private(&page.rig, KEY);
+}
+
+#[test]
+fn open_page_projects_four_fields_while_mcp_keeps_six() {
+    let page = PageRig::build(true);
+    page.status("Running", false);
+    let public = page.get();
+    let row = &public["connectors"][0];
+    let mut keys: Vec<_> = row
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["kind", "name", "state", "tailnetName"]);
+    assert_eq!(
+        page.get(),
+        public,
+        "the cached page rows have the same projection"
+    );
+    let door = external::Door::over(&page.rig);
+    page.status("Running", false);
+    let reply = door.reply("reach_list", json!({}));
+    assert_eq!(reply["result"]["isError"], false);
+    let row = &reply["result"]["structuredContent"]["connectors"][0];
+    let mut keys: Vec<_> = row
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "edge",
+            "kind",
+            "name",
+            "state",
+            "tailnetAddress",
+            "tailnetName"
+        ]
+    );
+    assert_eq!(row["tailnetAddress"], "100.64.0.7");
+    assert_eq!(row["edge"], "edge");
 }
