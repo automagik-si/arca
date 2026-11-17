@@ -44,6 +44,12 @@ uncertain answers carry an explicit code. Label keeping during snapshot rollback
 the rollback or changes its result.
 Both reads are marked as carrying untrusted text because labels are caller data.
 
+`tenant_image_import` uses an approved card to copy an exact image from the node's store into a tenant and add its
+alias. The card binds source properties and the destination's exact properties and alias state, and shows any
+property replacement explicitly. Completed steps stay in the tenant's store after failure; a new card can finish
+them. There is no import record, automatic rollback or delete. Success and refusal outcomes have closed schemas.
+Repeated completed imports send no Incus writes. No file or remote fetch is accepted. See docs/OPERATING.md.
+
 ## 0.35.0 (2026-11-16)
 
 A config PATCH whose answer times out or is lost reads the object back to settle its intent. A read that still shows

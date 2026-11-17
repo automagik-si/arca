@@ -76,6 +76,7 @@ pub enum ActionKind {
     InstanceRestart,
     TenantCreate,
     TenantRemove,
+    TenantImageImport,
     DeployRemove,
     FunctionCreate,
     FunctionRemove,
@@ -146,7 +147,7 @@ fn setting_words(value: &Value) -> String {
 
 impl ActionKind {
     /// Every allowed action, in the order the table documents them.
-    pub const ALL: [ActionKind; 33] = [
+    pub const ALL: [ActionKind; 34] = [
         Self::ServiceCreate,
         Self::ServiceRemove,
         Self::ServiceUpdate,
@@ -169,6 +170,7 @@ impl ActionKind {
         Self::InstanceRestart,
         Self::TenantCreate,
         Self::TenantRemove,
+        Self::TenantImageImport,
         Self::DeployRemove,
         Self::FunctionCreate,
         Self::FunctionRemove,
@@ -223,6 +225,9 @@ impl ActionKind {
             Self::InstanceStop => "Ask your assistant to start it again.",
             Self::InstanceRestart => "There is nothing to undo: it runs again once it is back.",
             Self::TenantCreate => "Ask your assistant to remove the tenant.",
+            Self::TenantImageImport => {
+                "There is no automatic rollback: completed steps stay in the tenant's store. A new approved card can complete the import. Removing the tenant removes its images."
+            }
             Self::TenantRemove => {
                 "It cannot be undone: the tenant is deleted with every service in it and their data."
             }
@@ -322,6 +327,7 @@ impl ActionKind {
             Self::InstanceRestart => "instance_restart",
             Self::TenantCreate => "tenant_create",
             Self::TenantRemove => "tenant_remove",
+            Self::TenantImageImport => "tenant_image_import",
             Self::DeployRemove => "deploy_remove",
             Self::FunctionCreate => "function_create",
             Self::FunctionRemove => "function_remove",
@@ -708,6 +714,25 @@ impl ActionKind {
                 rows.push(row("Effect","Arca follows the replacement. No instance or volume is changed or deleted; the old backup stays unchanged."));
                 rows
             }
+            Self::TenantImageImport => vec![
+                row("Fingerprint", text("fingerprint")),
+                row("Project", text("project")),
+                row("Tenant incarnation", text("tenantIncarnation")),
+                row("Alias", text("alias")),
+                row("Source properties", &args["properties"].to_string()),
+                row("Destination image", &match args["destination"]["kind"].as_str() {
+                    Some("absent") => "The tenant does not have this image yet. Copy it with the approved source properties.".into(),
+                    Some("sameProperties") => "The tenant already has this image with the same properties. No image write; only add the alias if needed.".into(),
+                    Some("differentProperties") => format!("The tenant already has this image with different properties; approving replaces them with: {}. Current properties: {}.", args["properties"], args["destination"]["properties"]),
+                    _ => "The destination was not bound; make a new proposal.".into(),
+                }),
+                row("Destination alias", &args["destination"]["aliasTarget"].as_str().map_or_else(
+                    || "The alias is absent.".into(), |target| format!("The alias already points at {target}; it is not replaced."))),
+                row(
+                    "Effect",
+                    "Use this exact image from the node owner's image store in this tenant, with these source properties. Only the destination changes shown here are approved. No image or alias is deleted, even if a later step fails.",
+                ),
+            ],
             Self::ServiceImport => vec![
                 row("Name", text("name")),
                 row(
@@ -1157,6 +1182,9 @@ impl ActionKind {
                 "Create a tenant with caps above this node's defaults".to_string()
             }
             Self::TenantCreate => "Create a tenant".to_string(),
+            Self::TenantImageImport => {
+                format!("Import image {} as {}", text("fingerprint"), text("alias"))
+            }
             Self::TenantRemove => format!("Remove the tenant {} and everything in it", text("id")),
             Self::DeployRemove => {
                 format!("Remove everything the deploy {} created", text("deploy"))

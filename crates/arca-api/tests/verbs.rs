@@ -93,6 +93,7 @@ fn the_table_holds_the_initial_plan_alerts_postgres_and_ontology_verbs_in_order(
             "tenant_status",
             "tenant_usage",
             "tenant_remove",
+            "tenant_image_import",
             "deploy_confirm",
             "deploy_rollback",
             "deploy_remove",
@@ -196,6 +197,13 @@ fn each_verb_has_its_table_row_for_class_scope_and_writes() {
         ("tenant_status", VerbClass::L, Scope::Viewer, false, false),
         ("tenant_usage", VerbClass::L, Scope::Viewer, false, false),
         ("tenant_remove", VerbClass::L, Scope::Doctor, true, true),
+        (
+            "tenant_image_import",
+            VerbClass::L,
+            Scope::Doctor,
+            true,
+            false,
+        ),
         ("deploy_confirm", VerbClass::L, Scope::Doctor, true, false),
         ("deploy_rollback", VerbClass::L, Scope::Doctor, true, true),
         ("deploy_remove", VerbClass::L, Scope::Doctor, true, true),
@@ -447,6 +455,7 @@ fn plan_verb_schemas_equal_their_table_rows() {
         "instance_restart",
         "tenant_create",
         "tenant_remove",
+        "tenant_image_import",
         "deploy_remove",
         "function_create",
         "function_remove",
@@ -2044,7 +2053,7 @@ fn action_propose_describes_the_args_of_every_action_with_an_example_it_takes() 
         .iter()
         .map(|action| action.as_str().expect("a name"))
         .collect();
-    assert_eq!(actions.len(), 33);
+    assert_eq!(actions.len(), 34);
     let args = &params["properties"]["args"];
     assert_eq!(args["type"], json!("object"));
     assert_eq!(args["x-arca-by"], json!("action"));
@@ -2169,6 +2178,11 @@ fn a_field_the_kernel_fills_in_is_taken_at_the_door_with_any_value() {
         for field in fields {
             let rule = &own["properties"][*field];
             assert!(rule.is_object(), "{action} takes {field}");
+            let off_rule = if conforms(rule, &off_rule).is_ok() {
+                json!(7)
+            } else {
+                off_rule.clone()
+            };
             assert!(
                 conforms(rule, &off_rule).is_err(),
                 "{action}/{field}: off its rule"
@@ -2492,4 +2506,41 @@ fn service_labels_are_a_doctor_write_with_closed_contracts() {
         );
         assert!(conforms(&row["properties"]["labels"], &json!({"hold":"true"})).is_ok());
     }
+}
+
+#[test]
+fn tenant_image_import_exposes_closed_success_and_refusal_outcomes() {
+    let schema = (verb("tenant_image_import").unwrap().result)();
+    for kind in ["imported", "completed", "alreadyPresent"] {
+        let reply = json!({ "tenant": "abcdefgh", "project": "arcak-t-abcdefgh",
+            "fingerprint": "a".repeat(64), "alias": "app", "kind": kind,
+            "imageWrite": kind == "imported", "aliasWrite": kind != "alreadyPresent" });
+        conforms(&schema, &reply).expect("closed success");
+        let mut bad = reply.clone();
+        bad["kind"] = json!("other");
+        assert!(conforms(&schema, &bad).is_err());
+    }
+    let refusals = &schema["x-arca-refusal-data"];
+    for code in [
+        "StaleCard",
+        "AliasTaken",
+        "SourceMissing",
+        "PartialImport",
+        "ImportFailed",
+    ] {
+        let data = json!({ "refusal": code, "imageState": "present", "aliasState": "absent",
+            "imageWrite": true, "aliasWrite": false, "fingerprint": "a".repeat(64),
+            "properties": { "extra": "from default" }, "proposeAgain": true });
+        conforms(refusals, &data).expect("closed refusal");
+        let mut bad = data.clone();
+        bad["refusal"] = json!("PropertiesDiffer");
+        assert!(
+            conforms(refusals, &bad).is_err(),
+            "different properties are an explicit card, not a blind refusal"
+        );
+        let mut bad = data.clone();
+        bad["imageState"] = json!("other");
+        assert!(conforms(refusals, &bad).is_err());
+    }
+    conforms(refusals, &json!({ "refusal": "NotApproved" })).unwrap();
 }

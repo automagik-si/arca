@@ -983,7 +983,7 @@ impl UnixIncusWriter {
     }
 
     /// Sends one request the caller has already checked, under `timeout`, as [`Self::send_within`] sends it. It skips the
-    /// family and the ownership checks, so the adoption and service writers call it only for their closed tables. The
+    /// family and the ownership checks, so the adoption, service and tenant image writers call it only for their closed tables. The
     /// request still passes `exchange`, so its guard applies.
     pub(crate) fn send_checked(
         &self,

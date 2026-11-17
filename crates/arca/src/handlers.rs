@@ -1883,6 +1883,10 @@ impl ToolHandler for ActionPropose {
                 "args/template: the kernel names the template and the image it pins when the proposal is made; a caller names neither"
                     .to_string(),
             ));
+        } else if action == ActionKind::TenantImageImport {
+            let node = self.node.as_deref().ok_or_else(tenants::no_tenants)?;
+            let entries = lock(&self.kernel)?.entries().to_vec();
+            tenant_images::enrich(node, &entries, &payload)?
         } else if let (ActionKind::TenantCreate | ActionKind::TenantRemove, Some(node)) =
             (action, &self.node)
         {
@@ -3035,6 +3039,7 @@ impl ActionExecutor {
                 | "instance_restart"
                 | "tenant_create"
                 | "tenant_remove"
+                | "tenant_image_import"
                 | "deploy_remove"
                 | "function_create"
                 | "function_remove"
@@ -6230,6 +6235,8 @@ pub use service_update::{
     DEFAULT_HEALTH_SECONDS, MAX_HEALTH_SECONDS, OLD_ANSWERS_SECONDS, Probe as UpdateProbe,
     STEP_DEADLINE, UpdateOptions, digest_ok as service_digest_ok,
 };
+#[path = "tenant_images.rs"]
+mod tenant_images;
 #[path = "tenants.rs"]
 mod tenants;
 pub use tenants::{SnapshotListInTenant, spawn_front_sync, sync_front, tenant_handlers};

@@ -2761,6 +2761,7 @@
                           "instance_restart",
                           "tenant_create",
                           "tenant_remove",
+                          "tenant_image_import",
                           "deploy_remove",
                           "function_create",
                           "function_remove",
@@ -2903,6 +2904,7 @@
               "instance_restart",
               "tenant_create",
               "tenant_remove",
+              "tenant_image_import",
               "deploy_remove",
               "function_create",
               "function_remove",
@@ -3990,6 +3992,52 @@
               },
               {
                 "additionalProperties": false,
+                "description": "The args of tenant_image_import: Import an image from the node's own store by full fingerprint, only through an approved proposal. The card binds the source, tenant incarnation and destination image properties and alias. It may explicitly approve replacing different destination properties. Success kinds: imported, completed, alreadyPresent; imageWrite and aliasWrite say which writes were issued, excluding a property PUT rejected with 412. Refusals: NotApproved, StaleCard, AliasTaken, SourceMissing, PartialImport, ImportFailed; their closed data schema is result.schema.x-arca-refusal-data. Completed steps stay in the tenant's store: no import record, rollback or deletion. Example: {\"alias\":\"app\",\"fingerprint\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"tenant\":\"abcdefgh\"}",
+                "examples": [
+                  {
+                    "alias": "app",
+                    "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "tenant": "abcdefgh"
+                  }
+                ],
+                "properties": {
+                  "alias": {
+                    "maxLength": 128,
+                    "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+                    "type": "string"
+                  },
+                  "destination": {
+                    "description": "The kernel fills it in when the proposal is made, so it may be left out; a value sent here is replaced."
+                  },
+                  "fingerprint": {
+                    "pattern": "^[0-9a-f]{64}$",
+                    "type": "string"
+                  },
+                  "project": {
+                    "description": "The kernel fills it in when the proposal is made, so it may be left out; a value sent here is replaced."
+                  },
+                  "properties": {
+                    "description": "The kernel fills it in when the proposal is made, so it may be left out; a value sent here is replaced."
+                  },
+                  "tenant": {
+                    "description": "The tenant's id: 8 lowercase base32 characters (a to z, 2 to 7). It is random, never a name.",
+                    "pattern": "^[a-z2-7]{8}$",
+                    "type": "string"
+                  },
+                  "tenantIncarnation": {
+                    "description": "The kernel fills it in when the proposal is made, so it may be left out; a value sent here is replaced."
+                  }
+                },
+                "required": [
+                  "tenant",
+                  "fingerprint",
+                  "alias"
+                ],
+                "title": "tenant_image_import",
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
                 "description": "The args of deploy_remove: Remove everything a deploy created in a tenant, once the deploy is confirmed or its 15 minutes have passed, only from a proposal the owner approved: one approval for all its services, each instance deleted and confirmed gone before its firewall rules, then its secrets and volumes. Nothing else of the tenant is touched. A deploy that is still provisional is refused: its own token rolls it back. Example: {\"deploy\":\"d1\",\"tenant\":\"abcdefgh\"}",
                 "examples": [
                   {
@@ -4589,6 +4637,7 @@
                 "instance_restart",
                 "tenant_create",
                 "tenant_remove",
+                "tenant_image_import",
                 "deploy_remove",
                 "function_create",
                 "function_remove",
@@ -5096,6 +5145,7 @@
                 "instance_restart",
                 "tenant_create",
                 "tenant_remove",
+                "tenant_image_import",
                 "deploy_remove",
                 "function_create",
                 "function_remove",
@@ -12537,6 +12587,244 @@
         }
       },
       "summary": "Remove a tenant and everything in it, only from a proposal the owner approved: each instance is deleted and confirmed gone before its firewall rules, then its secrets, and last the tenant's profile and project.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
+      "x-arca-scope": "doctor",
+      "x-arca-writes": true
+    },
+    {
+      "name": "tenant_image_import",
+      "params": [
+        {
+          "name": "alias",
+          "required": true,
+          "schema": {
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "fingerprint",
+          "required": true,
+          "schema": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "tenant",
+          "required": true,
+          "schema": {
+            "description": "The tenant's id: 8 lowercase base32 characters (a to z, 2 to 7). It is random, never a name.",
+            "pattern": "^[a-z2-7]{8}$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "approval",
+          "required": false,
+          "schema": {
+            "description": "The one-shot grant of an approved proposal. Without it the verb returns NotApproved.",
+            "maxLength": 16384,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        {
+          "name": "destination",
+          "required": false,
+          "schema": {
+            "additionalProperties": false,
+            "properties": {
+              "aliasTarget": {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "kind": {
+                "enum": [
+                  "absent",
+                  "sameProperties",
+                  "differentProperties"
+                ],
+                "type": "string"
+              },
+              "properties": {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": [
+                  "object",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "kind",
+              "properties",
+              "aliasTarget"
+            ],
+            "type": "object"
+          }
+        },
+        {
+          "name": "project",
+          "required": false,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "properties",
+          "required": false,
+          "schema": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
+          }
+        },
+        {
+          "name": "tenantIncarnation",
+          "required": false,
+          "schema": {
+            "pattern": "^[1-9][0-9]*$",
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "additionalProperties": false,
+          "properties": {
+            "alias": {
+              "type": "string"
+            },
+            "aliasWrite": {
+              "description": "This run issued an alias-create request.",
+              "type": "boolean"
+            },
+            "fingerprint": {
+              "type": "string"
+            },
+            "imageWrite": {
+              "description": "This run issued an image copy or property-write request.",
+              "type": "boolean"
+            },
+            "kind": {
+              "enum": [
+                "imported",
+                "completed",
+                "alreadyPresent"
+              ],
+              "type": "string"
+            },
+            "project": {
+              "type": "string"
+            },
+            "tenant": {
+              "description": "The tenant's id: 8 lowercase base32 characters (a to z, 2 to 7). It is random, never a name.",
+              "pattern": "^[a-z2-7]{8}$",
+              "type": "string"
+            }
+          },
+          "required": [
+            "tenant",
+            "project",
+            "fingerprint",
+            "alias",
+            "kind",
+            "imageWrite",
+            "aliasWrite"
+          ],
+          "type": "object",
+          "x-arca-refusal-data": {
+            "anyOf": [
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "refusal": {
+                    "const": "NotApproved"
+                  }
+                },
+                "required": [
+                  "refusal"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "aliasState": {
+                    "enum": [
+                      "absent",
+                      "matching",
+                      "taken",
+                      "unknown"
+                    ],
+                    "type": "string"
+                  },
+                  "aliasTarget": {
+                    "pattern": "^[0-9a-f]{64}$",
+                    "type": "string"
+                  },
+                  "aliasWrite": {
+                    "type": "boolean"
+                  },
+                  "fingerprint": {
+                    "pattern": "^[0-9a-f]{64}$",
+                    "type": "string"
+                  },
+                  "imageState": {
+                    "enum": [
+                      "absent",
+                      "present",
+                      "unknown"
+                    ],
+                    "type": "string"
+                  },
+                  "imageWrite": {
+                    "type": "boolean"
+                  },
+                  "properties": {
+                    "additionalProperties": {
+                      "type": "string"
+                    },
+                    "type": "object"
+                  },
+                  "proposeAgain": {
+                    "const": true
+                  },
+                  "refusal": {
+                    "enum": [
+                      "StaleCard",
+                      "AliasTaken",
+                      "SourceMissing",
+                      "PartialImport",
+                      "ImportFailed"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "refusal",
+                  "imageState",
+                  "aliasState",
+                  "imageWrite",
+                  "aliasWrite"
+                ],
+                "type": "object"
+              }
+            ]
+          }
+        }
+      },
+      "summary": "Import an image from the node's own store by full fingerprint, only through an approved proposal. The card binds the source, tenant incarnation and destination image properties and alias. It may explicitly approve replacing different destination properties. Success kinds: imported, completed, alreadyPresent; imageWrite and aliasWrite say which writes were issued, excluding a property PUT rejected with 412. Refusals: NotApproved, StaleCard, AliasTaken, SourceMissing, PartialImport, ImportFailed; their closed data schema is result.schema.x-arca-refusal-data. Completed steps stay in the tenant's store: no import record, rollback or deletion.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
       "x-arca-read-only-hint": false,

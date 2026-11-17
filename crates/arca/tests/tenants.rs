@@ -3,6 +3,9 @@ mod common;
 #[path = "tenants/status_fields.rs"]
 mod status_fields;
 
+#[path = "tenants/image_import.rs"]
+mod image_import;
+
 #[path = "tenants/container_options.rs"]
 mod container_options;
 

@@ -24,6 +24,8 @@ pub mod folder;
 #[cfg(feature = "write")]
 pub mod function_run;
 #[cfg(feature = "write")]
+pub mod image;
+#[cfg(feature = "write")]
 pub mod import;
 #[cfg(feature = "write")]
 pub mod lifecycle;

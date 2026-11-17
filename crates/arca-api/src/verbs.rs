@@ -172,7 +172,7 @@ macro_rules! on_node {
     }};
 }
 
-static VERBS: [Verb; 98] = [
+static VERBS: [Verb; 99] = [
     Verb {
         name: "arca_status",
         summary: "Node status: the API version, the node id, the mode, the uptime, whether Incus answers and the last applied sequence number.",
@@ -1076,6 +1076,21 @@ static VERBS: [Verb; 98] = [
         cut: no_cut,
         params: tenant_remove_params,
         result: service_remove_result,
+        target: Target::Node,
+    },
+    Verb {
+        name: "tenant_image_import",
+        summary: "Import an image from the node's own store by full fingerprint, only through an approved proposal. The card binds the source, tenant incarnation and destination image properties and alias. It may explicitly approve replacing different destination properties. Success kinds: imported, completed, alreadyPresent; imageWrite and aliasWrite say which writes were issued, excluding a property PUT rejected with 412. Refusals: NotApproved, StaleCard, AliasTaken, SourceMissing, PartialImport, ImportFailed; their closed data schema is result.schema.x-arca-refusal-data. Completed steps stay in the tenant's store: no import record, rollback or deletion.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_tenant_image_import,
+        cut: no_cut,
+        params: tenant_image_import_params,
+        result: tenant_image_import_result,
         target: Target::Node,
     },
     Verb {
@@ -4463,8 +4478,8 @@ fn plan_list_result() -> Value {
     )])
 }
 
-/// The twenty-nine verbs an action proposal may name. The list is closed here and checked by the handler again.
-pub(crate) const ACTION_NAMES: [&str; 33] = [
+/// The verbs an action proposal may name. The list is closed here and checked by the handler again.
+pub(crate) const ACTION_NAMES: [&str; 34] = [
     "reach_connect",
     "service_create",
     "service_remove",
@@ -4488,6 +4503,7 @@ pub(crate) const ACTION_NAMES: [&str; 33] = [
     "instance_restart",
     "tenant_create",
     "tenant_remove",
+    "tenant_image_import",
     "deploy_remove",
     "function_create",
     "function_remove",
@@ -4521,7 +4537,11 @@ fn action_propose_params() -> Value {
 /// removed or overwritten before the action's own check runs (the GPU verbs from the instance, storage_add from the
 /// disk survey, the snapshot verbs from the source or the snapshot). A branch takes any value for them, as the door did
 /// before it held `args` to a branch, and says so.
-pub const KERNEL_FILLED: [(&str, &[&str]); 7] = [
+pub const KERNEL_FILLED: [(&str, &[&str]); 8] = [
+    (
+        "tenant_image_import",
+        &["project", "tenantIncarnation", "properties", "destination"],
+    ),
     ("service_reconfigure", &["changes"]),
     ("service_update", &["changes"]),
     ("gpu_attach", &["project", "kind", "uuid"]),
@@ -4572,7 +4592,7 @@ pub fn kernel_filled(action: &str) -> &'static [&'static str] {
 }
 
 /// One `args` of each action, as an assistant proposes it: the fields it must name, and no field in [`KERNEL_FILLED`].
-const ACTION_EXAMPLES: [(&str, &str); 33] = [
+const ACTION_EXAMPLES: [(&str, &str); 34] = [
     ("reach_connect", r#"{"kind":"tailscale"}"#),
     ("service_create", r#"{"name":"nats","template":"nats"}"#),
     ("service_remove", r#"{"name":"nats"}"#),
@@ -4611,6 +4631,10 @@ const ACTION_EXAMPLES: [(&str, &str); 33] = [
     ),
     ("tenant_create", r#"{}"#),
     ("tenant_remove", r#"{"id":"abcdefgh"}"#),
+    (
+        "tenant_image_import",
+        r#"{"tenant":"abcdefgh","fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","alias":"app"}"#,
+    ),
     ("deploy_remove", r#"{"tenant":"abcdefgh","deploy":"d1"}"#),
     (
         "function_create",
@@ -7157,4 +7181,106 @@ pub fn summary_owner_approval_list(v: &Value) -> String {
         "{} owner approval request(s) in the last 24 h, {pending} pending. Untrusted: requesters wrote the arguments.",
         requests.len()
     )
+}
+
+fn tenant_image_import_params() -> Value {
+    params(vec![
+        ("tenant", true, tenant_id_schema()),
+        (
+            "fingerprint",
+            true,
+            json!({ "type": "string", "pattern": "^[0-9a-f]{64}$" }),
+        ),
+        (
+            "alias",
+            true,
+            json!({ "type": "string", "maxLength": 128, "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$" }),
+        ),
+        (
+            "approval",
+            false,
+            json!({ "type": "string", "minLength": 1, "maxLength": 16384,
+            "description": "The one-shot grant of an approved proposal. Without it the verb returns NotApproved." }),
+        ),
+        (
+            "destination",
+            false,
+            params(vec![
+                (
+                    "kind",
+                    true,
+                    one_of(&["absent", "sameProperties", "differentProperties"]),
+                ),
+                (
+                    "properties",
+                    true,
+                    json!({ "type": ["object", "null"], "additionalProperties": { "type": "string" } }),
+                ),
+                (
+                    "aliasTarget",
+                    true,
+                    json!({ "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$" }),
+                ),
+            ]),
+        ),
+        ("project", false, string()),
+        (
+            "tenantIncarnation",
+            false,
+            json!({ "type": "string", "pattern": "^[1-9][0-9]*$" }),
+        ),
+        (
+            "properties",
+            false,
+            json!({ "type": "object", "additionalProperties": { "type": "string" } }),
+        ),
+    ])
+}
+
+fn tenant_image_import_result() -> Value {
+    let mut schema = params(vec![
+        ("tenant", true, tenant_id_schema()),
+        ("project", true, string()),
+        ("fingerprint", true, string()),
+        ("alias", true, string()),
+        (
+            "kind",
+            true,
+            one_of(&["imported", "completed", "alreadyPresent"]),
+        ),
+        (
+            "imageWrite",
+            true,
+            json!({ "type": "boolean", "description": "This run issued an image copy or property-write request." }),
+        ),
+        (
+            "aliasWrite",
+            true,
+            json!({ "type": "boolean", "description": "This run issued an alias-create request." }),
+        ),
+    ]);
+    schema["x-arca-refusal-data"] = json!({ "anyOf": [
+        params(vec![("refusal", true, json!({ "const": "NotApproved" }))]),
+        params(vec![
+            ("refusal", true, one_of(&["StaleCard", "AliasTaken", "SourceMissing", "PartialImport", "ImportFailed"])),
+            ("imageState", true, one_of(&["absent", "present", "unknown"])),
+            ("aliasState", true, one_of(&["absent", "matching", "taken", "unknown"])),
+            ("imageWrite", true, boolean()),
+            ("aliasWrite", true, boolean()),
+            ("fingerprint", false, json!({ "type": "string", "pattern": "^[0-9a-f]{64}$" })),
+            ("properties", false, json!({ "type": "object", "additionalProperties": { "type": "string" } })),
+            ("aliasTarget", false, json!({ "type": "string", "pattern": "^[0-9a-f]{64}$" })),
+            ("proposeAgain", false, json!({ "const": true })),
+        ]),
+    ] });
+    schema
+}
+
+pub fn summary_tenant_image_import(result: &Value) -> String {
+    match result["kind"].as_str() {
+        Some("imported") => "Image imported into the tenant's store",
+        Some("completed") => "Image import completed from the approved destination state",
+        _ => "Image and alias already present in the tenant's store",
+    }
+    .into()
 }

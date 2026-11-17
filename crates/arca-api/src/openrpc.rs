@@ -11,7 +11,8 @@
 //!
 //! The document's own `x-arca-refusals` lists the refusals for want of room and for asking too often
 //! ([`crate::refusals`]): one entry per code, with its `family` (`capacity` or `rate`), a summary and the schema of the
-//! error's `data`. It is not every code a verb answers.
+//! error's `data`. It is not every code a verb answers. A verb may instead document its closed error data in its
+//! result schema's `x-arca-refusal-data` extension; that schema is checked here too.
 
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -165,6 +166,10 @@ fn check(doc: &Value, hint_required: bool) -> Result<(), String> {
             .ok_or_else(|| format!("method {name} has no result schema"))?;
         check_schema(result, "")
             .map_err(|e| format!("method {name} result has a malformed schema: {e}"))?;
+        if let Some(refusal) = result.get("x-arca-refusal-data") {
+            check_schema(refusal, "")
+                .map_err(|e| format!("method {name} refusal data has a malformed schema: {e}"))?;
+        }
     }
     check_refusals(doc, hint_required)
 }
