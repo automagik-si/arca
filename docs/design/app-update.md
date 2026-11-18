@@ -226,7 +226,8 @@ decided. Both begin the same way.
    (`service_update.rs:106-128`). The instance is the one Arca's record names, by its uuid
    (`service_update.rs:915-918`). A by-digest service also passes every check `service_update` makes today before it
    writes (`service_update.rs:820-933`), answered in its words, save the one for a declared port: the formula's
-   health check replaces the port check. The version reader runs if the instance runs.
+   health check replaces the port check. The version reader runs if the instance runs. For an instance that is marked
+   hung, a clearing stop comes in front of this step ("What changes under the verb").
 1. **`begin`.** One line with the version or digest asked, the version read, the digest the service runs, whether the
    instance ran, the snapshot's name, the parts the snapshot will have, and the SHA-256 of the formula. If it cannot
    be written, the call is refused, as today (`service_update.rs:984-986`).
@@ -278,13 +279,16 @@ decided. Both begin the same way.
 `service_update.rs:1717`, `service_update.rs:1722`, `service_update.rs:1741-1743`). Here they are: `rollback starts`;
 `rollback stop`; `restore`, of the instance snapshot; `restore volume`, once for each volume snapshot; `start old`,
 if the instance ran before; `old answers`, the health check for at most 30 seconds (the time `service_update` gives
-an old version today, `service_update.rs:60-61`); `old version`, the version read. No line of a rollback is ever
-named `health`, `start` or `version`. The call is then refused with the code `rolled_back` and says what happened.
-`old answers` is the rollback's own result, never the update's: the refusal carries it as `oldAnswers`, and the run
-is recorded as rolled back healthy or rolled back unhealthy by it. A stopped service is left running after a good
-update; after a rollback it is stopped again as it was. With one more at a restart, for an instance that has not run
-since its snapshot (below), these are the only restores Arca makes with no person. Every other one is `app_rollback`,
-on the owner's card (section 4).
+an old version today, `service_update.rs:60-61`); `old version`, the version read. `old answers` and `old version`
+run only after `start old`, as `service_update` checks an old version only when it ran before
+(`service_update.rs:1739-1744`). A rollback that leaves the instance stopped makes no check and is recorded
+`rolled_back_healthy`, as today's code holds that answer true. No line of a rollback is ever named `health`, `start`
+or `version`. The call is then refused with the code `rolled_back` and says what happened. `old answers` is the
+rollback's own result, never the update's: the refusal carries it as `oldAnswers`, and the run is recorded as rolled
+back healthy or rolled back unhealthy by it. A stopped service is left running after a good update; after a rollback
+it is stopped again as it was. With one more at a restart, for an instance that has not run since its snapshot
+(below), these are the only restores Arca makes with no person. Every other one is `app_rollback`, on the owner's
+card (section 4).
 
 **Every run ends in exactly one recorded state.** Decided. A run that wrote `begin` writes `end` as its last line, as
 `service_update` does on each of its outcomes today (`service_update.rs:1306`, `service_update.rs:1357-1358`,
@@ -298,8 +302,10 @@ on the owner's card (section 4).
   `interrupted`.
 
 A run that ended before its update step touched anything is not an update at all: its `end` says `nothing_changed`,
-as every refusal that ends "Nothing was changed" does. A `begin` with no `end` only ever means that Arca itself
-stopped in the middle, and a run whose `end` says rolled back is never read again.
+as every refusal that ends "Nothing was changed" does. It is the record of a refused call, not a fifth outcome of an
+update; when the instance was left stopped, `service_status` says so and names `instance_start`, as the refusal does.
+A `begin` with no `end` means that Arca itself stopped in the middle, or that the `end` could not be written. The
+read at a start takes such a run by its lines (below). A run whose `end` says rolled back is never read again.
 
 **Why a by-digest update gets this rollback.** Such an app changes its stored data when a new version first starts:
 the example's image "reconfigures and upgrades itself" on its first run. Today's rollback puts the old root back and
@@ -354,10 +360,10 @@ with that failure in its journal.
 | By-digest: Incus does not finish the rebuild in time | Rolls nothing back, so as not to rebuild and restore at once, as today (`service_update.rs:1356-1368`). Keeps the snapshot. Records `kept_for_owner`. | Stopped, with the root as Incus leaves it. | `update_unsettled`. The update is left unfinished (below). |
 | System container: the update command exits non-zero | Rolls back. | The old version, as it was at the snapshot. | `rolled_back`, with the exit code and the kept output. |
 | System container: the update command runs past `update.seconds` | The command is killed inside the instance at its limit, as every Rule 50 command is today (`crates/arca-incus/src/exec.rs:230-237`). Rolls back. | The old version, as it was. | `rolled_back`, "ran past N seconds", with the kept output. |
-| Incus does not answer about a formula's command by Arca's own deadline: the update command, a health try or the version read | Marks the instance hung, as a Rule 50 command does today. The step has failed. Rolls back: the rollback's stop ends what still runs inside and clears the mark. | The old version, as it was. | `rolled_back`. |
+| Incus does not answer about a formula's command by Arca's own deadline: the update command, a `health` try or the `version` read after it | Marks the instance hung, as a Rule 50 command does today. The step has failed. Rolls back: the rollback's stop ends what still runs inside and clears the mark. | The old version, as it was. | `rolled_back`. |
 | Health never comes within `health.seconds` | Rolls back. | The old version, as it was. | `rolled_back`, with the last lines of the health command. |
 | The version reader fails after a good health check | Nothing: the update is good. | The new version, running. | `updated: true`, `version.after: null`, and the message says the version could not be read. |
-| After a rollback the old version does not pass `old answers` in 30 seconds | Nothing more. Records `rolled_back_unhealthy`. | The old version, running. | `rolled_back` with `oldAnswers: false`, and a note, as `service_update` notes it today (`service_update.rs:1416-1418`). An app that did not recover from a crash-consistent snapshot shows here. |
+| After a rollback the old version does not pass `old answers` in 30 seconds | Nothing more: the snapshot is removed, as after any rollback that worked. Records `rolled_back_unhealthy`. | The old version, running. | `rolled_back` with `oldAnswers: false`, and a note, as `service_update` notes it today (`service_update.rs:1416-1418`). An app that did not recover from a crash-consistent snapshot shows here. |
 | The rollback itself fails or does not end in time: the stop, a restore, or the start | Stops trying, in this run and after it. Keeps the snapshot. Journals which parts were restored. Records `kept_for_owner`. | Stopped, if the stop worked. If the stop is what failed: as it is, which can be the new version running, or a command that did not answer still running under the hung mark. | `rollback_failed`, with both failures, the snapshot's name and the update's id: `service_update`'s code for this (`service_update.rs:1424-1444`). The update is left unfinished (below). |
 | The `drop snapshot` step fails after a good update | Nothing: the update is good. | The new version, running. | `updated: true`. The older snapshot is still there; the next look removes it. |
 | Arca restarts after the update step began (the read at a start, below) | By-digest, with a whole snapshot and an instance that has not run since it: restores the snapshot and starts the old version, by itself. Otherwise: restores nothing. | The old version on the old data, in the first case. Otherwise as the restart found it. | No caller waits any more. `service_status` shows rolled back, healthy or unhealthy, or `kept_for_owner` with `interrupted` and why a card is needed. |
@@ -393,26 +399,30 @@ and starts no instance under a running operation. Then it takes the first of the
 1. **A rollback line is there** (`rollback starts` or any after it): the run was rolling back, and it is never taken
    as good, whatever other lines it has. If the lines show the rollback whole (`restore`, a `restore volume` for each
    volume `begin` names, and `start old` when `begin` says the instance ran), Arca finishes it as rolled back: it
-   runs `old answers` if the run had not, removes the snapshot, as a rollback that worked does, and writes `end` with
-   `rolled_back_healthy` or `rolled_back_unhealthy`. If they do not, the case is 5.
+   runs `old answers` if the run had not and the instance runs, removes the snapshot, as a rollback that worked does,
+   and writes `end` with `rolled_back_healthy` or `rolled_back_unhealthy`. If a rollback line is a failed one, the
+   run's own rollback failed: Arca never restores such a run by itself, and writes `end` with `kept_for_owner`. If
+   the rollback was only cut, the case is 5.
 2. **No line that says the update step starts:** nothing inside the instance was changed, and Arca stopped nothing.
    Arca removes any snapshot that carries the name in `begin`, stops a system container again if `begin` says it was
    stopped, and writes `end` with `nothing_changed`.
 3. **That line, by-digest, no `rebuild` line, and a snapshot that is not whole:** the rebuild never began, since it
    only follows a whole snapshot. Arca looks at the snapshot itself for this, not only at the journal. It removes the
    parts, starts the instance if `begin` says it ran, and writes `end` with `nothing_changed`. Nothing is restored.
-4. **A good `health` line, and no failed line after it:** the new version passed its health check, so the update was
-   good. Arca finishes what was left of it: the digest in the record for a by-digest service, the `drop snapshot`
-   step, and `end` with `updated`. `health` is only ever the new version's check; a rollback's is `old answers`.
+4. **A good `health` line, and no failed `record` line and no rollback line after it:** the new version passed its
+   health check, so the update was good. Arca finishes what was left of it: the digest in the record for a by-digest
+   service, the `drop snapshot` step, and `end` with `updated`. `health` is only ever the new version's check; a
+   rollback's is `old answers`. A failed `version` or `drop snapshot` line does not change this: the table calls both
+   a good update.
 5. **Every other case:** the update step began, and the update neither ended good nor was rolled back whole. Arca
    then asks one thing: has the instance run since its snapshot? If it **has not**, nothing can have been written
    after the snapshot. Arca puts the old version back by itself, with no card: `restore`, `restore volume`, `start
-   old` if `begin` says it ran, `old answers`, `old version`, then `end` with `rolled_back_healthy` or
-   `rolled_back_unhealthy`. If a part of that fails, or if the instance **ran** since its snapshot, or if Arca
-   **cannot tell**, Arca restores nothing. No check failed straight before, and the app may have written since. It
-   writes `end` with `kept_for_owner` and `interrupted`: going back is the owner's card. A system container's update
-   command may still run inside; Arca marks the instance hung again, since the mark in memory did not outlive the
-   restart (below).
+   old` if `begin` says it ran, `old answers`, `old version`. It then removes the snapshot, as after any rollback
+   that worked, and writes `end` with `rolled_back_healthy` or `rolled_back_unhealthy`. If a part of that fails, or
+   if the instance **ran** since its snapshot, or if Arca **cannot tell**, Arca restores nothing. No check failed
+   straight before, and the app may have written since. It writes `end` with `kept_for_owner` and `interrupted`:
+   going back is the owner's card. A system container's update command may still run inside; Arca marks the instance
+   hung again, since the mark in memory did not outlive the restart (below).
 
 Every `end` the read writes also says `interrupted: true`.
 
@@ -483,7 +493,8 @@ Each snapshot belongs to one update, by the update's id in the journal. A good u
 owner can still go back (section 4). Decided: it is kept until the next good update of that service, and at most 7
 days. Arca removes a snapshot, with no card, in these cases:
 
-- after a rollback that worked, in the run or by `app_rollback`, since the instance is then what the snapshot holds;
+- after a rollback that worked, in the run, by the read at a restart, or by `app_rollback`, whether the old version
+  then answered or not, since the instance is then what the snapshot holds;
 - when the **next** good update of the same service passes its health check: its `drop snapshot` step removes the
   snapshots of the updates before it, an unfinished one's among them;
 - when a good update's snapshot is 7 days old. Arca looks at each start and once an hour after, and writes the
@@ -545,17 +556,35 @@ in a tenant is left out too: no service command is run inside a tenant's instanc
 - **The hung mark stays, and it is Arca's to clear.** Decided. Today a command that passes Arca's own deadline marks
   the instance's uuid hung, in memory, and every later command but a cleanup is refused until the uuid changes
   (`service_exec.rs:218-227`, `service_exec.rs:314-321`; Rule 50, `docs/OWNERSHIP.md:855`). The new type keeps that
-  mark: a formula command that Incus does not answer for sets it, and no formula command runs in a marked instance. A
-  restore and a rebuild keep the uuid (`service_update.rs:9-11`), so here a changed uuid is not what clears it.
-  Stopping the instance is: a stopped instance runs nothing, so the old command is gone. Arca makes that stop itself,
-  and nobody is left stuck. The rollback's stop makes it, straight after the command that did not answer, so the
-  rollback's own `old answers` and `old version` run. If that stop failed, the next `app_update` or `app_rollback`
-  makes it: before anything else it stops the instance, waits until Incus shows it stopped, and clears the mark. That
-  is a wait inside the call, not a refusal. For a by-digest service it is the stop its move makes anyway, moved to
-  the front; its `health before` is then not run. For a system container it means that this one retry stops the
-  instance: it is then snapshotted stopped, started, and updated as a stopped one is. Until then `service_status`
-  says in plain words why it waits. The mark is in memory, so the read at a restart sets it again for a run whose
-  command may still be running (above).
+  mark. A formula command that Incus does not answer for sets it, whichever command it is: the update command, a
+  health try, the version reader, `health before`. No formula command runs in a marked instance. A rebuild keeps the
+  uuid (`service_update.rs:9-11`), and so does a restore (*inferred*: not read in Incus's source), so here a changed
+  uuid is not what clears the mark. Stopping the instance is: a stopped instance runs nothing, so the old command is
+  gone. Arca makes that stop itself, and nobody is left stuck. Any mark is cleared this one way, whatever command set
+  it.
+  - **In the run that set it.** After the update step began, the rollback's stop clears it, straight after the
+    command that did not answer, so the rollback's own `old answers` and `old version` run. A mark set earlier in a
+    run, by the version reader of step 0 or by `health before`, is cleared by a clearing stop as below, and the run
+    goes on from where it was.
+  - **In the next call, when that stop had failed.** One order holds for `app_update` and `app_rollback`, and for
+    both kinds of service. First the call checks its arguments and takes the service's claim. Then, holding the
+    claim, it writes a journal line of its own, `clearing stop`, with whether the instance ran; stops the instance;
+    waits until Incus shows it stopped; and clears the mark. Only then come the rest of step 0 and everything after
+    it. The clearing stop is in front of step 0's version reader, and that reader is not run on a stopped instance,
+    so no formula command of the call ever meets the mark. That is a wait inside the call, not a refusal.
+  - **What `begin` records.** `begin` says whether the instance ran as it was **before** the clearing stop. So the
+    retry starts the app, and a rollback of the retry starts it again: an app that was serving is not left stopped.
+    If a check of step 0 fails after the clearing stop, Arca starts the instance again before it refuses.
+  - **Both kinds.** For a by-digest service the clearing stop is the stop its move makes anyway, moved in front of
+    step 0: its `health before` is not run, and its step 3 finds the instance already stopped. For a system container
+    this one retry stops the instance: it is snapshotted stopped, started, and then updated.
+  - **A restart in between.** If Arca itself stops between the clearing stop and `begin`, the read at a start finds a
+    `clearing stop` line with no `begin` after it. If Incus shows the instance stopped, Arca starts it again when the
+    line says it ran, and writes that run's `end` with `nothing_changed`. If Incus shows it still running, the stop
+    never took: the mark is set again, and the `end` is the same.
+  - **Status.** Until the mark is cleared, `service_status` says in plain words why the service waits. The mark is in
+    memory, so the read at a restart sets it again for a run with no `end` whose command may still be running
+    (above).
 - **How that command is run.** It takes the way a runner machine's command is run today: started detached, with no
   websocket, then waited on through its Incus operation in bounded waits
   (`crates/arca-incus/src/runner_vm.rs:238-293`). The reason is the length: a command of up to two hours should not
