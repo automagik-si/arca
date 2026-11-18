@@ -44,6 +44,8 @@ pub struct Answer {
     /// When set, the answer is an SSE stream of these messages, the last of which is the call's own reply, and `body` is
     /// not sent. Only a call whose terminal is asked about a plan streams ([`crate::elicit`]).
     pub stream: Option<tokio::sync::mpsc::Receiver<Value>>,
+    /// The session id an `initialize` was given, sent back as `Mcp-Session-Id` ([`crate::elicit`]).
+    pub session: Option<String>,
 }
 
 impl Answer {
@@ -52,6 +54,7 @@ impl Answer {
             status: StatusCode::OK,
             body,
             stream: None,
+            session: None,
         }
     }
 }
@@ -114,20 +117,35 @@ pub async fn dispatch(
                 status: StatusCode::BAD_REQUEST,
                 body: error_reply(id, refusal.code, &refusal.message, refusal.data),
                 stream: None,
+                session: None,
             }));
         }
     };
     let body = match (era, method) {
-        // Discovery is answered to anyone who asks, in the one shape it has: it is how a caller learns the versions.
-        (_, "server/discover") => result_reply(id, discover_result()),
+        // Discovery is answered to anyone who asks: it is how a caller learns the versions. A caller this server may ask
+        // to approve is offered `2025-11-25` alone, because only there can the server ask it when it did not call: its
+        // client then initializes and opens the server's stream ([`listen`]). A request in `2026-07-28` is still served.
+        (_, "server/discover") => {
+            let asks = server
+                .terminal
+                .as_ref()
+                .is_some_and(|terminal| terminal.approver.may_ask(caller) != Asking::No);
+            result_reply(id, discover_result(asks))
+        }
         (Era::Legacy, "initialize") => {
-            // The server keeps no session, so what a client that may be asked can be asked is remembered by its token's id.
+            // What a client that may be asked can be asked is remembered by its token's id. Such a client is given a
+            // session id, so a restart of the server (which forgets it) tells the client to initialize again.
+            let mut session = None;
             if let Some(terminal) = &server.terminal
                 && terminal.approver.may_ask(caller) != Asking::No
             {
                 terminal.note_initialize(&caller.token_id, &params);
+                session = terminal.open_session(&caller.token_id);
             }
-            result_reply(id, initialize_result())
+            return Ok(Some(Answer {
+                session,
+                ..Answer::ok(result_reply(id, initialize_result()))
+            }));
         }
         (Era::Legacy, "ping") => result_reply(id, json!({})),
         (Era::Legacy, "tools/list") => {
@@ -153,6 +171,7 @@ pub async fn dispatch(
                     status: StatusCode::OK,
                     body: Value::Null,
                     stream,
+                    session: None,
                 }));
             }
             if era == Era::Modern
@@ -168,6 +187,7 @@ pub async fn dispatch(
                 status: StatusCode::NOT_FOUND,
                 body: error_reply(id, METHOD_NOT_FOUND, "method not found", None),
                 stream: None,
+                session: None,
             }));
         }
     };
@@ -190,14 +210,20 @@ fn initialize_result() -> Value {
 }
 
 /// The answer to `server/discover`: the versions, the capabilities and the server's name and release. It is the same
-/// for every caller, so any cache may keep it.
-fn discover_result() -> Value {
+/// for every caller, so any cache may keep it, except for a caller the server may ask to approve (`asks`): that one is
+/// offered `2025-11-25` alone, and the answer is its own.
+fn discover_result(asks: bool) -> Value {
+    let (versions, scope): (&[&str], &str) = if asks {
+        (&[PROTOCOL_VERSION], "private")
+    } else {
+        (&SUPPORTED_VERSIONS, "public")
+    };
     modern_result(json!({
-        "supportedVersions": SUPPORTED_VERSIONS,
+        "supportedVersions": versions,
         "capabilities": capabilities(),
         "serverInfo": server_info(),
         "ttlMs": CACHE_TTL_MS,
-        "cacheScope": "public"
+        "cacheScope": scope
     }))
 }
 
@@ -518,9 +544,17 @@ async fn call_tool(
                 )));
             }
             let asked = asked.filter(|_| asking);
-            let many = asked
+            // A plan whose question is open on the session's stream now is not asked on the call too.
+            let many: Vec<PendingPlan> = asked
                 .as_ref()
-                .map(|(terminal, _, _)| terminal.approver.waiting(name, &value, caller))
+                .map(|(terminal, _, _)| {
+                    terminal
+                        .approver
+                        .waiting(name, &value, caller)
+                        .into_iter()
+                        .filter(|plan| !terminal.on_stream(plan))
+                        .collect()
+                })
                 .unwrap_or_default();
             let waiting = asked
                 .as_ref()
@@ -552,6 +586,9 @@ async fn call_tool(
                         result_reply(id, step_up_required(&url, &state))
                     }
                     (Era::Modern, None) => {
+                        for plan in &many {
+                            terminal.mark_asked(plan, now_seconds());
+                        }
                         let state = terminal.sign_many(
                             &caller.token_id,
                             &many,
@@ -587,6 +624,12 @@ async fn call_tool(
             let Some((terminal, plan)) = waiting else {
                 return Ok(Some(reply));
             };
+            // A plan whose question is open on the session's stream is not asked on the call too; one asked here is not
+            // put to the stream after.
+            if terminal.on_stream(&plan) {
+                return Ok(Some(reply));
+            }
+            terminal.mark_asked(&plan, now_seconds());
             match era {
                 Era::Modern => {
                     let state = terminal.sign(
@@ -866,6 +909,8 @@ fn ask_many_on_stream(
             let Some((request_id, answer)) = terminal.expect(&caller.token_id) else {
                 break;
             };
+            // Asked here on the owner's request, it is not put to the session's stream after.
+            terminal.mark_asked(&plan, now_seconds());
             let request = json!({
                 "jsonrpc": "2.0",
                 "id": request_id,
@@ -892,6 +937,178 @@ fn ask_many_on_stream(
         let _ = tx.send(many_reply(id, approving, decisions)).await;
     });
     Some(rx)
+}
+
+/// How often the server's own stream looks for plans that started waiting.
+const LISTEN_POLL: std::time::Duration = std::time::Duration::from_secs(1);
+/// How often an idle server stream sends a comment, so a proxy in between keeps it open.
+const LISTEN_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(15);
+/// How long a question put on the server's stream waits for its answer: as long as a plan can wait. No call is held
+/// open by it, so it is not cut to the few minutes a client keeps a call.
+const LISTEN_ANSWER: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// Opens the server's own stream for `caller` (`GET /mcp`, `2025-11-25`), when its terminal may be asked and its client
+/// declared elicitation at `initialize`. Every plan that starts waiting and that the caller may be asked about
+/// ([`crate::elicit::TerminalApprover::waiting_now`]) is put to it as an `elicitation/create`, once in all: a yes approves
+/// and runs it, an explicit no in the owner's session declines it, anything else leaves it waiting on its card. A
+/// session whose passkey is too old is first sent the step-up page (URL mode), once for the plans waiting then, and its
+/// plans are asked as soon as it may be asked. The stream ends when the caller may no longer be asked. Each message is
+/// one JSON-RPC message; a `null` is a keepalive, sent as a comment.
+pub(crate) fn listen(
+    server: &Arc<Server>,
+    caller: &Caller,
+) -> Option<tokio::sync::mpsc::Receiver<Value>> {
+    let terminal = server.terminal.as_ref()?;
+    if terminal.approver.may_ask(caller) == Asking::No {
+        return None;
+    }
+    let modes = terminal.modes(&caller.token_id);
+    if !(modes.form || modes.url) {
+        return None;
+    }
+    let (tx, rx) = tokio::sync::mpsc::channel::<Value>(8);
+    let server = Arc::clone(server);
+    let caller = caller.clone();
+    tokio::spawn(async move { push(server, caller, modes, tx).await });
+    Some(rx)
+}
+
+async fn push(
+    server: Arc<Server>,
+    caller: Caller,
+    modes: Modes,
+    tx: tokio::sync::mpsc::Sender<Value>,
+) {
+    let Some(terminal) = server.terminal.as_ref() else {
+        return;
+    };
+    // The plans the owner was sent to the step-up page for on this stream, and that page's open request.
+    let mut stepped: std::collections::HashSet<(String, u64)> = std::collections::HashSet::new();
+    let mut confirming: Option<String> = None;
+    let mut quiet = tokio::time::Instant::now();
+    loop {
+        if tx.is_closed() {
+            return;
+        }
+        let asking = terminal.approver.may_ask(&caller);
+        if asking == Asking::No {
+            return;
+        }
+        if asking == Asking::Yes
+            && let Some(elicitation) = confirming.take()
+        {
+            let complete = json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/elicitation/complete",
+                "params": { "elicitationId": elicitation }
+            });
+            if tx.send(complete).await.is_err() {
+                return;
+            }
+        }
+        let approver = Arc::clone(&terminal.approver);
+        let owned = caller.clone();
+        let plans: Vec<PendingPlan> =
+            tokio::task::spawn_blocking(move || approver.waiting_now(&owned))
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|plan| !terminal.was_asked(plan))
+                .collect();
+        match asking {
+            Asking::Yes if modes.form => {
+                for plan in plans {
+                    if !terminal.claim_plan(&plan, now_seconds()) {
+                        continue;
+                    }
+                    let Some((request_id, answer)) = terminal.expect(&caller.token_id) else {
+                        terminal.unclaim_plan(&plan);
+                        break;
+                    };
+                    let request = json!({
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "method": "elicitation/create",
+                        "params": crate::elicit::request_params(&plan.message, caller.is_issued())
+                    });
+                    terminal.streaming(&plan, true);
+                    if tx.send(request).await.is_err() {
+                        terminal.forget(&request_id);
+                        terminal.streaming(&plan, false);
+                        terminal.unclaim_plan(&plan);
+                        return;
+                    }
+                    quiet = tokio::time::Instant::now();
+                    // Each question waits for its own answer, so a plan that starts waiting meanwhile is asked too.
+                    let (server, caller, closed) =
+                        (Arc::clone(&server), caller.clone(), tx.clone());
+                    tokio::spawn(async move {
+                        let Some(terminal) = server.terminal.as_ref() else {
+                            return;
+                        };
+                        let answered = tokio::select! {
+                            answered = tokio::time::timeout(LISTEN_ANSWER, answer) => answered.ok().and_then(Result::ok),
+                            () = closed.closed() => None,
+                        };
+                        terminal.forget(&request_id);
+                        let said = answered.map_or(crate::elicit::Answer::Left, |response| {
+                            crate::elicit::answer(&response["result"])
+                        });
+                        decide(terminal, &caller, &plan.id, plan.created_at, said).await;
+                        terminal.streaming(&plan, false);
+                    });
+                }
+            }
+            Asking::StepUp { url } if modes.url => {
+                let fresh: Vec<(String, u64)> = plans
+                    .iter()
+                    .map(|plan| (plan.id.clone(), plan.created_at))
+                    .filter(|key| !stepped.contains(key))
+                    .collect();
+                if !fresh.is_empty() {
+                    stepped.extend(fresh);
+                    let Some((request_id, answer)) = terminal.expect(&caller.token_id) else {
+                        return;
+                    };
+                    let request = json!({
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "method": "elicitation/create",
+                        "params": crate::elicit::url_params(crate::elicit::STEP_UP_MESSAGE, &url, &request_id)
+                    });
+                    if tx.send(request).await.is_err() {
+                        terminal.forget(&request_id);
+                        return;
+                    }
+                    quiet = tokio::time::Instant::now();
+                    confirming = Some(request_id.clone());
+                    // The client answers once the owner chose to open the page; the passkey tap itself is seen above, as
+                    // the session becoming one that may be asked.
+                    let (server, closed) = (Arc::clone(&server), tx.clone());
+                    tokio::spawn(async move {
+                        let _ = tokio::select! {
+                            answered = tokio::time::timeout(LISTEN_ANSWER, answer) => answered.ok(),
+                            () = closed.closed() => None,
+                        };
+                        if let Some(terminal) = server.terminal.as_ref() {
+                            terminal.forget(&request_id);
+                        }
+                    });
+                }
+            }
+            _ => {}
+        }
+        if quiet.elapsed() >= LISTEN_KEEPALIVE {
+            if tx.send(Value::Null).await.is_err() {
+                return;
+            }
+            quiet = tokio::time::Instant::now();
+        }
+        tokio::select! {
+            () = tokio::time::sleep(LISTEN_POLL) => {}
+            () = tx.closed() => return,
+        }
+    }
 }
 
 /// What became of one plan asked about: approved and run, refused when approved, or left waiting on its card.

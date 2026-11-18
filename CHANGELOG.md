@@ -4,6 +4,13 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 
 ## Unreleased
 
+The owner's signed-in session is asked about a plan another agent proposes as soon as it starts waiting, with nobody
+typing: its client opens `GET /mcp`, the node's own event stream, and each plan is put to it there once as a yes-or-no
+question. A yes approves and runs it, a no declines it; plans that erase keep the passkey card, and a session whose
+passkey is older than 12 hours is sent the step-up page first. `server/discover` offers such a caller `2025-11-25`
+alone, the version with requests from the node, so Claude Code opens the stream with no setting. Such a caller gets an
+`Mcp-Session-Id` at `initialize`. See docs/OPERATING.md.
+
 `service_labels_set` merges a service's plain labels, with null removing a key. `service_status` and `service_list`
 rows now include the label map. Writes use ownership checks, If-Match and read-back outside the effect journal;
 uncertain answers carry an explicit code. Label keeping during snapshot rollback is best effort and never prevents

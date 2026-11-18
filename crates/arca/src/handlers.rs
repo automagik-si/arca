@@ -2689,6 +2689,33 @@ impl arca_mcp::TerminalApprover for TerminalApproval {
             .collect()
     }
 
+    fn waiting_now(&self, caller: &Caller) -> Vec<arca_mcp::PendingPlan> {
+        let now = (self.clock)();
+        let session = caller.is_issued();
+        let Ok(kernel) = self.kernel.lock() else {
+            return Vec::new();
+        };
+        kernel
+            .action_proposals()
+            .iter()
+            .filter(|proposal| !proposal.expired(now) && proposal.id.starts_with("act-"))
+            // The owner's signed-in session is never asked about a plan that deletes or erases: it keeps its passkey card.
+            .filter(|proposal| !(session && erases(&json!(proposal.action), &proposal.args)))
+            .map(|proposal| arca_mcp::PendingPlan {
+                id: proposal.id.clone(),
+                message: terminal_question(
+                    &json!({
+                        "summary": proposal.summary,
+                        "details": proposal.details,
+                        "expiresAt": proposal.expires_at,
+                    }),
+                    session,
+                ),
+                created_at: proposal.created_ms,
+            })
+            .collect()
+    }
+
     fn approve(&self, plan: &str, created_at: u64, caller: &Caller) -> Result<Value, CallError> {
         let forbidden = || CallError::Forbidden {
             verb: "action_propose".to_string(),

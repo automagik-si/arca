@@ -1991,6 +1991,52 @@ fn the_session_is_never_asked_about_an_erasing_plan_that_action_propose_answers_
     );
 }
 
+#[test]
+fn the_sessions_stream_is_put_every_waiting_plan_anyone_proposed_except_the_ones_that_erase() {
+    let (rig, key) = Rig::new("oauth-waiting-now");
+    let (_, access, _) = rig.connected(&key, "Owner app", "viewer approvals");
+    let session = rig.caller(&access);
+    let (_, plain_access, _) = rig.connected(&key, "Plain app", "operator");
+    let plain = rig.caller(&plain_access);
+    let terminal = rig.terminal();
+    assert!(terminal.waiting_now(&session).is_empty());
+    // Another agent's proposals, made in the kernel as its `action_propose` makes them.
+    let stop = rig.propose(
+        ActionKind::InstanceStop,
+        json!({ "project": "p1", "instance": "api" }),
+    );
+    let remove = rig.propose(ActionKind::ServiceRemove, json!({ "name": "demo" }));
+    let waiting = terminal.waiting_now(&session);
+    assert_eq!(
+        waiting
+            .iter()
+            .map(|plan| plan.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![stop.as_str()],
+        "the erasing plan {remove} keeps its passkey card"
+    );
+    assert_eq!(waiting[0].created_at, created(&rig, &stop));
+    assert!(waiting[0].message.starts_with("Approve this plan? "));
+    assert!(
+        waiting[0].message.contains("No declines it"),
+        "{}",
+        waiting[0].message
+    );
+    // The question is the one the listing's would be.
+    let listed = terminal.waiting(
+        "owner_approval_pending",
+        &rig.pending_handler()
+            .call(json!({}), &session)
+            .expect("listed"),
+        &session,
+    );
+    assert_eq!(listed, waiting);
+    // An app without `approvals` is never asked; a plan that lapsed is no longer put.
+    assert_eq!(terminal.may_ask(&plain), arca_mcp::Asking::No);
+    rig.advance(DAY + HOUR);
+    assert!(terminal.waiting_now(&session).is_empty());
+}
+
 // -------------------------------------------------------------------------------------------------------------------
 // The device authorization grant (RFC 8628): an agent away from the person's browser (in a container or on a server)
 // shows a short link and a code; the person approves on any device with the passkey; the agent polls for its token.
