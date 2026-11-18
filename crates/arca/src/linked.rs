@@ -1,7 +1,8 @@
 //! The approval page's relay to the linked kernels (`approval.linkedHosts`): on this machine, or on another machine whose
 //! MCP socket is forwarded to a path on this one (an SSH-forwarded unix socket, say). The page lists a linked
 //! kernel's waiting proposals with `plan_list` and hands the owner's signed approval to that kernel's `action_approve`, or
-//! a decline to its `plan_decline`, over the kernel's own MCP unix socket. The page never checks, spends or stores a
+//! a decline to its `plan_decline`, over the kernel's own MCP unix socket. Owner approval request steps use the same
+//! relay. The page never checks, spends or stores a
 //! linked kernel's approval: the target verifies it with its own verifier, nonce store and sign counts, and its answer is
 //! returned as it came.
 //!
@@ -215,7 +216,7 @@ fn answer_of(reply: &Value) -> Result<Value, RelayError> {
 /// How long a relayed call of `verb` waits for the linked kernel's answer.
 pub fn timeout_for(verb: &str) -> Duration {
     match verb {
-        "plan_list" | "arca_status" => LIST_TIMEOUT,
+        "plan_list" | "arca_status" | "owner_approval_list" => LIST_TIMEOUT,
         "action_approve" | "approval_submit" => APPROVAL_TIMEOUT,
         _ => TIMEOUT,
     }

@@ -1,6 +1,5 @@
 //! Multi-host approvals on one machine: the page host (alpha) lists a linked kernel's (beta's) waiting proposals and relays
-//! the owner's signed approval to beta's `action_approve` over beta's own socket. Beta verifies it with its own verifier,
-//! trusting alpha's passkeys file read-only. The page host never approves for another host.
+//! approvals over beta's own socket. Beta verifies them using its own verifier and the keys it trusts from alpha.
 //!
 //! Every key is a fixture: a software P-256 passkey from a fixed seed, written into the test's own scratch directory.
 
@@ -17,6 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use arca::approval_requests::{self, ApprovalRequests};
 use arca::approve_page::{Page, SetupCodeDisplay};
 use arca::config::LinkedHost;
 use arca::desired_store::EntryChange;
@@ -25,10 +25,12 @@ use arca::handlers::{
     plan_handlers_with,
 };
 use arca::kernel::{AppliedSeq, Kernel};
+use arca::linked::{self, RelayError};
 use arca_api::Scope;
 use arca_approval::{
     ApprovalRefusal, ApprovalVerifier, FileNonces, FileSignCounts, ForeignPasskeys, OwnerKeys,
-    PasskeyVerifier, STATE_PASSKEYS_FILE, SshSigVerifier, parse_passkeys,
+    PasskeyVerifier, PeerPasskeys, STATE_PASSKEYS_FILE, SshSigVerifier, normalize_set,
+    parse_passkeys,
 };
 use arca_kernel::canon::{Digest, canonical_json, params_digest};
 use arca_kernel::desired::EntryId;
@@ -64,10 +66,48 @@ impl ToolHandler for CountingAction {
     }
 }
 
+struct SubstitutedRequestStatement(&'static str);
+
+impl ToolHandler for SubstitutedRequestStatement {
+    fn call(&self, args: Value, _caller: &Caller) -> Result<Value, CallError> {
+        let entropy = args["nonce"].as_str().expect("page entropy");
+        let id = args["id"].as_str().expect("request id");
+        let mut statement = json!({
+            "host": BETA_HOST,
+            "action": "enroll",
+            "target": "AB12CD",
+            "paramsDigest": params_digest(&json!({ "service": "example-service" })).expect("digest"),
+            "issuedAt": args["issuedAt"],
+            "expiresAt": arca::handlers::iso_utc(NOW + 900_000),
+            "nonce": format!("{}{entropy}", id.trim_start_matches("ar_")),
+        });
+        statement[self.0] = match self.0 {
+            "host" => json!(format!("other-{BETA_HOST}")),
+            "nonce" => {
+                let different = if id == "ar_0123456789abcdef" {
+                    "fedcba9876543210"
+                } else {
+                    "0123456789abcdef"
+                };
+                json!(format!("{different}{entropy}"))
+            }
+            "issuedAt" => json!(arca::handlers::iso_utc(NOW - 1_000)),
+            "expiresAt" => json!(arca::handlers::iso_utc(NOW + 899_000)),
+            "action" => json!("spend"),
+            "target" => json!("CD34EF"),
+            "paramsDigest" => json!("ab".repeat(32)),
+            field => panic!("unexpected field {field}"),
+        };
+        Ok(json!({ "statement": canonical_json(&statement).expect("statement") }))
+    }
+}
+
 /// How beta trusts alpha's passkeys.
 enum BetaTrust {
     /// `approval.trustOwnerKeysFrom` names alpha's passkeys file, for alpha's origin.
     AlphaFile,
+    /// `approval.peerKeys` keeps alpha's synced passkeys.
+    AlphaPeer,
     /// No `approval` key: beta trusts only its own passkey.
     None,
     /// `approval.trustOwnerKeysFrom` names a file beta cannot read.
@@ -93,6 +133,7 @@ struct Pair {
     foreign: ForeignPasskeys,
     /// Beta's state directory, where its state-file passkeys live.
     beta_state: PathBuf,
+    beta_requester: LinkedHost,
     _runtime: Runtime,
 }
 
@@ -133,6 +174,15 @@ impl Pair {
 
     /// A pair whose relay token on beta admits `tools`.
     fn with_tools(tag: &str, trust: BetaTrust, tools: &[&str]) -> (Pair, SoftPasskey) {
+        Self::with_begin(tag, trust, tools, None)
+    }
+
+    fn with_begin(
+        tag: &str,
+        trust: BetaTrust,
+        tools: &[&str],
+        begin: Option<Arc<dyn ToolHandler>>,
+    ) -> (Pair, SoftPasskey) {
         let alpha_scratch = Scratch::new(&format!("{tag}-alpha"));
         let beta_scratch = Scratch::new(&format!("{tag}-beta"));
         let alpha_fake = start_fake(&alpha_scratch);
@@ -163,7 +213,7 @@ impl Pair {
             BetaTrust::AlphaFile => {
                 ForeignPasskeys::new(vec![alpha_passkeys.clone()], vec![ORIGIN.to_string()])
             }
-            BetaTrust::None => ForeignPasskeys::default(),
+            BetaTrust::AlphaPeer | BetaTrust::None => ForeignPasskeys::default(),
             BetaTrust::Unreadable => {
                 fs::set_permissions(&alpha_passkeys, fs::Permissions::from_mode(0o000))
                     .expect("mode 0000");
@@ -172,16 +222,24 @@ impl Pair {
         };
         let beta_lines = parse_passkeys(format!("{}\n", beta_own.line(NAMESPACE)).as_bytes())
             .expect("beta's own line parses");
+        let mut passkeys = PasskeyVerifier::new(
+            beta_lines,
+            FileSignCounts::open(&beta_scratch.path("beta-counts.jsonl")).expect("counts"),
+        )
+        .with_foreign(foreign.clone());
+        if matches!(trust, BetaTrust::AlphaPeer) {
+            let peer = PeerPasskeys::new(
+                beta_scratch.path("peer-passkeys"),
+                "alpha".to_string(),
+                vec![ORIGIN.to_string()],
+            );
+            let lines = normalize_set(&[owner.line(NAMESPACE)]).expect("a key to sync");
+            peer.write(&lines, NOW, None).expect("the synced keys");
+            passkeys = passkeys.with_peer(peer);
+        }
         let beta_verifier = ApprovalVerifier::new(
             BETA_HOST.to_string(),
-            OwnerKeys::new(
-                SshSigVerifier::new(Vec::new()),
-                PasskeyVerifier::new(
-                    beta_lines,
-                    FileSignCounts::open(&beta_scratch.path("beta-counts.jsonl")).expect("counts"),
-                )
-                .with_foreign(foreign.clone()),
-            ),
+            OwnerKeys::new(SshSigVerifier::new(Vec::new()), passkeys),
             FileNonces::open(&beta_scratch.path("beta-nonces.jsonl")).expect("nonces"),
         );
         let beta = Arc::new(Mutex::new(
@@ -202,6 +260,10 @@ impl Pair {
         let tools: Vec<String> = tools.iter().map(|tool| tool.to_string()).collect();
         let (secret, hash) = mint_with_tools(Scope::Doctor, Some(&tools));
         write_mode(&tokens_dir.join("relay.hash"), &hash, 0o400);
+        let (requester, hash) = mint_with_tools(Scope::Doctor, None);
+        write_mode(&tokens_dir.join("requester.hash"), &hash, 0o400);
+        let requester_file = beta_scratch.path("requester.secret");
+        write_mode(&requester_file, &requester, 0o600);
         let token_file = alpha_scratch.path("beta-relay.secret");
         write_mode(&token_file, &format!("{secret}\n"), 0o600);
         let tokens = TokenStore::load(&tokens_dir).expect("the token store loads");
@@ -210,15 +272,27 @@ impl Pair {
         let beta_clock: Clock = Arc::new(move || beta_clock.load(Ordering::SeqCst));
         let slot = ActionSlot::default();
         let mut beta_server = Server::new(arca_api::verbs(), tokens);
-        for (verb, handler) in
-            plan_handlers_with(Arc::clone(&beta), beta_clock, None, None, Arc::clone(&slot))
-        {
+        for (verb, handler) in plan_handlers_with(
+            Arc::clone(&beta),
+            beta_clock.clone(),
+            None,
+            None,
+            Arc::clone(&slot),
+        ) {
             beta_server = beta_server.handle(verb, handler);
         }
         let _ = slot.set(executor(&beta_runs));
         let beta_socket = beta_scratch.path("beta.sock");
         let beta_state = beta_scratch.path("state");
         private_dir(&beta_state);
+        let requests = Arc::new(ApprovalRequests::open(&beta_state, None, NOW).expect("requests"));
+        for (verb, handler) in approval_requests::handlers(Arc::clone(&beta), beta_clock, requests)
+        {
+            beta_server = beta_server.handle(verb, handler);
+        }
+        if let Some(begin) = begin {
+            beta_server = beta_server.handle("owner_approval_begin", begin);
+        }
 
         // Alpha's page, linked to beta.
         let alpha_state = alpha_scratch.path("state");
@@ -286,6 +360,13 @@ impl Pair {
             token_file,
             foreign,
             beta_state,
+            beta_requester: LinkedHost {
+                name: "beta".to_string(),
+                socket: beta_socket,
+                token_file: requester_file,
+                incus_socket: None,
+                ceph: None,
+            },
             _runtime: runtime,
         };
         (pair, owner)
@@ -430,6 +511,244 @@ fn approval(key: &SoftPasskey, statement: &str) -> String {
         statement,
         &key.assert(&Assert::over(NAMESPACE, statement.as_bytes())),
     )
+}
+
+const REQUEST_TOOLS: [&str; 5] = [
+    "owner_approval_list",
+    "owner_approval_begin",
+    "owner_approval_approve",
+    "owner_approval_deny",
+    "owner_approval_status",
+];
+
+fn enroll_request(pair: &Pair) -> (Value, Value) {
+    let input = json!({ "target": "AB12CD", "args": { "service": "example-service" } });
+    let mut args = input.clone();
+    args["kind"] = json!("arca");
+    args["action"] = json!("enroll");
+    let made = linked::call(&pair.beta_requester, "owner_approval_request", args).expect("request");
+    assert_eq!(made["dashboard"], Value::Null, "beta serves no page");
+    (made["id"].clone(), input)
+}
+
+fn request_step(pair: &Pair, step: &str, body: Value) -> (u16, Value) {
+    pair.request("POST", &format!("/approve/requests/{step}"), Some(body))
+}
+
+fn assert_request_audit(pair: &Pair, tool: &str, id: &Value) {
+    let audit = fs::read_to_string(pair.beta_state.join(approval_requests::AUDIT_FILE))
+        .expect("linked kernel audit");
+    let prefix = format!("{}:", id.as_str().expect("request id"));
+    let decision = audit
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("audit line"))
+        .find(|line| line["tool"] == tool)
+        .expect("recorded decision");
+    assert_eq!(decision["principal"], "mcp:relay");
+    assert!(
+        decision["outcome"]
+            .as_str()
+            .expect("outcome")
+            .contains(&prefix)
+    );
+}
+
+#[test]
+fn the_page_refuses_a_begun_statement_for_a_different_host_before_signing() {
+    for field in [
+        "host",
+        "nonce",
+        "issuedAt",
+        "expiresAt",
+        "action",
+        "target",
+        "paramsDigest",
+    ] {
+        let (pair, _) = Pair::with_begin(
+            "req-foreign",
+            BetaTrust::AlphaPeer,
+            &REQUEST_TOOLS,
+            Some(Arc::new(SubstitutedRequestStatement(field))),
+        );
+        let (id, _) = enroll_request(&pair);
+        let row = pair.plans()["approvalRequests"][0].clone();
+        assert_eq!(row["host"], BETA_HOST);
+        assert_eq!(row["id"], id);
+        let (status, body) = request_step(
+            &pair,
+            "begin",
+            json!({ "host": "beta", "id": id, "card": row }),
+        );
+        assert_eq!(status, 502, "{field}: {body}");
+        assert!(body.get("statement").is_none());
+        assert_eq!(body["refusal"], "InvalidStatement");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("card")
+        );
+    }
+}
+
+#[test]
+fn the_page_lists_a_linked_enroll_request_and_only_the_requester_can_spend_its_approval() {
+    let (pair, owner) = Pair::with_tools("req-ok", BetaTrust::AlphaPeer, &REQUEST_TOOLS);
+    let (id, input) = enroll_request(&pair);
+    let plans = pair.plans();
+    let rows = plans["approvalRequests"].as_array().expect("request cards");
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    assert_eq!(row["id"], id);
+    assert_eq!(row["linkedHost"], "beta");
+    assert_eq!(row["state"], "pending");
+    assert_eq!(row["fields"]["action"], "enroll");
+    assert_eq!(row["fields"]["target"], input["target"]);
+    assert_eq!(row["args"], input["args"]);
+
+    let begin = || {
+        let (status, body) = request_step(
+            &pair,
+            "begin",
+            json!({ "host": "beta", "id": id, "card": row }),
+        );
+        assert_eq!(status, 200, "{body}");
+        body["statement"].as_str().expect("statement").to_string()
+    };
+    let first: Value = serde_json::from_str(&begin()).expect("statement JSON");
+    let statement = begin();
+    let fields: Value = serde_json::from_str(&statement).expect("statement JSON");
+    assert_eq!(fields["host"], BETA_HOST);
+    assert_eq!(fields["action"], "enroll");
+    assert_eq!(fields["target"], input["target"]);
+    assert_eq!(fields["paramsDigest"], row["fields"]["paramsDigest"]);
+    assert_ne!(fields["nonce"], first["nonce"]);
+    let request_hex = id.as_str().unwrap().strip_prefix("ar_").unwrap();
+    let nonce = fields["nonce"].as_str().unwrap();
+    assert_eq!(nonce.len(), 48);
+    assert!(nonce.starts_with(request_hex));
+    assert_eq!(fields["issuedAt"], arca::handlers::iso_utc(NOW));
+    assert_eq!(fields["expiresAt"], arca::handlers::iso_utc(NOW + 900_000));
+
+    let proof = owner.proof_value(&Assert::over(NAMESPACE, statement.as_bytes()));
+    let (status, body) = request_step(
+        &pair,
+        "approve",
+        json!({ "host": "beta", "id": id, "statement": statement, "proof": proof }),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["state"], "approved");
+    assert!(body.get("approval").is_none());
+    assert_request_audit(&pair, approval_requests::APPROVED_AUDIT, &id);
+    assert_eq!(pair.plans()["approvalRequests"], json!([]));
+
+    let status_args = json!({ "id": id });
+    let mut relay = pair.beta_requester.clone();
+    relay.token_file = pair.token_file.clone();
+    let other =
+        linked::call(&relay, "owner_approval_status", status_args.clone()).expect("other status");
+    assert_eq!(other["state"], "approved");
+    assert!(other.get("approval").is_none());
+    let own = linked::call(&pair.beta_requester, "owner_approval_status", status_args)
+        .expect("requester status");
+    assert_eq!(own["state"], "approved");
+    let mut confirm = input;
+    confirm["approval"] = json!(own["approval"].as_str().expect("approval for requester"));
+    assert_eq!(
+        linked::call(&pair.beta_requester, "enroll_confirm", confirm.clone()),
+        Ok(json!({ "confirmed": true }))
+    );
+    assert!(matches!(
+        linked::call(&pair.beta_requester, "enroll_confirm", confirm),
+        Err(RelayError::Refused { code, .. }) if code == "owner_approval"
+    ));
+}
+
+#[test]
+fn the_page_relays_request_refusals_and_declines_to_the_linked_kernel() {
+    let (pair, owner) = Pair::with_tools("req-no", BetaTrust::None, &REQUEST_TOOLS);
+    let (id, _) = enroll_request(&pair);
+    let named = json!({ "host": "beta", "id": id });
+    let status = || {
+        linked::call(
+            &pair.beta_requester,
+            "owner_approval_status",
+            json!({ "id": id }),
+        )
+        .expect("status")["state"]
+            .clone()
+    };
+    let (code, body) = request_step(&pair, "deny", json!({ "host": "unknown", "id": id }));
+    assert_eq!(code, 403);
+    assert_eq!(body["refusal"], "NotLinked");
+    assert_eq!(status(), "pending");
+
+    let row = pair.plans()["approvalRequests"][0].clone();
+    let (code, body) = request_step(
+        &pair,
+        "begin",
+        json!({ "host": "beta", "id": id, "card": row }),
+    );
+    assert_eq!(code, 200, "{body}");
+    let statement = body["statement"].as_str().expect("statement");
+    let proof = owner.proof_value(&Assert::over(NAMESPACE, statement.as_bytes()));
+    let (code, body) = request_step(
+        &pair,
+        "approve",
+        json!({ "host": "beta", "id": id, "statement": statement, "proof": proof }),
+    );
+    let Err(RelayError::Refused {
+        code: expected,
+        message,
+    }) = linked::call(
+        &pair.beta_requester,
+        "owner_approval_approve",
+        json!({ "id": id, "statement": statement, "proof": proof }),
+    )
+    else {
+        panic!("the target kernel must refuse the untrusted passkey");
+    };
+    assert_eq!(code, 403);
+    assert_eq!(expected, "assertion_refused");
+    assert_eq!(body, json!({ "refusal": expected, "message": message }));
+    assert_eq!(status(), "pending");
+
+    let (code, body) = request_step(&pair, "deny", named.clone());
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(body["state"], "denied");
+    assert_request_audit(&pair, approval_requests::DENIED_AUDIT, &id);
+    assert_eq!(status(), "denied");
+    assert_eq!(pair.plans()["approvalRequests"], json!([]));
+}
+
+#[test]
+fn a_request_relay_reports_a_refused_token_and_an_unreachable_socket() {
+    let (pair, _) = Pair::new("req-link", BetaTrust::AlphaPeer);
+    let (id, _) = enroll_request(&pair);
+    let request = json!({ "host": "beta", "id": id });
+    let (status, body) = request_step(&pair, "deny", request.clone());
+    assert_eq!(status, 502);
+    assert_eq!(body["refusal"], "LinkToken");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("owner_approval_deny")
+    );
+    assert_eq!(
+        linked::call(
+            &pair.beta_requester,
+            "owner_approval_status",
+            json!({ "id": id })
+        )
+        .expect("status")["state"],
+        "pending"
+    );
+
+    fs::remove_file(&pair.beta_requester.socket).expect("unlink the target test socket");
+    let (status, body) = request_step(&pair, "deny", request);
+    assert_eq!(status, 502);
+    assert_eq!(body["refusal"], "Unreachable");
 }
 
 #[test]

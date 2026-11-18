@@ -21,7 +21,7 @@
 //! mints the statement, the passkey signs it, and `POST /approve/requests/approve` takes the request id, that statement and
 //! the proof (see `crate::approval_requests`). `POST /approve/requests/deny` declines one without a passkey.
 //!
-//! With `approval.linkedHosts`, the page also lists the waiting action proposals and delete plans of other kernels on this
+//! With `approval.linkedHosts`, the page also lists waiting proposals, delete plans and owner requests of other kernels on this
 //! machine and relays the owner's signed approval (or an action's decline) for one of them to that kernel over its own
 //! socket (see `crate::linked`). The page never checks or spends another kernel's approval, and never asks its own kernel
 //! about another kernel's id.
@@ -56,12 +56,14 @@ use tokio::sync::Semaphore;
 use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::approval_requests::{ApprovalRequests, PageRefusal, passkey_summary};
+use crate::approval_requests::{
+    ApprovalRequests, PageRefusal, linked_card_statement, passkey_summary,
+};
 use crate::canvas::{self, Canvas};
 use crate::config::LinkedHost;
 use crate::handlers::{
-    ActionExecutor, Clock, action_statement, approve_plan, decline_plan, fresh_nonce, list_plans,
-    plan_statement, run_approved_action,
+    ActionExecutor, Clock, action_statement, approve_plan, decline_plan, fresh_nonce, iso_utc,
+    list_plans, plan_statement, run_approved_action,
 };
 use crate::kernel::Kernel;
 use crate::linked::{self, RelayError};
@@ -404,8 +406,7 @@ impl Page {
         self
     }
 
-    /// The linked kernels on this machine whose waiting proposals the page lists, and to which it relays the owner's signed
-    /// approvals and declines. The page never approves for another host: the linked kernel checks every approval itself.
+    /// The linked kernels whose waiting cards the page lists and to which it relays passkey answers and declines.
     pub fn with_linked_hosts(mut self, hosts: Vec<LinkedHost>) -> Self {
         self.state.linked = Arc::new(hosts);
         self
@@ -1123,17 +1124,21 @@ async fn plans(State(state): State<Arc<PageState>>) -> Response {
         return Json(body).into_response();
     }
     let linked = Arc::clone(&state.linked);
-    let Ok(listed) = tokio::task::spawn_blocking(move || linked_plans(&linked, now)).await else {
+    let Ok(listed) = tokio::task::spawn_blocking(move || linked_cards(&linked, now)).await else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
-    let (rows, hosts) = listed;
     if let Ok(mut waits) = state.linked_waits.lock() {
-        keep_waits(&mut waits, &rows, &hosts);
+        keep_waits(&mut waits, &listed.plans, &listed.hosts);
     }
     if let Some(plans) = body["plans"].as_array_mut() {
-        plans.extend(rows);
+        plans.extend(listed.plans);
     }
-    body["linkedHosts"] = json!(hosts);
+    if let Some(requests) = body["approvalRequests"].as_array_mut() {
+        requests.extend(listed.requests);
+    } else {
+        body["approvalRequests"] = json!(listed.requests);
+    }
+    body["linkedHosts"] = json!(listed.hosts);
     Json(body).into_response()
 }
 
@@ -1378,16 +1383,39 @@ async fn peer_keys_trust(State(state): State<Arc<PageState>>, body: Bytes) -> Re
     }
 }
 
+#[derive(Default)]
+struct LinkedCards {
+    plans: Vec<Value>,
+    requests: Vec<Value>,
+    hosts: Vec<Value>,
+}
+
 /// The waiting action proposals and delete plans of every linked kernel, each with `linkedHost` naming it and a fresh
 /// statement that names the host the linked kernel says its statements carry, and one `{name, read}` per linked kernel. A
 /// kernel that does not answer adds no row. A delete plan is approved there with `approval_submit`: when the token this
 /// page holds for that kernel does not admit it, the plan's row says so in `relayNote`, with what the owner changes.
-fn linked_plans(linked: &[LinkedHost], now: u64) -> (Vec<Value>, Vec<Value>) {
-    let mut rows = Vec::new();
-    let mut hosts = Vec::new();
+/// Request cards get their statement on Approve, from their own kernel.
+fn linked_cards(linked: &[LinkedHost], now: u64) -> LinkedCards {
+    let mut cards = LinkedCards::default();
     for host in linked {
         let listed = linked::call(host, "plan_list", json!({}));
-        hosts.push(json!({ "name": host.name, "read": listed.is_ok() }));
+        cards
+            .hosts
+            .push(json!({ "name": host.name, "read": listed.is_ok() }));
+        if let Ok(requests) = linked::call(host, "owner_approval_list", json!({})) {
+            cards.requests.extend(
+                requests["requests"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|row| row["state"] == "pending")
+                    .cloned()
+                    .map(|mut row| {
+                        row["linkedHost"] = json!(host.name);
+                        row
+                    }),
+            );
+        }
         let Ok(listed) = listed else {
             continue;
         };
@@ -1416,7 +1444,7 @@ fn linked_plans(linked: &[LinkedHost], now: u64) -> (Vec<Value>, Vec<Value>) {
             let mut row = row.clone();
             row["linkedHost"] = json!(host.name);
             row["statement"] = json!(statement);
-            rows.push(row);
+            cards.plans.push(row);
         }
         if deletes.is_empty() {
             continue;
@@ -1431,10 +1459,10 @@ fn linked_plans(linked: &[LinkedHost], now: u64) -> (Vec<Value>, Vec<Value>) {
             if let Some(note) = &note {
                 row["relayNote"] = json!(note);
             }
-            rows.push(row);
+            cards.plans.push(row);
         }
     }
-    (rows, hosts)
+    cards
 }
 
 /// A linked kernel's delete plan as the page lists it: its row with a fresh statement minted here, for the host its own
@@ -1787,6 +1815,16 @@ enum RequestStep {
     Deny,
 }
 
+impl RequestStep {
+    fn relay_verb(self) -> &'static str {
+        match self {
+            Self::Begin => "owner_approval_begin",
+            Self::Approve => "owner_approval_approve",
+            Self::Deny => "owner_approval_deny",
+        }
+    }
+}
+
 async fn request_begin(
     State(state): State<Arc<PageState>>,
     headers: HeaderMap,
@@ -1812,16 +1850,16 @@ async fn request_deny(
 }
 
 /// One step of an owner approval request: `{id}` to begin or deny, `{id, statement, proof}` to approve, as
-/// `application/json`. Nothing the body holds is echoed back.
+/// `application/json`. An optional `host` sends the step to that linked kernel. A linked begin also takes the displayed card.
 async fn request_step(
     state: Arc<PageState>,
     headers: &HeaderMap,
     body: Bytes,
     step: RequestStep,
 ) -> Response {
-    let Some(requests) = state.requests.clone() else {
+    if state.requests.is_none() && state.linked.is_empty() {
         return StatusCode::NOT_FOUND.into_response();
-    };
+    }
     // As droidd's: a step is a JSON body, so a form or a text/plain post (which a page elsewhere could send) is refused.
     if !is_json_content_type(headers) {
         return page_refusal(PageRefusal {
@@ -1839,7 +1877,7 @@ async fn request_step(
             extra: serde_json::Map::new(),
         })
     };
-    let args: Value = if body.is_empty() {
+    let mut args: Value = if body.is_empty() {
         json!({})
     } else {
         match serde_json::from_slice(&body) {
@@ -1849,6 +1887,27 @@ async fn request_step(
     };
     let Some(id) = args.get("id").and_then(Value::as_str).map(str::to_string) else {
         return invalid();
+    };
+    match linked_host(&state, &args) {
+        Err(refusal) => return refusal.into_response(),
+        Ok(Some(host)) => {
+            if matches!(step, RequestStep::Begin) {
+                return relay_request_begin(&state, host, &id, &args["card"]).await;
+            }
+            let name = host.name.clone();
+            let verb = step.relay_verb();
+            args.as_object_mut()
+                .expect("request object with an id")
+                .remove("host");
+            return match relay(host, verb, args, linked::timeout_for(verb)).await {
+                Ok(value) => canvas_json(StatusCode::OK, value),
+                Err(error) => relay_error_response(&name, verb, error),
+            };
+        }
+        Ok(None) => {}
+    }
+    let Some(requests) = state.requests.clone() else {
+        return StatusCode::NOT_FOUND.into_response();
     };
     let now = (state.clock)();
     let kernel = Arc::clone(&state.kernel);
@@ -1884,6 +1943,40 @@ async fn request_step(
         Ok(Ok(value)) => canvas_json(StatusCode::OK, value),
         Ok(Err(refusal)) => page_refusal(refusal),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+async fn relay_request_begin(
+    state: &PageState,
+    host: LinkedHost,
+    id: &str,
+    card: &Value,
+) -> Response {
+    let Ok(entropy) = fresh_nonce() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let now = (state.clock)();
+    let name = host.name.clone();
+    let Some(expected) =
+        linked_card_statement(card, id, &entropy, now).filter(|_| card["linkedHost"] == name)
+    else {
+        return canvas_json(
+            StatusCode::BAD_REQUEST,
+            json!({ "refusal": "invalid", "message": "the request card could not be checked; reload the page" }),
+        );
+    };
+    let verb = RequestStep::Begin.relay_verb();
+    let args = json!({ "id": id, "nonce": entropy, "issuedAt": iso_utc(now) });
+    match relay(host, verb, args, linked::timeout_for(verb)).await {
+        Ok(value) if value["statement"] == expected => canvas_json(
+            StatusCode::OK,
+            json!({ "statement": expected, "host": name }),
+        ),
+        Ok(_) => canvas_json(
+            StatusCode::BAD_GATEWAY,
+            json!({ "refusal": "InvalidStatement", "message": "the linked machine returned a statement that does not match this request card" }),
+        ),
+        Err(error) => relay_error_response(&name, verb, error),
     }
 }
 

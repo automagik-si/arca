@@ -4450,9 +4450,9 @@ What this does not do:
 #### Approving on another kernel of this machine
 
 One canvas can approve changes on every Arca kernel that runs on the same machine as the page host, with the same passkey.
-The page host never approves for another kernel: each kernel records its own proposals, and each verifies the owner's
-signed statement with its own verifier, nonce store and sign counts. The page host only lists the other kernel's waiting
-proposals and carries the signed bytes to it. A kernel on another machine is linked the same way, with its socket forwarded
+Each kernel records its own proposals and owner approval requests, and verifies the owner's signed statement with its
+own verifier, nonce store and sign counts. The page host lists the waiting cards and carries the signed answer to
+the kernel that owns each card. A kernel on another machine is linked the same way, with its socket forwarded
 to this machine and the owner's passkeys kept in sync there; see [Approving on another machine](#approving-on-another-machine).
 
 On the page host (here `alpha`, page origin `https://alpha.example.com`), list each linked kernel with its MCP socket and
@@ -4467,19 +4467,22 @@ the file holding a token for it:
 ```
 
 `name` is the name the canvas knows that machine by (its `hosts[].name` in the canvas config). The token is minted on the
-linked kernel with scope `doctor`, limited to the verbs relayed with it. For the page alone that is its four verbs
-(`approval_submit` approves that kernel's delete plans; a token without it still relays actions, and each delete card
-says what to change); to read and propose on that kernel through this kernel's MCP door as well, list those verbs too
+linked kernel with scope `doctor`, limited to the verbs relayed with it. `approval_submit` approves that kernel's delete
+plans. A token that omits it still relays action proposals, and each delete card says what to change.
+To read and propose on that kernel through this kernel's MCP door as well, list those verbs too
 (see [Asking a linked node: `node`](#asking-a-linked-node-node)):
 
 ```sh
-arca token mint --scope doctor --id relay-alpha --tools plan_list,action_approve,plan_decline,approval_submit \
+arca token mint --scope doctor --id relay-alpha \
+  --tools plan_list,action_approve,plan_decline,approval_submit,owner_approval_list,owner_approval_begin,owner_approval_approve,owner_approval_deny \
   --out /etc/arca/alpha/beta-relay.secret --config /etc/arca/beta.json
 ```
 
 It is read from its file at each call, so it can be rotated without a restart. It is opened without following a link, and
 must be a regular file owned by root or by the page host's user, with no group or other permission bit; any other token
 file relays nothing (502 `LinkToken`).
+Add `owner_approval_list`, `owner_approval_begin`, `owner_approval_approve` and `owner_approval_deny` when rotating an
+existing relay token to support request cards.
 
 On the linked kernel (`beta`), trust the page host's passkeys file read-only, for the page host's origin only:
 
@@ -4497,15 +4500,15 @@ whose `origin` is listed are trusted. A file that is missing, unreadable or refu
 reason. The sign-in route of beta's own canvas never uses these keys, and neither does a passkey change: only beta's own
 passkeys (its root file and its state file) can add or remove one of beta's passkeys, and a passkey trusted from another
 kernel's file is refused with "only this machine's own passkeys can change its passkeys". The trusted keys approve action
-proposals and delete plans only. With no `approval` key, a kernel trusts only its own owner keys and does not serve `action_approve`, as
+proposals, delete plans and owner approval requests. With no `approval` key, a kernel trusts only its own owner keys and does not serve `action_approve`, as
 before.
 
 Then:
 
 - `GET /approve/plans` adds each linked kernel's waiting action proposals and delete plans. Each row carries `linkedHost`
   (the linked name) and a fresh `statement` that names the host that kernel's statements name (an action row also says
-  it in `host`). The answer adds `linkedHosts: [{ "name", "read" }]`; a kernel that does not answer (`read: false`) adds
-  no row. When a kernel has a delete plan waiting, the page reads that kernel's `tools/list` with its token, and when
+  it in `host`). The answer adds `linkedHosts: [{ "name", "read" }]`; a kernel whose plan list cannot be read
+  (`read: false`) adds no plan row. When a kernel has a delete plan waiting, the page reads that kernel's `tools/list` with its token, and when
   `approval_submit` is not on it, each of its delete rows carries `relayNote`: what to change, which the card shows.
 - `POST /approve/approve` with `"host": "<linked name>"` relays `{plan, approval}` to that kernel: an action id
   (`act-…`) to its `action_approve`, a delete plan's digest to its `approval_submit`. It answers what that kernel said:
@@ -4518,8 +4521,11 @@ Then:
   could not read keeps the wait it was listed with before.
 - A `host` the page does not list is refused 403 `{ "refusal": "NotLinked", "message": "this machine is not linked for
   approvals yet" }`. A linked kernel that refuses the token answers 502 `LinkToken`, with a message that says what to
-  change; one that does not answer, 502 `Unreachable`. Nothing is relayed in either case.
-- Every approval and decline from the page, of its own kernel's cards or a linked one's, writes one line to the page
+  change; one that does not answer, 502 `Unreachable`.
+- Pending [owner approval requests](#owner-approval-requests) from linked kernels are added to `approvalRequests` with
+  `linkedHost` and shown as **Request** cards. The request routes take the card's linked name in `host` and return the
+  same relay refusals. The linked kernel checks the proof and records the decision.
+- Every plan approval and decline from the page, of its own kernel's cards or a linked one's, writes one line to the page
   host's log: `arca: approval of <id> on <host>: approved`, `approved, then failed <code>` (the approval was accepted
   and spent, and the action then failed), `refused <code>`, `unreachable` or `declined`. The line never holds the
   statement, its nonce, the proof or a message.
@@ -4555,7 +4561,7 @@ The token is minted on gamma with scope `doctor`, limited to the verbs the page 
 
 ```sh
 arca token mint --scope doctor --id relay-alpha \
-  --tools arca_status,plan_list,action_approve,plan_decline,approval_submit,peer_keys_sync \
+  --tools arca_status,plan_list,action_approve,plan_decline,approval_submit,peer_keys_sync,owner_approval_list,owner_approval_begin,owner_approval_approve,owner_approval_deny \
   --out gamma-relay.secret --config /etc/arca/gamma.json
 ```
 
@@ -8396,6 +8402,15 @@ owner adds it again on the page. Approval is the owner's built-in passkey only. 
 whoever can open the passkey page at its address can decline a request there, as they can decline an action proposal,
 because declining only takes away. The page's request posts need the page's exact `Origin` and an `application/json` body.
 
+A kernel without a page of its own can show its pending requests on a page that links it through `approval.linkedHosts`.
+The page lists them with `owner_approval_list` and relays `/approve/requests/begin`, `/approve/requests/approve` and
+`/approve/requests/deny` to `owner_approval_begin`, `owner_approval_approve` and `owner_approval_deny`, respectively.
+The linked kernel mints the statement from its stored request using fresh nonce entropy and an issue time supplied by
+the page host. The nonce also binds the request id. Before opening the passkey prompt, the page host checks that the
+statement matches the displayed approval host, action, target and arguments, and the nonce and 15-minute window it
+requested. The linked kernel checks the proof against its trusted keys. The requester reads the approval string on the
+kernel that holds the request.
+
 `owner_approval_status` (with `waitMs` up to 30000 to wait for the decision) answers the state. The approval string goes
 to the token that asked, never to another token or to the page, and the assistant passes it to its call, which spends it
 once. With a device-bound passkey that counts its signatures (synced passkeys report 0), approvals must be spent in
@@ -8417,7 +8432,7 @@ signed outside a request, is refused and spends nothing. A second spend, another
 another action, or one past its 15 minutes is refused with `owner_approval`, and an `enroll` approval is refused by every
 other call. Each confirmation is a line in `approval-requests-audit.jsonl` (`owner_enroll_confirmed`, naming the request,
 the code, the args' digest and the token that asked, never the approval). The passkeys that can approve a request are
-this node's own and those of its `approval.peerKeys` sources; see "More than one page host".
+this node's own and those it trusts through `approval.peerKeys` or `approval.trustOwnerKeysFrom`.
 
 A pending request expires after 60 minutes. The requests live in `approval-requests.json` in the state directory (mode
 0600), which every request verb, the page's list and each page step reads and, when anything changed, rewrites whole (a
@@ -8427,12 +8442,13 @@ an unspent approval is kept while it is among the newest 50 of the last 24 hours
 Until the next read, a spent or expired string stays in the file, where it can no longer be spent. The rewrite does not
 scrub the disk blocks the older file used. Each request, approval and decline is saved first, then written as a line in
 `approval-requests-audit.jsonl` (append-only, never pruned) naming the request, its digest and the requester, never an
-approval string, a credential or a challenge.
+approval string, a credential or a challenge. A local approval-page decision is recorded as `page:owner`. An MCP
+decision, including one relayed by another kernel's page, records `mcp:<token id>` for the authenticated caller.
 
-**What is recorded, and no delivery.** There is no verb that delivers an approval into a request. The page's
-`POST /approve/requests/approve` is the one way a request becomes approved, and it takes the passkey's answer over the
-statement `begin` minted: an SSH signature or a whole approval string sent as `proof` is refused as `invalid`, and the
-request stays pending. An SSH approval goes to the call itself (`service_remove`, say), which spends it with no request.
+**What is recorded.** The request becomes approved when the kernel accepts a passkey's proof over its begun statement.
+The page submits that proof locally or relays it via `owner_approval_approve`. A request stays pending if sent an SSH
+signature or a whole approval string as `proof`. An SSH approval goes to the call itself (`service_remove`, say), which
+spends it with no request.
 The approval's audit line names the passkey and how it signed
 (`approved:<id>:arca:<action>:<target>:params=<digest>:requester=<token>:key=passkey:<fingerprint>:via=passkey:count=<n>:synced=<0|1>`).
 A spend, by either kind of key, with or without a request, is recorded as one line in `approval-nonces.jsonl` (its

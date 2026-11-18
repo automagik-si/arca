@@ -569,7 +569,8 @@ fn a_doctor_tools_list_shows_the_three_omni_tools_and_a_viewer_does_not() {
 }
 
 #[test]
-fn owner_approval_request_and_status_are_a_doctors_and_the_list_is_a_viewers_too() {
+fn owner_approval_listing_is_available_to_viewers_and_the_other_request_verbs_require_doctor_scope()
+{
     let fx = Fixture::start("list-owner-approval");
     let listed = |token: &str| -> Vec<String> {
         names_of(&fx.call(token, "tools/list", json!({})))
@@ -582,12 +583,18 @@ fn owner_approval_request_and_status_are_a_doctors_and_the_list_is_a_viewers_too
         "owner_approval_request",
         "owner_approval_status",
         "owner_approval_list",
+        "owner_approval_begin",
+        "owner_approval_approve",
+        "owner_approval_deny",
     ];
     assert_eq!(listed(&fx.doctor), all);
     assert_eq!(listed(&fx.operator), all);
     assert_eq!(listed(&fx.viewer), ["owner_approval_list"]);
-    // A viewer's request or status is refused before any handler runs: a status may carry an approval string.
-    for verb in ["owner_approval_request", "owner_approval_status"] {
+    // The door refuses each doctor-only request verb before any handler runs.
+    for verb in all
+        .into_iter()
+        .filter(|verb| *verb != "owner_approval_list")
+    {
         let reply = fx.tool_call(&fx.viewer, verb, json!({ "id": "ar_0123456789abcdef" }));
         assert_eq!(reply.status, 403, "{verb}");
     }

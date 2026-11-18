@@ -901,6 +901,10 @@ function requestCard(request, current = () => request) {
     facts.append(row);
   };
   const requester = request.requester || {};
+  if (request.linkedHost) fact("Machine", String(request.linkedHost), false);
+  if (request.linkedHost && request.host !== request.linkedHost) {
+    fact("Approval host", String(request.host), false);
+  }
   fact("Asked by", String(requester.name) + " (" + String(requester.kind) + ")", false);
   for (const [key, value] of Object.entries(args)) {
     fact(key, typeof value === "string" ? value : JSON.stringify(value), true);
@@ -909,7 +913,7 @@ function requestCard(request, current = () => request) {
   more.add("Fingerprint", String(fields.paramsDigest || ""), true);
 
   const buttons = el("div", "actions");
-  const approving = approveButton(title, (button) => approveRequest(current(), button));
+  const approving = approveButton(title, (button) => approveRequest(request, button));
   const denyButton = el("button", "btn btn-secondary", "Decline");
   denyButton.type = "button";
   denyButton.addEventListener("click", () => denyRequest(current(), denyButton));
@@ -934,6 +938,10 @@ async function requestPost(path, body) {
   return result;
 }
 
+function requestTarget(request) {
+  return request.linkedHost ? { id: request.id, host: request.linkedHost } : { id: request.id };
+}
+
 // One tap: Arca mints the statement for this request, the passkey signs it, and the approval is bound to the request id
 // and that statement.
 async function approveRequest(request, button) {
@@ -941,9 +949,11 @@ async function approveRequest(request, button) {
   busy++;
   status("Confirm with your passkey…", "wait");
   try {
-    const begun = await requestPost("/approve/requests/begin", { id: request.id });
+    const target = requestTarget(request);
+    const begin = request.linkedHost ? { ...target, card: request } : target;
+    const begun = await requestPost("/approve/requests/begin", begin);
     const proof = await trustedProof(begun.statement);
-    await requestPost("/approve/requests/approve", { id: request.id, statement: begun.statement, proof });
+    await requestPost("/approve/requests/approve", { ...target, statement: begun.statement, proof });
     status("Approved. Your assistant can go ahead now.", "ok");
     await loadPlans();
   } catch (error) {
@@ -959,7 +969,7 @@ async function denyRequest(request, button) {
   busy++;
   status("Declining…", "wait");
   try {
-    await requestPost("/approve/requests/deny", { id: request.id });
+    await requestPost("/approve/requests/deny", requestTarget(request));
     status("Declined. Nothing changed.", "ok");
     await loadPlans();
   } catch (error) {
@@ -1094,7 +1104,7 @@ async function loadPlans(quiet) {
     const listed = new Set(body.plans.map(cardKey));
     for (const key of [...cardNotes.keys()]) if (!listed.has(key)) cardNotes.delete(key);
     const keyOf = (item) => {
-      if (item[REQUEST]) return "request\n" + String(item.id);
+      if (item[REQUEST]) return "request\n" + cardKey(item);
       return item.kind === "peerKeys" ? "keys\n" + item.linkedHost : "plan\n" + cardKey(item);
     };
     const draw = (item, current) => {
