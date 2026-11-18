@@ -68,7 +68,7 @@ fn omni_node(key: Option<&common::SkKey>) -> Rig {
         rig.cfg.clone(),
         None,
         UpdateOptions {
-            probe: Arc::new(|_, _, _| true),
+            probe: Arc::new(|_, _, _, _, _| true),
             pace: Duration::from_millis(10),
         },
     )

@@ -6271,7 +6271,7 @@ fn service_update_params_base() -> Value {
                 "type": "boolean"
             },
             "timeoutSeconds": {
-                "description": "How many seconds the service's first port has to answer TCP after the start, 1 to 900. 120 when absent.",
+                "description": "How many seconds the service's health check has after the start, 1 to 900. 120 when absent.",
                 "maximum": 900,
                 "minimum": 1,
                 "type": "integer"

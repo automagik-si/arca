@@ -656,6 +656,7 @@ impl ServiceHandler {
             // The plain values. A secret's value joins them when it is set, as a reference to its file.
             environment: function.env.clone(),
             droidd_port: None,
+            health: None,
             root_size: None,
             port_isolation: false,
             limits: Some(definition.limits.clone()),

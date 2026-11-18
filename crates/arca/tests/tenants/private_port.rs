@@ -483,7 +483,7 @@ fn a_service_update_keeps_the_device_and_checks_the_service_through_the_private_
         rig.cfg.clone(),
         None,
         UpdateOptions {
-            probe: Arc::new(move |address, port, forwarded| {
+            probe: Arc::new(move |address, port, forwarded, _, _| {
                 log.lock()
                     .unwrap()
                     .push((address.to_string(), port, forwarded));
@@ -637,7 +637,7 @@ fn a_failed_health_check_names_the_private_port_it_probed_and_not_the_first_port
         rig.cfg.clone(),
         None,
         UpdateOptions {
-            probe: Arc::new(|_, _, _| false),
+            probe: Arc::new(|_, _, _, _, _| false),
             pace: Duration::from_millis(10),
         },
     )

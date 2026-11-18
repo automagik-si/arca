@@ -1204,10 +1204,10 @@ rebuilt: change `noNewPrivileges` in its template (`arca templates install`), th
 the service already runs. When the template and the service differ, that call checks the project as above, saves the
 record, writes `raw.lxc` into the instance and **restarts it if it runs, which interrupts it**. The setting takes effect
 at the next start, so a stopped service has it from then and is not restarted. The image and the data volume are not
-touched and nothing is rebuilt. After the restart the call runs the same health check as a digest update (the service's
-first port must answer, or the instance must stay running) and honours `timeoutSeconds`. If the write is refused, the
-restart fails or the service does not come back healthy, the old setting is put back in the record and in the instance's
-config, the service is restarted again, and the answer says so (`rolled_back` for the health check). The answer says
+touched and nothing is rebuilt. After the restart the call runs the same health check as a digest update and honours
+`timeoutSeconds`. If the write is refused, the restart fails or the service does not come back healthy, the old setting
+is put back in the record and in the instance's config. The service is restarted again, and the answer says so
+(`rolled_back` for the health check). The answer says
 `noNewPrivileges` and `restarted`. A proposal for it (`action_propose`) gets a card of its own: it says it turns
 no-new-privileges on or off, restarts the service, puts the old setting back if the service does not come back healthy,
 and erases nothing; it states no `eraseData`. A call, and a proposal, that also moves the digest are refused while the
@@ -1616,9 +1616,8 @@ others. Arca writes no such rule.
 
 `service_status` and `service_list` show `privatePort: { "address", "port" }`; `service_status` adds `ready`, true when
 the instance carries the device as Arca made it and the host still holds the address, and otherwise false with a
-`problem`. `service_update` leaves the device where it is and checks the service after the update through the private
-address (not the node's loopback, where the proxy does not listen). `service_remove` removes the instance with its
-device and the record, as for any service.
+`problem`. `service_update` leaves the device where it is and checks that port through the private address when it
+is the health check's target. `service_remove` removes the instance with its device and the record, as for any service.
 
 A worked example. Two nodes, joined by a private /24 on a dedicated interface; this node holds `198.51.100.7` on it and
 the other `198.51.100.8`. NATS on this node accepts leafnode connections on 7422, and only the other node dials it.
@@ -1989,15 +1988,29 @@ state directory (an append-only file of JSON lines: a `begin`, one line per step
    (`/var/lib/autopg/data`, `/data`, `/app/data`) from 0.23.0; a service made from them up to 0.22.0 keeps its data
    on its root disk and gets no volume by itself;
 3. it is started;
-4. the health check, within `timeoutSeconds` (1 to 900, 120 when absent). The node can reach a service's port only
-   through a proxy, since the firewall opens nothing else to it. A service with a host port (`lan`) is tried
-   through it, on the node's loopback: the connection must stay open. A service whose first port is its droidd port
-   is tried at its address. Any other service must only stay running for 10 seconds;
+4. the health check, within `timeoutSeconds` (1 to 900, 120 when absent). The installed template can name the port
+   and optionally an HTTP path. The answer says which check passed;
 5. the new digest is written into the service's record, so a restart keeps it and `service_status` names it.
 
+A container template can check TCP or HTTP.
+
+- `"health": { "port": 8080 }` checks that TCP port 8080 accepts a connection.
+- `"health": { "port": 8080, "httpPath": "/ready" }` sends an HTTP GET to that port and requires a 2xx response.
+  The path starts with `/`. The check uses plain HTTP and follows no redirects.
+
+The node tries the matching `lan` or `privatePort` proxy when there is one. Otherwise, it checks the service's
+address directly. At create and on update, a named port reached directly gets an ACL rule for TCP from the node's
+bridge address, like the droidd port. It adds no host listener. An image that starts but never answers the named check
+is rolled back, including any changes to the health rule.
+
+A template that omits `health` keeps the previous check. The node tries the `lan` or private proxy when present,
+or the droidd port when it is the first port. Other services with declared ports must stay running for 10 seconds
+or for `timeoutSeconds`, whichever is shorter. A successful running check says, for example, “kept running for 10 s”.
+
 A failure at any step puts the old version back: the snapshot is restored, or, with none, the root is rebuilt from
-the old digest; the old version is started if it was running before, given 30 seconds to answer, and the call is
-refused with code `rolled_back` and the failing step's words (and a note when the old version does not answer yet).
+the old digest; the old version is started if it was running before and given up to 30 seconds, bounded by
+`timeoutSeconds`, for its own health check. The call is refused with code `rolled_back` and the failing step's
+words (and a note when the old version fails its check).
 When Incus could not fetch the new image, the old root was never taken away: if it cannot fetch the old one either,
 the old version is started as it is, and the refusal says so. If Incus does not finish a rebuild in time, nothing is
 rolled back, so as not to rebuild twice at once: the refusal is `update_unsettled`, and the same update may be asked
