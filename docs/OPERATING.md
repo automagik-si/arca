@@ -6051,6 +6051,46 @@ digits>`, in lower case) and which `createSettings` does not list: a create neve
 that breaks this is refused, and so is `update` on a container template, whose version is its `digest`. The shipped
 `automagik-workspace` names `serverImage`.
 
+**A formula that updates the app (`appUpdate`).** A container template may carry `appUpdate`: how the app inside the
+service is updated, checked and asked its version. It is its own name, apart from `update` above. This release reads,
+checks and shows it; no verb runs it yet, and no shipped template has one. An OCI template (an image by digest) has a
+health check and a version reader, since its update is the move to another digest:
+
+```json
+"appUpdate": {
+  "health":  { "command": ["/usr/bin/curl", "--fail", "--silent", "http://localhost/ready"], "seconds": 300 },
+  "version": { "command": ["/usr/bin/cat", "/opt/app/version.txt"] }
+}
+```
+
+A `system` container template has the same two parts and `update`, the command that moves the app to a version:
+
+```json
+"update": { "command": ["/usr/local/sbin/app-update", "{version}"], "seconds": 3600 }
+```
+
+| Part | Kind | Meaning | `seconds` |
+|---|---|---|---|
+| `update` | `system`: required. `oci`: refused. | The command that moves the app to a version. | Required, 10 to 7200. |
+| `health` | both, required | Exit code 0 says the app is healthy. | 1 to 900, 120 when absent. |
+| `version` | both, required | Prints the app's version as the first line of its output. | 1 to 60, 15 when absent. |
+
+Each `command` is a list of 1 to 32 arguments, each 1 to 512 bytes of plain text (no control or hidden character),
+the first the absolute path of the program. It is never one line, and no shell reads it. `{version}` is the only
+placeholder: it stands exactly once, in one argument of `update.command` that is not the first, and never in `health`
+or `version`. The whole field is at most 8 KiB as compact JSON. A version a call names is 1 to 64 bytes, each an ASCII
+letter, a digit, or one of `.` `_` `+` `~` `:` `-`, the first a letter or a digit (so `5:27.0.3-1~ubuntu.24.04`
+passes, and `--force`, a space, a quote or `$(` do not); it replaces `{version}` inside its one argument, which stays
+one argument. What the named program does with its arguments is the template's: a formula that hands the version to
+`/bin/sh -c` or to `env` gives it that power, and Arca does not refuse such a template. A formula that needs more than
+one command names a script file inside the instance. `appUpdate` on a virtual-machine template, an `update` part on an
+OCI template, a missing part, or any limit broken makes the template refused, with the field named.
+
+`service_status` of a service whose installed template has a formula adds `"appUpdate": { "formula": "template" }`;
+every other service answers as before, and `service_list` does not change. An Arca older than this one refuses a
+template that has the field, as it refuses any key it does not know: install such a template only on a node that runs
+this release or a later one, and before going back to an older build, install that build's own templates.
+
 ### What every virtual machine carries
 
 Whatever its network, a virtual machine Arca creates has two things more than its root disk and its NIC:

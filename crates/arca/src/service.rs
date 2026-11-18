@@ -1744,6 +1744,11 @@ pub struct Template {
     /// The connector kind, such as tailscale or cloudflare. Absent for other services.
     #[serde(default)]
     pub connector: Option<String>,
+    /// The formula that updates the app inside the service ([`crate::app_formula::AppUpdate`]): `health` and `version`
+    /// on an OCI template, and `update` too on a system container template. No other kind sets it. Its own name, apart
+    /// from `update`, which is a virtual machine's pinned version.
+    #[serde(default)]
+    pub app_update: Option<crate::app_formula::AppUpdate>,
 }
 
 /// A service's connector kind, including a service made before its record carried the kind.
@@ -2132,6 +2137,11 @@ fn validate_template(template: &Template, dir: &Path) -> Result<(), TemplateErro
             "template {name}: kind is oci, system or virtual-machine"
         )));
     }
+    if let Some(formula) = &template.app_update
+        && let Err(why) = formula.check(&template.kind)
+    {
+        return Err(TemplateError::refused(format!("template {name}: {why}")));
+    }
     if template
         .root_size
         .as_deref()
@@ -2322,6 +2332,11 @@ fn validate_template(template: &Template, dir: &Path) -> Result<(), TemplateErro
 fn validate_vm_template(template: &Template) -> Result<(), TemplateError> {
     let name = &template.name;
     let refused = |why: &str| Err(TemplateError::refused(format!("template {name}: {why}")));
+    if template.app_update.is_some() {
+        return refused(
+            "appUpdate is only for an OCI or a system container template, never a virtual machine",
+        );
+    }
     if !template.limits.as_ref().is_some_and(|l| {
         l.cpu.as_deref().is_some_and(decimal) && l.memory.as_deref().is_some_and(size_ok)
     }) {
@@ -3050,6 +3065,18 @@ pub fn update_view(
     };
     let state = if now == pin { "same" } else { "differs" };
     Some(json!({ "pin": pin, "templatePin": now, "state": state }))
+}
+
+/// What `service_status` answers under `appUpdate`: that the service has a formula, and where it comes from. Only a
+/// formula of the installed template exists now, so `formula` is `template`. `None` for a service whose installed
+/// template has none, cannot be read, or is gone, for an adopted instance and for a virtual machine: their answer
+/// carries no such key. No command is run for it and nothing is read but the template's file.
+pub fn app_update_view(cfg: &ServiceConfig, template: Option<&Template>) -> Option<Value> {
+    if cfg.adopted || cfg.vm.is_some() {
+        return None;
+    }
+    template?.app_update.as_ref()?;
+    Some(json!({ "formula": "template" }))
 }
 
 /// The Incus source for a template: an OCI image by digest, a system image by alias or fingerprint.
