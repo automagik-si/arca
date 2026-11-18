@@ -292,14 +292,17 @@ fn redact_connector_links(text: &str) -> String {
         ))
         .expect("fixed connector login-link pattern")
     });
+    LINKS.replace_all(text, "[sign-in link]").into_owned()
+}
+
+fn clean_connector_strings(text: &str) -> String {
     static STRINGS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(
             r"(?:\x1b[PX^_]|[\x{90}\x{98}\x{9e}\x{9f}])[^\x1b\x18\x1a\r\n\x{85}\x{2028}\x{2029}\x{9c}]*(?:\x1b\\|\x{9c})|(?:\x1b\]|\x{9d})[^\x1b\x07\x18\x1a\r\n\x{85}\x{2028}\x{2029}\x{9c}]*(?:\x07|\x1b\\|\x{9c})"
         ).expect("fixed connector console-string pattern")
     });
-    let masked = LINKS.replace_all(text, "[sign-in link]");
     STRINGS
-        .replace_all(&masked, |found: &regex::Captures| {
+        .replace_all(text, |found: &regex::Captures| {
             if found[0].contains("[sign-in link]") {
                 "[sign-in link]"
             } else {
@@ -343,7 +346,11 @@ pub(crate) fn connector_log(text: &str, secrets: &[String]) -> (String, service:
             values.push(found["id"].replace('\r', ""));
         }
     }
-    let raw = redact_connector_links(&service::redact_blocks(text));
+    let masked = redact_connector_links(&service::redact_blocks(text));
+    let detection = redact_login_links(&clean_console(
+        &masked.replace("[sign-in link]", "\u{1b}[0m[sign-in link]"),
+    ));
+    let raw = clean_connector_strings(&masked);
     // Keep the fixed placeholder outside any unfinished terminal escape while rendering it.
     let raw = raw.replace("[sign-in link]", "\u{1b}[0m[sign-in link]");
     let answer = redact_login_links(&clean_console(&raw));
@@ -354,6 +361,7 @@ pub(crate) fn connector_log(text: &str, secrets: &[String]) -> (String, service:
     values.extend(
         URL_IDS
             .captures_iter(&answer)
+            .chain(URL_IDS.captures_iter(&detection))
             .map(|found| found[1].to_string()),
     );
     // values_to_hide keeps its existing 8-byte floor: short identifiers are hidden by shape, not as ordinary words.
@@ -462,6 +470,26 @@ mod tests {
             }
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn connector_privacy_three_position_samples() {
+        let id = "syntheticSweep1234";
+        let mut rows = 0;
+        for (intro, term) in [
+            ("\u{1b}]0;", "\u{7}"),
+            ("\u{1b}]8;;", "\u{1b}\\"),
+            ("\u{1b}P", "\u{1b}\\"),
+            ("\u{9d}", "\u{7}"),
+        ] {
+            let raw = format!("{intro}visit https://l{term};ogin.tailscale.com/a/{id} done\n");
+            let lines = rendered_connector_lines(&raw);
+            let longest = visible_identifier_piece(id, &lines.concat());
+            assert!(longest < 4, "longest={longest} answer={lines:?}");
+            assert_eq!(lines, [";ogin.tailscale.com/a/[secret] done"]);
+            rows += 1;
+        }
+        assert_eq!(rows, 4);
     }
 
     #[test]
