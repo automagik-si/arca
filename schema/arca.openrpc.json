@@ -10296,6 +10296,132 @@
       "x-arca-writes": false
     },
     {
+      "name": "owner_approval_begin",
+      "params": [
+        {
+          "name": "id",
+          "required": true,
+          "schema": {
+            "pattern": "^ar_[0-9a-f]{16}$",
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "additionalProperties": false,
+          "properties": {
+            "statement": {
+              "description": "The canonical JSON statement minted for the request.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "statement"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "Mint the statement for a pending owner approval request, for a linked approval page to sign with the owner's passkey. The statement belongs to this kernel and is valid for 15 minutes. Send the proof to owner_approval_approve within 120 seconds.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
+      "x-arca-scope": "doctor",
+      "x-arca-writes": true
+    },
+    {
+      "name": "owner_approval_approve",
+      "params": [
+        {
+          "name": "id",
+          "required": true,
+          "schema": {
+            "pattern": "^ar_[0-9a-f]{16}$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "proof",
+          "required": true,
+          "schema": {
+            "description": "The owner's WebAuthn passkey proof over the statement.",
+            "type": "object"
+          }
+        },
+        {
+          "name": "statement",
+          "required": true,
+          "schema": {
+            "description": "The canonical JSON statement minted for the request.",
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "additionalProperties": false,
+          "properties": {
+            "approvalExpiresAt": {
+              "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$",
+              "type": "string"
+            },
+            "state": {
+              "const": "approved",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state",
+            "approvalExpiresAt"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "Approve a pending owner approval request with a trusted passkey's proof over the statement minted by owner_approval_begin. The approval string is available only to the original requester through owner_approval_status.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
+      "x-arca-scope": "doctor",
+      "x-arca-writes": true
+    },
+    {
+      "name": "owner_approval_deny",
+      "params": [
+        {
+          "name": "id",
+          "required": true,
+          "schema": {
+            "pattern": "^ar_[0-9a-f]{16}$",
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "additionalProperties": false,
+          "properties": {
+            "state": {
+              "const": "denied",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "Decline a pending owner approval request. A decline does not require a passkey.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
+      "x-arca-scope": "doctor",
+      "x-arca-writes": true
+    },
+    {
       "name": "owner_approval_pending",
       "params": [],
       "result": {

@@ -273,12 +273,12 @@ pub struct ApprovalConfig {
     /// The page origins a passkey from those files may answer from. Required when `trustOwnerKeysFrom` names a file.
     #[serde(default)]
     pub origins: Vec<String>,
-    /// The kernels whose waiting proposals this kernel's approval page lists and relays approvals to: on this machine, or on
+    /// The kernels whose waiting cards this kernel's approval page lists and relays approvals to: on this machine, or on
     /// another machine whose MCP socket is forwarded to a path here.
     #[serde(default)]
     pub linked_hosts: Vec<LinkedHost>,
     /// The page hosts on other machines whose owner passkeys this kernel keeps in sync (`peer_keys_sync`) and trusts for
-    /// action approvals: one source as an object, or a list of sources. Absent, `peer_keys_sync` is not served and no peer
+    /// approvals: one source as an object, or a list of sources. Absent, `peer_keys_sync` is not served and no peer
     /// passkey is trusted.
     #[serde(default)]
     pub peer_keys: Option<PeerKeys>,
@@ -341,7 +341,7 @@ pub struct PeerKeysConfig {
 }
 
 /// One linked kernel: the name the canvas knows it by, its MCP unix socket, and the file holding the token this kernel relays
-/// with: the approval page (`plan_list`, `action_approve`, `plan_decline`) and the MCP door's calls that name it with
+/// with: the approval page and the MCP door's calls that name it with
 /// `node` (the reads and `action_propose`). Scope `doctor`, limited to the verbs relayed with it. `incusSocket`, when set,
 /// is that machine's Incus socket on this one (local, or forwarded to a path here): `instance_move_preflight` reads the
 /// linked host's facts through it, with GETs only.

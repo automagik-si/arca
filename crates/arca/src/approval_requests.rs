@@ -21,6 +21,8 @@
 //!   pending. The approval string goes to the token that asked, and to no other.
 //! - `owner_approval_list` (viewer scope, read-only, untrusted): the last 24 h of requests, every pending one first, then the
 //!   newest others, 50 in all; never an approval string.
+//! - `owner_approval_begin`, `owner_approval_approve` and `owner_approval_deny` (doctor scope): the linked page relays
+//!   the same steps over MCP. It uses its own passkeys for the prompt and the request's kernel decides.
 //!
 //! Page (see `crate::approve_page`): `begin` mints the statement the passkey signs (the request's fields, this kernel's host,
 //! a fresh nonce, issued now, valid 15 minutes) and keeps it on the request; `approve`, within 120 s of `begin`, takes the
@@ -599,18 +601,48 @@ impl ApprovalRequests {
         rp_id: &str,
         now: u64,
     ) -> Result<Value, PageRefusal> {
+        self.begin_for(kernel, id, Some(rp_id), now)
+    }
+
+    /// A local page asks for credentials for its relying party. A linked page needs only the statement because it
+    /// already has its credential list. Its proof is checked against this kernel's trusted passkeys on approval.
+    fn begin_for(
+        &self,
+        kernel: &Kernel,
+        id: &str,
+        rp_id: Option<&str>,
+        now: u64,
+    ) -> Result<Value, PageRefusal> {
         let mut inner = self.lock().map_err(|_| page_internal())?;
         self.sweep(&mut inner, kernel, now);
         let row = page_row(&inner.rows, id)?.clone();
         if row.state != RequestState::Pending {
             return Err(not_pending(&row));
         }
-        let lines = passkeys_for(kernel, rp_id)?;
+        let local = rp_id
+            .map(|rp_id| passkeys_for(kernel, rp_id).map(|lines| (rp_id, lines)))
+            .transpose()?;
         let nonce = crate::handlers::fresh_nonce().map_err(|_| page_internal())?;
         let statement =
             statement_of(&row, kernel.host(), &nonce, now).map_err(|_| page_internal())?;
-        let challenge =
-            challenge_for(ARCA_NAMESPACE, statement.as_bytes()).map_err(|_| page_internal())?;
+        let answer = if let Some((rp_id, lines)) = &local {
+            let challenge =
+                challenge_for(ARCA_NAMESPACE, statement.as_bytes()).map_err(|_| page_internal())?;
+            json!({
+                "id": row.id,
+                "namespace": ARCA_NAMESPACE,
+                "statement": statement,
+                "challenge": URL_SAFE_NO_PAD.encode(challenge),
+                "rpId": rp_id,
+                "allowCredentials": lines
+                    .iter()
+                    .map(|line| json!({ "id": URL_SAFE_NO_PAD.encode(&line.credential_id) }))
+                    .collect::<Vec<_>>(),
+                "timeoutMs": BEGUN_MAX_MS,
+            })
+        } else {
+            json!({ "statement": statement })
+        };
         let stored = inner
             .rows
             .iter_mut()
@@ -621,25 +653,16 @@ impl ApprovalRequests {
         stored.version += 1;
         self.persist(&inner).map_err(|_| page_internal())?;
         self.changed.notify_all();
+        let credentials = local.map_or_else(String::new, |(rp_id, lines)| {
+            format!(", {} passkey(s) for {rp_id}", lines.len())
+        });
         (self.log)(&format!(
-            "arca: approval request {} begun ({}): nonce {}…, {} passkey(s) for {rp_id}",
+            "arca: approval request {} begun ({}): nonce {}…{credentials}",
             row.id,
             row.subject_line(),
-            &nonce[..8],
-            lines.len()
+            &nonce[..8]
         ));
-        Ok(json!({
-            "id": row.id,
-            "namespace": ARCA_NAMESPACE,
-            "statement": statement,
-            "challenge": URL_SAFE_NO_PAD.encode(challenge),
-            "rpId": rp_id,
-            "allowCredentials": lines
-                .iter()
-                .map(|line| json!({ "id": URL_SAFE_NO_PAD.encode(&line.credential_id) }))
-                .collect::<Vec<_>>(),
-            "timeoutMs": BEGUN_MAX_MS,
-        }))
+        Ok(answer)
     }
 
     /// The page's `approve`: request `id` approved with the passkey's `proof` over `statement`, the statement `begin` minted
@@ -1461,8 +1484,7 @@ pub struct ApprovalRequestHandler {
 
 impl arca_mcp::ToolHandler for ApprovalRequestHandler {
     fn call(&self, args: Value, caller: &Caller) -> Result<Value, CallError> {
-        // The door holds a viewer token to its verbs already; a request or a status (which may carry an approval string) is
-        // never a viewer's, whatever door it came through.
+        // Listing is the only request verb available to viewers.
         if self.verb != "owner_approval_list" && caller.scope < arca_api::Scope::Doctor {
             return Err(CallError::Forbidden {
                 verb: self.verb.to_string(),
@@ -1500,6 +1522,28 @@ impl arca_mcp::ToolHandler for ApprovalRequestHandler {
                 let requests = self.requests.list(&kernel, (self.clock)())?;
                 Ok(json!({ "requests": requests }))
             }
+            "owner_approval_begin" | "owner_approval_approve" | "owner_approval_deny" => {
+                let id = args
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| invalid("id: expected a string"))?;
+                let kernel = self.kernel.lock().map_err(|_| internal())?;
+                let now = (self.clock)();
+                match self.verb {
+                    "owner_approval_begin" => self.requests.begin_for(&kernel, id, None, now),
+                    "owner_approval_deny" => self.requests.deny(&kernel, id, now),
+                    _ => {
+                        let (Some(statement), Some(proof)) = (
+                            args.get("statement").and_then(Value::as_str),
+                            args.get("proof"),
+                        ) else {
+                            return Err(invalid("the arguments are {id, statement, proof}"));
+                        };
+                        self.requests.approve(&kernel, id, statement, proof, now)
+                    }
+                }
+                .map_err(|why| refused(why.code, why.message))
+            }
             _ => Err(CallError::NotFound),
         }
     }
@@ -1515,6 +1559,9 @@ pub fn handlers(
         "owner_approval_request",
         "owner_approval_status",
         "owner_approval_list",
+        "owner_approval_begin",
+        "owner_approval_approve",
+        "owner_approval_deny",
         "enroll_confirm",
     ]
     .into_iter()

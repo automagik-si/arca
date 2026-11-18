@@ -4169,6 +4169,22 @@ fn the_request_card_keeps_its_enroll_sentence_and_its_large_code_element() {
 }
 
 #[test]
+fn the_request_card_displays_its_linked_host_and_sends_it_on_every_step() {
+    let html = include_str!("../src/approve_page.html");
+    for wiring in [
+        r#"if (request.linkedHost) fact("Machine", String(request.linkedHost), false);"#,
+        r#"return request.linkedHost ? { id: request.id, host: request.linkedHost } : { id: request.id };"#,
+        r#"const target = requestTarget(request);"#,
+        r#"requestPost("/approve/requests/begin", target)"#,
+        r#"requestPost("/approve/requests/approve", { ...target, statement: begun.statement, proof })"#,
+        r#"requestPost("/approve/requests/deny", requestTarget(request))"#,
+        r#"if (item[REQUEST]) return "request\n" + cardKey(item);"#,
+    ] {
+        assert!(html.contains(wiring), "{wiring}");
+    }
+}
+
+#[test]
 fn every_inline_page_carries_the_open_intelligence_tag_once_as_a_picture_and_never_a_link() {
     // The footer cut exactly as `assets/open-intelligence/render.mjs` draws it from the we unfold Badge component.
     let tag =
@@ -4903,7 +4919,7 @@ fn g7_a_kind_arca_request_is_approved_by_one_tap_on_the_page_and_kind_upgrade_is
 #[test]
 fn g7_the_approve_route_takes_what_a_delivery_would_and_refuses_another_target_another_host_and_an_ssh_signature()
  {
-    // Arca has no verb that delivers an approval into a request: `POST /approve/requests/approve` is the one way in.
+    // A request takes a proof over its begun statement. It cannot accept a completed approval string.
     let (rig, key) = Rig::new("page-g7-deliver", true);
     let read = Arc::clone(&rig.clock);
     let clock: Clock = Arc::new(move || read.load(Ordering::SeqCst));

@@ -112,8 +112,8 @@ pub const NODE: &str = "node";
 /// the tool's own `outputSchema`.
 pub const LINKED_NODE: &str = "linkedNode";
 
-/// The verbs that take [`NODE`]: every read the MCP door serves, and `action_propose`. Not the three `owner_approval_*`
-/// reads: their rows are the calling token's own requests, and a relayed call is the linked token's, never the caller's.
+/// The verbs that take [`NODE`]: the MCP door's linked reads and `action_propose`. The `owner_approval_*` verbs address
+/// the kernel that owns the requests. The approval page calls that kernel directly with its relay token.
 /// Not the `support_*` verbs either: a report is filed, read and picked up on the node it is filed with.
 pub const NODE_VERBS: [&str; 31] = [
     "arca_status",
@@ -172,7 +172,7 @@ macro_rules! on_node {
     }};
 }
 
-static VERBS: [Verb; 100] = [
+static VERBS: [Verb; 103] = [
     Verb {
         name: "arca_status",
         summary: "Node status: the API version, the node id, the mode, the uptime, whether Incus answers and the last applied sequence number.",
@@ -821,6 +821,51 @@ static VERBS: [Verb; 100] = [
         cut: no_cut,
         params: owner_approval_list_params,
         result: owner_approval_list_result,
+        target: Target::Node,
+    },
+    Verb {
+        name: "owner_approval_begin",
+        summary: "Mint the statement for a pending owner approval request, for a linked approval page to sign with the owner's passkey. The statement belongs to this kernel and is valid for 15 minutes. Send the proof to owner_approval_approve within 120 seconds.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: |_| "The owner approval statement is ready to sign.".to_string(),
+        cut: no_cut,
+        params: owner_approval_id_params,
+        result: owner_approval_begin_result,
+        target: Target::Node,
+    },
+    Verb {
+        name: "owner_approval_approve",
+        summary: "Approve a pending owner approval request with a trusted passkey's proof over the statement minted by owner_approval_begin. The approval string is available only to the original requester through owner_approval_status.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: |_| "The owner approval request was approved.".to_string(),
+        cut: no_cut,
+        params: owner_approval_approve_params,
+        result: owner_approval_approve_result,
+        target: Target::Node,
+    },
+    Verb {
+        name: "owner_approval_deny",
+        summary: "Decline a pending owner approval request. A decline does not require a passkey.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: |_| "The owner approval request was declined.".to_string(),
+        cut: no_cut,
+        params: owner_approval_id_params,
+        result: owner_approval_deny_result,
         target: Target::Node,
     },
     Verb {
@@ -7107,6 +7152,49 @@ fn owner_approval_list_result() -> Value {
         "required": ["requests"],
         "type": "object"
     })
+}
+
+fn owner_approval_id_params() -> Value {
+    params(vec![("id", true, owner_schema(REQUEST_ID))])
+}
+
+fn owner_approval_statement() -> Value {
+    json!({ "type": "string", "description": "The canonical JSON statement minted for the request." })
+}
+
+fn owner_approval_begin_result() -> Value {
+    params(vec![("statement", true, owner_approval_statement())])
+}
+
+fn owner_approval_approve_params() -> Value {
+    params(vec![
+        ("id", true, owner_schema(REQUEST_ID)),
+        ("statement", true, owner_approval_statement()),
+        (
+            "proof",
+            true,
+            json!({ "type": "object", "description": "The owner's WebAuthn passkey proof over the statement." }),
+        ),
+    ])
+}
+
+fn owner_approval_approve_result() -> Value {
+    params(vec![
+        (
+            "state",
+            true,
+            json!({ "type": "string", "const": "approved" }),
+        ),
+        ("approvalExpiresAt", true, owner_schema(ISO_TIME)),
+    ])
+}
+
+fn owner_approval_deny_result() -> Value {
+    params(vec![(
+        "state",
+        true,
+        json!({ "type": "string", "const": "denied" }),
+    )])
 }
 
 fn owner_approval_pending_params() -> Value {

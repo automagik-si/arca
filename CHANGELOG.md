@@ -4,6 +4,10 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 
 ## Unreleased
 
+The approval page now shows pending owner approval requests from linked kernels, including service claim codes, and
+relays passkey approvals and declines. The linked kernel decides the request, and only the requesting token can read
+the approval string there. See OPERATING.md for the relay token's tool list.
+
 ## 0.37.0 (2026-11-18)
 
 A container template may carry `appUpdate`, a formula for updating the app inside its service: a `health` command and
