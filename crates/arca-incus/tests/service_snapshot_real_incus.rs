@@ -59,11 +59,8 @@ impl Proof {
 
     fn power(&self, action: StateAction) {
         let seen = self.seen();
-        let already = match action {
-            StateAction::Stop => seen.is_stopped(),
-            _ => seen.is_running(),
-        };
-        if !already {
+        let stop = matches!(action, StateAction::Stop);
+        if !(stop && seen.is_stopped() || !stop && seen.is_running()) {
             self.changer
                 .change(&seen, action)
                 .expect("the state change");
@@ -71,24 +68,22 @@ impl Proof {
     }
 
     fn sh(&self, script: &str) -> String {
+        let args = [
+            "exec",
+            "--project",
+            PROJECT,
+            &self.instance,
+            "--",
+            "sh",
+            "-c",
+            script,
+        ];
         let out = Command::new("incus")
-            .args([
-                "exec",
-                "--project",
-                PROJECT,
-                &self.instance,
-                "--",
-                "sh",
-                "-c",
-                script,
-            ])
+            .args(args)
             .output()
             .expect("incus exec");
-        assert!(
-            out.status.success(),
-            "{script}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{script}: {err}");
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
@@ -141,19 +136,15 @@ impl Proof {
 
     fn driver(&self) -> String {
         let read = UnixIncus::new(self.socket.clone().into());
-        let instance = read
-            .get(&format!(
-                "/1.0/instances/{}?project={PROJECT}",
-                self.instance
-            ))
-            .expect("the instance");
+        let get = |path: String| read.get(&path).expect("a read");
+        let instance = get(format!(
+            "/1.0/instances/{}?project={PROJECT}",
+            self.instance
+        ));
         let pool = instance["expanded_devices"]["root"]["pool"]
             .as_str()
-            .unwrap_or("")
-            .to_string();
-        let pool = read
-            .get(&format!("/1.0/storage-pools/{pool}"))
-            .expect("the pool");
+            .unwrap_or("");
+        let pool = get(format!("/1.0/storage-pools/{pool}"));
         pool["driver"].as_str().unwrap_or("").to_string()
     }
 }

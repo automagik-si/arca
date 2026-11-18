@@ -488,8 +488,9 @@ impl StateChanger {
     }
 
     /// Puts the parts `parts` of the stopped service instance `seen` back to their snapshot `snapshot`: the instance first
-    /// when it is named, then each volume in the order given. Every check is made before the first write. A restore
-    /// cannot be undone, so a failure names the part and the parts already restored, and nothing is put back.
+    /// when it is named, then each volume in the order given. Every check is made before the first write, that each part
+    /// holds the snapshot among them. A restore cannot be undone, so a failure names the part and the parts already
+    /// restored, and nothing is put back.
     pub fn restore_with_volumes(
         &self,
         seen: &InstanceState,
@@ -511,6 +512,11 @@ impl StateChanger {
                 self.mounted_volume(&fresh, &metadata, pool, volume)
                     .map_err(early(part.clone()))?;
             }
+            // Each part must hold the snapshot, so a missing one is refused before anything is restored.
+            let url = snapshot_url(&fresh, part, snapshot).map_err(early(part.clone()))?;
+            self.send("GET", &url, None)
+                .and_then(checked_envelope)
+                .map_err(early(part.clone()))?;
         }
         let mut ordered: Vec<SnapshotPart> = parts.to_vec();
         ordered.sort_by_key(|part| !matches!(part, SnapshotPart::Instance));
@@ -648,24 +654,10 @@ impl StateChanger {
         part: &SnapshotPart,
         snapshot: &str,
     ) -> Result<(), IncusError> {
-        let project = &fresh.project;
-        let url = match part {
-            SnapshotPart::Instance => {
-                object_url(project, &fresh.name)?;
-                format!(
-                    "/1.0/instances/{}/snapshots/{snapshot}?project={project}",
-                    fresh.name
-                )
-            }
-            SnapshotPart::Volume { pool, volume } => format!(
-                "{}/snapshots/{snapshot}?project={project}",
-                volume_path(project, pool, volume)?
-            ),
-        };
+        let url = snapshot_url(fresh, part, snapshot)?;
         let envelope = checked_envelope(self.send("DELETE", &url, None)?)?;
         self.wait_for(&envelope)
     }
-
     /// Gives one stopped instance the root of another image, an OCI image by digest on a registry: Incus rebuilds the
     /// root disk and keeps the config, the devices (a data volume among them) and the uuid. `source` must be exactly
     /// the five fields of such an image. A registry that asks for a credential is named with it, in the address that is
@@ -1135,6 +1127,28 @@ fn named(snapshot: &str) -> Result<(), IncusError> {
     } else {
         Err(refused("the snapshot name is not plain"))
     }
+}
+
+/// The path of one part's snapshot, with its project.
+fn snapshot_url(
+    fresh: &InstanceState,
+    part: &SnapshotPart,
+    snapshot: &str,
+) -> Result<String, IncusError> {
+    let project = &fresh.project;
+    Ok(match part {
+        SnapshotPart::Instance => {
+            object_url(project, &fresh.name)?;
+            format!(
+                "/1.0/instances/{}/snapshots/{snapshot}?project={project}",
+                fresh.name
+            )
+        }
+        SnapshotPart::Volume { pool, volume } => format!(
+            "{}/snapshots/{snapshot}?project={project}",
+            volume_path(project, pool, volume)?
+        ),
+    })
 }
 
 /// The path of one custom volume, without its query.

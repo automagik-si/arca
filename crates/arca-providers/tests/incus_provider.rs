@@ -4787,6 +4787,30 @@ fn either_owner_of_the_service_project_may_let_it_hold_snapshots_and_no_other_en
             );
         }
     }
+    // Every other guarded restriction Incus has, by either owner, at a create and by a patch. The keys other rules
+    // admit for these owners (the proxy and NIC allowances, the bridge grant) are left to their own tests.
+    let others = "backups cluster.groups cluster.target containers.interception containers.lowlevel \
+        containers.nesting containers.privilege devices.disk devices.disk.paths devices.gpu devices.infiniband \
+        devices.pci devices.unix-block devices.unix-char devices.unix-hotplug devices.usb idmap.gid idmap.uid \
+        networks.integrations networks.subnets networks.uplinks networks.zones virtual-machines.lowlevel";
+    for owner in [net, br] {
+        for key in others
+            .split_whitespace()
+            .map(|key| format!("restricted.{key}"))
+        {
+            let key = key.as_str();
+            let op = patch(project(svc), &[(key, Some("allow"))]);
+            let patched = provider.plan(&entry(owner), &op);
+            let config = json!({"config":{ key: "allow" }});
+            let op = create(IncusKind::Project, svc, None, svc, config);
+            for planned in [patched, provider.plan(&entry(owner), &op)] {
+                assert!(
+                    matches!(planned, Err(EffectRefusal::Provider(_))),
+                    "{owner}: {key}"
+                );
+            }
+        }
+    }
     assert!(fake.requests().is_empty(), "refused before any request");
 
     // Each owner sets it, on its project's create or by a patch of it, and the project then holds it.

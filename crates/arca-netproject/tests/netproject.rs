@@ -469,12 +469,17 @@ fn an_owner_entry_an_earlier_kernel_wrote_reads_and_writes_back_byte_for_byte() 
     let parsed: BridgedProjectConfig = serde_json::from_str(set).unwrap();
     assert!(parsed.snapshots);
     assert_eq!(serde_json::to_string(&parsed).unwrap(), set);
+    let set = r#"{"project":"arcak-svc","bridge":"arcak-svcbr","cidr":"192.0.2.0/24","virtualMachines":0,"snapshots":true}"#;
+    let parsed: NetProjectConfig = serde_json::from_str(set).unwrap();
+    assert!(parsed.snapshots);
+    assert_eq!(serde_json::to_string(&parsed).unwrap(), set);
 }
 
 #[test]
 fn each_owner_lets_its_project_hold_snapshots_once_its_entry_has_the_step() {
     let dir =
         std::env::temp_dir().join(format!("arca-netproject-snapshots-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir(&dir).unwrap();
     let start = |tag: &str| {
         let dir = dir.join(tag);
@@ -601,4 +606,5 @@ fn each_owner_lets_its_project_hold_snapshots_once_its_entry_has_the_step() {
             "written once, when it was missing"
         );
     }
+    std::fs::remove_dir_all(&dir).unwrap();
 }

@@ -154,6 +154,12 @@ impl Rig {
     }
 }
 
+impl Drop for Rig {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self._dir);
+    }
+}
+
 fn volume(name: &str) -> SnapshotPart {
     SnapshotPart::Volume {
         pool: "pool1".into(),
@@ -247,49 +253,49 @@ fn a_disk_that_is_no_custom_volume_is_named_as_not_taken() {
 #[test]
 fn a_restore_puts_back_the_parts_it_names_and_only_those() {
     let rig = Rig::new(true);
-    let seen = rig.seen(PROJECT, "cold");
-    rig.changer
-        .snapshot_with_volumes(&seen, "pre-app-update-1")
+    let (c, seen) = (&rig.changer, rig.seen(PROJECT, "cold"));
+    c.snapshot_with_volumes(&seen, "pre-app-update-1")
         .expect("taken");
+    let instance_put = format!("PUT /1.0/instances/cold?project={PROJECT}");
+    let volume_put =
+        format!("PUT /1.0/storage-pools/pool1/volumes/custom/cold-data?project={PROJECT}");
+    let counts = || {
+        let volumes = rig.fake.volume_restores(PROJECT, "pool1", "cold-data");
+        (rig.fake.restores(PROJECT, "cold").len(), volumes.len())
+    };
+    // Both, named volume first: the instance is restored first. Then a strict subset, the volume alone and the
+    // instance alone, each by its one PUT and no other.
+    let cases = [
+        (
+            vec![volume("cold-data"), SnapshotPart::Instance],
+            vec![instance_put.clone(), volume_put.clone()],
+            (1, 1),
+        ),
+        (vec![volume("cold-data")], vec![volume_put.clone()], (1, 2)),
+        (vec![SnapshotPart::Instance], vec![instance_put], (2, 2)),
+    ];
+    for (parts, puts, after) in cases {
+        let before = rig.fake.writes().len();
+        let done = c.restore_with_volumes(&seen, "pre-app-update-1", &parts);
+        // The instance first, then each volume in the order given.
+        let mut wanted = parts.clone();
+        wanted.sort_by_key(|part| *part != SnapshotPart::Instance);
+        let got = (done.expect("restored"), rig.writes()[before..].to_vec());
+        assert_eq!((got, counts()), ((wanted, puts), after));
+    }
+    assert_eq!(rig.fake.restores(PROJECT, "cold")[0], "pre-app-update-1");
+    c.restore_volume(&seen, "pool1", "cold-data", "pre-app-update-1")
+        .expect("the volume by its own write");
+    assert_eq!(counts(), (2, 3));
+
+    // A part that holds no snapshot of that name is refused before anything is restored.
     let before = rig.fake.writes().len();
-
-    let done = rig
-        .changer
-        .restore_with_volumes(
-            &seen,
-            "pre-app-update-1",
-            &[volume("cold-data"), SnapshotPart::Instance],
-        )
-        .expect("restored");
-    assert_eq!(
-        done,
-        vec![SnapshotPart::Instance, volume("cold-data")],
-        "the instance first"
-    );
-    assert_eq!(
-        rig.writes()[before..],
-        [
-            format!("PUT /1.0/instances/cold?project={PROJECT}"),
-            format!("PUT /1.0/storage-pools/pool1/volumes/custom/cold-data?project={PROJECT}"),
-        ]
-    );
-    assert_eq!(rig.fake.restores(PROJECT, "cold"), ["pre-app-update-1"]);
-    assert_eq!(
-        rig.fake.volume_restores(PROJECT, "pool1", "cold-data"),
-        ["pre-app-update-1"]
-    );
-
-    // The volume alone: the instance is not restored again.
-    rig.changer
-        .restore_volume(&seen, "pool1", "cold-data", "pre-app-update-1")
-        .expect("the volume alone");
-    assert_eq!(rig.fake.restores(PROJECT, "cold").len(), 1);
-    assert_eq!(
-        rig.fake
-            .volume_restores(PROJECT, "pool1", "cold-data")
-            .len(),
-        2
-    );
+    let both = [SnapshotPart::Instance, volume("cold-data")];
+    let missing = c
+        .restore_with_volumes(&seen, "pre-app-update-9", &both)
+        .expect_err("none");
+    assert_eq!(missing.part, SnapshotPart::Instance);
+    assert_eq!(rig.fake.writes().len(), before);
     assert!(rig.fake.state_actions(PROJECT, "cold").is_empty());
 }
 
