@@ -29,8 +29,8 @@ hint, instead of `not_found`.
 Connector logs hide more sign-in identifiers and link remnants. Terminal titles and hyperlink targets are cleaned
 while preserving ordinary lines and the output of other services.
 
-Connector logs also hide short sign-in identifiers by their login link's host and path. Masking may hide an adjacent
-word when terminal formatting intervenes.
+Connector logs also hide short sign-in identifiers by their login link's host and path. Masking may hide a matching
+word elsewhere in the log when terminal formatting intervenes.
 
 Database approval cards on nodes with a configured image show requested private destinations, kernel access and
 private ports in plain words, and say that they are not used because this node makes its database from its configured

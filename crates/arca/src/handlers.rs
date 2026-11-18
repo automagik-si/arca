@@ -8710,6 +8710,11 @@ impl ServiceHandler {
                 // A PEM block is hidden whole before the log is cut into lines: cut first, its lines are no longer
                 // one block. Each line is then cleaned and hidden again, a secret of several lines line by line.
                 let connector = crate::reach::kind(&self.cfg, &config).is_some();
+                let identifiers = if connector {
+                    crate::reach::connector_log_identifiers(&text)
+                } else {
+                    Vec::new()
+                };
                 let (text, hidden) = if connector {
                     crate::reach::connector_log(&text, &secrets)
                 } else {
@@ -8727,7 +8732,8 @@ impl ServiceHandler {
                     if !clean.is_empty() {
                         let hidden = crate::service::redact_hidden(&clean, &hidden);
                         lines_out.push(json!(if connector {
-                            crate::reach::finish_connector_log(&hidden)
+                            let finished = crate::reach::finish_connector_log(&hidden);
+                            crate::reach::redact_connector_identifiers(&finished, &identifiers)
                         } else {
                             hidden
                         }));

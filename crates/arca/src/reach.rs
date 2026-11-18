@@ -350,11 +350,7 @@ pub(crate) fn connector_log(text: &str, secrets: &[String]) -> (String, service:
             values.push(found["id"].replace('\r', ""));
         }
     }
-    let masked = redact_connector_links(&service::redact_blocks(text));
-    let detection = redact_login_links(&clean_console(
-        &masked.replace("[sign-in link]", "\u{1b}[0m[sign-in link]"),
-    ));
-    let (raw, dropped) = clean_connector_strings(&masked);
+    let raw = clean_connector_strings(&redact_connector_links(&service::redact_blocks(text))).0;
     // Keep the fixed placeholder outside any unfinished terminal escape while rendering it.
     let raw = raw.replace("[sign-in link]", "\u{1b}[0m[sign-in link]");
     let answer = redact_login_links(&clean_console(&raw));
@@ -362,50 +358,46 @@ pub(crate) fn connector_log(text: &str, secrets: &[String]) -> (String, service:
         regex::Regex::new(r"//[^\s/]*\.[^\s/]*/a/([A-Za-z0-9_-]{8,})")
             .expect("fixed URL-identifier pattern")
     });
-    let dropped = redact_login_links(&clean_console(&dropped));
-    let dropped_links: std::collections::HashSet<_> = URL_IDS
-        .find_iter(&dropped)
-        .map(|found| found.as_str())
-        .collect();
     values.extend(
         URL_IDS
             .captures_iter(&answer)
             .map(|found| found[1].to_string()),
     );
-    let detected: Vec<_> = URL_IDS
-        .captures_iter(&detection)
-        .filter(|found| !dropped_links.contains(&found[0]))
-        .map(|found| found[1].to_string())
-        .collect();
-    let additional: Vec<_> = detected
-        .iter()
-        .filter(|value| {
-            values.contains(value)
-                || !values
-                    .iter()
-                    .chain(&detected)
-                    .any(|other| overlapping_values_in_answer(value, other, &answer))
-        })
-        .cloned()
-        .collect();
-    values.extend(additional);
     // values_to_hide keeps its existing 8-byte floor: short identifiers are hidden by shape, not as ordinary words.
     (answer, service::values_to_hide(&values))
 }
 
-fn overlapping_values_in_answer(left: &str, right: &str, answer: &str) -> bool {
-    if left.contains(right) || right.contains(left) {
-        return false;
-    }
-    (1..left.len().min(right.len())).any(|len| {
-        (left.as_bytes()[left.len() - len..] == right.as_bytes()[..len]
-            && right
-                .get(len..)
-                .is_some_and(|tail| answer.contains(format!("{left}{tail}").as_str())))
-            || (right.as_bytes()[right.len() - len..] == left.as_bytes()[..len]
-                && left
-                    .get(len..)
-                    .is_some_and(|tail| answer.contains(format!("{right}{tail}").as_str())))
+/// Find additional identifiers without changing the ordinary renderer's hidden values.
+pub(crate) fn connector_log_identifiers(text: &str) -> Vec<String> {
+    let masked = redact_connector_links(&service::redact_blocks(text));
+    let detection = redact_login_links(&clean_console(
+        &masked.replace("[sign-in link]", "\u{1b}[0m[sign-in link]"),
+    ));
+    let (_, dropped) = clean_connector_strings(&masked);
+    let dropped = redact_login_links(&clean_console(&dropped));
+    static URL_IDS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"//[^\s/]*\.[^\s/]*/a/([A-Za-z0-9_-]{8,})")
+            .expect("fixed URL-identifier pattern")
+    });
+    let dropped_links: std::collections::HashSet<_> = URL_IDS
+        .find_iter(&dropped)
+        .map(|found| found.as_str())
+        .collect();
+    let mut identifiers: Vec<_> = URL_IDS
+        .captures_iter(&detection)
+        .filter(|found| !dropped_links.contains(&found[0]))
+        .map(|found| found[1].to_string())
+        .collect();
+    identifiers.sort_unstable();
+    identifiers.dedup();
+    identifiers.sort_by_key(|value| std::cmp::Reverse(value.len()));
+    identifiers
+}
+
+/// Apply additional identifier masking only after the ordinary connector line is finished.
+pub(crate) fn redact_connector_identifiers(text: &str, identifiers: &[String]) -> String {
+    identifiers.iter().fold(text.to_string(), |line, value| {
+        line.replace(value.as_str(), "[secret]")
     })
 }
 
@@ -439,12 +431,16 @@ mod tests {
     }
 
     fn rendered_connector_lines(raw: &str) -> Vec<String> {
+        let identifiers = connector_log_identifiers(raw);
         let (text, hidden) = connector_log(raw, &[]);
         text.split(['\n', '\r'])
             .filter(|line| !line.trim().is_empty())
             .map(service::clean_log)
             .filter(|line| !line.is_empty())
-            .map(|line| finish_connector_log(&service::redact_hidden(&line, &hidden)))
+            .map(|line| {
+                let finished = finish_connector_log(&service::redact_hidden(&line, &hidden));
+                redact_connector_identifiers(&finished, &identifiers)
+            })
             .collect()
     }
 
@@ -598,6 +594,127 @@ mod tests {
             lines,
             ["[sign-in link]", ";ogin.tailscale.com/a/[secret] done"]
         );
+    }
+
+    fn baseline_connector_log(text: &str, secrets: &[String]) -> (String, service::Hidden) {
+        let shown = clean_console(&service::redact_blocks(text));
+        let without_controls: String = text.chars().filter(|ch| !ch.is_control()).collect();
+        static INTRODUCERS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+            regex::Regex::new(r"\x1b(?:[\[\]][0-?]*)?").expect("fixed terminal-introducer pattern")
+        });
+        // A detection-only projection: discard introducers and parameters without consuming a following letter.
+        let without_introducers = INTRODUCERS.replace_all(text, "");
+        let mut values = secrets.to_vec();
+        for view in [
+            text,
+            &shown,
+            &without_controls,
+            without_introducers.as_ref(),
+        ] {
+            for found in login_links().captures_iter(view) {
+                values.push(found["id"].replace('\r', ""));
+            }
+        }
+        let raw = clean_connector_strings(&redact_connector_links(&service::redact_blocks(text))).0;
+        // Keep the fixed placeholder outside any unfinished terminal escape while rendering it.
+        let raw = raw.replace("[sign-in link]", "\u{1b}[0m[sign-in link]");
+        let answer = redact_login_links(&clean_console(&raw));
+        static URL_IDS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+            regex::Regex::new(r"//[^\s/]*\.[^\s/]*/a/([A-Za-z0-9_-]{8,})")
+                .expect("fixed URL-identifier pattern")
+        });
+        values.extend(
+            URL_IDS
+                .captures_iter(&answer)
+                .map(|found| found[1].to_string()),
+        );
+        // values_to_hide keeps its existing 8-byte floor: short identifiers are hidden by shape, not as ordinary words.
+        (answer, service::values_to_hide(&values))
+    }
+
+    #[test]
+    fn connector_privacy_last_pass_preserves_hidden_positions() {
+        // The ordinary renderer must still give the baseline text and finished lines.
+        // Every character of an existing hiding marker must survive the last pass;
+        // additional masking may replace visible text but cannot uncover hidden positions.
+        let id = "syntheticSweep1234";
+        let line = format!("visit https://login.tailscale.com/a/{id} done\n");
+        let id_start = line.find(id).unwrap();
+        let markers = regex::Regex::new(r"\[secret\]|\[sign-in link\]").unwrap();
+        let render = |text: &str, hidden: &service::Hidden| {
+            text.split(['\n', '\r'])
+                .filter(|line| !line.trim().is_empty())
+                .map(service::clean_log)
+                .filter(|line| !line.is_empty())
+                .map(|line| finish_connector_log(&service::redact_hidden(&line, hidden)))
+                .collect::<Vec<_>>()
+        };
+        let mut rows = 0;
+        for (intro, term) in [
+            ("\u{1b}]0;", "\u{7}"),
+            ("\u{1b}]8;;", "\u{1b}\\"),
+            ("\u{1b}P", "\u{1b}\\"),
+            ("\u{9d}", "\u{7}"),
+        ] {
+            for first in 0..id_start {
+                for second in first + 1..=id_start {
+                    for extra in [
+                        ";", "_", ".", "%", "\u{1b}7", "\u{1b})0", "\u{1b}=", "\u{9b}1m", " ",
+                        "\t", "\u{3164}",
+                    ] {
+                        let raw = format!(
+                            "{}{intro}{}{term}{extra}{}",
+                            &line[..first],
+                            &line[first..second],
+                            &line[second..]
+                        );
+                        let (text, hidden) = connector_log(&raw, &[]);
+                        let (baseline_text, baseline_hidden) = baseline_connector_log(&raw, &[]);
+                        assert_eq!(text, baseline_text, "row={rows}");
+                        let before = render(&text, &hidden);
+                        assert_eq!(
+                            before,
+                            render(&baseline_text, &baseline_hidden),
+                            "row={rows}"
+                        );
+                        let identifiers = connector_log_identifiers(&raw);
+                        for line in before {
+                            let after = redact_connector_identifiers(&line, &identifiers);
+                            let mut protected = String::new();
+                            let mut hidden_positions = Vec::new();
+                            let mut end = 0;
+                            for marker in markers.find_iter(&line) {
+                                protected.push_str(&redact_connector_identifiers(
+                                    &line[end..marker.start()],
+                                    &identifiers,
+                                ));
+                                let output_start = protected.chars().count();
+                                protected.push_str(marker.as_str());
+                                hidden_positions.extend(
+                                    marker
+                                        .as_str()
+                                        .chars()
+                                        .enumerate()
+                                        .map(|(offset, ch)| (output_start + offset, ch)),
+                                );
+                                end = marker.end();
+                            }
+                            protected.push_str(&redact_connector_identifiers(
+                                &line[end..],
+                                &identifiers,
+                            ));
+                            assert_eq!(after, protected, "row={rows}");
+                            let after: Vec<_> = after.chars().collect();
+                            for (position, ch) in hidden_positions {
+                                assert_eq!(after[position], ch, "row={rows} position={position}");
+                            }
+                        }
+                        rows += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(rows, 29304);
     }
 
     #[test]
