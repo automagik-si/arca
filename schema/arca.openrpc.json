@@ -10305,6 +10305,23 @@
             "pattern": "^ar_[0-9a-f]{16}$",
             "type": "string"
           }
+        },
+        {
+          "name": "issuedAt",
+          "required": true,
+          "schema": {
+            "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "nonce",
+          "required": true,
+          "schema": {
+            "description": "32 fresh lowercase hex digits from the page host.",
+            "pattern": "^[0-9a-f]{32}$",
+            "type": "string"
+          }
         }
       ],
       "result": {
@@ -10323,7 +10340,7 @@
           "type": "object"
         }
       },
-      "summary": "Mint the statement for a pending owner approval request, for a linked approval page to sign with the owner's passkey. The statement belongs to this kernel and is valid for 15 minutes. Send the proof to owner_approval_approve within 120 seconds.",
+      "summary": "Mint the statement for a pending owner approval request, for a linked approval page to sign with the owner's passkey. The page supplies fresh nonce entropy and the issue time. The statement binds the request id in the nonce and is valid for 15 minutes. Send the proof to owner_approval_approve within 120 seconds.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
       "x-arca-read-only-hint": false,

@@ -601,7 +601,7 @@ impl ApprovalRequests {
         rp_id: &str,
         now: u64,
     ) -> Result<Value, PageRefusal> {
-        self.begin_for(kernel, id, Some(rp_id), now)
+        self.begin_for(kernel, id, Some(rp_id), None, now)
     }
 
     /// A local page asks for credentials for its relying party. A linked page needs only the statement because it
@@ -611,6 +611,7 @@ impl ApprovalRequests {
         kernel: &Kernel,
         id: &str,
         rp_id: Option<&str>,
+        linked: Option<(&str, u64)>,
         now: u64,
     ) -> Result<Value, PageRefusal> {
         let mut inner = self.lock().map_err(|_| page_internal())?;
@@ -622,9 +623,20 @@ impl ApprovalRequests {
         let local = rp_id
             .map(|rp_id| passkeys_for(kernel, rp_id).map(|lines| (rp_id, lines)))
             .transpose()?;
-        let nonce = crate::handlers::fresh_nonce().map_err(|_| page_internal())?;
+        let (nonce, issued_at) = match linked {
+            Some((entropy, issued_at)) => (
+                linked_request_nonce(&row.id, entropy).ok_or_else(|| {
+                    PageRefusal::new(400, "invalid", "the nonce must be 32 lowercase hex digits")
+                })?,
+                issued_at,
+            ),
+            None => (
+                crate::handlers::fresh_nonce().map_err(|_| page_internal())?,
+                now,
+            ),
+        };
         let statement =
-            statement_of(&row, kernel.host(), &nonce, now).map_err(|_| page_internal())?;
+            statement_of(&row, kernel.host(), &nonce, issued_at).map_err(|_| page_internal())?;
         let answer = if let Some((rp_id, lines)) = &local {
             let challenge =
                 challenge_for(ARCA_NAMESPACE, statement.as_bytes()).map_err(|_| page_internal())?;
@@ -674,6 +686,18 @@ impl ApprovalRequests {
         id: &str,
         statement: &str,
         proof: &Value,
+        now: u64,
+    ) -> Result<Value, PageRefusal> {
+        self.approve_as(kernel, id, statement, proof, PAGE_PRINCIPAL, now)
+    }
+
+    fn approve_as(
+        &self,
+        kernel: &Kernel,
+        id: &str,
+        statement: &str,
+        proof: &Value,
+        principal: &str,
         now: u64,
     ) -> Result<Value, PageRefusal> {
         let row = {
@@ -763,15 +787,8 @@ impl ApprovalRequests {
         stored.approval_expires_at = Some(expires);
         stored.decided_at = Some(now);
         stored.version += 1;
-        self.commit(
-            &mut inner,
-            before,
-            now,
-            PAGE_PRINCIPAL,
-            APPROVED_AUDIT,
-            &outcome,
-        )
-        .map_err(|_| page_internal())?;
+        self.commit(&mut inner, before, now, principal, APPROVED_AUDIT, &outcome)
+            .map_err(|_| page_internal())?;
         self.changed.notify_all();
         (self.log)(&format!(
             "arca: approval request {} approved ({}): nonce {}…, key {}…, valid until {}",
@@ -786,6 +803,16 @@ impl ApprovalRequests {
 
     /// The page's `deny`: final, audited, and needing no passkey.
     pub fn deny(&self, kernel: &Kernel, id: &str, now: u64) -> Result<Value, PageRefusal> {
+        self.deny_as(kernel, id, PAGE_PRINCIPAL, now)
+    }
+
+    fn deny_as(
+        &self,
+        kernel: &Kernel,
+        id: &str,
+        principal: &str,
+        now: u64,
+    ) -> Result<Value, PageRefusal> {
         let row = {
             let mut inner = self.lock().map_err(|_| page_internal())?;
             self.sweep(&mut inner, kernel, now);
@@ -813,15 +840,8 @@ impl ApprovalRequests {
         stored.begun_at = None;
         stored.decided_at = Some(now);
         stored.version += 1;
-        self.commit(
-            &mut inner,
-            before,
-            now,
-            PAGE_PRINCIPAL,
-            DENIED_AUDIT,
-            &outcome,
-        )
-        .map_err(|_| page_internal())?;
+        self.commit(&mut inner, before, now, principal, DENIED_AUDIT, &outcome)
+            .map_err(|_| page_internal())?;
         self.changed.notify_all();
         (self.log)(&format!(
             "arca: approval request {} denied ({})",
@@ -1009,11 +1029,29 @@ fn view_of(row: &Row, host: &str) -> Value {
 /// The statement a passkey signs for `row`: its subject, this host, a fresh nonce, issued now and valid 15 minutes, as
 /// canonical JSON that the spend's own parser reads back.
 fn statement_of(row: &Row, host: &str, nonce: &str, now: u64) -> Result<String, CallError> {
+    request_statement(
+        host,
+        row.field("action"),
+        row.field("target"),
+        row.field("paramsDigest"),
+        nonce,
+        now,
+    )
+}
+
+fn request_statement(
+    host: &str,
+    action: &str,
+    target: &str,
+    params_digest: &str,
+    nonce: &str,
+    now: u64,
+) -> Result<String, CallError> {
     let text = canonical_json(&json!({
         "host": host,
-        "action": row.field("action"),
-        "target": row.field("target"),
-        "paramsDigest": row.field("paramsDigest"),
+        "action": action,
+        "target": target,
+        "paramsDigest": params_digest,
         "issuedAt": iso_utc(now),
         "expiresAt": iso_utc(now.saturating_add(APPROVAL_TTL_MS)),
         "nonce": nonce,
@@ -1021,6 +1059,47 @@ fn statement_of(row: &Row, host: &str, nonce: &str, now: u64) -> Result<String, 
     .map_err(|_| internal())?;
     parse_statement(text.as_bytes()).map_err(|_| internal())?;
     Ok(text)
+}
+
+/// The nonce signs the actual request id without changing the approval format. Even identical requests from two
+/// tokens have different nonces when begun with the same entropy.
+fn linked_request_nonce(id: &str, entropy: &str) -> Option<String> {
+    (valid_id(id)
+        && entropy.len() == 32
+        && entropy
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+    .then(|| format!("{}{entropy}", &id[3..]))
+}
+
+/// The only linked statement the page will offer to its passkey for the card the owner saw.
+pub(crate) fn linked_card_statement(
+    card: &Value,
+    id: &str,
+    entropy: &str,
+    now: u64,
+) -> Option<String> {
+    if card["id"] != id {
+        return None;
+    }
+    let host = card["host"].as_str()?;
+    let fields = &card["fields"];
+    let args = &card["args"];
+    let action = fields["action"].as_str()?;
+    let target = fields["target"].as_str()?;
+    let (subject, checked_args, digest) = fields_of(
+        &json!({
+            "kind": card["kind"], "action": action, "target": target, "args": args,
+        }),
+        host,
+        now,
+    )
+    .ok()?;
+    if *fields != Value::Object(subject) || *args != checked_args {
+        return None;
+    }
+    let nonce = linked_request_nonce(id, entropy)?;
+    request_statement(host, action, target, &digest, &nonce, now).ok()
 }
 
 fn action_of(row: &Row) -> Option<ArcaAction> {
@@ -1529,9 +1608,24 @@ impl arca_mcp::ToolHandler for ApprovalRequestHandler {
                     .ok_or_else(|| invalid("id: expected a string"))?;
                 let kernel = self.kernel.lock().map_err(|_| internal())?;
                 let now = (self.clock)();
+                let principal = format!("mcp:{}", caller.token_id);
                 match self.verb {
-                    "owner_approval_begin" => self.requests.begin_for(&kernel, id, None, now),
-                    "owner_approval_deny" => self.requests.deny(&kernel, id, now),
+                    "owner_approval_begin" => {
+                        let entropy = args["nonce"]
+                            .as_str()
+                            .ok_or_else(|| invalid("nonce: expected a string"))?;
+                        let issued_at = args["issuedAt"]
+                            .as_str()
+                            .and_then(iso_ms)
+                            .and_then(|at| u64::try_from(at).ok())
+                            .filter(|at| now.abs_diff(*at) <= ISSUE_SKEW_MS)
+                            .ok_or_else(|| {
+                                invalid("issuedAt must be within 5 minutes of this kernel's clock")
+                            })?;
+                        self.requests
+                            .begin_for(&kernel, id, None, Some((entropy, issued_at)), now)
+                    }
+                    "owner_approval_deny" => self.requests.deny_as(&kernel, id, &principal, now),
                     _ => {
                         let (Some(statement), Some(proof)) = (
                             args.get("statement").and_then(Value::as_str),
@@ -1539,7 +1633,8 @@ impl arca_mcp::ToolHandler for ApprovalRequestHandler {
                         ) else {
                             return Err(invalid("the arguments are {id, statement, proof}"));
                         };
-                        self.requests.approve(&kernel, id, statement, proof, now)
+                        self.requests
+                            .approve_as(&kernel, id, statement, proof, &principal, now)
                     }
                 }
                 .map_err(|why| refused(why.code, why.message))

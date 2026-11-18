@@ -825,7 +825,7 @@ static VERBS: [Verb; 103] = [
     },
     Verb {
         name: "owner_approval_begin",
-        summary: "Mint the statement for a pending owner approval request, for a linked approval page to sign with the owner's passkey. The statement belongs to this kernel and is valid for 15 minutes. Send the proof to owner_approval_approve within 120 seconds.",
+        summary: "Mint the statement for a pending owner approval request, for a linked approval page to sign with the owner's passkey. The page supplies fresh nonce entropy and the issue time. The statement binds the request id in the nonce and is valid for 15 minutes. Send the proof to owner_approval_approve within 120 seconds.",
         class: VerbClass::L,
         min_scope: Scope::Doctor,
         writes: true,
@@ -834,7 +834,7 @@ static VERBS: [Verb; 103] = [
         output_key: None,
         summary_text: |_| "The owner approval statement is ready to sign.".to_string(),
         cut: no_cut,
-        params: owner_approval_id_params,
+        params: owner_approval_begin_params,
         result: owner_approval_begin_result,
         target: Target::Node,
     },
@@ -7160,6 +7160,18 @@ fn owner_approval_id_params() -> Value {
 
 fn owner_approval_statement() -> Value {
     json!({ "type": "string", "description": "The canonical JSON statement minted for the request." })
+}
+
+fn owner_approval_begin_params() -> Value {
+    params(vec![
+        ("id", true, owner_schema(REQUEST_ID)),
+        (
+            "nonce",
+            true,
+            json!({ "type": "string", "pattern": "^[0-9a-f]{32}$", "description": "32 fresh lowercase hex digits from the page host." }),
+        ),
+        ("issuedAt", true, owner_schema(ISO_TIME)),
+    ])
 }
 
 fn owner_approval_begin_result() -> Value {

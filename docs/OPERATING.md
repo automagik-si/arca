@@ -8365,8 +8365,11 @@ because declining only takes away. The page's request posts need the page's exac
 A kernel without a page of its own can show its pending requests on a page that links it through `approval.linkedHosts`.
 The page lists them with `owner_approval_list` and relays `/approve/requests/begin`, `/approve/requests/approve` and
 `/approve/requests/deny` to `owner_approval_begin`, `owner_approval_approve` and `owner_approval_deny`, respectively.
-The linked kernel mints the statement and checks the proof against its trusted keys. The page host uses its own
-passkey prompt. The requester reads the approval string on the kernel that holds the request.
+The linked kernel mints the statement from its stored request using fresh nonce entropy and an issue time supplied by
+the page host. The nonce also binds the request id. Before opening the passkey prompt, the page host checks that the
+statement matches the displayed approval host, action, target and arguments, and the nonce and 15-minute window it
+requested. The linked kernel checks the proof against its trusted keys. The requester reads the approval string on the
+kernel that holds the request.
 
 `owner_approval_status` (with `waitMs` up to 30000 to wait for the decision) answers the state. The approval string goes
 to the token that asked, never to another token or to the page, and the assistant passes it to its call, which spends it
@@ -8399,7 +8402,8 @@ an unspent approval is kept while it is among the newest 50 of the last 24 hours
 Until the next read, a spent or expired string stays in the file, where it can no longer be spent. The rewrite does not
 scrub the disk blocks the older file used. Each request, approval and decline is saved first, then written as a line in
 `approval-requests-audit.jsonl` (append-only, never pruned) naming the request, its digest and the requester, never an
-approval string, a credential or a challenge.
+approval string, a credential or a challenge. A local approval-page decision is recorded as `page:owner`. An MCP
+decision, including one relayed by another kernel's page, records `mcp:<token id>` for the authenticated caller.
 
 **What is recorded.** The request becomes approved when the kernel accepts a passkey's proof over its begun statement.
 The page submits that proof locally or relays it via `owner_approval_approve`. A request stays pending if sent an SSH

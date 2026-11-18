@@ -56,12 +56,14 @@ use tokio::sync::Semaphore;
 use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::approval_requests::{ApprovalRequests, PageRefusal, passkey_summary};
+use crate::approval_requests::{
+    ApprovalRequests, PageRefusal, linked_card_statement, passkey_summary,
+};
 use crate::canvas::{self, Canvas};
 use crate::config::LinkedHost;
 use crate::handlers::{
-    ActionExecutor, Clock, action_statement, approve_plan, decline_plan, fresh_nonce, list_plans,
-    plan_statement, run_approved_action,
+    ActionExecutor, Clock, action_statement, approve_plan, decline_plan, fresh_nonce, iso_utc,
+    list_plans, plan_statement, run_approved_action,
 };
 use crate::kernel::Kernel;
 use crate::linked::{self, RelayError};
@@ -1848,7 +1850,7 @@ async fn request_deny(
 }
 
 /// One step of an owner approval request: `{id}` to begin or deny, `{id, statement, proof}` to approve, as
-/// `application/json`. An optional `host` sends the step to that linked kernel.
+/// `application/json`. An optional `host` sends the step to that linked kernel. A linked begin also takes the displayed card.
 async fn request_step(
     state: Arc<PageState>,
     headers: &HeaderMap,
@@ -1889,6 +1891,9 @@ async fn request_step(
     match linked_host(&state, &args) {
         Err(refusal) => return refusal.into_response(),
         Ok(Some(host)) => {
+            if matches!(step, RequestStep::Begin) {
+                return relay_request_begin(&state, host, &id, &args["card"]).await;
+            }
             let name = host.name.clone();
             let verb = step.relay_verb();
             args.as_object_mut()
@@ -1938,6 +1943,40 @@ async fn request_step(
         Ok(Ok(value)) => canvas_json(StatusCode::OK, value),
         Ok(Err(refusal)) => page_refusal(refusal),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+async fn relay_request_begin(
+    state: &PageState,
+    host: LinkedHost,
+    id: &str,
+    card: &Value,
+) -> Response {
+    let Ok(entropy) = fresh_nonce() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let now = (state.clock)();
+    let name = host.name.clone();
+    let Some(expected) =
+        linked_card_statement(card, id, &entropy, now).filter(|_| card["linkedHost"] == name)
+    else {
+        return canvas_json(
+            StatusCode::BAD_REQUEST,
+            json!({ "refusal": "invalid", "message": "the request card could not be checked; reload the page" }),
+        );
+    };
+    let verb = RequestStep::Begin.relay_verb();
+    let args = json!({ "id": id, "nonce": entropy, "issuedAt": iso_utc(now) });
+    match relay(host, verb, args, linked::timeout_for(verb)).await {
+        Ok(value) if value["statement"] == expected => canvas_json(
+            StatusCode::OK,
+            json!({ "statement": expected, "host": name }),
+        ),
+        Ok(_) => canvas_json(
+            StatusCode::BAD_GATEWAY,
+            json!({ "refusal": "InvalidStatement", "message": "the linked machine returned a statement that does not match this request card" }),
+        ),
+        Err(error) => relay_error_response(&name, verb, error),
     }
 }
 

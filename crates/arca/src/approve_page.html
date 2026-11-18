@@ -902,6 +902,9 @@ function requestCard(request, current = () => request) {
   };
   const requester = request.requester || {};
   if (request.linkedHost) fact("Machine", String(request.linkedHost), false);
+  if (request.linkedHost && request.host !== request.linkedHost) {
+    fact("Approval host", String(request.host), false);
+  }
   fact("Asked by", String(requester.name) + " (" + String(requester.kind) + ")", false);
   for (const [key, value] of Object.entries(args)) {
     fact(key, typeof value === "string" ? value : JSON.stringify(value), true);
@@ -910,7 +913,7 @@ function requestCard(request, current = () => request) {
   more.add("Fingerprint", String(fields.paramsDigest || ""), true);
 
   const buttons = el("div", "actions");
-  const approving = approveButton(title, (button) => approveRequest(current(), button));
+  const approving = approveButton(title, (button) => approveRequest(request, button));
   const denyButton = el("button", "btn btn-secondary", "Decline");
   denyButton.type = "button";
   denyButton.addEventListener("click", () => denyRequest(current(), denyButton));
@@ -947,7 +950,8 @@ async function approveRequest(request, button) {
   status("Confirm with your passkey…", "wait");
   try {
     const target = requestTarget(request);
-    const begun = await requestPost("/approve/requests/begin", target);
+    const begin = request.linkedHost ? { ...target, card: request } : target;
+    const begun = await requestPost("/approve/requests/begin", begin);
     const proof = await trustedProof(begun.statement);
     await requestPost("/approve/requests/approve", { ...target, statement: begun.statement, proof });
     status("Approved. Your assistant can go ahead now.", "ok");
