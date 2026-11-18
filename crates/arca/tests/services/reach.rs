@@ -421,6 +421,41 @@ fn privacy_cases(cases: &[(&str, String)], id: &str, placeholder: bool) {
 }
 
 #[test]
+fn logs_privacy_preserves_derived_secret_values() {
+    let (rig, key) = rig();
+    connect(&rig, &key, Some("node-ts")).unwrap();
+    let directory = rig.dir.join("secrets/privacy-values");
+    fs::create_dir_all(&directory).unwrap();
+    let cases = [
+        (
+            "syntheticSecret12345\r",
+            "\u{1b}]0;x //h.io/a/ret12345Mo\u{7}reSyntheticSuffix\ntoken syntheticSecret12345MoreSyntheticSuffix end\n",
+        ),
+        (
+            "syntheticSecret12345 ",
+            "\u{1b}]0;x //h.io/a/ret12345Mo\u{7}reSyntheticSuffix\ntoken syntheticSecret12345MoreSyntheticSuffix end\n",
+        ),
+        (
+            "syntheticSecretLine0001\nsecondLineOfKeyFile0",
+            "\u{1b}]0;x //h.io/a/Line0001Mo\u{7}reSyntheticSuffix\ntoken syntheticSecretLine0001MoreSyntheticSuffix end\n",
+        ),
+        (
+            "firstLineOfKeyFile00\nsecondLineOfKeyLine0002",
+            "\u{1b}]0;x //h.io/a/Line0002Mo\u{7}reSyntheticSuffix\ntoken secondLineOfKeyLine0002MoreSyntheticSuffix end\n",
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (row, (secret, raw)) in cases.into_iter().enumerate() {
+        fs::write(directory.join("value"), secret).unwrap();
+        let lines = privacy_log_lines(&rig, "node-ts", raw);
+        if lines != ["reSyntheticSuffix", "token [secret]MoreSyntheticSuffix end"] {
+            failures.push((row, lines));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:?}");
+}
+
+#[test]
 fn logs_privacy_terminal_wrappers() {
     let id = "syntheticTerminal1234";
     let url = format!("https://login.tailscale.com/a/{id}");
