@@ -1,7 +1,8 @@
 # GitLab CE migration to an Arca service
 
 **Not yet run on a live node.** Template and runbook only; no migration has been performed.
-The first step is an empty-service rehearsal. Do not move data unless that service reaches readiness.
+The first step is an empty-service rehearsal. Do not move old data until readiness, a repository write and
+a backup/restore round trip all pass.
 Only the owner or the operator they authorize runs these commands, after review and approval of host changes.
 
 This procedure is for a single-node Omnibus CE installation, using its bundled PostgreSQL and local repository
@@ -99,6 +100,95 @@ declare shared-memory size or an HTTP readiness check. A successful Arca process
    data device. If any check fails, stop here and record it as **not checked/failed**; do not move the old data.
    A private-port SSH variant, if required, must be selected and rehearsed before this create (step 9).
 
+   **Rehearse a repository write and a backup/restore round trip now, using only disposable data.** Nothing from
+   the old instance may be copied until this succeeds. Keep the original service and shared DNS unchanged.
+   Stage only step 8's approved link/route and client-only name resolution on an **isolated rehearsal edge** for
+   the existing external hostname; never replace a route serving the old instance. Verify the edge's sign-in
+   request from step 8 returns exactly 200, without redirects. **Not checked:** isolated client access and fresh
+   administrator credential handling; arrange these privately with the owner or stop here. Never print the
+   generated root password or put credentials in a URL, command argument or shell history.
+
+   On that client, sign in to the empty service and create a private blank project, `<rehearsal-project>`, in
+   `<rehearsal-namespace>`, without a README. Confirm the project page shows an empty repository on this service.
+   Use prompted credentials or the owner's credential manager for Git. From a private client directory:
+
+   ```sh
+   rehearsal_dir=$(mktemp -d)
+   git -C "$rehearsal_dir" init -b main
+   printf '%s\n' 'rehearsal-only' > "$rehearsal_dir/README.md"
+   git -C "$rehearsal_dir" add README.md
+   git -C "$rehearsal_dir" commit -m 'Rehearse repository storage before migration'
+   git -C "$rehearsal_dir" remote add origin 'https://<external-hostname>/<rehearsal-namespace>/<rehearsal-project>.git'
+   git -C "$rehearsal_dir" -c http.followRedirects=false push -u origin main
+   rehearsal_head=$(git -C "$rehearsal_dir" rev-parse HEAD)
+   test "$(git -C "$rehearsal_dir" -c http.followRedirects=false ls-remote origin refs/heads/main | cut -f1)" = "$rehearsal_head"
+   ```
+
+   Require push exit 0, the same commit on the project page, and a matching remote branch hash. Keep this client
+   shell and `rehearsal_head` for the restore check. No runners, mail, integrations or other users may write to
+   this rehearsal service. On the new node, stop the application writers and create the rehearsal backup:
+
+   ```sh
+   sudo incus exec --project '<new-project>' '<new-container>' -- gitlab-ctl stop puma
+   sudo incus exec --project '<new-project>' '<new-container>' -- gitlab-ctl stop sidekiq
+   sudo incus exec --project '<new-project>' '<new-container>' -- gitlab-ctl status
+   sudo incus exec --project '<new-project>' '<new-container>' -- gitlab-backup create
+   sudo incus exec --project '<new-project>' '<new-container>' -- find /var/opt/gitlab/backups -maxdepth 1 -name '*_gitlab_backup.tar' -printf '%f %s bytes\n'
+   sudo incus exec --project '<new-project>' '<new-container>' -- tar -tf '/var/opt/gitlab/backups/<rehearsal-backup-id>_gitlab_backup.tar' > /dev/null
+   sudo incus exec --project '<new-project>' '<new-container>' -- gitlab-ctl start
+   ```
+
+   Require Puma and Sidekiq down while PostgreSQL, Redis and Gitaly remain up for backup, a successful backup
+   exit, and a new nonzero archive whose listing succeeds. Record its ID as `<rehearsal-backup-id>`, distinct
+   from the later real `<backup-id>`. Check free backup-directory space is at least three archive sizes before
+   restoring, with additional room for expansion. Keep `/etc/gitlab` and its secrets unchanged for this round trip.
+   After starting, repeat the exact readiness and staged-edge checks above; both must return 200. On the client,
+   push a second, deliberately unbacked-up commit so a successful restore must visibly roll it back:
+
+   ```sh
+   printf '%s\n' 'after-rehearsal-backup' >> "$rehearsal_dir/README.md"
+   git -C "$rehearsal_dir" add README.md
+   git -C "$rehearsal_dir" commit -m 'Verify rehearsal restore rolls back later writes'
+   git -C "$rehearsal_dir" -c http.followRedirects=false push origin main
+   test "$(git -C "$rehearsal_dir" -c http.followRedirects=false ls-remote origin refs/heads/main | cut -f1)" = "$(git -C "$rehearsal_dir" rev-parse HEAD)"
+   test "$(git -C "$rehearsal_dir" rev-parse HEAD)" != "$rehearsal_head"
+   ```
+
+   Require the second push and both hash checks to succeed. On the new node, restore **only the rehearsal
+   archive into this still-disposable service**. Answer the restore confirmations and require each command's
+   exit 0; this intentionally replaces the rehearsal database and repository, never the old installation:
+
+   ```sh
+   sudo incus exec --project '<new-project>' '<new-container>' -- gitlab-ctl stop puma
+   sudo incus exec --project '<new-project>' '<new-container>' -- gitlab-ctl stop sidekiq
+   sudo incus exec --project '<new-project>' '<new-container>' -- gitlab-ctl status
+   sudo incus exec --project '<new-project>' '<new-container>' -- gitlab-backup restore 'BACKUP=<rehearsal-backup-id>'
+   sudo incus exec --project '<new-project>' '<new-container>' -- gitlab-psql -d gitlabhq_production -c 'SET statement_timeout = 0; ANALYZE VERBOSE;'
+   sudo incus exec --project '<new-project>' '<new-container>' -- gitlab-ctl reconfigure
+   sudo incus exec --project '<new-project>' '<new-container>' -- gitlab-ctl restart
+   sudo incus exec --project '<new-project>' '<new-container>' -- gitlab-rake gitlab:check SANITIZE=true
+   sudo incus exec --project '<new-project>' '<new-container>' -- gitlab-rake gitlab:doctor:secrets
+   sudo incus exec --project '<new-project>' '<new-container>' -- readlink -f /etc/gitlab /var/opt/gitlab /var/log/gitlab
+   ```
+
+   Before restore, require Puma and Sidekiq down and the backup dependencies up. Afterwards require no
+   unexplained check failures, the same three `/data` targets, and the exact readiness and staged-edge checks
+   above returning 200 without redirects. Back on the client, clone into a different empty directory:
+
+   ```sh
+   restored_dir=$(mktemp -d)
+   git -c http.followRedirects=false clone --branch main 'https://<external-hostname>/<rehearsal-namespace>/<rehearsal-project>.git' "$restored_dir"
+   test "$(git -C "$restored_dir" rev-parse HEAD)" = "$rehearsal_head"
+   test "$(cat "$restored_dir/README.md")" = 'rehearsal-only'
+   ```
+
+   Require the backed-up commit and original file contents, not the second commit, and verify them in the UI.
+   Only then permanently delete this throwaway project through the administrator UI; check both active and
+   pending-deletion project lists are empty before proceeding to step 2. Retain the rehearsal archive privately
+   as evidence, clearly separate from the real migration archive. **Not checked on a live node:** this entire
+   rehearsal, including Gitaly writes and backup/restore through the symlinks. Any failure stops migration before
+   old data moves; do not waive it because readiness alone passes.
+
 2. **Check both versions and storage, and retain an untouched recovery copy.**
 
    On the old node, verify the old package; on the new node repeat the first command in step 1. Both must say
@@ -166,7 +256,7 @@ declare shared-memory size or an HTTP readiness check. A successful Arca process
 
    Require a successful backup exit and a new, nonzero archive; record its ID as `<backup-id>` without
    `_gitlab_backup.tar`. The archive does not include `gitlab.rb`, `gitlab-secrets.json`, TLS/SSH keys, Redis or
-   queued jobs, external object storage, or custom hooks/system files. This procedure drains queued work rather
+   queued jobs, external object storage, global server hooks, file hooks and other system files. This procedure drains queued work rather
    than migrating Redis. If any excluded data is used, back it up separately and verify it before continuing.
    For a custom `backup_path`, replace every default backup path in these commands.
 
