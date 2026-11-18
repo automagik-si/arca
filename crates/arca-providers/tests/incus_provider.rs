@@ -4726,3 +4726,96 @@ fn a_live_acl_patch_landing_after_the_next_get_keeps_its_original_inverse() {
     let (records, _) = FileJournal::open(&path).unwrap().load().unwrap();
     assert_eq!(records[1].state, EffectState::Applied);
 }
+
+#[test]
+fn either_owner_of_the_service_project_may_let_it_hold_snapshots_and_no_other_entry_key_or_value_may()
+ {
+    let provider_on = |tag: &str| {
+        let (scratch, fake) = start(tag);
+        let mut family = family();
+        family.projects.push("arcak-svc".into());
+        let provider = IncusProvider::new(
+            fake.socket().into(),
+            family,
+            secrets_dir(&scratch),
+            RetainedSet::empty(),
+        );
+        (scratch, fake, provider.unwrap())
+    };
+    let (_scratch, fake, provider) = provider_on("service-project-snapshots");
+    let (net, br, svc, key) = (
+        "net-arcak-svc",
+        "bridged-arcak-svc",
+        "arcak-svc",
+        "restricted.snapshots",
+    );
+    let project = |name: &str| object(IncusKind::Project, name, None, name);
+    for (owner, name, key, value) in [
+        ("toy", svc, key, Some("allow")),
+        (net, "svc", key, Some("allow")),
+        (net, svc, key, Some("block")),
+        (net, svc, key, None),
+        (br, svc, key, Some("")),
+        (net, svc, "restricted.backups", Some("allow")),
+        (br, svc, "restricted.backups", Some("allow")),
+        (net, svc, "restricted.containers.privilege", Some("allow")),
+        (net, svc, "restricted.containers.nesting", Some("allow")),
+        (net, svc, "restricted.devices.disk", Some("allow")),
+        (net, svc, "restricted.devices.gpu", Some("allow")),
+        (br, svc, "restricted.devices.disk", Some("allow")),
+        (net, svc, "restricted", Some("false")),
+        (net, svc, "features.images", Some("false")),
+    ] {
+        let op = patch(project(name), &[(key, value)]);
+        let planned = provider.plan(&entry(owner), &op);
+        assert!(
+            matches!(planned, Err(EffectRefusal::Provider(_))),
+            "patch by {owner} of {name}: {key}={value:?}"
+        );
+        if let Some(value) = value {
+            let op = create(
+                IncusKind::Project,
+                name,
+                None,
+                name,
+                json!({"config":{ key: value }}),
+            );
+            let planned = provider.plan(&entry(owner), &op);
+            assert!(
+                matches!(planned, Err(EffectRefusal::Provider(_))),
+                "create by {owner} of {name}: {key}={value}"
+            );
+        }
+    }
+    assert!(fake.requests().is_empty(), "refused before any request");
+
+    // Each owner sets it, on its project's create or by a patch of it, and the project then holds it.
+    for (tag, owner, at_create) in [("snapshots-br", br, true), ("snapshots-net", net, false)] {
+        let (_scratch, fake, mut provider) = provider_on(tag);
+        let owner = entry(owner);
+        let mut config = json!({"restricted.devices.proxy":"allow"});
+        if at_create {
+            config[key] = json!("allow");
+        }
+        let op = create(
+            IncusKind::Project,
+            svc,
+            None,
+            svc,
+            json!({ "config": config }),
+        );
+        let plan = provider.plan(&owner, &op).expect("the create is planned");
+        provider.effect(&owner, &op, &plan).expect("created");
+        if !at_create {
+            let op = patch(project(svc), &[(key, Some("allow"))]);
+            let plan = provider.plan(&owner, &op).expect("the widening is planned");
+            provider.effect(&owner, &op, &plan).expect("widened");
+        }
+        let made = arca_incus::UnixIncus::new(fake.socket().into())
+            .get("/1.0/projects/arcak-svc?project=arcak-svc")
+            .expect("the project");
+        assert_eq!(made["config"]["restricted"], "true", "{tag}");
+        assert_eq!(made["config"][key], "allow", "{tag}");
+        assert!(made["config"].get("restricted.backups").is_none(), "{tag}");
+    }
+}

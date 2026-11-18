@@ -4,6 +4,15 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 
 ## Unreleased
 
+Arca can now take an Incus snapshot of a service's instance together with each custom volume it mounts, under one
+name, without stopping or starting it; restore the parts it names on a stopped instance; and remove them. A disk that
+is a path of the host is listed as not snapshotted. If one part fails, the parts already taken are removed and the
+answer names the failing part. The node's service project may now hold snapshots: its owner's entry gains a
+`snapshots` step that sets `restricted.snapshots` to `allow`, written with no card the first time such a snapshot
+needs it. No verb uses this yet, so nothing changes on a node by this release alone. Once a node's project holds
+snapshots, `service_update` takes its own pre-update snapshot there and restores it on a rollback, and each update
+keeps one snapshot until a later release removes old ones.
+
 `service_labels_set` merges a service's plain labels, with null removing a key. `service_status` and `service_list`
 rows now include the label map. Writes use ownership checks, If-Match and read-back outside the effect journal;
 uncertain answers carry an explicit code. Label keeping during snapshot rollback is best effort and never prevents

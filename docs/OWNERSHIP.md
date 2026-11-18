@@ -963,6 +963,7 @@ is exactly the entry an earlier kernel wrote.
 | `net-arcak-svc` | `virtualMachines: <cap>` | the first virtual machine, and any later virtual-machine create that finds the configured cap changed | sets `limits.virtual-machines` to the cap |
 | `bridged-arcak-svc` | `virtualMachines`, `cpu`, `memory`, `disk` | a virtual-machine create that finds the configured caps changed | sets `limits.virtual-machines`, and while `managed` is unset `limits.cpu`, `limits.memory` and `limits.disk`, to the caps |
 | `net-arcak-svc` | `hostBridges: true` | the first virtual machine on a host bridge | sets `restricted.devices.nic` to `allow`; unsets `restricted.networks.access` |
+| either owner | `snapshots: true` | the first snapshot of a service's instance with its volumes (Rule 81) | sets `restricted.snapshots` to `allow` |
 
 The caps Incus holds follow the node's configured caps, for both owners alike, and nothing is set by hand. A
 virtual-machine create that has passed Arca's own cap check (Rule 58) writes the configured caps into the owner's entry when
@@ -985,15 +986,22 @@ them, containers included (Rule 58). `restricted.networks.access` goes because I
 `parent` against that list once NICs are allowed, and the list may name only bridges the entry made (Rule 41); a project with
 host-bridge NICs has no grant on a bridged node either. Which bridge a NIC joins is then Arca's own check, as it is on a bridged
 node: the managed bridge, or a name in `kernel.bridged.bridges`. The provider admits these guarded keys for these two entries in
-this one project and for no other: `restricted.devices.proxy=allow` on a create or a patch by either entry,
+this one project and for no other: `restricted.devices.proxy=allow` and `restricted.snapshots=allow` on a create or a
+patch by either entry,
 `restricted.devices.nic=allow` on a create by the bridged entry or a patch by the network entry, and the removal of
 `restricted.networks.access` by the network entry. Every other guarded key is refused as Rule 30 states.
 Source: `BridgedProject::apply` and `NetProject::apply` in `crates/arca-netproject/src/lib.rs`; `service_proxy_allowance`,
-`host_nic_allowance`, `bridge_grant_removal` and `check_patch_keys` in `crates/arca-providers/src/incus.rs`; Incus's
+`host_nic_allowance`, `bridge_grant_removal`, `service_snapshot_allowance` and `check_patch_keys` in
+`crates/arca-providers/src/incus.rs`; `allow_service_snapshots` in `crates/arca/src/handlers.rs`; Incus's
 `NetworkAllowed` in `internal/server/project/project.go` for the grant; tests
 `the_service_project_owners_may_widen_it_and_no_other_entry_or_key_may` and
-`the_host_bridge_nic_allowance_is_scoped_to_the_bridged_project_entry_and_to_a_create` in
-`crates/arca-providers/tests/incus_provider.rs`,
+`the_host_bridge_nic_allowance_is_scoped_to_the_bridged_project_entry_and_to_a_create` and
+`either_owner_of_the_service_project_may_let_it_hold_snapshots_and_no_other_entry_key_or_value_may` in
+`crates/arca-providers/tests/incus_provider.rs`, `each_owner_lets_its_project_hold_snapshots_once_its_entry_has_the_step`
+and `an_owner_entry_an_earlier_kernel_wrote_reads_and_writes_back_byte_for_byte` in
+`crates/arca-netproject/tests/netproject.rs`,
+`a_project_arca_let_hold_snapshots_gives_service_update_its_snapshot_and_its_restore` and
+`no_existing_verb_asks_for_the_service_project_to_hold_snapshots` in `crates/arca/tests/services/update.rs`,
 `the_bridged_project_is_created_alone_with_no_network_or_profile_and_a_retry_skips_it` and
 `the_network_entry_widens_its_own_project_for_virtual_machines_and_host_bridges` in
 `crates/arca-netproject/tests/netproject.rs`, the two tests of Rule 54, and for the caps
@@ -1775,6 +1783,32 @@ steps in place on failure. A new approval can complete them from a new destinati
 the tenant by containment and Arca removes them only with the tenant, through Rule 42.
 Source: `ImageWriter` in `crates/arca-incus/src/image.rs`, `tenant_images` in `crates/arca/src/tenant_images.rs`;
 tests in `crates/arca/tests/tenants/image_import.rs`.
+
+## A service's snapshots
+
+**Rule 81.** A service's instance and the custom volumes it mounts are snapshotted, restored and their snapshots removed only
+through the state changer's snapshot writes, outside the desired-state journal, and only for a container or virtual machine
+of the node's own service project `arcak-svc` whose own config carries a service's mark (`service-<name>`) and no tombstone.
+A target outside the family, a tenant's project, an adoption project, an instance whose mark is an adoption's, an instance
+with no service mark and one being removed are refused from the instance the caller read, before any request; the instance
+is then read again and refused when its uuid, its type or its mark changed. A volume is written only when the instance
+mounts it (its own devices laid over its profiles') and the volume's own config carries the instance's mark and no
+tombstone. The requests are a `POST .../instances/<i>/snapshots` of `{name, stateful: false}`, a
+`POST /1.0/storage-pools/<p>/volumes/custom/<v>/snapshots` of `{name}`, a `PUT` of the instance or of the volume of
+`{restore}` alone, which only a stopped instance takes, and a `DELETE` of the snapshot's own path; each is waited on. None
+sends a stop or a start: the caller decides when a snapshot is taken. The call for an instance with its volumes checks
+every part before its first write, takes the instance and then each volume under one name, and names every other disk but
+the root (a path of the host is in no Incus snapshot); when a part fails, it removes the parts it took, the last first,
+and names the failing part and any part it could not remove. A part whose own request failed is left as Incus left it. A
+restore is not undone when a later part fails; its failure names the parts already restored. The service project holds
+snapshots only after its owner's `snapshots` step (Rule 55), which Arca writes, with no card, the first time such a
+snapshot needs it; no verb asks for one yet. Once a node has it, `service_update` takes its own pre-update snapshot of the
+instance there and restores it on a rollback, and nothing yet removes those snapshots.
+Source: `StateChanger::{snapshot_volume, restore_volume, remove_instance_snapshot, remove_volume_snapshot,
+snapshot_with_volumes, restore_with_volumes}` and `service_target` in
+`crates/arca-incus/src/lifecycle.rs`; the fake's `volume_snapshot` and `restore_volume` in `crates/arca-incus/src/fake.rs`;
+tests in `crates/arca-incus/tests/service_snapshots.rs`; by hand on a test node, the ignored tests of
+`crates/arca-incus/tests/service_snapshot_real_incus.rs`.
 
 ## Out of scope
 

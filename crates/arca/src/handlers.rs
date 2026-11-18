@@ -3882,6 +3882,8 @@ pub struct ProjectNeeds {
     pub vm: bool,
     /// A NIC on a host bridge.
     pub host_bridge: bool,
+    /// Incus snapshots in the project: its owner's `snapshots` step (Rule 55). The project must exist already.
+    pub snapshots: bool,
 }
 
 /// The shared network is the first change when absent, in the caller's one document.
@@ -3917,6 +3919,11 @@ pub fn project_changes(
     cfg: &NodeConfig,
     needs: ProjectNeeds,
 ) -> Result<Vec<crate::desired_store::EntryChange>, CallError> {
+    if needs.snapshots && project_owner(entries).is_none() {
+        return Err(CallError::Invalid(
+            "the node has no service project to hold snapshots".into(),
+        ));
+    }
     let cidr = if needs.managed {
         let cidr = cfg
             .kernel
@@ -3979,6 +3986,9 @@ pub fn project_changes(
                 if needs.managed {
                     config["managed"] = json!(true);
                 }
+                if needs.snapshots {
+                    config["snapshots"] = json!(true);
+                }
                 // The caps Incus holds follow the node's config: whenever the owner's entry is written, for a virtual
                 // machine or for the widening alike, it carries the configured caps, never the ones it held. The
                 // plugin writes the count on every apply, so an entry whose caps were stale (one an earlier release
@@ -4033,6 +4043,9 @@ pub fn project_changes(
             if needs.host_bridge && config["hostBridges"] != json!(true) {
                 config["hostBridges"] = json!(true);
             }
+            if needs.snapshots {
+                config["snapshots"] = json!(true);
+            }
             if config != entry.config {
                 if needs.vm {
                     count_fits(cfg, entries)?;
@@ -4042,6 +4055,36 @@ pub fn project_changes(
         }
     }
     Ok(changes)
+}
+
+/// Lets the node's service project hold Incus snapshots: its owner's entry gains the `snapshots` step of Rule 55, in a
+/// document of its own, applied at once, with no card. An owner entry that has the step already is not written again, and
+/// the answer is then `false`. The first snapshot of a service's instance with its volumes needs it; no verb calls it yet,
+/// so no node writes it before such a snapshot is asked for.
+pub fn allow_service_snapshots(
+    kernel: &Mutex<Kernel>,
+    cfg: &NodeConfig,
+    now: u64,
+) -> Result<bool, CallError> {
+    let mut kernel = lock(kernel)?;
+    let needs = ProjectNeeds {
+        snapshots: true,
+        ..ProjectNeeds::default()
+    };
+    let changes = project_changes(kernel.entries(), cfg, needs)?;
+    if changes.is_empty() {
+        return Ok(false);
+    }
+    let owner = project_owner(kernel.entries()).ok_or_else(internal)?;
+    let outcomes = kernel.propose(changes, now).map_err(|_| internal())?;
+    if service_wiring::failed_for(&outcomes, &[owner]) {
+        let why = service_wiring::failure_reason(&outcomes, &[owner])
+            .unwrap_or_else(|| "the kernel recorded no reason".to_string());
+        return Err(service_refused(format!(
+            "the service project could not be set to hold snapshots ({why})"
+        )));
+    }
+    Ok(true)
 }
 
 /// Refuses, in words and before any write, a write of the project owner's entry whose configured virtual-machine count is
@@ -4665,6 +4708,7 @@ fn enrich_service_create(
                 managed: matches!(network, VmNetwork::Managed),
                 vm: true,
                 host_bridge: matches!(network, VmNetwork::Host(_)),
+                snapshots: false,
             },
         )
         .map_err(no_service_project)?;
@@ -9214,6 +9258,7 @@ impl ServiceHandler {
                         managed: matches!(network, VmNetwork::Managed),
                         vm: true,
                         host_bridge: matches!(network, VmNetwork::Host(_)),
+                        snapshots: false,
                     };
                     let pool = match bridged {
                         Some(bridged) => bridged.pool.clone(),
