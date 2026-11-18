@@ -89,7 +89,7 @@ declare shared-memory size or an HTTP readiness check. A successful Arca process
    sudo incus exec --project '<new-project>' '<new-container>' -- gitlab-ctl status
    readiness_status=$(sudo incus exec --project '<new-project>' '<new-container>' -- \
      curl --silent --show-error --max-time 10 --max-redirs 0 --output /dev/null \
-     --write-out '%{http_code}' 'http://localhost/-/readiness?all=1') && test "$readiness_status" = 200
+     --write-out '%{http_code}' 'http://localhost/-/readiness?all=1') && test "$readiness_status" = 200 || { printf 'HTTP check failed: status %s (expected 200 and a successful request).\n' "${readiness_status:-none}" >&2; false; }
    sudo incus exec --project '<new-project>' '<new-container>' -- readlink -f /etc/gitlab /var/opt/gitlab /var/log/gitlab
    arca call service_status --config '<config>' --args '{"name":"<new-service>"}'
    ```
@@ -102,15 +102,18 @@ declare shared-memory size or an HTTP readiness check. A successful Arca process
 
    **Rehearse a repository write and a backup/restore round trip now, using only disposable data.** Nothing from
    the old instance may be copied until this succeeds. Keep the original service and shared DNS unchanged.
-   Stage only step 8's approved link/route and client-only name resolution on an **isolated rehearsal edge** for
-   the existing external hostname; never replace a route serving the old instance. Verify the edge's sign-in
+   Before staging access, record the client's current name resolution and its exact inverse change privately.
+   Use a separate disposable browser profile and rehearsal-only Git credentials so the source's sessions and
+   credential entries stay distinct. Stage only step 8's approved link/route and client-only name resolution on
+   the **new node's edge** for the existing external hostname; never replace a route serving the old instance.
+   Arca selects one edge per node; there is no separate rehearsal-edge selector. Verify the edge's sign-in
    request from step 8 returns exactly 200, without redirects. **Not checked:** isolated client access and fresh
    administrator credential handling; arrange these privately with the owner or stop here. Never print the
    generated root password or put credentials in a URL, command argument or shell history.
 
    On that client, sign in to the empty service and create a private blank project, `<rehearsal-project>`, in
    `<rehearsal-namespace>`, without a README. Confirm the project page shows an empty repository on this service.
-   Use prompted credentials or the owner's credential manager for Git. From a private client directory:
+   Use prompted credentials or a rehearsal-only credential-store entry for Git. From a private client directory:
 
    ```sh
    rehearsal_dir=$(mktemp -d)
@@ -183,11 +186,83 @@ declare shared-memory size or an HTTP readiness check. A successful Arca process
    ```
 
    Require the backed-up commit and original file contents, not the second commit, and verify them in the UI.
-   Only then permanently delete this throwaway project through the administrator UI; check both active and
-   pending-deletion project lists are empty before proceeding to step 2. Retain the rehearsal archive privately
-   as evidence, clearly separate from the real migration archive. **Not checked on a live node:** this entire
-   rehearsal, including Gitaly writes and backup/restore through the symlinks. Any failure stops migration before
-   old data moves; do not waive it because readiness alone passes.
+   Complete **all** of the following numbered cleanup steps before step 2. Stop on any failed check; steps 2–7
+   require the rehearsal route, link and client override to be gone.
+
+   **1.1. Remove the throwaway project and credentials while rehearsal access still works.**
+
+   Permanently delete only the throwaway project through the administrator UI; require both active and
+   pending-deletion project lists to be empty on the new service. Revoke any personal access token or additional
+   temporary administrator credential created solely for this rehearsal and confirm it is revoked in the new service.
+   Sign out and discard the disposable browser profile, including its cookies and sessions; remove the
+   rehearsal-only entry from any Git credential store and confirm it is absent. Keep the source's existing
+   credentials and sessions separate. The temporary Arca doctor token from provisioning must already be revoked.
+
+   **1.2. Remove the rehearsal route on the new node.**
+
+   ```sh
+   arca call action_propose --config '<config>' --args '{"action":"route_remove","args":{"hostname":"<external-hostname>"}}'
+   ```
+
+   Have the owner approve and wait for completion. Require `applied: true` and `reloaded: true` in the completed
+   route-removal result; a failed reload can leave the previous route serving even when its record is absent.
+   Resolve any note about a stale config copy on the edge's data volume before continuing. Then check its routes:
+
+   ```sh
+   arca call route_list --config '<config>'
+   ```
+
+   Require no entry in `routes` with `hostname: "<external-hostname>"`. Both successful application/reload and
+   absence from this list are required; retry the removal through a new approved proposal if either fails.
+
+   **1.3. Disconnect the rehearsal edge-to-service link.**
+
+   ```sh
+   arca call action_propose --config '<config>' --args '{"action":"service_disconnect","args":{"from":"<edge-service>","to":"<new-service>"}}'
+   ```
+
+   Have the owner approve, wait for successful completion, then inspect the consumer's links:
+
+   ```sh
+   arca call service_status --config '<config>' --args '{"name":"<edge-service>"}'
+   arca call route_list --config '<config>'
+   ```
+
+   Require no `links` entry whose `to` is `<new-service>`, and no route for `<external-hostname>`. The disconnect
+   removes the provider's grant to the edge as well as the consumer's link; neither a remaining link nor a
+   remaining route is acceptable. Recreate both only at step 8 after the real restore and data checks.
+
+   **1.4. Undo the client-only name override and verify the source destination.**
+
+   Apply the recorded inverse for the hosts-file/resolver/browser override, clear the affected resolver cache,
+   and compare the client's effective name resolution with its pre-rehearsal values. On a Linux client:
+
+   ```sh
+   getent ahosts '<external-hostname>'
+   ```
+
+   Require the original source destination, never the rehearsal edge; `dig` alone does not detect a hosts-file
+   override. **Not checked:** platform-specific inverse/cache commands and browser resolver settings; verify all
+   of them before proceeding. Reopen the source in its normal browser profile, sign in with the source account,
+   and verify a known existing source project and commit. Close the rehearsal admin session; step 3's drain and
+   denial checks must inspect that confirmed source, not the empty destination.
+
+   **1.5. Account for the remaining rehearsal artifacts.**
+
+   Retain the rehearsal archive and the two local clones only as private offline evidence, clearly separate
+   from the real migration archive. Unset `rehearsal_dir`, `restored_dir` and `rehearsal_head` after recording that
+   evidence so later steps cannot reuse them accidentally. The Git rehearsal uses HTTPS and creates no Git SSH
+   known-host entry; keep verified administrative SSH trust needed for steps 2–8, and remove any entry added
+   solely for rehearsal only after checking its recorded fingerprint. Leave the new service running with only
+   its fresh installation accounts/settings, no user-created projects, no additional rehearsal token/session,
+   no route and no edge link. The Arca-managed `GITLAB_EXTERNAL_URL` and `GITLAB_ROOT_PASSWORD` secrets remain
+   provisioned for the service; never use the fresh root credentials on the source. Step 4 replaces the new
+   service's configuration and step 6 restores the real accounts and application data. The edge's existing
+   certificate credentials stay configured for step 8. Confirm all cleanup checks above before step 2; recreate
+   client-only access at step 8 when that step calls for it.
+
+   **Not checked on a live node:** this entire rehearsal and cleanup, including Gitaly writes and backup/restore
+   through the symlinks. Any failure stops migration before old data moves; readiness alone is insufficient.
 
 2. **Check both versions and storage, and retain an untouched recovery copy.**
 
@@ -399,12 +474,16 @@ declare shared-memory size or an HTTP readiness check. A successful Arca process
    ```sh
    edge_status=$(curl --silent --show-error --max-time 10 --max-redirs 0 --output /dev/null \
      --resolve '<external-hostname>:443:<edge-address>' --write-out '%{http_code}' \
-     'https://<external-hostname>/users/sign_in') && test "$edge_status" = 200
+     'https://<external-hostname>/users/sign_in') && test "$edge_status" = 200 || { printf 'HTTP check failed: status %s (expected 200 and a successful request).\n' "${edge_status:-none}" >&2; false; }
    ```
 
    This request exercises the new edge's own HTTPS-to-HTTP route, keeping the external hostname and certificate
    check while selecting its address before DNS changes. Require 200 with no redirect; a 301 back to the same
    HTTPS URL indicates a backend redirect loop and stops cutover even if container-local readiness passes.
+   A source configured to auto-redirect sign-in to an outside identity provider will not return 200 on
+   `/users/sign_in`; use `/users/sign_in?auto_sign_in=false` in both edge checks in that case, as described in
+   GitLab's [OmniAuth automatic sign-in](https://docs.gitlab.com/integration/omniauth/#sign-in-with-a-provider-automatically),
+   and still require exactly 200 without following redirects.
 
    On an authorized test client, point only that client's name resolution at the new edge for the existing origin.
    **Not checked:** the client's resolver change; verify it before sign-in. Sign in with an existing account and
@@ -425,7 +504,7 @@ declare shared-memory size or an HTTP readiness check. A successful Arca process
    dig +short '<external-hostname>' A
    dig +short '<external-hostname>' AAAA
    edge_status=$(curl --silent --show-error --max-time 10 --max-redirs 0 --output /dev/null \
-     --write-out '%{http_code}' 'https://<external-hostname>/users/sign_in') && test "$edge_status" = 200
+     --write-out '%{http_code}' 'https://<external-hostname>/users/sign_in') && test "$edge_status" = 200 || { printf 'HTTP check failed: status %s (expected 200 and a successful request).\n' "${edge_status:-none}" >&2; false; }
    git ls-remote 'https://<external-hostname>/<group>/<repository>.git' HEAD
    git remote set-url origin 'https://<external-hostname>/<group>/<repository>.git'
    ```
@@ -443,7 +522,7 @@ declare shared-memory size or an HTTP readiness check. A successful Arca process
    sudo incus exec --project '<new-project>' '<new-container>' -- gitlab-rake gitlab:check SANITIZE=true
    readiness_status=$(sudo incus exec --project '<new-project>' '<new-container>' -- \
      curl --silent --show-error --max-time 10 --max-redirs 0 --output /dev/null \
-     --write-out '%{http_code}' 'http://localhost/-/readiness?all=1') && test "$readiness_status" = 200
+     --write-out '%{http_code}' 'http://localhost/-/readiness?all=1') && test "$readiness_status" = 200 || { printf 'HTTP check failed: status %s (expected 200 and a successful request).\n' "${readiness_status:-none}" >&2; false; }
    ```
 
    Re-enable periodic jobs and runners only on the new service. Check a disposable project can clone and push
@@ -547,7 +626,7 @@ declare shared-memory size or an HTTP readiness check. A successful Arca process
     sudo incus exec --project '<old-project>' '<old-container>' -- gitlab-ctl start
     readiness_status=$(sudo incus exec --project '<old-project>' '<old-container>' -- \
       curl --silent --show-error --max-time 10 --max-redirs 0 --output /dev/null \
-      --write-out '%{http_code}' 'http://localhost/-/readiness?all=1') && test "$readiness_status" = 200
+      --write-out '%{http_code}' 'http://localhost/-/readiness?all=1') && test "$readiness_status" = 200 || { printf 'HTTP check failed: status %s (expected 200 and a successful request).\n' "${readiness_status:-none}" >&2; false; }
     ```
 
     Restore the old ingress rules and runner/periodic-job controls from step 3; repeat the outside URL, sign-in,
