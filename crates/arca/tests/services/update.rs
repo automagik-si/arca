@@ -156,6 +156,26 @@ fn journal(rig: &Rig) -> Vec<(String, bool)> {
         .collect()
 }
 
+/// The snapshots the service `app`'s data volume was restored to.
+fn volume_restores(rig: &Rig) -> Vec<String> {
+    rig.fake.volume_restores(PROJECT, "pool1", "app-data")
+}
+
+/// The Incus snapshots the instance `app` holds.
+fn instance_snapshots(rig: &Rig) -> Value {
+    rig.get(&format!("/1.0/instances/app/snapshots?project={PROJECT}"))
+        .expect("the list")
+}
+
+/// Takes an Incus snapshot of the instance `app` by hand.
+fn snapshot_by_hand(rig: &Rig, name: &str) {
+    rig.edit(
+        "POST",
+        &format!("/1.0/instances/app/snapshots?project={PROJECT}"),
+        json!({ "name": name, "stateful": false }),
+    );
+}
+
 #[test]
 fn an_update_rebuilds_from_the_new_digest_keeps_the_data_and_records_the_digest() {
     let up = Arc::new(AtomicBool::new(true));
@@ -204,6 +224,7 @@ fn an_update_rebuilds_from_the_new_digest_keeps_the_data_and_records_the_digest(
     // The root was rebuilt once from the registry, and the instance runs again with what the rebuild keeps.
     assert_eq!(rig.fake.rebuilds(PROJECT, "app"), vec!["registry"]);
     assert!(rig.fake.restores(PROJECT, "app").is_empty());
+    assert!(volume_restores(&rig).is_empty());
     let after = instance(&rig);
     assert_eq!(
         after["config"]["user.arca.labels"],
@@ -220,13 +241,15 @@ fn an_update_rebuilds_from_the_new_digest_keeps_the_data_and_records_the_digest(
         after["config"]["volatile.uuid"],
         before["config"]["volatile.uuid"]
     );
+    // The data volume's snapshot is kept, and the instance holds none, so a later rebuild is not refused.
     assert!(
         rig.get(&format!(
-            "/1.0/instances/app/snapshots/{snapshot}?project={PROJECT}"
+            "/1.0/storage-pools/pool1/volumes/custom/app-data/snapshots/{snapshot}?project={PROJECT}"
         ))
         .is_some(),
-        "the snapshot of the old version is kept"
+        "the snapshot of the old data is kept"
     );
+    assert_eq!(instance_snapshots(&rig), json!([]));
 
     // The record names the new digest, so a restart keeps it, and the status says the service runs it.
     assert_eq!(alias_of_record(&rig), format!("app@{NEW}"));
@@ -260,6 +283,17 @@ fn an_update_rebuilds_from_the_new_digest_keeps_the_data_and_records_the_digest(
     let again = update(&rig, json!({ "name": "app", "digest": NEW })).expect("again");
     assert_eq!(again["updated"], false);
     assert_eq!(rig.fake.rebuilds(PROJECT, "app").len(), 1);
+
+    // The next digest rebuilds again beside the kept volume snapshot, and takes one of its own.
+    let third = format!("sha256:{}", "3".repeat(64));
+    let next = update(&rig, json!({ "name": "app", "digest": third })).expect("the next update");
+    assert_eq!(next["updated"], true);
+    assert_eq!(rig.fake.rebuilds(PROJECT, "app").len(), 2);
+    assert_eq!(
+        next["snapshot"],
+        format!("{snapshot}-2"),
+        "the clock did not move"
+    );
 }
 
 #[test]
@@ -280,11 +314,16 @@ fn a_port_that_never_answers_rolls_the_update_back_to_the_snapshot() {
     assert!(message.contains("rolled back"), "{message}");
     assert!(message.contains("health check"), "{message}");
 
-    // The new root was built and started, then the snapshot was restored and the old version started.
-    assert_eq!(rig.fake.rebuilds(PROJECT, "app"), vec!["registry"]);
-    let restored = rig.fake.restores(PROJECT, "app");
+    // The new root was built and started, then the old root was rebuilt, the data volume restored to its snapshot and
+    // the old version started.
+    assert_eq!(
+        rig.fake.rebuilds(PROJECT, "app"),
+        vec!["registry", "registry"]
+    );
+    let restored = volume_restores(&rig);
     assert_eq!(restored.len(), 1);
     assert!(restored[0].starts_with("pre-update-"));
+    assert!(rig.fake.restores(PROJECT, "app").is_empty());
     assert_eq!(instance(&rig)["status"], "Running");
     assert_eq!(
         alias_of_record(&rig),
@@ -293,7 +332,13 @@ fn a_port_that_never_answers_rolls_the_update_back_to_the_snapshot() {
     );
     let steps = journal(&rig);
     assert!(steps.contains(&("health check".to_string(), false)));
-    assert!(steps.contains(&("restore".to_string(), true)));
+    let at = |step: &str| {
+        steps
+            .iter()
+            .position(|(name, ok)| name == step && *ok)
+            .unwrap_or_else(|| panic!("{step} in {steps:?}"))
+    };
+    assert!(at("rebuild back") < at("restore"), "{steps:?}");
     assert_eq!(steps.last(), Some(&("end".to_string(), false)));
 }
 
@@ -314,7 +359,8 @@ fn a_rebuild_that_fails_rolls_the_update_back_to_the_snapshot() {
     assert!(message.contains("rebuild"), "{message}");
 
     assert!(rig.fake.rebuilds(PROJECT, "app").is_empty());
-    assert_eq!(rig.fake.restores(PROJECT, "app").len(), 1);
+    assert_eq!(volume_restores(&rig).len(), 1);
+    assert!(rig.fake.restores(PROJECT, "app").is_empty());
     assert_eq!(instance(&rig)["status"], "Running");
     assert_eq!(alias_of_record(&rig), old);
 }
@@ -364,10 +410,12 @@ fn a_call_that_cannot_run_changes_nothing() {
 }
 
 #[test]
-fn a_project_that_forbids_snapshots_is_rolled_back_by_a_rebuild_from_the_old_digest() {
+fn a_project_that_holds_no_snapshot_yet_is_given_its_step_by_the_first_update_which_restores_the_volume()
+ {
     let up = Arc::new(AtomicBool::new(false));
     let rig = bare_rig(&up);
     let old = alias_of_record(&rig);
+    assert!(project_config(&rig).get("restricted.snapshots").is_none());
 
     let refusal = update(
         &rig,
@@ -379,19 +427,113 @@ fn a_project_that_forbids_snapshots_is_rolled_back_by_a_rebuild_from_the_old_dig
     };
     assert_eq!(code, "rolled_back");
     assert!(message.contains("rolled back"), "{message}");
-    // No snapshot to restore: the root was rebuilt from the new digest and then from the old one.
+    // The project refused the volume's snapshot, so the owner's entry gained its step, and the snapshot was taken then.
+    let owner = rig
+        .entries()
+        .into_iter()
+        .find(|entry| entry.id.0 == "net-arcak-svc")
+        .expect("the project's owner");
+    assert_eq!(owner.config["snapshots"], true);
+    assert_eq!(project_config(&rig)["restricted.snapshots"], "allow");
+    let steps = journal(&rig);
+    assert!(
+        steps.contains(&("snapshots allowed".to_string(), true)),
+        "{steps:?}"
+    );
+    assert!(steps.contains(&("snapshot".to_string(), true)), "{steps:?}");
     assert_eq!(
         rig.fake.rebuilds(PROJECT, "app"),
         vec!["registry", "registry"]
     );
+    assert_eq!(volume_restores(&rig).len(), 1);
     assert!(rig.fake.restores(PROJECT, "app").is_empty());
     assert_eq!(instance(&rig)["status"], "Running");
     assert_eq!(alias_of_record(&rig), old);
 
+    // The step is written once: the next update finds it there.
     up.store(true, Ordering::SeqCst);
+    let writes = rig.fake.writes().len();
     let done = update(&rig, json!({ "name": "app", "digest": NEW })).expect("update");
     assert_eq!(done["updated"], true);
-    assert_eq!(done["snapshot"], Value::Null);
+    assert!(done["snapshot"].as_str().is_some());
+    assert!(rig.fake.writes()[writes..].iter().all(|write| {
+        !write
+            .config_keys
+            .iter()
+            .any(|key| key == "restricted.snapshots")
+    }));
+}
+
+#[test]
+fn an_instance_that_holds_a_snapshot_is_refused_before_any_change_naming_each_snapshot() {
+    let up = Arc::new(AtomicBool::new(true));
+    let rig = rig(&up);
+    snapshot_by_hand(&rig, "before-upgrade");
+    let one = update(&rig, json!({ "name": "app", "digest": NEW }));
+    snapshot_by_hand(&rig, "nightly");
+    let before = instance(&rig);
+    let actions = rig.fake.state_actions(PROJECT, "app");
+    let writes = rig.fake.writes().len();
+    let two = update(&rig, json!({ "name": "app", "digest": NEW }));
+
+    let (code, message) = refusal_words(one);
+    assert_eq!(code, "refused");
+    assert!(
+        message.contains("holds the Incus snapshot before-upgrade, and Incus does not rebuild"),
+        "{message}"
+    );
+    assert!(message.contains("passkey"), "{message}");
+    assert!(message.ends_with("Nothing was changed"), "{message}");
+    let (_, message) = refusal_words(two);
+    assert!(
+        message.contains("holds the Incus snapshots before-upgrade, nightly"),
+        "{message}"
+    );
+    assert!(message.contains("Removing them"), "{message}");
+    // Nothing was stopped, snapshotted, rebuilt or recorded.
+    assert!(rig.fake.rebuilds(PROJECT, "app").is_empty());
+    assert_eq!(rig.fake.state_actions(PROJECT, "app"), actions);
+    assert_eq!(rig.fake.writes().len(), writes);
+    assert_eq!(instance(&rig), before);
+    assert!(!rig.dir.join("service-updates.jsonl").exists());
+    assert_eq!(alias_of_record(&rig), "app@".to_string() + DIGEST);
+}
+
+#[test]
+fn the_fake_refuses_a_rebuild_while_the_instance_holds_a_snapshot_as_incus_7_6_does() {
+    let rig = rig(&Arc::new(AtomicBool::new(true)));
+    let changer = arca_incus::StateChanger::new(
+        rig.fake.socket().to_path_buf(),
+        arca_incus::ProjectFamily::new([PROJECT], std::iter::empty::<&str>()).unwrap(),
+    );
+    let running = changer.read(PROJECT, "app").expect("read");
+    let stopped = changer
+        .change(&running, arca_incus::StateAction::Stop)
+        .expect("stopped");
+    snapshot_by_hand(&rig, "held");
+    let source = rig.service_config("app").source;
+    let refused = changer
+        .rebuild_from_registry(&stopped, &source, None)
+        .expect_err("refused");
+    assert!(
+        refused
+            .to_string()
+            .contains("Cannot remove an instance volume that has snapshots"),
+        "{refused}"
+    );
+    assert!(rig.fake.rebuilds(PROJECT, "app").is_empty());
+    // A snapshot of the data volume alone does not stand in its way.
+    changer
+        .remove_instance_snapshot(&stopped, "held")
+        .expect("removed");
+    let taken = changer
+        .snapshot_own_volumes(&stopped, "pre-update-1")
+        .expect("taken");
+    assert_eq!(taken.taken.len(), 1);
+    changer
+        .rebuild_from_registry(&stopped, &source, None)
+        .expect("rebuilt");
+    assert_eq!(rig.fake.rebuilds(PROJECT, "app"), vec!["registry"]);
 }
 
 #[test]
@@ -1311,7 +1453,12 @@ fn local_pinned_service_updates_to_the_fingerprint_its_template_names_and_keeps_
     .expect("the local update runs");
     assert_eq!(done["updated"], true);
     assert_eq!(done["digest"], format!("sha256:{next}"));
-    assert_eq!(done["snapshot"], Value::Null);
+    // The data volume is snapshotted, the project given its step by this first update.
+    assert!(
+        done["snapshot"]
+            .as_str()
+            .is_some_and(|name| name.starts_with("pre-update-"))
+    );
 
     // The root was rebuilt from the project's own copy of the new image, by its fingerprint.
     assert_eq!(
@@ -1342,11 +1489,12 @@ fn local_pinned_service_updates_to_the_fingerprint_its_template_names_and_keeps_
     let touched: Vec<String> = rig.fake.writes()[writes..]
         .iter()
         .filter(|write| write.path.contains("/volumes/"))
+        .filter(|write| !(write.method == "POST" && write.path.contains("/snapshots?")))
         .map(|write| write.path.clone())
         .collect();
     assert!(
         touched.is_empty(),
-        "the data volume was written to: {touched:?}"
+        "the data volume was written to, beside its snapshot: {touched:?}"
     );
 
     let steps = journal(&rig);
@@ -1727,7 +1875,7 @@ fn an_update_empties_the_new_roots_run_so_the_service_keeps_a_memory_run() {
 }
 
 #[test]
-fn labels_set_before_and_during_a_failed_update_survive_snapshot_rollback() {
+fn labels_set_before_and_during_a_failed_update_survive_its_rollback() {
     let up = Arc::new(AtomicBool::new(false));
     let mut rig = rig(&up);
     rig.call(
@@ -1776,180 +1924,14 @@ fn labels_set_before_and_during_a_failed_update_survive_snapshot_rollback() {
     .unwrap_err();
     assert!(matches!(failure, CallError::Refused {code, ..} if code == "rolled_back"));
     assert!(fired.load(Ordering::SeqCst));
-    assert_eq!(rig.fake.restores(PROJECT, "app").len(), 1);
-    assert!(
-        instance(&rig)["config"].get("user.note").is_none(),
-        "other keys still restore from the snapshot"
-    );
+    // The rollback rebuilds the root and restores the data volume: the instance's config is never put back.
+    assert!(rig.fake.restores(PROJECT, "app").is_empty());
+    assert_eq!(volume_restores(&rig).len(), 1);
+    assert_eq!(instance(&rig)["config"]["user.note"], "temporary");
 
     assert_eq!(
         rig.call("service_status", json!({"name":"app"})).unwrap()["labels"],
         json!({"before":"kept", "during":"kept", "change":"new"})
-    );
-}
-
-fn rollback_with_unavailable_label_preservation(pre_read_fails: bool) {
-    let up = Arc::new(AtomicBool::new(false));
-    let mut rig = rig(&up);
-    rig.call(
-        "service_labels_set",
-        json!({"name":"app", "labels":{"version":"snapshot"}}),
-    )
-    .unwrap();
-    let setter = rig.handlers["service_labels_set"].clone();
-    let fake = Arc::clone(&rig.fake);
-    let fired = Arc::new(AtomicBool::new(false));
-    let armed = Arc::clone(&fired);
-    rig.handlers = service_handlers_updating(
-        rig.kernel.clone(),
-        Arc::new(|| NOW),
-        rig.cfg.clone(),
-        None,
-        UpdateOptions {
-            probe: Arc::new(move |_, _, _| {
-                if !armed.swap(true, Ordering::SeqCst) {
-                    let answer = setter
-                        .call(
-                            json!({"name":"app", "labels":{"version":"during-update"}}),
-                            &Caller {
-                                token_id: "doctor".into(),
-                                scope: Scope::Doctor,
-                                tools: None,
-                                limits: Default::default(),
-                            },
-                        )
-                        .unwrap();
-                    assert_eq!(answer["code"], "confirmed");
-                    if pre_read_fails {
-                        // The rollback stop reads before its PUT and reads it back afterward. Fail only the
-                        // following read: label preservation's ownership/config read, not dev's restore read.
-                        fake.slow_reads("/1.0/instances/app?", 2, Duration::ZERO);
-                        fake.fail_reads("/1.0/instances/app?", 1, 503);
-                    } else {
-                        fake.set_reject_patch("/1.0/instances/app");
-                    }
-                }
-                false
-            }),
-            pace: Duration::from_millis(10),
-        },
-    )
-    .into_iter()
-    .collect();
-    let failure = update(
-        &rig,
-        json!({"name":"app", "digest":NEW, "timeoutSeconds":1}),
-    )
-    .unwrap_err();
-    assert!(
-        matches!(failure, CallError::Refused {ref code, ..} if code == "rolled_back"),
-        "{failure:?}"
-    );
-    assert!(fired.load(Ordering::SeqCst));
-    assert_eq!(
-        rig.fake.restores(PROJECT, "app").len(),
-        1,
-        "the root was restored"
-    );
-    assert_eq!(
-        instance(&rig)["status"],
-        "Running",
-        "the old instance restarted"
-    );
-    assert_eq!(
-        rig.call("service_status", json!({"name":"app"})).unwrap()["labels"],
-        json!({"version":"snapshot"})
-    );
-    let requests = rig.fake.requests();
-    assert!(
-        requests
-            .iter()
-            .any(|request| request.status == if pre_read_fails { 503 } else { 400 }),
-        "the intended fault was reached"
-    );
-}
-
-#[test]
-fn rollback_still_succeeds_when_label_pre_read_fails() {
-    rollback_with_unavailable_label_preservation(true);
-}
-
-#[test]
-fn rollback_still_succeeds_when_label_put_back_fails() {
-    rollback_with_unavailable_label_preservation(false);
-}
-
-#[test]
-fn rollback_preserves_a_post_restore_label_writer_after_412() {
-    let up = Arc::new(AtomicBool::new(false));
-    let mut rig = rig(&up);
-    rig.call(
-        "service_labels_set",
-        json!({"name":"app", "labels":{"before":"snapshot"}}),
-    )
-    .unwrap();
-    let setter = rig.handlers["service_labels_set"].clone();
-    let fake = Arc::clone(&rig.fake);
-    let armed = Arc::new(AtomicBool::new(false));
-    rig.handlers = service_handlers_updating(
-        rig.kernel.clone(),
-        Arc::new(|| NOW),
-        rig.cfg.clone(),
-        None,
-        UpdateOptions {
-            probe: Arc::new(move |_, _, _| {
-                if !armed.swap(true, Ordering::SeqCst) {
-                    let set = setter
-                        .call(
-                            json!({"name":"app", "labels":{"during":"before-restore"}}),
-                            &Caller {
-                                token_id: "doctor".into(),
-                                scope: Scope::Doctor,
-                                tools: None,
-                                limits: Default::default(),
-                            },
-                        )
-                        .unwrap();
-                    assert_eq!(set["code"], "confirmed");
-                    // No PATCH occurs between the health failure and label put-back. Change the label value
-                    // just before that PATCH checks If-Match: its 412 must not overwrite this writer on retry.
-                    fake.race_patch_config(
-                        "/1.0/instances/app",
-                        "user.arca.labels",
-                        r#"{"after":"restore"}"#,
-                    );
-                }
-                false
-            }),
-            pace: Duration::from_millis(10),
-        },
-    )
-    .into_iter()
-    .collect();
-    let failure = update(
-        &rig,
-        json!({"name":"app", "digest":NEW, "timeoutSeconds":1}),
-    )
-    .unwrap_err();
-    assert!(
-        matches!(failure, CallError::Refused {ref code, ..} if code == "rolled_back"),
-        "{failure:?}"
-    );
-    assert_eq!(rig.fake.restores(PROJECT, "app").len(), 1);
-    assert_eq!(
-        rig.call("service_status", json!({"name":"app"})).unwrap()["labels"],
-        json!({"after":"restore"})
-    );
-    let requests = rig.fake.requests();
-    let conflict = requests
-        .iter()
-        .position(|request| request.method == "PATCH" && request.status == 412)
-        .expect("put-back lost an If-Match race");
-    assert!(
-        !requests[conflict + 1..]
-            .iter()
-            .any(|request| request.method == "PATCH"),
-        "a different label value is not overwritten on retry"
     );
 }
 
@@ -1961,7 +1943,7 @@ fn project_config(rig: &Rig) -> Value {
 }
 
 #[test]
-fn a_project_arca_let_hold_snapshots_gives_service_update_its_snapshot_and_its_restore() {
+fn a_project_arca_let_hold_snapshots_gives_service_update_a_volume_snapshot_and_its_restore() {
     for healthy in [true, false] {
         let up = Arc::new(AtomicBool::new(healthy));
         let rig = bare_rig(&up);
@@ -1994,21 +1976,27 @@ fn a_project_arca_let_hold_snapshots_gives_service_update_its_snapshot_and_its_r
         );
         let steps = journal(&rig);
         assert!(steps.contains(&("snapshot".to_string(), true)), "{steps:?}");
+        assert!(
+            !steps.iter().any(|(step, _)| step == "snapshots allowed"),
+            "{steps:?}"
+        );
+        assert!(rig.fake.restores(PROJECT, "app").is_empty());
+        assert_eq!(instance_snapshots(&rig), json!([]));
         if healthy {
             let done = result.expect("updated");
             let snapshot = done["snapshot"].as_str().expect("a snapshot");
             assert!(snapshot.starts_with("pre-update-"));
             assert!(
                 rig.get(&format!(
-                    "/1.0/instances/app/snapshots/{snapshot}?project={PROJECT}"
+                    "/1.0/storage-pools/pool1/volumes/custom/app-data/snapshots/{snapshot}?project={PROJECT}"
                 ))
                 .is_some()
             );
-            assert!(rig.fake.restores(PROJECT, "app").is_empty());
+            assert!(volume_restores(&rig).is_empty());
             assert_eq!(alias_of_record(&rig), format!("app@{NEW}"));
         } else {
             assert_eq!(refusal_words(result).0, "rolled_back");
-            let restored = rig.fake.restores(PROJECT, "app");
+            let restored = volume_restores(&rig);
             assert_eq!(restored.len(), 1);
             assert!(restored[0].starts_with("pre-update-"));
             assert!(steps.contains(&("restore".to_string(), true)), "{steps:?}");
@@ -2023,30 +2011,46 @@ fn a_project_arca_let_hold_snapshots_gives_service_update_its_snapshot_and_its_r
 }
 
 #[test]
-fn no_existing_verb_asks_for_the_service_project_to_hold_snapshots() {
-    for healthy in [true, false] {
-        let up = Arc::new(AtomicBool::new(healthy));
-        let rig = bare_rig(&up);
-        let _ = update(
-            &rig,
-            json!({ "name": "app", "digest": NEW, "timeoutSeconds": 1 }),
-        );
-        let _ = rig.call("service_status", json!({ "name": "app" }));
-        assert!(
-            rig.fake.writes().iter().all(|write| !write
+fn only_an_update_that_snapshots_a_volume_asks_for_the_service_project_to_hold_snapshots() {
+    let key_written = |rig: &Rig| {
+        rig.fake.writes().iter().any(|write| {
+            write
                 .config_keys
                 .iter()
-                .any(|key| key == "restricted.snapshots")),
-            "no write names the key"
-        );
-        assert!(project_config(&rig).get("restricted.snapshots").is_none());
-        let owner = rig
-            .entries()
-            .into_iter()
-            .find(|entry| entry.id.0 == "net-arcak-svc")
-            .expect("the project's owner");
-        assert!(owner.config.get("snapshots").is_none());
-        // So the update still goes on without its snapshot, as before.
-        assert!(journal(&rig).contains(&("snapshot".to_string(), false)));
-    }
+                .any(|key| key == "restricted.snapshots")
+        })
+    };
+    // A status asks for nothing.
+    let rig = bare_rig(&Arc::new(AtomicBool::new(true)));
+    let _ = rig.call("service_status", json!({ "name": "app" }));
+    assert!(!key_written(&rig));
+    assert!(project_config(&rig).get("restricted.snapshots").is_none());
+
+    // A service with no volume of its own has nothing to snapshot: the project is left as it is, and a rollback
+    // rebuilds the old root alone.
+    let rig = bare_node(&Arc::new(AtomicBool::new(false)), None);
+    rig.template("app", without_data(&app_template()));
+    rig.call(
+        "service_create",
+        json!({ "name": "app", "template": "app" }),
+    )
+    .expect("create");
+    let result = update(
+        &rig,
+        json!({ "name": "app", "digest": NEW, "timeoutSeconds": 1 }),
+    );
+    assert_eq!(refusal_words(result).0, "rolled_back");
+    assert!(!key_written(&rig));
+    assert!(project_config(&rig).get("restricted.snapshots").is_none());
+    let owner = rig
+        .entries()
+        .into_iter()
+        .find(|entry| entry.id.0 == "net-arcak-svc")
+        .expect("the project's owner");
+    assert!(owner.config.get("snapshots").is_none());
+    assert!(journal(&rig).contains(&("snapshot".to_string(), false)));
+    assert_eq!(
+        rig.fake.rebuilds(PROJECT, "app"),
+        vec!["registry", "registry"]
+    );
 }

@@ -7,11 +7,19 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 Arca can now take an Incus snapshot of a service's instance together with each custom volume it mounts, under one
 name, without stopping or starting it; restore the parts it names on a stopped instance; and remove them. A disk that
 is a path of the host is listed as not snapshotted. If one part fails, the parts already taken are removed and the
-answer names the failing part. The node's service project may now hold snapshots: its owner's entry gains a
-`snapshots` step that sets `restricted.snapshots` to `allow`, written with no card the first time such a snapshot
-needs it. No verb uses this yet, so nothing changes on a node by this release alone. Once a node's project holds
-snapshots, `service_update` takes its own pre-update snapshot there and restores it on a rollback, and each update
-keeps one snapshot until a later release removes old ones.
+answer names the failing part. The node's service project and each tenant's project may now hold snapshots: the
+owner's entry (the tenant's entry, for a tenant's project) gains a `snapshots` step that sets `restricted.snapshots`
+to `allow`, written with no card the first time a snapshot needs it.
+
+`service_update` now keeps the service's data safe across a failed update. Before the rebuild it snapshots the
+service's data volume, `pre-update-<time>`, and never its instance: Incus 7.6 refuses to rebuild an instance that
+holds a snapshot, while a volume's snapshot does not stop a rebuild. A rollback rebuilds the old digest, then restores
+the volume to that snapshot, so what the new version wrote there is undone. Before, an update in a project Arca made
+rolled back with no snapshot at all and left the new version's writes in the data volume. The first update whose
+snapshot the project refuses gives the project its `snapshots` step, in the node's service project and in a tenant's
+alike. Each update keeps its volume snapshot until a later release removes old ones. An instance that already holds
+an Incus snapshot is refused before anything is changed, in words that name each snapshot; removing them is a plan of
+its own, on the owner's passkey card.
 
 A container template may carry `appUpdate`, a formula for updating the app inside its service: a `health` command and
 a `version` reader, and on a `system` container an `update` command that takes the version as one argument

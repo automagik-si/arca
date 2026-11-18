@@ -60,7 +60,9 @@
 //! [`FakeIncus::set_static_lease`] gives, is listed as static, as Incus lists the lease a NIC's `ipv4.address` names; any other
 //! as dynamic. Snapshots and backups are
 //! served under `/1.0/instances/<i>/snapshots` and `/1.0/instances/<i>/backups`, and a custom volume's snapshots under
-//! `/1.0/storage-pools/<p>/volumes/custom/<v>/snapshots`, restored by a PUT of the volume naming `restore`. A POST to an instance moves it to the project
+//! `/1.0/storage-pools/<p>/volumes/custom/<v>/snapshots`, restored by a PUT of the volume naming `restore`. As on Incus 7.6, a rebuild of an instance that holds a
+//! snapshot fails in its operation ("Cannot remove an instance volume that has snapshots"); a volume's snapshot does not
+//! stop it. A POST to an instance moves it to the project
 //! its body names: it must be stopped, the target project must exist, and, as on Incus 7.5, the move is a copy that gets a new
 //! `volatile.uuid`. When a PATCH or a move takes a device out of the expanded devices, or changes it in more than its addresses, the fake clears that device's `volatile.<dev>.*` keys as Incus's `deviceVolatileReset`
 //! does: every one when the device goes or changes type, and otherwise each one whose key the new device sets. A restricted
@@ -4131,6 +4133,25 @@ fn rebuild(shared: &Shared, store: &mut Store, request: &Request, address: &Addr
             );
         }
         _ => {}
+    }
+    // As Incus 7.6 does: a rebuild takes the root volume away first, which Incus refuses while the instance holds a
+    // snapshot. A custom volume's snapshot does not stand in its way.
+    let holds_snapshot = store.objects.iter().any(|object| {
+        object.kind == "snapshot"
+            && object.project == address.project
+            && object.parent == address.name
+    });
+    if holds_snapshot {
+        return answered(
+            shared,
+            store,
+            "instance",
+            "PUT",
+            Err((
+                400,
+                "Cannot remove an instance volume that has snapshots".to_string(),
+            )),
+        );
     }
     let named = sent
         .get("source")

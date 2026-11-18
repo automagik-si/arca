@@ -55,7 +55,7 @@ fn second() -> Value {
 }
 
 /// A node whose owner holds `key`, with `app` made from [`first`] and running, the health check answering as `up` says.
-/// `snapshots` lets the project take a snapshot, which no project Arca makes does.
+/// `snapshots` lets the project take a snapshot before the update, as its owner's `snapshots` step would.
 fn node(up: &Arc<AtomicBool>, key: &common::SkKey, snapshots: bool) -> Rig {
     let rig = bare_node(up, Some(key));
     rig.template("app", first());
@@ -204,6 +204,8 @@ fn one_card_moves_the_image_and_the_template_from_no_entrypoint_to_a_shell_one_w
         [
             "begin",
             "stop",
+            // The project held no snapshot yet: this first update gives it its owner's step.
+            "snapshots allowed",
             "snapshot",
             "rebuild",
             "apply",
@@ -242,16 +244,18 @@ fn a_failed_health_check_puts_back_the_old_root_and_no_entrypoint_exactly() {
             "{message}"
         );
 
-        // The old root: from the snapshot where the project allows one, else rebuilt from the old digest.
-        if snapshots {
-            assert_eq!(rig.fake.rebuilds(PROJECT, "app"), vec!["registry"]);
-            assert_eq!(rig.fake.restores(PROJECT, "app").len(), 1);
-        } else {
-            assert_eq!(
-                rig.fake.rebuilds(PROJECT, "app"),
-                vec!["registry", "registry"]
-            );
-        }
+        // The old root is rebuilt from the old digest and the data volume restored to its snapshot, whether the project
+        // held snapshots before or the update gave it its step; the instance is never snapshotted.
+        assert_eq!(
+            rig.fake.rebuilds(PROJECT, "app"),
+            vec!["registry", "registry"]
+        );
+        assert!(rig.fake.restores(PROJECT, "app").is_empty());
+        assert_eq!(
+            rig.fake.volume_restores(PROJECT, "pool1", "app-data").len(),
+            1,
+            "snapshots {snapshots}"
+        );
         // The old record, exactly: no entrypoint, the old environment, the old digest.
         let record = rig.service_config("app");
         assert_eq!(record.entrypoint, None);
@@ -838,14 +842,15 @@ fn a_rollback_of_an_older_service_leaves_the_old_roots_run_on_its_disk() {
         let (code, message) = refusal_words(approve(&rig, &key, &proposed));
         assert_eq!(code, "rolled_back", "{message}");
         assert!(message.contains("health check"), "{message}");
-        if snapshots {
-            assert_eq!(rig.fake.restores(PROJECT, "app").len(), 1);
-        } else {
-            assert_eq!(
-                rig.fake.rebuilds(PROJECT, "app"),
-                vec!["registry", "registry"]
-            );
-        }
+        assert_eq!(
+            rig.fake.rebuilds(PROJECT, "app"),
+            vec!["registry", "registry"]
+        );
+        assert_eq!(
+            rig.fake.volume_restores(PROJECT, "pool1", "app-data").len(),
+            1,
+            "snapshots {snapshots}"
+        );
 
         // The old record and config: no memory /run, and its root keeps what the image ships in /run.
         assert!(!rig.service_config("app").run_tmpfs);
