@@ -1817,7 +1817,8 @@ tests in `crates/arca-incus/tests/service_snapshots.rs`; by hand on a test node,
 command, one try of its health check, or its version reader. It is made only from a formula that passes its checks for
 the template's kind, and the update command only with a version that passes the version rule, so the version is one
 argument and never the program. Its argument list is checked again where the request is built: 1 to 32 arguments, each
-1 to 512 bytes with no control character, the first an absolute path, and a limit of 1 to 7200 seconds. It runs in a
+1 to 567 bytes (a template's 512, less `{version}`, plus the longest version) with no control character, the first an
+absolute path, and a limit of 1 to 7200 seconds. It runs in a
 `system` container and in an OCI container of the node's own service project, and is refused, before any request to the
 instance, for an adopted instance, a tenant's instance, a virtual machine, another project, a record whose instance is
 not its own, a missing or changed uuid, a foreign or retained owner, a tombstone and a stopped instance. It keeps Rule
@@ -1826,7 +1827,8 @@ output of a changed instance. It is started detached (no websocket, no terminal)
 under the in-instance `/usr/bin/timeout -k 2` with the formula's seconds, and waited on through its operation in the
 node's own project in bounded waits until a client deadline 5 seconds past that limit. Its two recordings are read as a
 stream and the last 64 KiB of each is kept in place of Rule 50's cap; a longer output is never an error and is reported
-as cut. The kept text is masked as a service's log is (every PEM block whole, then per line control bytes, stored
+as cut. The kept tail of a longer output drops its first partial line, where a secret may be cut, and keeps nothing of
+that output when it holds no line break; the answer says which. The kept text is masked as a service's log is (every PEM block whole, then per line control bytes, stored
 secret values, the instance's own environment values and credential shapes), and only a bounded tail is returned: the
 update command's last 60 lines of at most 300 characters, a failed health check's last 5, the version reader's first
 line only when it is a plain version. Both recordings are deleted on every outcome, and the audit is Rule 50's, with

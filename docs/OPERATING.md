@@ -6125,13 +6125,15 @@ names, with the formula's arguments, as root, with no environment of its own add
 the image's `/usr/bin/timeout`, which ends it at its `seconds`, so an image without that program fails every check of
 its formula. A health try is cut at 30 seconds, or sooner when less of `health.seconds` is left. Arca waits on the
 command for its `seconds` and 5 more. The last 64 KiB of each of its two outputs is kept, and a longer output is no
-error: the answer says the output was cut. That text is masked as `service_logs` masks a log, so a key, a stored secret,
+error: the answer says the output was cut. What is kept of a longer output begins inside a line, so that first partial
+line is dropped, and a kept tail with no line break keeps nothing of that output; the answer says which. That text is masked as `service_logs` masks a log, so a key, a stored secret,
 one of the instance's own environment values or a credential shows as `[secret]`. Of the update command the last 60
 lines are kept, each cut at 300 characters, and of a failed health check the last 5. Of the version reader only its
 first line is kept, and only when it is a plain version. The recordings are deleted from the instance every time, and
 the exec audit holds no argument and no output. If Incus does not answer for a command by Arca's deadline, the
-instance is marked hung and no other command runs in it. The mark stays until Arca sees the instance stopped, since a
-stopped instance runs nothing.
+instance is marked hung. No formula command runs in it then, and no command of Rule 50's closed list but its cleanups
+(removing the tailnet key directory, stopping the daemon). The mark stays until Arca sees the instance stopped, since a
+stopped instance runs nothing, or until the instance's uuid changes, since that is another instance.
 
 ### What every virtual machine carries
 

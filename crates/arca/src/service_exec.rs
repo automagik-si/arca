@@ -172,13 +172,33 @@ pub struct FormulaRun {
     pub exit: i64,
     /// Whether the in-instance limit ended it (`/usr/bin/timeout`'s 124 or 137).
     pub past_limit: bool,
-    /// Whether an output was longer than the 64 KiB kept of it.
-    pub output_cut: bool,
+    /// Whether an output was longer than the 64 KiB kept of it, and what was dropped of what was kept.
+    pub output_cut: OutputCut,
     /// The kept lines, masked: the app's words, untrusted. Empty for the version reader and for a health check that
     /// passed.
     pub lines: Vec<String>,
     /// The version reader's first line, when it is a plain version. `None` for every other part.
     pub version: Option<String>,
+}
+
+/// Whether an output was longer than the 64 KiB kept of it. The kept tail of a longer output begins inside a line,
+/// where a secret may be cut and no longer match as a whole value, so that first partial line is dropped whole before
+/// the rest is masked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputCut {
+    /// Neither output was longer than what is kept of it.
+    Whole,
+    /// An output was longer: the first line of its kept tail, which began before the cut, was dropped.
+    FirstLineDropped,
+    /// An output was longer and its kept tail held no line break: nothing of that output is kept.
+    NothingKept,
+}
+
+impl OutputCut {
+    /// Whether an output was longer than what is kept of it.
+    pub fn is_cut(self) -> bool {
+        self != Self::Whole
+    }
 }
 
 #[derive(Clone)]
@@ -797,9 +817,18 @@ fn kept(
     stderr: &Tail,
     secrets: &[String],
 ) -> FormulaRun {
-    let output_cut = stdout.cut || stderr.cut;
-    let mut lines = masked_lines(&stdout.bytes, secrets);
-    lines.extend(masked_lines(&stderr.bytes, secrets));
+    let (out, out_cut) = whole_lines(stdout);
+    let (err, err_cut) = whole_lines(stderr);
+    let output_cut = [out_cut, err_cut]
+        .into_iter()
+        .max_by_key(|cut| match cut {
+            OutputCut::Whole => 0,
+            OutputCut::FirstLineDropped => 1,
+            OutputCut::NothingKept => 2,
+        })
+        .unwrap_or(OutputCut::Whole);
+    let mut lines = masked_lines(out, secrets);
+    lines.extend(masked_lines(err, secrets));
     let (lines, version) = match part {
         FormulaPart::Update => (last(lines, UPDATE_LINES), None),
         FormulaPart::Health if exit != 0 => (last(lines, HEALTH_LINES), None),
@@ -822,6 +851,18 @@ fn kept(
         output_cut,
         lines,
         version,
+    }
+}
+
+/// The part of a kept tail that is whole lines: all of it when the output was not cut, and otherwise what follows its
+/// first line break, since its first line began before the cut. A cut tail with no line break keeps nothing.
+fn whole_lines(tail: &Tail) -> (&[u8], OutputCut) {
+    if !tail.cut {
+        return (&tail.bytes, OutputCut::Whole);
+    }
+    match tail.bytes.iter().position(|b| matches!(b, b'\n' | b'\r')) {
+        Some(at) => (&tail.bytes[at + 1..], OutputCut::FirstLineDropped),
+        None => (&[], OutputCut::NothingKept),
     }
 }
 

@@ -244,15 +244,17 @@ impl ExecCommand {
 
 /// The most arguments a formula's command holds, the program among them.
 pub const FORMULA_ELEMENTS_MAX: usize = 32;
-/// The most bytes in one argument of a formula's command.
-pub const FORMULA_ELEMENT_MAX_BYTES: usize = 512;
+/// The most bytes in one argument of a formula's command, after its version is filled in: the 512 bytes a template's
+/// argument may hold, less the 9 of `{version}`, plus the 64 of the longest version. So every argument a formula takes
+/// still runs with any version a call may name.
+pub const FORMULA_ELEMENT_MAX_BYTES: usize = 512 - "{version}".len() + 64;
 /// The longest a formula's command may run inside the instance: the longest `update.seconds` a formula takes.
 pub const FORMULA_SECONDS_MAX: u64 = 7200;
 
 /// The second kind of service command, beside the closed [`ExecCommand`] list: a command a template's formula declares
 /// (Rule 82). It is a list of arguments whose first is an absolute path, and it is started as it is, with no shell, so
 /// Arca builds no command line from it. The arguments are checked again here, whoever built them: 1 to 32, each 1 to
-/// 512 bytes with no control character, the first an absolute path, and a limit of 1 to 7200 seconds. The service
+/// 567 bytes with no control character, the first an absolute path, and a limit of 1 to 7200 seconds. The service
 /// module makes one only from a checked formula (`arca::service_exec::DeclaredCommand`).
 /// ```compile_fail
 /// use arca_incus::exec::FormulaCommand;

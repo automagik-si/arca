@@ -5,7 +5,8 @@
 use super::*;
 use arca::app_formula::{AppUpdate, AppVersion};
 use arca::service_exec::{
-    AUDIT_FILE, DeclaredCommand, ExecError, ExecTarget, FormulaPart, FormulaRun, ServiceExec,
+    AUDIT_FILE, DeclaredCommand, ExecError, ExecTarget, FormulaPart, FormulaRun, OutputCut,
+    ServiceExec,
 };
 use arca_incus::{
     exec::{ExecCommand, FormulaCommand},
@@ -217,7 +218,7 @@ fn the_update_command_takes_its_version_as_one_argument_and_its_own_limit() {
     script(&rig, &command, 0, b"Setting up app\nDone\n", b"");
     let answer = run(&seam, &target, &command).expect("the update");
     assert_eq!(
-        (answer.exit, answer.past_limit, answer.output_cut),
+        (answer.exit, answer.past_limit, answer.output_cut.is_cut()),
         (0, false, false)
     );
     assert_eq!(answer.lines, ["Setting up app", "Done"]);
@@ -252,7 +253,7 @@ fn the_update_command_takes_its_version_as_one_argument_and_its_own_limit() {
         (vec!["relative/path".to_string()], 10),
         (vec!["/bin/true".to_string(), String::new()], 10),
         (vec!["/bin/true".to_string(), "a\u{7}b".to_string()], 10),
-        (vec!["/bin/true".to_string(), "x".repeat(513)], 10),
+        (vec!["/bin/true".to_string(), "x".repeat(568)], 10),
         (vec!["/bin/true".to_string(); 33], 10),
         (vec!["/bin/true".to_string()], 0),
         (vec!["/bin/true".to_string()], 7201),
@@ -260,6 +261,7 @@ fn the_update_command_takes_its_version_as_one_argument_and_its_own_limit() {
         assert!(FormulaCommand::new(list, seconds).is_err());
     }
     assert!(FormulaCommand::new(vec!["/bin/true".into(); 32], 7200).is_ok());
+    assert!(FormulaCommand::new(vec!["/bin/true".into(), "x".repeat(567)], 10).is_ok());
 }
 
 #[test]
@@ -353,7 +355,7 @@ fn an_output_over_the_cap_keeps_its_tail_and_each_part_keeps_its_own_lines() {
     assert!(out.len() > 3 * 64 * 1024);
     script(&rig, &update("2.0"), 100, &out, &err);
     let answer = run(&seam, &target, &update("2.0")).expect("a long output is no error");
-    assert!(answer.output_cut);
+    assert_eq!(answer.output_cut, OutputCut::FirstLineDropped);
     assert_eq!(answer.exit, 100);
     assert_eq!(answer.lines.len(), 60);
     assert_eq!(answer.lines.first().unwrap(), "err line 19940");
@@ -362,7 +364,7 @@ fn an_output_over_the_cap_keeps_its_tail_and_each_part_keeps_its_own_lines() {
     let long = format!("{}\nend\n", "y".repeat(1000));
     script(&rig, &update("2.0"), 0, long.as_bytes(), b"");
     let answer = run(&seam, &target, &update("2.0")).unwrap();
-    assert!(!answer.output_cut);
+    assert_eq!(answer.output_cut, OutputCut::Whole);
     assert_eq!(answer.lines, ["y".repeat(300), "end".to_string()]);
     // A failed health check keeps its last 5 lines.
     let many: String = (0..20).map(|n| format!("try {n}\n")).collect();
@@ -549,4 +551,66 @@ fn the_refusals_that_stay_send_no_exec_request() {
         assert!(execs(&rig).is_empty(), "{damage}");
         assert!(!seam.hung(&target), "{damage}: a refusal marks nothing");
     }
+}
+
+/// A stored secret cut by the 64 KiB boundary: the kept tail begins inside it, where a value is no longer whole and
+/// cannot be matched. The first partial line of a cut output is dropped, so no byte of the secret's end is answered.
+#[test]
+fn a_secret_cut_by_the_kept_tail_shows_no_byte_of_its_end() {
+    let rig = service("system");
+    let (seam, target) = seam(&rig);
+    for cut_at in [1, STORED.len() / 2, STORED.len() - 1] {
+        let end = &STORED[cut_at..];
+        // What follows the secret: a line break, then lines, so that the last 64 KiB starts at `cut_at`.
+        let need = 64 * 1024 - end.len();
+        let mut rest = String::from("\n");
+        while rest.len() + 2001 < need - 10 {
+            rest.push_str(&"y".repeat(2000));
+            rest.push('\n');
+        }
+        rest.push_str(&"w".repeat(need - rest.len() - 1));
+        rest.push('\n');
+        assert_eq!(rest.len(), need);
+        let stdout = format!("{}\nlead {STORED}{rest}", "z".repeat(5000));
+        script(&rig, &update("2.0"), 1, stdout.as_bytes(), b"");
+        let answer = run(&seam, &target, &update("2.0")).expect("an answer");
+        assert_eq!(answer.output_cut, OutputCut::FirstLineDropped, "{cut_at}");
+        for line in &answer.lines {
+            assert!(
+                !line.contains(end),
+                "{cut_at}: the secret's end is shown in {line:?}"
+            );
+        }
+        assert!(answer.lines.first().unwrap().starts_with('y'), "{cut_at}");
+    }
+    // A cut output with no line break in what is kept keeps nothing, and says so; the other output is kept whole.
+    let stdout = format!("{STORED}{}", "q".repeat(70 * 1024));
+    script(
+        &rig,
+        &update("2.0"),
+        1,
+        stdout.as_bytes(),
+        b"the other output\n",
+    );
+    let answer = run(&seam, &target, &update("2.0")).expect("an answer");
+    assert_eq!(answer.output_cut, OutputCut::NothingKept);
+    assert_eq!(answer.lines, ["the other output"]);
+}
+
+/// An argument of a formula that row 1 takes, at its 512 bytes with `{version}` in it, still makes a command once a
+/// version of 64 bytes is filled in: 512 - 9 + 64 = 567 bytes.
+#[test]
+fn the_longest_argument_a_formula_takes_still_runs_with_the_longest_version() {
+    let element = format!("--to={}{{version}}", "a".repeat(512 - 5 - 9));
+    assert_eq!(element.len(), 512);
+    let formula: AppUpdate = serde_json::from_value(json!({
+        "update": { "command": ["/usr/local/sbin/app-update", element], "seconds": 3600 },
+        "health": { "command": ["/usr/bin/true"] },
+        "version": { "command": ["/usr/bin/true"] }
+    }))
+    .unwrap();
+    formula.check("system").expect("row 1 takes it");
+    let version = AppVersion::parse(&"9".repeat(64)).unwrap();
+    let command = DeclaredCommand::update(&formula, "system", &version).expect("a command");
+    assert_eq!(command.argv().last().unwrap().len(), 567);
 }
