@@ -76,14 +76,19 @@ declare shared-memory size or an HTTP readiness check. A successful Arca process
    `service_logs` masks the external URL as `[secret]`. A missing or invalid URL makes the entrypoint exit with
    one plain instruction instead of starting GitLab. Revoke any temporary doctor token after provisioning.
 
-   Run these checks on the new node; repeat the readiness request manually while first boot completes:
+   Run these checks on the new node; repeat the readiness request manually while first boot completes.
+   Every HTTP check below requires status **200 exactly** and follows no redirects. `curl --fail` alone accepts
+   3xx responses; a redirect is a failed check even when it points back to the requested URL. Stop on any
+   nonzero command exit, TLS/connection error or status other than 200 before proceeding:
 
    ```sh
    sudo incus exec --project '<new-project>' '<new-container>' -- dpkg-query -W gitlab-ce
    sudo incus exec --project '<new-project>' '<new-container>' -- ps -p 1 -o args=
    sudo incus exec --project '<new-project>' '<new-container>' -- df -h /dev/shm /data /
    sudo incus exec --project '<new-project>' '<new-container>' -- gitlab-ctl status
-   sudo incus exec --project '<new-project>' '<new-container>' -- curl --fail --silent --show-error --max-time 10 'http://localhost/-/readiness?all=1'
+   readiness_status=$(sudo incus exec --project '<new-project>' '<new-container>' -- \
+     curl --silent --show-error --max-time 10 --max-redirs 0 --output /dev/null \
+     --write-out '%{http_code}' 'http://localhost/-/readiness?all=1') && test "$readiness_status" = 200
    sudo incus exec --project '<new-project>' '<new-container>' -- readlink -f /etc/gitlab /var/opt/gitlab /var/log/gitlab
    arca call service_status --config '<config>' --args '{"name":"<new-service>"}'
    ```
@@ -218,6 +223,13 @@ declare shared-memory size or an HTTP readiness check. A successful Arca process
    database or Redis. **Not checked:** source-specific settings; stop if they exceed this single-node procedure.
    Ensure GitLab's NGINX remains enabled. At each start the entrypoint writes `/etc/gitlab/arca.rb` and includes it
    last in `gitlab.rb`: the owner's URL, HTTP backend 80, no backend TLS/ACME, and fresh-install root password.
+   Restored `gitlab.rb` must not override these template-owned settings or load conflicting settings after
+   `arca.rb`. The backend listener uses `gitlab_rails['nginx']['listen_port'] = 80`,
+   `gitlab_rails['nginx']['listen_https'] = false` and
+   `gitlab_rails['nginx']['redirect_http_to_https'] = false`. In the publisher's
+   [19.4.8 NGINX configuration translation](https://gitlab.com/gitlab-org/omnibus-gitlab/-/blob/19.4.8%2Bce.0/files/gitlab-cookbooks/gitlab/libraries/gitlab_rails.rb#L646-658),
+   these nested keys take precedence over legacy `nginx[...]` values, so setting only the legacy values would
+   leave a restored nested HTTPS listener active. External HTTPS terminates at the approved edge route.
 
    Temporarily disable background processing and mail on the new service while it is isolated:
 
@@ -295,8 +307,14 @@ declare shared-memory size or an HTTP readiness check. A successful Arca process
    the node, before changing DNS:
 
    ```sh
-   curl --fail --show-error --resolve '<external-hostname>:443:<edge-address>' 'https://<external-hostname>/users/sign_in' -o /dev/null
+   edge_status=$(curl --silent --show-error --max-time 10 --max-redirs 0 --output /dev/null \
+     --resolve '<external-hostname>:443:<edge-address>' --write-out '%{http_code}' \
+     'https://<external-hostname>/users/sign_in') && test "$edge_status" = 200
    ```
+
+   This request exercises the new edge's own HTTPS-to-HTTP route, keeping the external hostname and certificate
+   check while selecting its address before DNS changes. Require 200 with no redirect; a 301 back to the same
+   HTTPS URL indicates a backend redirect loop and stops cutover even if container-local readiness passes.
 
    On an authorized test client, point only that client's name resolution at the new edge for the existing origin.
    **Not checked:** the client's resolver change; verify it before sign-in. Sign in with an existing account and
@@ -316,12 +334,14 @@ declare shared-memory size or an HTTP readiness check. A successful Arca process
    ```sh
    dig +short '<external-hostname>' A
    dig +short '<external-hostname>' AAAA
-   curl --fail --show-error 'https://<external-hostname>/users/sign_in' -o /dev/null
+   edge_status=$(curl --silent --show-error --max-time 10 --max-redirs 0 --output /dev/null \
+     --write-out '%{http_code}' 'https://<external-hostname>/users/sign_in') && test "$edge_status" = 200
    git ls-remote 'https://<external-hostname>/<group>/<repository>.git' HEAD
    git remote set-url origin 'https://<external-hostname>/<group>/<repository>.git'
    ```
 
-   Require the intended address, trusted certificate, successful existing-account sign-in and the expected HEAD.
+   Require the intended address, trusted certificate, HTTP 200 without redirects, successful existing-account
+   sign-in and the expected HEAD.
    Once the old instance is stopped and the destination is selected, remove the temporary mail/worker override
    on the new node and reconfigure; this restores the copied installation's own settings:
 
@@ -331,7 +351,9 @@ declare shared-memory size or an HTTP readiness check. A successful Arca process
    sudo incus exec --project '<new-project>' '<new-container>' -- gitlab-ctl reconfigure
    sudo incus exec --project '<new-project>' '<new-container>' -- gitlab-ctl restart
    sudo incus exec --project '<new-project>' '<new-container>' -- gitlab-rake gitlab:check SANITIZE=true
-   sudo incus exec --project '<new-project>' '<new-container>' -- curl --fail --silent --show-error 'http://localhost/-/readiness?all=1'
+   readiness_status=$(sudo incus exec --project '<new-project>' '<new-container>' -- \
+     curl --silent --show-error --max-time 10 --max-redirs 0 --output /dev/null \
+     --write-out '%{http_code}' 'http://localhost/-/readiness?all=1') && test "$readiness_status" = 200
    ```
 
    Re-enable periodic jobs and runners only on the new service. Check a disposable project can clone and push
@@ -433,7 +455,9 @@ declare shared-memory size or an HTTP readiness check. A successful Arca process
     ```sh
     sudo incus start --project '<old-project>' '<old-container>'
     sudo incus exec --project '<old-project>' '<old-container>' -- gitlab-ctl start
-    sudo incus exec --project '<old-project>' '<old-container>' -- curl --fail --silent --show-error 'http://localhost/-/readiness?all=1'
+    readiness_status=$(sudo incus exec --project '<old-project>' '<old-container>' -- \
+      curl --silent --show-error --max-time 10 --max-redirs 0 --output /dev/null \
+      --write-out '%{http_code}' 'http://localhost/-/readiness?all=1') && test "$readiness_status" = 200
     ```
 
     Restore the old ingress rules and runner/periodic-job controls from step 3; repeat the outside URL, sign-in,

@@ -33,9 +33,10 @@ done
 # belong to this template; repository storage names and other old settings stay.
 cat > /etc/gitlab/arca.rb <<'RUBY'
 external_url ENV.fetch('GITLAB_EXTERNAL_URL')
-nginx['listen_port'] = 80
-nginx['listen_https'] = false
-nginx['redirect_http_to_https'] = false
+# In 19.4.8, nested keys win over legacy nginx settings in a restored file.
+gitlab_rails['nginx']['listen_port'] = 80
+gitlab_rails['nginx']['listen_https'] = false
+gitlab_rails['nginx']['redirect_http_to_https'] = false
 letsencrypt['enable'] = false
 gitlab_rails['initial_root_password'] = ENV.fetch('GITLAB_ROOT_PASSWORD')
 RUBY
