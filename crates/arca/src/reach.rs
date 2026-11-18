@@ -292,21 +292,28 @@ fn redact_connector_links(text: &str) -> String {
         ))
         .expect("fixed connector login-link pattern")
     });
+    LINKS.replace_all(text, "[sign-in link]").into_owned()
+}
+
+fn clean_connector_strings(text: &str) -> (String, String) {
     static STRINGS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(
             r"(?:\x1b[PX^_]|[\x{90}\x{98}\x{9e}\x{9f}])[^\x1b\x18\x1a\r\n\x{85}\x{2028}\x{2029}\x{9c}]*(?:\x1b\\|\x{9c})|(?:\x1b\]|\x{9d})[^\x1b\x07\x18\x1a\r\n\x{85}\x{2028}\x{2029}\x{9c}]*(?:\x07|\x1b\\|\x{9c})"
         ).expect("fixed connector console-string pattern")
     });
-    let masked = LINKS.replace_all(text, "[sign-in link]");
-    STRINGS
-        .replace_all(&masked, |found: &regex::Captures| {
+    let mut dropped = String::new();
+    let cleaned = STRINGS
+        .replace_all(text, |found: &regex::Captures| {
             if found[0].contains("[sign-in link]") {
                 "[sign-in link]"
             } else {
+                dropped.push_str(&found[0]);
+                dropped.push('\n');
                 ""
             }
         })
-        .into_owned()
+        .into_owned();
+    (cleaned, dropped)
 }
 
 fn clean_console(text: &str) -> String {
@@ -343,7 +350,7 @@ pub(crate) fn connector_log(text: &str, secrets: &[String]) -> (String, service:
             values.push(found["id"].replace('\r', ""));
         }
     }
-    let raw = redact_connector_links(&service::redact_blocks(text));
+    let raw = clean_connector_strings(&redact_connector_links(&service::redact_blocks(text))).0;
     // Keep the fixed placeholder outside any unfinished terminal escape while rendering it.
     let raw = raw.replace("[sign-in link]", "\u{1b}[0m[sign-in link]");
     let answer = redact_login_links(&clean_console(&raw));
@@ -358,6 +365,40 @@ pub(crate) fn connector_log(text: &str, secrets: &[String]) -> (String, service:
     );
     // values_to_hide keeps its existing 8-byte floor: short identifiers are hidden by shape, not as ordinary words.
     (answer, service::values_to_hide(&values))
+}
+
+/// Find additional identifiers without changing the ordinary renderer's hidden values.
+pub(crate) fn connector_log_identifiers(text: &str) -> Vec<String> {
+    let masked = redact_connector_links(&service::redact_blocks(text));
+    let detection = redact_login_links(&clean_console(
+        &masked.replace("[sign-in link]", "\u{1b}[0m[sign-in link]"),
+    ));
+    let (_, dropped) = clean_connector_strings(&masked);
+    let dropped = redact_login_links(&clean_console(&dropped));
+    static URL_IDS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"//[^\s/]*\.[^\s/]*/a/([A-Za-z0-9_-]{8,})")
+            .expect("fixed URL-identifier pattern")
+    });
+    let dropped_links: std::collections::HashSet<_> = URL_IDS
+        .find_iter(&dropped)
+        .map(|found| found.as_str())
+        .collect();
+    let mut identifiers: Vec<_> = URL_IDS
+        .captures_iter(&detection)
+        .filter(|found| !dropped_links.contains(&found[0]))
+        .map(|found| found[1].to_string())
+        .collect();
+    identifiers.sort_unstable();
+    identifiers.dedup();
+    identifiers.sort_by_key(|value| std::cmp::Reverse(value.len()));
+    identifiers
+}
+
+/// Apply additional identifier masking only after the ordinary connector line is finished.
+pub(crate) fn redact_connector_identifiers(text: &str, identifiers: &[String]) -> String {
+    identifiers.iter().fold(text.to_string(), |line, value| {
+        line.replace(value.as_str(), "[secret]")
+    })
 }
 
 /// Finish connector redaction after cleaning and value hiding, including adjacent identifier continuations.
@@ -390,12 +431,16 @@ mod tests {
     }
 
     fn rendered_connector_lines(raw: &str) -> Vec<String> {
+        let identifiers = connector_log_identifiers(raw);
         let (text, hidden) = connector_log(raw, &[]);
         text.split(['\n', '\r'])
             .filter(|line| !line.trim().is_empty())
             .map(service::clean_log)
             .filter(|line| !line.is_empty())
-            .map(|line| finish_connector_log(&service::redact_hidden(&line, &hidden)))
+            .map(|line| {
+                let finished = finish_connector_log(&service::redact_hidden(&line, &hidden));
+                redact_connector_identifiers(&finished, &identifiers)
+            })
             .collect()
     }
 
@@ -462,6 +507,214 @@ mod tests {
             }
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn connector_privacy_four_samples() {
+        let id = "syntheticSweep1234";
+        let mut rows = 0;
+        for (intro, term) in [
+            ("\u{1b}]0;", "\u{7}"),
+            ("\u{1b}]8;;", "\u{1b}\\"),
+            ("\u{1b}P", "\u{1b}\\"),
+            ("\u{9d}", "\u{7}"),
+        ] {
+            let raw = format!("{intro}visit https://l{term};ogin.tailscale.com/a/{id} done\n");
+            let lines = rendered_connector_lines(&raw);
+            let longest = visible_identifier_piece(id, &lines.concat());
+            assert!(longest < 4, "longest={longest} answer={lines:?}");
+            assert_eq!(lines, [";ogin.tailscale.com/a/[secret] done"]);
+            rows += 1;
+        }
+        assert_eq!(rows, 4);
+    }
+
+    #[test]
+    fn connector_privacy_preserves_sign_in_identifier_masking() {
+        let raw = "https://login.tailscale.com/a/abcdefghijkl\n\u{1b}]0;x //h.io/a/ghijklMOREMOREMORE\u{7}\ntoken abcdefghijklMOREMOREMORE end\n";
+        assert_eq!(
+            rendered_connector_lines(raw),
+            ["[sign-in link]", "token [secret]MOREMOREMORE end"]
+        );
+    }
+
+    #[test]
+    fn connector_privacy_preserves_ordinary_words() {
+        let raw = "see \u{1b}]8;;https://docs.example.com/a/installation\u{7} docs\u{1b}]8;;\u{7}\nrun installation now\n";
+        assert_eq!(
+            rendered_connector_lines(raw),
+            ["see docs", "run installation now"]
+        );
+    }
+
+    #[test]
+    fn connector_privacy_preserves_ordinary_status() {
+        let raw = "\u{1b}P1$r//x.example.com/a/sessionabc\u{1b}\\\nsessionabc is fine\n";
+        assert_eq!(rendered_connector_lines(raw), ["sessionabc is fine"]);
+    }
+
+    #[test]
+    fn connector_privacy_preserves_identifier_precedence() {
+        let raw = "https://login.tailscale.com/a/abcdefghijkl\n\u{1b}]0;x //h.io/a/ghijklMO\u{7}REMOREMORE\ntoken abcdefghijklMOREMOREMORE end\n";
+        assert_eq!(
+            rendered_connector_lines(raw),
+            [
+                "[sign-in link]",
+                "REMOREMORE",
+                "token [secret]MOREMOREMORE end"
+            ]
+        );
+    }
+
+    #[test]
+    fn connector_privacy_stored_value_preservation() {
+        let secret = "syntheticSecret12345";
+        assert_eq!(secret.len(), 20);
+        let raw = "\u{1b}]0;x //h.io/a/ret12345Mo\u{7}reSyntheticSuffix\ntoken syntheticSecret12345MoreSyntheticSuffix end\n";
+        let (text, hidden) = connector_log(raw, &[secret.to_string()]);
+        let lines: Vec<_> = text
+            .split(['\n', '\r'])
+            .filter(|line| !line.trim().is_empty())
+            .map(service::clean_log)
+            .filter(|line| !line.is_empty())
+            .map(|line| finish_connector_log(&service::redact_hidden(&line, &hidden)))
+            .collect();
+        assert_eq!(
+            lines,
+            ["reSyntheticSuffix", "token [secret]MoreSyntheticSuffix end"]
+        );
+    }
+
+    #[test]
+    fn connector_privacy_independent_value_preservation() {
+        let raw = "https://login.tailscale.com/a/syntheticOther99s\n\u{1b}]0;visit https://l\u{7};ogin.tailscale.com/a/syntheticSweep1234 done\n";
+        let lines = rendered_connector_lines(raw);
+        assert!(visible_identifier_piece("syntheticSweep1234", &lines.concat()) < 4);
+        assert_eq!(
+            lines,
+            ["[sign-in link]", ";ogin.tailscale.com/a/[secret] done"]
+        );
+    }
+
+    fn baseline_connector_log(text: &str, secrets: &[String]) -> (String, service::Hidden) {
+        let shown = clean_console(&service::redact_blocks(text));
+        let without_controls: String = text.chars().filter(|ch| !ch.is_control()).collect();
+        static INTRODUCERS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+            regex::Regex::new(r"\x1b(?:[\[\]][0-?]*)?").expect("fixed terminal-introducer pattern")
+        });
+        // A detection-only projection: discard introducers and parameters without consuming a following letter.
+        let without_introducers = INTRODUCERS.replace_all(text, "");
+        let mut values = secrets.to_vec();
+        for view in [
+            text,
+            &shown,
+            &without_controls,
+            without_introducers.as_ref(),
+        ] {
+            for found in login_links().captures_iter(view) {
+                values.push(found["id"].replace('\r', ""));
+            }
+        }
+        let raw = clean_connector_strings(&redact_connector_links(&service::redact_blocks(text))).0;
+        // Keep the fixed placeholder outside any unfinished terminal escape while rendering it.
+        let raw = raw.replace("[sign-in link]", "\u{1b}[0m[sign-in link]");
+        let answer = redact_login_links(&clean_console(&raw));
+        static URL_IDS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+            regex::Regex::new(r"//[^\s/]*\.[^\s/]*/a/([A-Za-z0-9_-]{8,})")
+                .expect("fixed URL-identifier pattern")
+        });
+        values.extend(
+            URL_IDS
+                .captures_iter(&answer)
+                .map(|found| found[1].to_string()),
+        );
+        // values_to_hide keeps its existing 8-byte floor: short identifiers are hidden by shape, not as ordinary words.
+        (answer, service::values_to_hide(&values))
+    }
+
+    #[test]
+    fn connector_privacy_last_pass_preserves_hidden_positions() {
+        // The ordinary renderer must still give the baseline text and finished lines.
+        // Every character of an existing hiding marker must survive the last pass;
+        // additional masking may replace visible text but cannot uncover hidden positions.
+        let id = "syntheticSweep1234";
+        let line = format!("visit https://login.tailscale.com/a/{id} done\n");
+        let id_start = line.find(id).unwrap();
+        let markers = regex::Regex::new(r"\[secret\]|\[sign-in link\]").unwrap();
+        let render = |text: &str, hidden: &service::Hidden| {
+            text.split(['\n', '\r'])
+                .filter(|line| !line.trim().is_empty())
+                .map(service::clean_log)
+                .filter(|line| !line.is_empty())
+                .map(|line| finish_connector_log(&service::redact_hidden(&line, hidden)))
+                .collect::<Vec<_>>()
+        };
+        let mut rows = 0;
+        for (intro, term) in [
+            ("\u{1b}]0;", "\u{7}"),
+            ("\u{1b}]8;;", "\u{1b}\\"),
+            ("\u{1b}P", "\u{1b}\\"),
+            ("\u{9d}", "\u{7}"),
+        ] {
+            for first in 0..id_start {
+                for second in first + 1..=id_start {
+                    for extra in [
+                        ";", "_", ".", "%", "\u{1b}7", "\u{1b})0", "\u{1b}=", "\u{9b}1m", " ",
+                        "\t", "\u{3164}",
+                    ] {
+                        let raw = format!(
+                            "{}{intro}{}{term}{extra}{}",
+                            &line[..first],
+                            &line[first..second],
+                            &line[second..]
+                        );
+                        let (text, hidden) = connector_log(&raw, &[]);
+                        let (baseline_text, baseline_hidden) = baseline_connector_log(&raw, &[]);
+                        assert_eq!(text, baseline_text, "row={rows}");
+                        let before = render(&text, &hidden);
+                        assert_eq!(
+                            before,
+                            render(&baseline_text, &baseline_hidden),
+                            "row={rows}"
+                        );
+                        let identifiers = connector_log_identifiers(&raw);
+                        for line in before {
+                            let after = redact_connector_identifiers(&line, &identifiers);
+                            let mut protected = String::new();
+                            let mut hidden_positions = Vec::new();
+                            let mut end = 0;
+                            for marker in markers.find_iter(&line) {
+                                protected.push_str(&redact_connector_identifiers(
+                                    &line[end..marker.start()],
+                                    &identifiers,
+                                ));
+                                let output_start = protected.chars().count();
+                                protected.push_str(marker.as_str());
+                                hidden_positions.extend(
+                                    marker
+                                        .as_str()
+                                        .chars()
+                                        .enumerate()
+                                        .map(|(offset, ch)| (output_start + offset, ch)),
+                                );
+                                end = marker.end();
+                            }
+                            protected.push_str(&redact_connector_identifiers(
+                                &line[end..],
+                                &identifiers,
+                            ));
+                            assert_eq!(after, protected, "row={rows}");
+                            let after: Vec<_> = after.chars().collect();
+                            for (position, ch) in hidden_positions {
+                                assert_eq!(after[position], ch, "row={rows} position={position}");
+                            }
+                        }
+                        rows += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(rows, 29304);
     }
 
     #[test]
