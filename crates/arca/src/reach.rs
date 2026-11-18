@@ -370,15 +370,37 @@ pub(crate) fn connector_log(text: &str, secrets: &[String]) -> (String, service:
     values.extend(
         URL_IDS
             .captures_iter(&answer)
-            .chain(
-                URL_IDS
-                    .captures_iter(&detection)
-                    .filter(|found| !dropped_links.contains(&found[0])),
-            )
             .map(|found| found[1].to_string()),
     );
+    let detected: Vec<_> = URL_IDS
+        .captures_iter(&detection)
+        .filter(|found| !dropped_links.contains(&found[0]))
+        .map(|found| found[1].to_string())
+        .collect();
+    let additional: Vec<_> = detected
+        .iter()
+        .filter(|value| {
+            values.contains(value)
+                || !values[secrets.len()..]
+                    .iter()
+                    .chain(&detected)
+                    .any(|other| partial_identifier_overlap(value, other))
+        })
+        .cloned()
+        .collect();
+    values.extend(additional);
     // values_to_hide keeps its existing 8-byte floor: short identifiers are hidden by shape, not as ordinary words.
     (answer, service::values_to_hide(&values))
+}
+
+fn partial_identifier_overlap(left: &str, right: &str) -> bool {
+    if left.contains(right) || right.contains(left) {
+        return false;
+    }
+    let (left, right) = (left.as_bytes(), right.as_bytes());
+    (1..left.len().min(right.len())).any(|len| {
+        left[left.len() - len..] == right[..len] || right[right.len() - len..] == left[..len]
+    })
 }
 
 /// Finish connector redaction after cleaning and value hiding, including adjacent identifier continuations.
@@ -527,6 +549,19 @@ mod tests {
     fn connector_privacy_preserves_ordinary_status() {
         let raw = "\u{1b}P1$r//x.example.com/a/sessionabc\u{1b}\\\nsessionabc is fine\n";
         assert_eq!(rendered_connector_lines(raw), ["sessionabc is fine"]);
+    }
+
+    #[test]
+    fn connector_privacy_preserves_identifier_precedence() {
+        let raw = "https://login.tailscale.com/a/abcdefghijkl\n\u{1b}]0;x //h.io/a/ghijklMO\u{7}REMOREMORE\ntoken abcdefghijklMOREMOREMORE end\n";
+        assert_eq!(
+            rendered_connector_lines(raw),
+            [
+                "[sign-in link]",
+                "REMOREMORE",
+                "token [secret]MOREMOREMORE end"
+            ]
+        );
     }
 
     #[test]
