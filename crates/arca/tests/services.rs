@@ -4201,6 +4201,8 @@ fn service_remove_deletes_a_running_service_with_owner_approval() {
 
 #[path = "services/app_formula.rs"]
 mod app_formula;
+#[path = "services/app_formula_components.rs"]
+mod app_formula_components;
 #[path = "services/approval_requests.rs"]
 mod approval_requests;
 #[path = "services/create_digest.rs"]
