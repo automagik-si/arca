@@ -4,6 +4,13 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 
 ## Unreleased
 
+Container templates can declare a TCP port or an HTTP path and port in `health`. A direct check keeps a permanent
+TCP ACL rule from the node's bridge address to the service's health port while the record carries that check.
+`service_update` now names the check it ran. An image that starts but never serves on its named port is rolled back.
+Older releases refuse templates and service records that carry `health`. After a downgrade, they silently skip
+those records, so the services disappear from list and status. Before downgrading, restore the earlier templates
+and verify that affected service records no longer carry `health`.
+
 ## 0.37.0 (2026-11-18)
 
 A container template may carry `appUpdate`, a formula for updating the app inside its service: a `health` command and
