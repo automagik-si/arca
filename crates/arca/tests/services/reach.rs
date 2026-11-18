@@ -570,6 +570,151 @@ fn logs_privacy_every_link_offset() {
     );
 }
 
+fn privacy_additional_sweep(
+    id: &str,
+    offsets: std::ops::RangeInclusive<usize>,
+    inserts: &[&str],
+    expected_rows: usize,
+) {
+    let url = format!("https://login.tailscale.com/a/{id}");
+    let (rig, key) = rig();
+    connect(&rig, &key, Some("node-ts")).unwrap();
+    let mut failures = Vec::new();
+    let mut rows = 0;
+    for offset in offsets {
+        for (index, insert) in inserts.iter().enumerate() {
+            let raw = format!("visit {}{insert}{}\n", &url[..offset], &url[offset..]);
+            let lines = privacy_log_lines(&rig, "node-ts", &raw);
+            let longest = longest_visible_piece(id, &lines.concat());
+            if longest >= 4 {
+                failures.push(format!(
+                    "offset={offset} row={index}: longest={longest} {lines:?}"
+                ));
+            }
+            assert_eq!(
+                privacy_log_lines(&rig, "edge", &raw),
+                privacy_non_connector_lines(&raw)
+            );
+            rows += 1;
+        }
+    }
+    assert_private(&rig, id);
+    assert_eq!(rows, expected_rows);
+    println!("additional privacy sweep rows={rows}");
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn logs_privacy_additional_identifier_continuations() {
+    let id = "syntheticExtended1234";
+    let start = "https://login.tailscale.com/a/".len();
+    privacy_additional_sweep(
+        id,
+        start + 1..=start + id.len() - 1,
+        &[
+            "\u{ad}",
+            "\u{600}",
+            "\u{61c}",
+            "\u{200b}",
+            "\u{200c}",
+            "\u{200d}",
+            "\u{200e}",
+            "\u{200f}",
+            "\u{202a}",
+            "\u{202b}",
+            "\u{202c}",
+            "\u{202d}",
+            "\u{202e}",
+            "\u{2060}",
+            "\u{2066}",
+            "\u{2067}",
+            "\u{2068}",
+            "\u{2069}",
+            "\u{feff}",
+            "\u{e0001}",
+            "\u{1b}P1$r\u{1b}\\",
+            "\u{1b}Xpayload\u{1b}\\",
+            "\u{1b}^payload\u{1b}\\",
+            "\u{1b}_payload\u{1b}\\",
+            "\u{1b}]8;;https://example.invalid/synthetic\u{1b}\\",
+            "\u{90}payload\u{9c}",
+            "\u{98}payload\u{9c}",
+            "\u{9e}payload\u{9c}",
+            "\u{9f}payload\u{9c}",
+            "\u{9d}payload\u{7}",
+        ],
+        600,
+    );
+}
+
+#[test]
+fn logs_privacy_short_login_links() {
+    let id = "Qz6Xwq";
+    privacy_additional_sweep(
+        id,
+        0..="https://login.tailscale.com/a/".len() + id.len(),
+        &[
+            "\u{1b}",
+            "\u{1b}[",
+            "\u{1b}]8;;",
+            "\u{1b}[1;32",
+            "\0",
+            "\r",
+            "\u{7}",
+        ],
+        259,
+    );
+}
+
+#[test]
+fn logs_privacy_preserves_earlier_output() {
+    let (rig, key) = rig();
+    connect(&rig, &key, Some("node-ts")).unwrap();
+    let id = "syntheticSweep1234";
+    assert!(longest_visible_piece(id, "broken title ordinary line visit [sign-in link] after") < 4);
+    let raw = format!(
+        "\u{1b}]0;broken title\n{}visit https://login.tailscale.com/a/{}\u{7}{}\nafter\n",
+        "ordinary line\n".repeat(40),
+        &id[..5],
+        &id[5..]
+    );
+    let lines = privacy_log_lines(&rig, "node-ts", &raw);
+    assert_eq!(
+        lines.iter().filter(|line| *line == "ordinary line").count(),
+        40
+    );
+    assert!(longest_visible_piece(id, &lines.concat()) < 4, "{lines:?}");
+    assert!(lines.iter().any(|line| line == "visit [sign-in link]"));
+    assert_eq!(lines.last().map(String::as_str), Some("after"));
+    assert_eq!(
+        privacy_log_lines(&rig, "edge", &raw),
+        privacy_non_connector_lines(&raw)
+    );
+}
+
+#[test]
+fn logs_privacy_preserves_ordinary_content() {
+    let (rig, key) = rig();
+    connect(&rig, &key, Some("node-ts")).unwrap();
+    for raw in [
+        "\u{1b}Ppayload\nline two keeps\nline three keeps\n\u{1b}]8;;\u{1b}\\tail text\n",
+        "\u{1b}Ppayload \u{1b}[1mimportant text\u{1b}[0m more \u{1b}\\ after\n",
+    ] {
+        let lines = privacy_log_lines(&rig, "node-ts", raw);
+        if raw.contains("line two") {
+            for expected in ["payload", "line two keeps", "line three keeps"] {
+                assert!(lines.iter().any(|line| line == expected), "{lines:?}");
+            }
+        } else {
+            assert_eq!(lines, ["payload important text more fter"]);
+        }
+        assert_eq!(
+            privacy_log_lines(&rig, "edge", raw),
+            privacy_non_connector_lines(raw)
+        );
+    }
+}
+
 #[test]
 fn logs_privacy_two_inserts() {
     let id = "syntheticDouble1234";

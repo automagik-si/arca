@@ -1053,6 +1053,117 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
 }
 
 #[test]
+fn every_argument_of_a_configured_image_database_is_in_details() {
+    let key = SkKey::from_seed(1);
+    let rig = Rig::new("proposal-configured-fields", &key);
+    let fields = [
+        (
+            "destinations",
+            "Private network",
+            json!([{ "address": "198.51.100.8", "port": 5432 }]),
+            "Asked for: 198.51.100.8 port 5432. Not used: this node makes its database from its configured image.",
+        ),
+        (
+            "kernelAccess",
+            "Kernel access",
+            json!({ "port": 7461 }),
+            "Asked for: port 7461. Not used: this node makes its database from its configured image.",
+        ),
+        (
+            "privatePort",
+            "Private port",
+            json!({ "address": "198.51.100.7", "port": 7422 }),
+            "Asked for: 198.51.100.7 port 7422. Not used: this node makes its database from its configured image.",
+        ),
+    ];
+    for mask in 0..8 {
+        let mut args = json!({ "name": "orders" });
+        let mut expected = json!([
+            { "label": "Database", "value": "orders" },
+            { "label": "Image", "value": TEST_PG_IMAGE }
+        ]);
+        for (index, (field, label, value, words)) in fields.iter().enumerate() {
+            if mask & (1 << index) != 0 {
+                args[field] = value.clone();
+                expected.as_array_mut().unwrap().push(json!({
+                    "label": label,
+                    "value": words
+                }));
+            }
+        }
+        let proposed = rig
+            .propose("postgres_create", args.clone())
+            .expect("proposal");
+        args["image"] = json!(TEST_PG_IMAGE);
+        assert_eq!(proposed["args"], args);
+        assert_eq!(proposed["details"], expected, "combination {mask}");
+        assert_eq!(
+            proposed["summary"],
+            "Create a Postgres database called orders"
+        );
+    }
+}
+
+#[test]
+fn configured_image_database_details_show_plain_requests_or_a_fallback() {
+    let action = ActionKind::PostgresCreate;
+    let args = json!({
+        "name": "orders", "image": TEST_PG_IMAGE,
+        "destinations": [
+            { "address": "198.51.100.8", "port": 5432 },
+            { "address": "198.51.100.9", "port": 5433 }
+        ]
+    });
+    let details = action.details(&args);
+    assert_eq!(details[2].label, "Private network");
+    assert_eq!(
+        details[2].value,
+        "Asked for: 198.51.100.8 port 5432, 198.51.100.9 port 5433. Not used: this node makes its database from its configured image."
+    );
+    let details = action.details(&json!({
+        "name": "orders", "image": TEST_PG_IMAGE, "privatePort": { "port": 7422 }
+    }));
+    assert_eq!(details[2].label, "Private port");
+    assert_eq!(
+        details[2].value,
+        "Asked for: port 7422. Not used: this node makes its database from its configured image."
+    );
+    for (field, label) in [
+        ("destinations", "Private network"),
+        ("kernelAccess", "Kernel access"),
+        ("privatePort", "Private port"),
+    ] {
+        for value in [
+            Value::Null,
+            json!("synthetic-unreadable"),
+            json!(42),
+            json!([]),
+            json!({}),
+            json!({ "port": "synthetic-unreadable" }),
+            json!({ "address": "198.51.100.8" }),
+            json!({ "address": "synthetic-unreadable", "port": 7461 }),
+            json!({ "address": "198.51.100.8", "port": 0 }),
+            json!({ "address": "198.51.100.8", "port": 65536 }),
+            json!([{ "address": "198.51.100.8", "port": 5432 }, {}]),
+        ] {
+            // An unreadable address still leaves the kernel's port readable.
+            if field == "kernelAccess" && value["port"].as_u64() == Some(7461) {
+                continue;
+            }
+            let mut args = json!({ "name": "orders", "image": TEST_PG_IMAGE });
+            args[field] = value;
+            let details = action.details(&args);
+            assert_eq!(details.len(), 3);
+            assert_eq!(details[2].label, label);
+            assert_eq!(
+                details[2].value,
+                "Asked for: a value this card cannot show. Not used: this node makes its database from its configured image."
+            );
+        }
+    }
+}
+
+#[test]
 fn a_proposed_postgres_create_uses_only_the_configured_pinned_image() {
     let key = SkKey::from_seed(1);
     let rig = Rig::new("proposal-postgres", &key);

@@ -279,6 +279,36 @@ pub(crate) fn redact_login_links(text: &str) -> String {
         .into_owned()
 }
 
+fn redact_connector_links(text: &str) -> String {
+    static LINKS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        let gap = r"(?:\x1b(?:\[[0-?]*[ -/]*[@-~]?|\][0-?]*|[PX^_\\])?|[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]|\r|\p{Cf})*";
+        let host = "login.tailscale.com/a/"
+            .chars()
+            .map(|ch| regex::escape(&ch.to_string()))
+            .collect::<Vec<_>>()
+            .join(gap);
+        regex::Regex::new(&format!(
+            r"(?i)(?:[a-z\r]*:?\r*/\r*/)?{host}{gap}[ \t\r\n]*[A-Za-z0-9_-]+(?:\r+[A-Za-z0-9_-]+)*"
+        ))
+        .expect("fixed connector login-link pattern")
+    });
+    static STRINGS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r"(?:\x1b[PX^_]|[\x{90}\x{98}\x{9e}\x{9f}])[^\x1b\x18\x1a\r\n\x{85}\x{2028}\x{2029}\x{9c}]*(?:\x1b\\|\x{9c})|(?:\x1b\]|\x{9d})[^\x1b\x07\x18\x1a\r\n\x{85}\x{2028}\x{2029}\x{9c}]*(?:\x07|\x1b\\|\x{9c})"
+        ).expect("fixed connector console-string pattern")
+    });
+    let masked = LINKS.replace_all(text, "[sign-in link]");
+    STRINGS
+        .replace_all(&masked, |found: &regex::Captures| {
+            if found[0].contains("[sign-in link]") {
+                "[sign-in link]"
+            } else {
+                ""
+            }
+        })
+        .into_owned()
+}
+
 fn clean_console(text: &str) -> String {
     text.split('\n')
         .map(|line| {
@@ -313,7 +343,7 @@ pub(crate) fn connector_log(text: &str, secrets: &[String]) -> (String, service:
             values.push(found["id"].replace('\r', ""));
         }
     }
-    let raw = redact_login_links(&service::redact_blocks(text));
+    let raw = redact_connector_links(&service::redact_blocks(text));
     // Keep the fixed placeholder outside any unfinished terminal escape while rendering it.
     let raw = raw.replace("[sign-in link]", "\u{1b}[0m[sign-in link]");
     let answer = redact_login_links(&clean_console(&raw));
@@ -334,7 +364,7 @@ pub(crate) fn connector_log(text: &str, secrets: &[String]) -> (String, service:
 pub(crate) fn finish_connector_log(text: &str) -> String {
     static REMAINDERS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(
-            r"\[sign-in link\][A-Za-z0-9_-]+|(?i:(?:[a-z]*:?//)?login\.tailscale\.com/a/?)[A-Za-z0-9_-]{8,}"
+            r"\[sign-in link\][\p{Cf}A-Za-z0-9_-]+|(?i:(?:[a-z]*:?//)?login\.tailscale\.com/a/?)[A-Za-z0-9_-]{8,}"
         ).expect("fixed connector-log remainder pattern")
     });
     REMAINDERS.replace_all(text, "[sign-in link]").into_owned()
@@ -356,6 +386,119 @@ mod tests {
         assert_eq!(
             redact_login_links("https://login.tailscale.com/admin/machines"),
             "https://login.tailscale.com/admin/machines"
+        );
+    }
+
+    fn rendered_connector_lines(raw: &str) -> Vec<String> {
+        let (text, hidden) = connector_log(raw, &[]);
+        text.split(['\n', '\r'])
+            .filter(|line| !line.trim().is_empty())
+            .map(service::clean_log)
+            .filter(|line| !line.is_empty())
+            .map(|line| finish_connector_log(&service::redact_hidden(&line, &hidden)))
+            .collect()
+    }
+
+    fn visible_identifier_piece(id: &str, text: &str) -> usize {
+        assert!(id.is_ascii());
+        (1..=id.len())
+            .rev()
+            .find(|&len| (0..=id.len() - len).any(|start| text.contains(&id[start..start + len])))
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn connector_privacy_two_position_sweep() {
+        let mut failures = Vec::new();
+        for (id, expected_rows) in [("syntheticSweep1234", 14640), ("Qz6Xwq", 9408)] {
+            let line = format!("visit https://login.tailscale.com/a/{id} done\n");
+            let mut rows = 0;
+            let mut failed = 0;
+            let mut samples = Vec::new();
+            for (index, (intro, term)) in [
+                ("\u{1b}]0;", "\u{7}"),
+                ("\u{1b}]0;", "\u{1b}\\"),
+                ("\u{1b}]8;;", "\u{1b}\\"),
+                ("\u{1b}P", "\u{1b}\\"),
+                ("\u{1b}_", "\u{1b}\\"),
+                ("\u{9d}", "\u{7}"),
+                ("\u{90}", "\u{9c}"),
+                ("\u{1b}X", "\u{9c}"),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                for first in 0..line.len() {
+                    for second in first..line.len() {
+                        let raw = format!(
+                            "{}{intro}{}{term}{}",
+                            &line[..first],
+                            &line[first..second],
+                            &line[second..]
+                        );
+                        let lines = rendered_connector_lines(&raw);
+                        let longest = visible_identifier_piece(id, &lines.concat());
+                        rows += 1;
+                        if longest >= 4 {
+                            failed += 1;
+                            if samples.len() < 8 {
+                                samples.push(format!("row={index} first={first} second={second} longest={longest} answer={lines:?}"));
+                            }
+                        }
+                    }
+                }
+            }
+            assert_eq!(rows, expected_rows);
+            println!(
+                "two-position sweep identifier-length={} rows={rows} failures={failed}",
+                id.len()
+            );
+            if failed > 0 {
+                failures.push(format!(
+                    "identifier-length={} failures={failed}: {}",
+                    id.len(),
+                    samples.join("\n")
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn connector_privacy_host_continuations() {
+        let mut rows = 0;
+        let mut failures = Vec::new();
+        for id in ["syntheticSweep1234", "Qz6Xwq"] {
+            for scheme in ["https://", ""] {
+                let url = format!("{scheme}login.tailscale.com/a/{id}");
+                for offset in scheme.len()..=url.len() - id.len() {
+                    for insert in ["\u{200b}", "\u{ad}", "\u{200d}", "\u{feff}", "\u{202e}"] {
+                        let raw =
+                            format!("visit {}{insert}{} done\n", &url[..offset], &url[offset..]);
+                        let lines = rendered_connector_lines(&raw);
+                        let longest = visible_identifier_piece(id, &lines.concat());
+                        rows += 1;
+                        if longest >= 4 {
+                            failures.push(format!("row={rows} longest={longest} answer={lines:?}"));
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(rows, 460);
+        println!(
+            "host-continuation sweep rows={rows} failures={}",
+            failures.len()
+        );
+        assert!(
+            failures.is_empty(),
+            "{}",
+            failures
+                .iter()
+                .take(8)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n")
         );
     }
 

@@ -26,6 +26,16 @@ An imported service's `service_status` and `service_list` row now shows the uuid
 `null`. An approved database run whose template is missing now answers `refused` with the `arca templates install`
 hint, instead of `not_found`.
 
+Connector logs hide more sign-in link remnants while preserving the output of other services. Terminal titles and
+hyperlink targets are cleaned without dropping ordinary lines or reopening hidden sign-in details.
+
+Connector logs also hide short sign-in identifiers by their login link's host and path. Masking may hide an adjacent
+word when terminal formatting intervenes.
+
+Database approval cards on nodes with a configured image show requested private destinations, kernel access and
+private ports in plain words, and say that they are not used because this node makes its database from its configured
+image. A request that names only a private port shows that port.
+
 ## 0.36.0 (2026-11-17)
 
 An owner-approved `instance_start` card now starts an instance inside a tenant even when the proposing token's tool
