@@ -295,21 +295,25 @@ fn redact_connector_links(text: &str) -> String {
     LINKS.replace_all(text, "[sign-in link]").into_owned()
 }
 
-fn clean_connector_strings(text: &str) -> String {
+fn clean_connector_strings(text: &str) -> (String, String) {
     static STRINGS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(
             r"(?:\x1b[PX^_]|[\x{90}\x{98}\x{9e}\x{9f}])[^\x1b\x18\x1a\r\n\x{85}\x{2028}\x{2029}\x{9c}]*(?:\x1b\\|\x{9c})|(?:\x1b\]|\x{9d})[^\x1b\x07\x18\x1a\r\n\x{85}\x{2028}\x{2029}\x{9c}]*(?:\x07|\x1b\\|\x{9c})"
         ).expect("fixed connector console-string pattern")
     });
-    STRINGS
+    let mut dropped = String::new();
+    let cleaned = STRINGS
         .replace_all(text, |found: &regex::Captures| {
             if found[0].contains("[sign-in link]") {
                 "[sign-in link]"
             } else {
+                dropped.push_str(&found[0]);
+                dropped.push('\n');
                 ""
             }
         })
-        .into_owned()
+        .into_owned();
+    (cleaned, dropped)
 }
 
 fn clean_console(text: &str) -> String {
@@ -350,7 +354,7 @@ pub(crate) fn connector_log(text: &str, secrets: &[String]) -> (String, service:
     let detection = redact_login_links(&clean_console(
         &masked.replace("[sign-in link]", "\u{1b}[0m[sign-in link]"),
     ));
-    let raw = clean_connector_strings(&masked);
+    let (raw, dropped) = clean_connector_strings(&masked);
     // Keep the fixed placeholder outside any unfinished terminal escape while rendering it.
     let raw = raw.replace("[sign-in link]", "\u{1b}[0m[sign-in link]");
     let answer = redact_login_links(&clean_console(&raw));
@@ -358,10 +362,19 @@ pub(crate) fn connector_log(text: &str, secrets: &[String]) -> (String, service:
         regex::Regex::new(r"//[^\s/]*\.[^\s/]*/a/([A-Za-z0-9_-]{8,})")
             .expect("fixed URL-identifier pattern")
     });
+    let dropped = redact_login_links(&clean_console(&dropped));
+    let dropped_links: std::collections::HashSet<_> = URL_IDS
+        .find_iter(&dropped)
+        .map(|found| found.as_str())
+        .collect();
     values.extend(
         URL_IDS
             .captures_iter(&answer)
-            .chain(URL_IDS.captures_iter(&detection))
+            .chain(
+                URL_IDS
+                    .captures_iter(&detection)
+                    .filter(|found| !dropped_links.contains(&found[0])),
+            )
             .map(|found| found[1].to_string()),
     );
     // values_to_hide keeps its existing 8-byte floor: short identifiers are hidden by shape, not as ordinary words.
@@ -473,7 +486,7 @@ mod tests {
     }
 
     #[test]
-    fn connector_privacy_three_position_samples() {
+    fn connector_privacy_four_samples() {
         let id = "syntheticSweep1234";
         let mut rows = 0;
         for (intro, term) in [
@@ -490,6 +503,30 @@ mod tests {
             rows += 1;
         }
         assert_eq!(rows, 4);
+    }
+
+    #[test]
+    fn connector_privacy_preserves_sign_in_identifier_masking() {
+        let raw = "https://login.tailscale.com/a/abcdefghijkl\n\u{1b}]0;x //h.io/a/ghijklMOREMOREMORE\u{7}\ntoken abcdefghijklMOREMOREMORE end\n";
+        assert_eq!(
+            rendered_connector_lines(raw),
+            ["[sign-in link]", "token [secret]MOREMOREMORE end"]
+        );
+    }
+
+    #[test]
+    fn connector_privacy_preserves_ordinary_words() {
+        let raw = "see \u{1b}]8;;https://docs.example.com/a/installation\u{7} docs\u{1b}]8;;\u{7}\nrun installation now\n";
+        assert_eq!(
+            rendered_connector_lines(raw),
+            ["see docs", "run installation now"]
+        );
+    }
+
+    #[test]
+    fn connector_privacy_preserves_ordinary_status() {
+        let raw = "\u{1b}P1$r//x.example.com/a/sessionabc\u{1b}\\\nsessionabc is fine\n";
+        assert_eq!(rendered_connector_lines(raw), ["sessionabc is fine"]);
     }
 
     #[test]
