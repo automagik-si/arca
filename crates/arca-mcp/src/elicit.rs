@@ -14,8 +14,18 @@
 //! all at once as one `inputRequests` entry each. A session whose passkey is too old to be asked is first sent a URL-mode
 //! elicitation to the page where one passkey tap confirms it ([`Asking::StepUp`]).
 //!
-//! The server keeps no session. Which clients can be asked is remembered per token id from its last `initialize`
-//! (`2025-11-25`) and read from each request's own capabilities (`2026-07-28`). A `2026-07-28` retry carries a
+//! A session that may be asked is also asked when nobody called: on `2025-11-25` its client opens the server's own stream
+//! with `GET /mcp` (Streamable HTTP, "Listening for Messages from the Server"), and every plan that starts waiting, whoever
+//! proposed it, is put to it there as an `elicitation/create` ([`TerminalApprover::waiting_now`], [`crate::listen`]),
+//! never one that deletes or erases ([`TerminalApprover::approvable_on_stream`]). While the node runs, a stream asks each
+//! plan once in all ([`Terminal::claim_plan`]), and never one a call already asked; a call does not ask a plan whose
+//! question is open on a stream ([`Terminal::claim_for_call`]). `2026-07-28` has
+//! no request from the server outside a call, so a client on it is asked only on its own calls.
+//!
+//! Which clients can be asked is remembered per token id from its last `initialize` (`2025-11-25`) and read from each
+//! request's own capabilities (`2026-07-28`). An `initialize` from a caller that may be asked is given an
+//! `Mcp-Session-Id`, which its client sends on every later request; one the server did not give that token, or no longer
+//! knows (it restarted), is answered `404`, so the client initializes again and its capabilities are known again. A `2026-07-28` retry carries a
 //! `requestState` the server signed (HMAC-SHA256 under a key made at start): it names the token, the plan or plans, the
 //! verb with the digest of its arguments and an expiry, so a state is never taken for another caller's or another call's.
 
@@ -88,6 +98,20 @@ pub trait TerminalApprover: Send + Sync {
     /// refused.
     fn approve(&self, plan: &str, created_at: u64, caller: &Caller) -> Result<Value, CallError>;
 
+    /// Every plan that waits now and that `caller`'s terminal may be asked about, one question each, whoever proposed it.
+    /// The server puts each that [`TerminalApprover::approvable_on_stream`] allows to the stream the caller's client
+    /// opened with `GET /mcp`, once. None by default.
+    fn waiting_now(&self, _caller: &Caller) -> Vec<PendingPlan> {
+        Vec::new()
+    }
+
+    /// Whether the stored plan `plan`, made at `created_at`, may be put to the server's stream and decided there, for any
+    /// caller: it exists and it does not delete or erase. The stream asks this before it puts a plan and again when the
+    /// answer comes. False by default.
+    fn approvable_on_stream(&self, _plan: &str, _created_at: u64) -> bool {
+        false
+    }
+
     /// Declines plan `plan`, made at `created_at`, because `caller` answered no. Answers whether it was declined. By
     /// default nothing is: a no leaves the plan waiting on its card, as the admin token's always did.
     fn decline(&self, _plan: &str, _created_at: u64, _caller: &Caller) -> bool {
@@ -105,8 +129,28 @@ pub(crate) struct Terminal {
     capable: Mutex<HashMap<String, Modes>>,
     /// The states already used to approve, each until it expires: a state approves once.
     spent: Mutex<HashMap<String, u64>>,
+    /// The plans already put to a terminal, and the ones whose question is open on a stream now, under one lock: a
+    /// stream's claim and its open question are one step, so no call comes in between and asks the plan too.
+    asked: Mutex<Asked>,
+    /// The server's own streams (`GET /mcp`) by stream id, so a client that lost one resumes it ([`crate::listen`]).
+    pub(crate) streams: Mutex<HashMap<String, Arc<crate::listen::Stream>>>,
+    /// The session ids given at `initialize`, each with the token it was given to, in the order they were given.
+    sessions: Mutex<Vec<(String, String)>>,
     key: [u8; 32],
 }
+
+/// The plans asked, by id and creation time, each with when (unix seconds), and those whose question is open on a stream.
+#[derive(Default)]
+struct Asked {
+    at: HashMap<(String, u64), u64>,
+    open: std::collections::HashSet<(String, u64)>,
+}
+
+/// How long a plan is remembered as asked: past the longest a plan can wait (a day while the owner's session holds it).
+const ASKED_FOR_S: u64 = 25 * 60 * 60;
+
+/// The most session ids remembered at once; the oldest is forgotten first, and its client is told to initialize again.
+const MAX_SESSIONS: usize = 1024;
 
 impl Terminal {
     pub(crate) fn new(approver: Arc<dyn TerminalApprover>, timeout: Duration) -> Terminal {
@@ -118,6 +162,9 @@ impl Terminal {
             waiting: Mutex::new(HashMap::new()),
             capable: Mutex::new(HashMap::new()),
             spent: Mutex::new(HashMap::new()),
+            asked: Mutex::new(Asked::default()),
+            streams: Mutex::new(HashMap::new()),
+            sessions: Mutex::new(Vec::new()),
             key,
         }
     }
@@ -178,6 +225,97 @@ impl Terminal {
             let _ = tx.send(response);
         }
         true
+    }
+
+    /// Takes `plan` for a stream: `true` the first time, and its question is then open on the stream; `false` when it was
+    /// asked already, on any stream or call.
+    pub(crate) fn claim_plan(&self, plan: &PendingPlan, now_s: u64) -> bool {
+        let Ok(mut asked) = self.asked.lock() else {
+            return false;
+        };
+        asked
+            .at
+            .retain(|_, at| now_s.saturating_sub(*at) <= ASKED_FOR_S);
+        let key = (plan.id.clone(), plan.created_at);
+        if asked.at.contains_key(&key) {
+            return false;
+        }
+        asked.at.insert(key.clone(), now_s);
+        asked.open.insert(key);
+        true
+    }
+
+    /// Takes `plan` for a call that asks it: `false` while its question is open on a stream, else `true`, and no stream
+    /// asks it after. A call asks again a plan it asked before: the owner asked for it.
+    pub(crate) fn claim_for_call(&self, plan: &PendingPlan, now_s: u64) -> bool {
+        let Ok(mut asked) = self.asked.lock() else {
+            return false;
+        };
+        let key = (plan.id.clone(), plan.created_at);
+        if asked.open.contains(&key) {
+            return false;
+        }
+        asked.at.insert(key, now_s);
+        true
+    }
+
+    /// Whether the question of `plan` is open on a stream now.
+    pub(crate) fn on_stream(&self, plan: &PendingPlan) -> bool {
+        self.asked
+            .lock()
+            .is_ok_and(|asked| asked.open.contains(&(plan.id.clone(), plan.created_at)))
+    }
+
+    /// The question of `plan` on a stream is over. With `again`, the plan was not decided there (never answered, or the
+    /// session must confirm first), and a stream may ask it again.
+    pub(crate) fn release(&self, plan: &PendingPlan, again: bool) {
+        if let Ok(mut asked) = self.asked.lock() {
+            let key = (plan.id.clone(), plan.created_at);
+            asked.open.remove(&key);
+            if again {
+                asked.at.remove(&key);
+            }
+        }
+    }
+
+    /// Whether `plan` was asked already.
+    pub(crate) fn was_asked(&self, plan: &PendingPlan) -> bool {
+        self.asked
+            .lock()
+            .is_ok_and(|asked| asked.at.contains_key(&(plan.id.clone(), plan.created_at)))
+    }
+
+    /// A new session id for `token`, given at `initialize`: 32 random bytes, URL-safe base64, visible ASCII as the
+    /// transport requires.
+    pub(crate) fn open_session(&self, token: &str) -> Option<String> {
+        let mut raw = [0u8; 32];
+        getrandom::fill(&mut raw).ok()?;
+        let id = URL_SAFE_NO_PAD.encode(raw);
+        let mut sessions = self.sessions.lock().ok()?;
+        if sessions.len() >= MAX_SESSIONS {
+            sessions.remove(0);
+        }
+        sessions.push((id.clone(), token.to_string()));
+        Some(id)
+    }
+
+    /// Whether `id` is a session this server gave `token` and still knows.
+    pub(crate) fn has_session(&self, id: &str, token: &str) -> bool {
+        self.sessions.lock().is_ok_and(|sessions| {
+            sessions
+                .iter()
+                .any(|(known, owner)| known == id && owner == token)
+        })
+    }
+
+    /// Ends session `id` of `token` (the client's `DELETE /mcp`). `true` when there was one.
+    pub(crate) fn close_session(&self, id: &str, token: &str) -> bool {
+        let Ok(mut sessions) = self.sessions.lock() else {
+            return false;
+        };
+        let before = sessions.len();
+        sessions.retain(|(known, owner)| !(known == id && owner == token));
+        sessions.len() != before
     }
 
     /// Spends `state`: `true` the first time, `false` when it was spent already. A spent state is remembered until it would
@@ -434,6 +572,43 @@ fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct Nobody;
+
+    impl TerminalApprover for Nobody {
+        fn pending(&self, _verb: &str, _result: &Value, _caller: &Caller) -> Option<PendingPlan> {
+            None
+        }
+
+        fn approve(
+            &self,
+            _plan: &str,
+            _created_at: u64,
+            _caller: &Caller,
+        ) -> Result<Value, CallError> {
+            Err(CallError::NotFound)
+        }
+    }
+
+    #[test]
+    fn a_plan_the_stream_claimed_is_never_also_asked_by_a_call() {
+        let terminal = Terminal::new(Arc::new(Nobody), DEFAULT_TIMEOUT);
+        let plan = PendingPlan {
+            id: "act-000000000001".to_string(),
+            message: String::new(),
+            created_at: 1,
+        };
+        // The stream's claim and its open question are one step: no call can come in between and ask it too.
+        assert!(terminal.claim_plan(&plan, 10));
+        assert!(
+            terminal.on_stream(&plan),
+            "claimed but not yet open on the stream"
+        );
+        assert!(
+            !terminal.claim_for_call(&plan, 11),
+            "a call does not take it"
+        );
+    }
 
     #[test]
     fn hmac_matches_the_rfc_4231_vector() {

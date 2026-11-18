@@ -2437,8 +2437,7 @@ declared only URL mode, and any verb that does not answer with a waiting proposa
 and the card on the approval page waits as always. This path does not touch a delete plan, which keeps its card.
 
 - **`2025-11-25`.** The client declares `capabilities.elicitation` at `initialize`; the node remembers it for that
-  token id, since it keeps no session, so use one client per admin token (the last `initialize` wins, and `arca call`
-  declares none). The call's `POST` is then answered `200` with `text/event-stream`: a priming event, then an
+  token id, so use one client per admin token (the last `initialize` wins, and `arca call` declares none). The call's `POST` is then answered `200` with `text/event-stream`: a priming event, then an
   `elicitation/create` request in form mode, then, once answered, the call's own reply. The client's answer is a second
   `POST` of the JSON-RPC response, answered `202`. Only the token that was asked may answer.
 - **`2026-07-28`.** There are no server-to-client requests in this version; the client declares `elicitation` in each
@@ -2581,6 +2580,29 @@ confirms it is the owner. A refresh cannot add `approvals` to a grant that was a
   declines it, as **Decline** on the card does; a decline, a cancel or no answer leaves it waiting on its card. The
   answer's `decisions` says what each plan did (`approved`, `refused`, `declined`, `left`). The same holds for the one
   question an `action_propose` answer asks in the session: a `no` declines that plan, and the answer says `declinedIn`.
+- **Asked when nobody called.** A plan another agent proposes comes to the session by itself, with nobody typing. The
+  session's client opens the node's own stream, `GET /mcp` with `Accept: text/event-stream` (Streamable HTTP, "Listening
+  for Messages from the Server"), and each action plan that starts waiting is put to it there as one
+  `elicitation/create`, within about a second. A plan already waiting when the stream opens is asked too. The stream
+  never carries a plan that deletes or erases, for any caller, the admin token included: such a plan keeps its passkey
+  card, and the stored plan is checked again when the answer comes. `yes` approves and runs it, `no` declines it, and a
+  cancel or no answer leaves it on its card. After a yes or a no the node tells the session what became of the plan
+  (approved and run, declined, or not run and why) in a message on the same stream. An open question waits for its
+  answer as long as the plan can wait. While the node runs, each plan is asked once across its streams and calls: a plan
+  a call already asked is not put to a stream, and a call does not ask a plan whose question is open on one; after a
+  restart a plan still waiting is asked again. A session whose passkey is older than 12 hours is first sent the step-up
+  page on the stream (once for the plans waiting then), and its plans are asked as soon as the tap confirms it; a yes
+  given after the passkey lapsed runs nothing, brings the step-up page, and the plan is asked again after the tap. Every
+  event has an id of its own; a client that lost the stream and opens it again with `Last-Event-ID` within five minutes
+  is sent its open questions again. The stream ends, with its open questions, as soon as the session may no longer be
+  asked (its grant revoked), or five minutes after its client went away. Only `2025-11-25` has requests from the node
+  outside a call, so `server/discover` offers `2025-11-25` alone, with `cacheScope: "private"`, to a caller the node may
+  ask: Claude Code 2.1.327, which discovers first, then initializes on `2025-11-25` and opens the stream with no setting.
+  Every other caller is offered both versions as before, and a `2026-07-28` request of the session is still served; it
+  is asked only on its own calls. At `initialize` such a caller is given an `Mcp-Session-Id`, which its client sends on
+  every later request; an id the node did not give that token, or no longer knows after a restart, is answered `404`, so
+  the client initializes again, and `DELETE /mcp` with it ends it (`204`). A `GET` or `DELETE` on `/mcp` without a bearer
+  is `401`; by any other caller it is `405` with `Allow: POST`.
 - **Plans that delete or erase keep the passkey card.** A delete plan, an approval request and an action that erases
   (`service_remove`, `snapshot_delete`, `tenant_remove`, `deploy_remove`, `function_remove`, `storage_add`, and
   `service_update` with `eraseData`) are listed with the page link and never asked in the session.
@@ -2599,7 +2621,8 @@ last 12 hours, and **Disconnect** ends it at once. Calls of the admin token are 
 
 ### Protocol versions
 
-The server keeps no session, so each request is judged alone. The tools, their parameters and their results are the
+Each request is judged alone; the only session is the one a caller the node may ask is given at `initialize` (see
+"Approving in your own signed-in session"). The tools, their parameters and their results are the
 same in both versions, and so are the tokens and their scopes.
 
 - **`2026-07-28`.** A request says its version itself, with no `initialize` before it: the header

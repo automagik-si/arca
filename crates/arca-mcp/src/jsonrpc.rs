@@ -44,6 +44,8 @@ pub struct Answer {
     /// When set, the answer is an SSE stream of these messages, the last of which is the call's own reply, and `body` is
     /// not sent. Only a call whose terminal is asked about a plan streams ([`crate::elicit`]).
     pub stream: Option<tokio::sync::mpsc::Receiver<Value>>,
+    /// The session id an `initialize` was given, sent back as `Mcp-Session-Id` ([`crate::elicit`]).
+    pub session: Option<String>,
 }
 
 impl Answer {
@@ -52,6 +54,7 @@ impl Answer {
             status: StatusCode::OK,
             body,
             stream: None,
+            session: None,
         }
     }
 }
@@ -114,20 +117,35 @@ pub async fn dispatch(
                 status: StatusCode::BAD_REQUEST,
                 body: error_reply(id, refusal.code, &refusal.message, refusal.data),
                 stream: None,
+                session: None,
             }));
         }
     };
     let body = match (era, method) {
-        // Discovery is answered to anyone who asks, in the one shape it has: it is how a caller learns the versions.
-        (_, "server/discover") => result_reply(id, discover_result()),
+        // Discovery is answered to anyone who asks: it is how a caller learns the versions. A caller this server may ask
+        // to approve is offered `2025-11-25` alone, because only there can the server ask it when it did not call: its
+        // client then initializes and opens the server's stream ([`listen`]). A request in `2026-07-28` is still served.
+        (_, "server/discover") => {
+            let asks = server
+                .terminal
+                .as_ref()
+                .is_some_and(|terminal| terminal.approver.may_ask(caller) != Asking::No);
+            result_reply(id, discover_result(asks))
+        }
         (Era::Legacy, "initialize") => {
-            // The server keeps no session, so what a client that may be asked can be asked is remembered by its token's id.
+            // What a client that may be asked can be asked is remembered by its token's id. Such a client is given a
+            // session id, so a restart of the server (which forgets it) tells the client to initialize again.
+            let mut session = None;
             if let Some(terminal) = &server.terminal
                 && terminal.approver.may_ask(caller) != Asking::No
             {
                 terminal.note_initialize(&caller.token_id, &params);
+                session = terminal.open_session(&caller.token_id);
             }
-            result_reply(id, initialize_result())
+            return Ok(Some(Answer {
+                session,
+                ..Answer::ok(result_reply(id, initialize_result()))
+            }));
         }
         (Era::Legacy, "ping") => result_reply(id, json!({})),
         (Era::Legacy, "tools/list") => {
@@ -153,6 +171,7 @@ pub async fn dispatch(
                     status: StatusCode::OK,
                     body: Value::Null,
                     stream,
+                    session: None,
                 }));
             }
             if era == Era::Modern
@@ -168,6 +187,7 @@ pub async fn dispatch(
                 status: StatusCode::NOT_FOUND,
                 body: error_reply(id, METHOD_NOT_FOUND, "method not found", None),
                 stream: None,
+                session: None,
             }));
         }
     };
@@ -190,14 +210,20 @@ fn initialize_result() -> Value {
 }
 
 /// The answer to `server/discover`: the versions, the capabilities and the server's name and release. It is the same
-/// for every caller, so any cache may keep it.
-fn discover_result() -> Value {
+/// for every caller, so any cache may keep it, except for a caller the server may ask to approve (`asks`): that one is
+/// offered `2025-11-25` alone, and the answer is its own.
+fn discover_result(asks: bool) -> Value {
+    let (versions, scope): (&[&str], &str) = if asks {
+        (&[PROTOCOL_VERSION], "private")
+    } else {
+        (&SUPPORTED_VERSIONS, "public")
+    };
     modern_result(json!({
-        "supportedVersions": SUPPORTED_VERSIONS,
+        "supportedVersions": versions,
         "capabilities": capabilities(),
         "serverInfo": server_info(),
         "ttlMs": CACHE_TTL_MS,
-        "cacheScope": "public"
+        "cacheScope": scope
     }))
 }
 
@@ -518,9 +544,17 @@ async fn call_tool(
                 )));
             }
             let asked = asked.filter(|_| asking);
-            let many = asked
+            // A plan whose question is open on the session's stream now is not asked on the call too.
+            let many: Vec<PendingPlan> = asked
                 .as_ref()
-                .map(|(terminal, _, _)| terminal.approver.waiting(name, &value, caller))
+                .map(|(terminal, _, _)| {
+                    terminal
+                        .approver
+                        .waiting(name, &value, caller)
+                        .into_iter()
+                        .filter(|plan| !terminal.on_stream(plan))
+                        .collect()
+                })
                 .unwrap_or_default();
             let waiting = asked
                 .as_ref()
@@ -552,6 +586,14 @@ async fn call_tool(
                         result_reply(id, step_up_required(&url, &state))
                     }
                     (Era::Modern, None) => {
+                        // A plan a stream took meanwhile is left to the stream.
+                        let many: Vec<PendingPlan> = many
+                            .into_iter()
+                            .filter(|plan| terminal.claim_for_call(plan, now_seconds()))
+                            .collect();
+                        if many.is_empty() {
+                            return Ok(Some(reply));
+                        }
                         let state = terminal.sign_many(
                             &caller.token_id,
                             &many,
@@ -587,6 +629,11 @@ async fn call_tool(
             let Some((terminal, plan)) = waiting else {
                 return Ok(Some(reply));
             };
+            // A plan whose question is open on the session's stream is not asked on the call too; one asked here is not
+            // put to the stream after.
+            if !terminal.claim_for_call(&plan, now_seconds()) {
+                return Ok(Some(reply));
+            }
             match era {
                 Era::Modern => {
                     let state = terminal.sign(
@@ -863,6 +910,11 @@ fn ask_many_on_stream(
         }
         let mut decisions = Vec::new();
         for plan in asking.plans {
+            // Asked here on the owner's request, it is not put to the session's stream after; one a stream took meanwhile is
+            // left to the stream.
+            if !terminal.claim_for_call(&plan, now_seconds()) {
+                continue;
+            }
             let Some((request_id, answer)) = terminal.expect(&caller.token_id) else {
                 break;
             };
@@ -894,7 +946,6 @@ fn ask_many_on_stream(
     Some(rx)
 }
 
-/// What became of one plan asked about: approved and run, refused when approved, or left waiting on its card.
 /// Asks the node to decline `plan`, made at `created_at`, after `caller` said no. Answers whether it was declined.
 async fn decline(
     terminal: &crate::elicit::Terminal,
@@ -935,7 +986,8 @@ fn declined_reply(id: Value, caller: &Caller, approving: Approving) -> Value {
     result_reply(id, result)
 }
 
-async fn decide(
+/// What became of one plan asked about: approved and run, refused when approved, declined, or left waiting on its card.
+pub(crate) async fn decide(
     terminal: &crate::elicit::Terminal,
     caller: &Caller,
     plan: &str,

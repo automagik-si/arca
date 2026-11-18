@@ -16,6 +16,14 @@ data and logs on one volume. Create it stopped and supply `GITLAB_EXTERNAL_URL` 
 [migration runbook](docs/GITLAB-MIGRATION.md) covers an empty-service rehearsal, backup and restore, edge routing,
 an optional SSH listener and rollback. It has not yet been run on a live node.
 
+The owner's signed-in session is asked about a plan another agent proposes as soon as it starts waiting, with nobody
+typing: its client opens `GET /mcp`, the node's own event stream, and each plan is put to it there as a yes-or-no
+question, once while the node runs. A yes approves and runs it, a no declines it, and the session is told what became of
+it; the stream never carries a plan that erases, for any caller, and a session whose passkey is older than 12 hours is
+sent the step-up page first. `server/discover` offers such a caller `2025-11-25`
+alone, the version with requests from the node, so Claude Code opens the stream with no setting. Such a caller gets an
+`Mcp-Session-Id` at `initialize`. See docs/OPERATING.md.
+
 `service_labels_set` merges a service's plain labels, with null removing a key. `service_status` and `service_list`
 rows now include the label map. Writes use ownership checks, If-Match and read-back outside the effect journal;
 uncertain answers carry an explicit code. Label keeping during snapshot rollback is best effort and never prevents

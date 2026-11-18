@@ -3,7 +3,15 @@
 //!
 //! `POST /mcp` answers `200` with a JSON-RPC result or error, `202` to a notification, and to a request that declares
 //! protocol version `2026-07-28`: `400` when its headers and its body disagree or lack what that version requires, and
-//! `404` for a method the server does not have. A `GET` on `/mcp` is `405`, and no session id is ever issued or read.
+//! `404` for a method the server does not have.
+//!
+//! A caller whose terminal may be asked to approve ([`crate::elicit`]) is given an `Mcp-Session-Id` at `initialize`; a
+//! later request that carries a session id the server did not give that token, or has forgotten, is `404`, and
+//! `DELETE /mcp` with its id ends it (`204`). Such a caller, once its client declared elicitation, may open the server's
+//! own stream with `GET /mcp` (`text/event-stream`, [`crate::listen`]), where every plan that starts waiting and that does
+//! not delete or erase is put to it. A `GET` or `DELETE` on `/mcp` without a bearer is `401`; one by any other caller is
+//! `405` with `Allow: POST`, as the transport allows a server that offers that caller no stream. Every event of every
+//! stream carries an id of its own.
 //!
 //! A request carrying any `Origin` header is refused `403` before its body is read, whatever its method or path: a browser
 //! page is never a client. The unix socket is bound inside a fresh private directory, chmodded 0600 and renamed into place,
@@ -41,6 +49,9 @@ use axum::http::{HeaderMap, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+
+/// The header that carries a session id (Streamable HTTP, "Session Management").
+const SESSION_HEADER: &str = "mcp-session-id";
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
 use hyper_util::service::TowerToHyperService;
@@ -371,7 +382,7 @@ impl Server {
             .approver
             .take()
             .map(|approver| crate::elicit::Terminal::new(approver, self.terminal_timeout));
-        let mut router = Router::new().route("/mcp", post(mcp));
+        let mut router = Router::new().route("/mcp", post(mcp).get(listen).delete(end_session));
         for (path, tool, handler) in std::mem::take(&mut self.gets) {
             router = router.route(
                 path,
@@ -421,6 +432,9 @@ async fn mcp(State(server): State<Arc<Server>>, headers: HeaderMap, body: Bytes)
         method: mirrored(&headers, "mcp-method"),
         name: mirrored(&headers, "mcp-name"),
     };
+    if let Some(refused) = server.unknown_session(&caller, &headers, &body) {
+        return refused;
+    }
     // A client's answer to an elicitation request this server sent is not a request: it is handed to the call that asked,
     // and answered 202 (Streamable HTTP, "Sending Messages to the Server"). Any other body is dispatched as ever.
     if let Some(terminal) = &server.terminal
@@ -434,7 +448,14 @@ async fn mcp(State(server): State<Arc<Server>>, headers: HeaderMap, body: Bytes)
     }
     match jsonrpc::dispatch(&server, &caller, &mirrors, &body).await {
         Ok(Some(answer)) if answer.stream.is_some() => sse(answer),
-        Ok(Some(answer)) => (answer.status, Json(answer.body)).into_response(),
+        Ok(Some(answer)) => {
+            let session = answer.session.clone();
+            let mut response = (answer.status, Json(answer.body)).into_response();
+            if let Some(value) = session.and_then(|id| header::HeaderValue::from_str(&id).ok()) {
+                response.headers_mut().insert(SESSION_HEADER, value);
+            }
+            response
+        }
         Ok(None) => StatusCode::ACCEPTED.into_response(),
         Err(CallError::Forbidden { verb }) => server.forbidden(&caller, &verb, true),
         Err(CallError::Unauthenticated) => server.unauthorized(&headers),
@@ -442,13 +463,108 @@ async fn mcp(State(server): State<Arc<Server>>, headers: HeaderMap, body: Bytes)
     }
 }
 
-/// An answer that streams: `200` with `text/event-stream`. The first event carries an id and an empty `data`, to prime the
-/// client's reconnect (the transport's SHOULD), then each message is one `data` event, and the stream ends after the last.
+impl Server {
+    /// `404` for a request that carries a session id this server did not give `caller`'s token or no longer knows, so its
+    /// client initializes again (Streamable HTTP, "Session Management"). An `initialize` starts a new session whatever it
+    /// carries. Only a caller the server may ask is given a session, so only its session id is read.
+    fn unknown_session(
+        &self,
+        caller: &Caller,
+        headers: &HeaderMap,
+        body: &[u8],
+    ) -> Option<Response> {
+        let terminal = self.terminal.as_ref()?;
+        let id = headers.get(SESSION_HEADER)?.to_str().unwrap_or_default();
+        if terminal.approver.may_ask(caller) == crate::elicit::Asking::No {
+            return None;
+        }
+        if terminal.has_session(id, &caller.token_id) {
+            return None;
+        }
+        let initialize = serde_json::from_slice::<Value>(body)
+            .is_ok_and(|value| value.get("method").and_then(Value::as_str) == Some("initialize"));
+        (!initialize).then(|| StatusCode::NOT_FOUND.into_response())
+    }
+}
+
+/// `405` with `Allow: POST`: `/mcp` offers this caller no stream and no session to end.
+fn post_only() -> Response {
+    (StatusCode::METHOD_NOT_ALLOWED, [(header::ALLOW, "POST")]).into_response()
+}
+
+/// A priming event id no other stream of the session has: random, as [`crate::listen`]'s are.
+fn prime_event() -> Bytes {
+    let mut raw = [0u8; 16];
+    let _ = getrandom::fill(&mut raw);
+    Bytes::from(format!(
+        "id: {}.0\ndata:\n\n",
+        base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, raw)
+    ))
+}
+
+/// `GET /mcp`: the server's own stream, for a caller whose terminal may be asked and whose client declared elicitation
+/// ([`crate::listen`]); `Last-Event-ID` resumes one the client lost. Anyone else is `405`.
+async fn listen(State(server): State<Arc<Server>>, headers: HeaderMap) -> Response {
+    let Some(caller) = server.authenticate(&headers) else {
+        return server.unauthorized(&headers);
+    };
+    if let Some(refused) = server.unknown_session(&caller, &headers, b"") {
+        return refused;
+    }
+    let streams = headers
+        .get_all(header::ACCEPT)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .any(|value| value.contains("text/event-stream"));
+    let last_event = headers
+        .get("last-event-id")
+        .and_then(|value| value.to_str().ok());
+    let Some(events) = streams
+        .then(|| crate::listen::open(&server, &caller, last_event))
+        .flatten()
+    else {
+        return post_only();
+    };
+    let events = tokio_stream::wrappers::ReceiverStream::new(events).map(Ok::<_, io::Error>);
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "text/event-stream"),
+            (header::CACHE_CONTROL, "no-cache"),
+            (header::HeaderName::from_static("x-accel-buffering"), "no"),
+        ],
+        axum::body::Body::from_stream(events),
+    )
+        .into_response()
+}
+
+/// `DELETE /mcp`: the client ends its session. `204` when it was one this server gave the caller, `404` for one it did
+/// not, and `405` without a session id or for a caller the server gives none.
+async fn end_session(State(server): State<Arc<Server>>, headers: HeaderMap) -> Response {
+    let Some(caller) = server.authenticate(&headers) else {
+        return server.unauthorized(&headers);
+    };
+    let (Some(terminal), Some(id)) = (server.terminal.as_ref(), headers.get(SESSION_HEADER)) else {
+        return post_only();
+    };
+    if terminal.approver.may_ask(&caller) == crate::elicit::Asking::No {
+        return post_only();
+    }
+    if terminal.close_session(id.to_str().unwrap_or_default(), &caller.token_id) {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        StatusCode::NOT_FOUND.into_response()
+    }
+}
+
+/// An answer that streams: `200` with `text/event-stream`. The first event carries an id of its own and an empty `data`, to
+/// prime the client's reconnect (the transport's SHOULD), then each message is one `data` event, and the stream ends after
+/// the last.
 fn sse(answer: jsonrpc::Answer) -> Response {
     let Some(messages) = answer.stream else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
-    let prime = tokio_stream::once(Ok::<_, io::Error>(Bytes::from_static(b"id: 0\ndata:\n\n")));
+    let prime = tokio_stream::once(Ok::<_, io::Error>(prime_event()));
     let events = tokio_stream::wrappers::ReceiverStream::new(messages)
         .map(|message| Ok::<_, io::Error>(Bytes::from(format!("data: {message}\n\n"))));
     (

@@ -2689,6 +2689,47 @@ impl arca_mcp::TerminalApprover for TerminalApproval {
             .collect()
     }
 
+    fn waiting_now(&self, caller: &Caller) -> Vec<arca_mcp::PendingPlan> {
+        let now = (self.clock)();
+        let session = caller.is_issued();
+        let Ok(kernel) = self.kernel.lock() else {
+            return Vec::new();
+        };
+        kernel
+            .action_proposals()
+            .iter()
+            .filter(|proposal| !proposal.expired(now) && proposal.id.starts_with("act-"))
+            // The stream never carries a plan that deletes or erases, for any caller, the admin token included: such a
+            // plan keeps its passkey card. The admin token's own calls still ask it, as they always did.
+            .filter(|proposal| !erases(&json!(proposal.action), &proposal.args))
+            .map(|proposal| arca_mcp::PendingPlan {
+                id: proposal.id.clone(),
+                message: terminal_question(
+                    &json!({
+                        "summary": proposal.summary,
+                        "details": proposal.details,
+                        "expiresAt": proposal.expires_at,
+                    }),
+                    session,
+                ),
+                created_at: proposal.created_ms,
+            })
+            .collect()
+    }
+
+    fn approvable_on_stream(&self, plan: &str, created_at: u64) -> bool {
+        let now = (self.clock)();
+        let Ok(kernel) = self.kernel.lock() else {
+            return false;
+        };
+        kernel.action_proposals().iter().any(|proposal| {
+            proposal.id == plan
+                && proposal.created_ms == created_at
+                && !proposal.expired(now)
+                && !erases(&json!(proposal.action), &proposal.args)
+        })
+    }
+
     fn approve(&self, plan: &str, created_at: u64, caller: &Caller) -> Result<Value, CallError> {
         let forbidden = || CallError::Forbidden {
             verb: "action_propose".to_string(),
