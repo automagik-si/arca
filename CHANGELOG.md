@@ -13,6 +13,13 @@ needs it. No verb uses this yet, so nothing changes on a node by this release al
 snapshots, `service_update` takes its own pre-update snapshot there and restores it on a rollback, and each update
 keeps one snapshot until a later release removes old ones.
 
+Arca can now run a formula's command inside its service's container: a `system` container or an OCI container of the
+node's own service project. It is started as the formula names it, as root and with no environment added, under the
+image's `/usr/bin/timeout`, and waited on until its `seconds` and 5 more. The last 64 KiB of each output is kept, a
+longer output is no error, and what is kept is masked as `service_logs` masks a log. A command Incus does not answer
+for marks the instance hung until Arca sees it stopped. No verb runs a formula yet, so nothing changes on a node by
+this release alone. See OPERATING.md.
+
 A container template may carry `appUpdate`, a formula for updating the app inside its service: a `health` command and
 a `version` reader, and on a `system` container an `update` command that takes the version as one argument
 (`{version}`). Arca reads and checks it strictly when the template is read and `service_status` shows
