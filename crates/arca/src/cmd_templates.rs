@@ -41,6 +41,8 @@ pub const SHIPPED: &[(&str, &str)] = shipped![
     "gitlab-runner-pool-large.json",
     "gitlab-runner-pool.json",
     "gitlab-runner-pool.sh",
+    "gitlab.json",
+    "gitlab.sh",
     "nats-primary.json",
     "nats-replica.json",
     "nats-replica.sh",
