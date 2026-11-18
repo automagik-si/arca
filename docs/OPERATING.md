@@ -1978,8 +1978,12 @@ image, and the verb refuses it. In order, each step a line in `service-updates.j
 state directory (an append-only file of JSON lines: a `begin`, one line per step, an `end`; never a secret):
 
 1. the instance is stopped, if it runs, and a snapshot of it, `pre-update-<time>`, is taken where the project allows
-   one. No project Arca makes does (each is restricted, and Incus answers that it does not allow snapshot creation),
-   so on a node as Arca makes it there is no snapshot, and the answer's `snapshot` is `null`;
+   one. Every project Arca makes is restricted, and Incus answers that it does not allow snapshot creation, unless
+   the project sets `restricted.snapshots` to `allow`. The node's service project gets that from Arca, with no card,
+   only the first time a snapshot of a service's instance with its volumes needs it, which no verb asks for yet. So
+   on a node that has not been given it there is no snapshot, and the answer's `snapshot` is `null`; on one that
+   has, the update takes its snapshot there and a rollback restores it, and nothing yet removes such a snapshot: each
+   update keeps one, until you delete it;
 2. its root is rebuilt from `<repository>@<digest>`, or, for a local pinned image, from the project's own copy of the
    image whose fingerprint is `digest`; Incus may take up to 10 minutes to fetch an OCI image. Incus keeps
    what is not the root: the config, the secrets, the firewall rules and the data volume (a template's `data`

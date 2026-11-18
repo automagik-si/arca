@@ -18,6 +18,8 @@ use std::net::Ipv4Addr;
 pub const PROJECT: &str = "arcak-svc";
 pub const BRIDGE: &str = "arcak-svcbr";
 pub const PROFILE: &str = "arca-service";
+/// The project key that lets the service project hold Incus snapshots, set to `allow` by its owner's `snapshots` step.
+pub const SNAPSHOTS_KEY: &str = "restricted.snapshots";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -36,6 +38,10 @@ pub struct NetProjectConfig {
     /// with the node's first virtual machine on a host bridge.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub host_bridges: bool,
+    /// The project holds Incus snapshots: `restricted.snapshots` is `allow`. Set the first time a snapshot of a service's
+    /// instance with its volumes needs it. An entry an earlier kernel wrote has no such key.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub snapshots: bool,
 }
 pub struct NetProject;
 
@@ -134,6 +140,9 @@ pub struct BridgedProjectConfig {
     /// with the node's first service on the managed network. An entry an earlier kernel wrote has no such key.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub managed: bool,
+    /// The project holds Incus snapshots, as [`NetProjectConfig::snapshots`] says.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub snapshots: bool,
 }
 
 /// The `limits.*` keys a bridged-only project carries and a project that also holds containers does not.
@@ -192,6 +201,9 @@ impl Plugin for BridgedProject {
                 "restricted.devices.nic": "allow",
                 "limits.virtual-machines": cfg.virtual_machines.to_string()
             });
+            if cfg.snapshots {
+                config[SNAPSHOTS_KEY] = json!("allow");
+            }
             if cfg.managed {
                 config["restricted.devices.proxy"] = json!("allow");
             } else {
@@ -230,6 +242,9 @@ impl Plugin for BridgedProject {
             follow("limits.cpu", cfg.cpu.to_string());
             follow("limits.memory", cfg.memory.clone());
             follow("limits.disk", cfg.disk.clone());
+        }
+        if cfg.snapshots && current["config"][SNAPSHOTS_KEY].as_str() != Some("allow") {
+            changes.insert(SNAPSHOTS_KEY.into(), Some("allow".into()));
         }
         if !changes.is_empty() {
             ctx.effect(EffectOp::IncusPatchConfig {
@@ -285,7 +300,10 @@ impl Plugin for NetProject {
             let config = match project {
                 Some(project) => project["config"].clone(),
                 None => {
-                    let config = json!({"limits.virtual-machines":virtual_machines,"restricted.networks.access":cfg.bridge,"restricted.devices.proxy":"allow"});
+                    let mut config = json!({"limits.virtual-machines":virtual_machines,"restricted.networks.access":cfg.bridge,"restricted.devices.proxy":"allow"});
+                    if cfg.snapshots {
+                        config[SNAPSHOTS_KEY] = json!("allow");
+                    }
                     create(
                         ctx,
                         IncusKind::Project,
@@ -307,6 +325,9 @@ impl Plugin for NetProject {
                 && config["limits.virtual-machines"].as_str() != Some(virtual_machines.as_str())
             {
                 changes.insert("limits.virtual-machines".into(), Some(virtual_machines));
+            }
+            if cfg.snapshots && config[SNAPSHOTS_KEY].as_str() != Some("allow") {
+                changes.insert(SNAPSHOTS_KEY.into(), Some("allow".into()));
             }
             if cfg.host_bridges {
                 if config["restricted.devices.nic"].as_str() != Some("allow") {

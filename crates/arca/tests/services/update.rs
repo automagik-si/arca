@@ -1952,3 +1952,101 @@ fn rollback_preserves_a_post_restore_label_writer_after_412() {
         "a different label value is not overwritten on retry"
     );
 }
+
+/// The project config Incus holds for the node's service project.
+fn project_config(rig: &Rig) -> Value {
+    rig.get(&format!("/1.0/projects/{PROJECT}"))
+        .expect("the project")["config"]
+        .clone()
+}
+
+#[test]
+fn a_project_arca_let_hold_snapshots_gives_service_update_its_snapshot_and_its_restore() {
+    for healthy in [true, false] {
+        let up = Arc::new(AtomicBool::new(healthy));
+        let rig = bare_rig(&up);
+        let old = alias_of_record(&rig);
+        assert!(project_config(&rig).get("restricted.snapshots").is_none());
+
+        // The owner's entry gains its step, and the project follows it; a second call writes nothing.
+        assert_eq!(
+            arca::handlers::allow_service_snapshots(&rig.kernel, &rig.cfg, NOW),
+            Ok(true)
+        );
+        let writes = rig.fake.writes().len();
+        assert_eq!(
+            arca::handlers::allow_service_snapshots(&rig.kernel, &rig.cfg, NOW),
+            Ok(false)
+        );
+        assert_eq!(rig.fake.writes().len(), writes);
+        let owner = rig
+            .entries()
+            .into_iter()
+            .find(|entry| entry.id.0 == "net-arcak-svc")
+            .expect("the project's owner");
+        assert_eq!(owner.config["snapshots"], true);
+        assert_eq!(project_config(&rig)["restricted.snapshots"], "allow");
+        assert_eq!(project_config(&rig)["restricted"], "true");
+
+        let result = update(
+            &rig,
+            json!({ "name": "app", "digest": NEW, "timeoutSeconds": 1 }),
+        );
+        let steps = journal(&rig);
+        assert!(steps.contains(&("snapshot".to_string(), true)), "{steps:?}");
+        if healthy {
+            let done = result.expect("updated");
+            let snapshot = done["snapshot"].as_str().expect("a snapshot");
+            assert!(snapshot.starts_with("pre-update-"));
+            assert!(
+                rig.get(&format!(
+                    "/1.0/instances/app/snapshots/{snapshot}?project={PROJECT}"
+                ))
+                .is_some()
+            );
+            assert!(rig.fake.restores(PROJECT, "app").is_empty());
+            assert_eq!(alias_of_record(&rig), format!("app@{NEW}"));
+        } else {
+            assert_eq!(refusal_words(result).0, "rolled_back");
+            let restored = rig.fake.restores(PROJECT, "app");
+            assert_eq!(restored.len(), 1);
+            assert!(restored[0].starts_with("pre-update-"));
+            assert!(steps.contains(&("restore".to_string(), true)), "{steps:?}");
+            assert_eq!(
+                alias_of_record(&rig),
+                old,
+                "the record keeps the old digest"
+            );
+            assert_eq!(instance(&rig)["status"], "Running");
+        }
+    }
+}
+
+#[test]
+fn no_existing_verb_asks_for_the_service_project_to_hold_snapshots() {
+    for healthy in [true, false] {
+        let up = Arc::new(AtomicBool::new(healthy));
+        let rig = bare_rig(&up);
+        let _ = update(
+            &rig,
+            json!({ "name": "app", "digest": NEW, "timeoutSeconds": 1 }),
+        );
+        let _ = rig.call("service_status", json!({ "name": "app" }));
+        assert!(
+            rig.fake.writes().iter().all(|write| !write
+                .config_keys
+                .iter()
+                .any(|key| key == "restricted.snapshots")),
+            "no write names the key"
+        );
+        assert!(project_config(&rig).get("restricted.snapshots").is_none());
+        let owner = rig
+            .entries()
+            .into_iter()
+            .find(|entry| entry.id.0 == "net-arcak-svc")
+            .expect("the project's owner");
+        assert!(owner.config.get("snapshots").is_none());
+        // So the update still goes on without its snapshot, as before.
+        assert!(journal(&rig).contains(&("snapshot".to_string(), false)));
+    }
+}

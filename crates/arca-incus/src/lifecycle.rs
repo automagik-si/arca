@@ -1,16 +1,21 @@
-//! Starting, stopping and restarting one existing instance, outside the desired-state journal.
+//! Starting, stopping and restarting one existing instance, outside the desired-state journal, and its Incus snapshots.
 //!
 //! An instance's power state is not a desired-state entry: it is a live change to one existing instance. The kernel's own
 //! writer is entry-scoped, so this module is a separate, deliberately narrow path, as the device assigner is. It reads one
 //! instance and writes only its `state`: a `start`, a graceful `stop` or a graceful `restart`. It never creates, deletes,
 //! renames or reconfigures an instance, never forces a stop, and refuses a project outside the kernel family it was built
 //! with before any request. Whether the instance is the kernel's own is the caller's check, made on the row this module
-//! read.
+//! read. The one exception is a service's snapshots ([`StateChanger::snapshot_with_volumes`] and the writes beside it):
+//! they take, restore and remove Incus snapshots of a service instance of the node's own service project and of the
+//! custom volumes it mounts, check the instance's mark and each volume's themselves, and send no stop and no start.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::path::PathBuf;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use arca_kernel::ownership::{KERNEL_ENTRY_KEY, KERNEL_RETIRING_KEY};
 
 use serde_json::{Value, json};
 
@@ -132,6 +137,11 @@ impl StateChanger {
 
     /// Reads one instance: its type, its uuid, its own config and its status.
     pub fn read(&self, project: &str, name: &str) -> Result<InstanceState, IncusError> {
+        Ok(self.read_with(project, name)?.0)
+    }
+
+    /// The same read, with the instance's whole document.
+    fn read_with(&self, project: &str, name: &str) -> Result<(InstanceState, Value), IncusError> {
         self.allow(project)?;
         let url = object_url(project, name)?;
         let metadata = checked_metadata(self.send("GET", &url, None)?)?;
@@ -167,7 +177,7 @@ impl StateChanger {
             .filter(|status| !status.is_empty())
             .ok_or_else(|| decode("the instance has no status"))?
             .to_string();
-        Ok(InstanceState {
+        let state = InstanceState {
             project: project.to_string(),
             name: name.to_string(),
             kind,
@@ -175,7 +185,8 @@ impl StateChanger {
             own_config,
             own_devices,
             status,
-        })
+        };
+        Ok((state, metadata))
     }
 
     /// Sends one state change for the instance `seen` was read from, waits for its operation and reads the instance back.
@@ -360,6 +371,293 @@ impl StateChanger {
         self.wait_for(&envelope)
     }
 
+    /// Takes a snapshot named `snapshot` of one custom volume the service instance `seen` mounts, and waits for its
+    /// operation. It sends no stop and no start: the caller decides when the volume is snapshotted. The instance is
+    /// checked as [`StateChanger::snapshot_with_volumes`] checks it, and the volume must carry the instance's own mark.
+    pub fn snapshot_volume(
+        &self,
+        seen: &InstanceState,
+        pool: &str,
+        volume: &str,
+        snapshot: &str,
+    ) -> Result<(), IncusError> {
+        let (fresh, metadata) = self.owned_service(seen)?;
+        self.mounted_volume(&fresh, &metadata, pool, volume)?;
+        named(snapshot)?;
+        self.send_volume_snapshot(&fresh.project, pool, volume, snapshot)
+    }
+
+    /// Puts one custom volume the stopped service instance `seen` mounts back to its snapshot `snapshot`, and waits.
+    pub fn restore_volume(
+        &self,
+        seen: &InstanceState,
+        pool: &str,
+        volume: &str,
+        snapshot: &str,
+    ) -> Result<(), IncusError> {
+        let (fresh, metadata) = self.owned_service(seen)?;
+        if !fresh.is_stopped() {
+            return Err(refused("the instance is not stopped"));
+        }
+        self.mounted_volume(&fresh, &metadata, pool, volume)?;
+        named(snapshot)?;
+        self.send_volume_restore(&fresh.project, pool, volume, snapshot)
+    }
+
+    /// Removes the snapshot `snapshot` of the service instance `seen`, and waits. Nothing else of the instance changes.
+    pub fn remove_instance_snapshot(
+        &self,
+        seen: &InstanceState,
+        snapshot: &str,
+    ) -> Result<(), IncusError> {
+        let (fresh, _) = self.owned_service(seen)?;
+        named(snapshot)?;
+        self.send_removal(&fresh, &SnapshotPart::Instance, snapshot)
+    }
+
+    /// Removes the snapshot `snapshot` of one custom volume the service instance `seen` mounts, and waits.
+    pub fn remove_volume_snapshot(
+        &self,
+        seen: &InstanceState,
+        pool: &str,
+        volume: &str,
+        snapshot: &str,
+    ) -> Result<(), IncusError> {
+        let (fresh, metadata) = self.owned_service(seen)?;
+        self.mounted_volume(&fresh, &metadata, pool, volume)?;
+        named(snapshot)?;
+        let part = SnapshotPart::Volume {
+            pool: pool.to_string(),
+            volume: volume.to_string(),
+        };
+        self.send_removal(&fresh, &part, snapshot)
+    }
+
+    /// Snapshots a service instance with its volumes under the one name `snapshot`: first the instance (its root, config
+    /// and devices), then each custom volume it mounts, in device order. It sends no stop and no start, so a running
+    /// instance is snapshotted running, one volume after the other. Every check is made before the first write: the
+    /// instance is the node's own service's, as read, and each volume carries its mark. A disk that is not a custom
+    /// volume (a path of the host) is in no Incus snapshot and is named in the answer. When a part fails, each part
+    /// already taken is removed again, and the failure names the part, what was removed and what could not be.
+    pub fn snapshot_with_volumes(
+        &self,
+        seen: &InstanceState,
+        snapshot: &str,
+    ) -> Result<InstanceSnapshot, Box<PartFailure>> {
+        let early = |part: SnapshotPart| move |error| PartFailure::before(part, error);
+        named(snapshot).map_err(early(SnapshotPart::Instance))?;
+        let (fresh, metadata) = self
+            .owned_service(seen)
+            .map_err(early(SnapshotPart::Instance))?;
+        let (volumes, not_taken) = disks(&metadata);
+        let mark = fresh.own_config[KERNEL_ENTRY_KEY].clone();
+        for part in &volumes {
+            if let SnapshotPart::Volume { pool, volume } = part {
+                self.volume_of(&fresh.project, &mark, pool, volume)
+                    .map_err(early(part.clone()))?;
+            }
+        }
+        let mut taken: Vec<TakenPart> = Vec::new();
+        for part in std::iter::once(SnapshotPart::Instance).chain(volumes) {
+            let sent = match &part {
+                SnapshotPart::Instance => self.snapshot_instance(&fresh, snapshot),
+                SnapshotPart::Volume { pool, volume } => {
+                    self.send_volume_snapshot(&fresh.project, pool, volume, snapshot)
+                }
+            };
+            if let Err(error) = sent {
+                let done: Vec<SnapshotPart> = taken.iter().map(|t| t.part.clone()).collect();
+                let (done, left) = self.remove_parts(&fresh, snapshot, &done);
+                return Err(Box::new(PartFailure {
+                    part,
+                    error,
+                    done,
+                    left,
+                }));
+            }
+            taken.push(TakenPart {
+                part,
+                at_ms: now_ms(),
+            });
+        }
+        Ok(InstanceSnapshot {
+            name: snapshot.to_string(),
+            taken,
+            not_taken,
+        })
+    }
+
+    /// Puts the parts `parts` of the stopped service instance `seen` back to their snapshot `snapshot`: the instance first
+    /// when it is named, then each volume in the order given. Every check is made before the first write, that each part
+    /// holds the snapshot among them. A restore cannot be undone, so a failure names the part and the parts already
+    /// restored, and nothing is put back.
+    pub fn restore_with_volumes(
+        &self,
+        seen: &InstanceState,
+        snapshot: &str,
+        parts: &[SnapshotPart],
+    ) -> Result<Vec<SnapshotPart>, Box<PartFailure>> {
+        let first = parts.first().cloned().unwrap_or(SnapshotPart::Instance);
+        let early = |part: SnapshotPart| move |error| PartFailure::before(part, error);
+        named(snapshot).map_err(early(first.clone()))?;
+        let (fresh, metadata) = self.owned_service(seen).map_err(early(first.clone()))?;
+        if !fresh.is_stopped() {
+            return Err(PartFailure::before(
+                first,
+                refused("the instance is not stopped"),
+            ));
+        }
+        for part in parts {
+            if let SnapshotPart::Volume { pool, volume } = part {
+                self.mounted_volume(&fresh, &metadata, pool, volume)
+                    .map_err(early(part.clone()))?;
+            }
+            // Each part must hold the snapshot, so a missing one is refused before anything is restored.
+            let url = snapshot_url(&fresh, part, snapshot).map_err(early(part.clone()))?;
+            self.send("GET", &url, None)
+                .and_then(checked_envelope)
+                .map_err(early(part.clone()))?;
+        }
+        let mut ordered: Vec<SnapshotPart> = parts.to_vec();
+        ordered.sort_by_key(|part| !matches!(part, SnapshotPart::Instance));
+        let mut done = Vec::new();
+        for part in ordered {
+            let sent = match &part {
+                SnapshotPart::Instance => self.restore_snapshot(&fresh, snapshot),
+                SnapshotPart::Volume { pool, volume } => {
+                    self.send_volume_restore(&fresh.project, pool, volume, snapshot)
+                }
+            };
+            if let Err(error) = sent {
+                return Err(Box::new(PartFailure {
+                    part,
+                    error,
+                    done,
+                    left: Vec::new(),
+                }));
+            }
+            done.push(part);
+        }
+        Ok(done)
+    }
+
+    /// Removes each part's snapshot, the last taken first. Returns the parts removed and the ones that were not.
+    fn remove_parts(
+        &self,
+        fresh: &InstanceState,
+        snapshot: &str,
+        parts: &[SnapshotPart],
+    ) -> (Vec<SnapshotPart>, Vec<(SnapshotPart, IncusError)>) {
+        let mut done = Vec::new();
+        let mut left = Vec::new();
+        for part in parts.iter().rev() {
+            match self.send_removal(fresh, part, snapshot) {
+                Ok(()) => done.push(part.clone()),
+                Err(error) => left.push((part.clone(), error)),
+            }
+        }
+        (done, left)
+    }
+
+    /// Reads the instance `seen` names again and checks, before any write, that it is a service instance of the node's
+    /// own service project that Arca made and is not removing, and that it is the instance `seen` was read from. The
+    /// checks on `seen` come first, so a target that is not a service's is refused before any request.
+    fn owned_service(&self, seen: &InstanceState) -> Result<(InstanceState, Value), IncusError> {
+        self.allow(&seen.project)?;
+        service_target(seen)?;
+        let (fresh, metadata) = self.read_with(&seen.project, &seen.name)?;
+        if fresh.uuid != seen.uuid || fresh.kind != seen.kind {
+            return Err(refused("the instance was recreated since it was read"));
+        }
+        service_target(&fresh)?;
+        if fresh.own_config.get(KERNEL_ENTRY_KEY) != seen.own_config.get(KERNEL_ENTRY_KEY) {
+            return Err(refused("the instance's owner changed since it was read"));
+        }
+        Ok((fresh, metadata))
+    }
+
+    /// Checks that the instance mounts the custom volume `pool`/`volume` and that the volume carries its mark.
+    fn mounted_volume(
+        &self,
+        fresh: &InstanceState,
+        metadata: &Value,
+        pool: &str,
+        volume: &str,
+    ) -> Result<(), IncusError> {
+        let part = SnapshotPart::Volume {
+            pool: pool.to_string(),
+            volume: volume.to_string(),
+        };
+        if !disks(metadata).0.contains(&part) {
+            return Err(refused("the instance does not mount that volume"));
+        }
+        self.volume_of(
+            &fresh.project,
+            &fresh.own_config[KERNEL_ENTRY_KEY],
+            pool,
+            volume,
+        )
+    }
+
+    /// Reads one custom volume and checks that it carries `mark`, the instance's own, and no tombstone.
+    fn volume_of(
+        &self,
+        project: &str,
+        mark: &str,
+        pool: &str,
+        volume: &str,
+    ) -> Result<(), IncusError> {
+        let url = format!("{}?project={project}", volume_path(project, pool, volume)?);
+        let metadata = checked_metadata(self.send("GET", &url, None)?)?;
+        let config = &metadata["config"];
+        if config[KERNEL_ENTRY_KEY].as_str() != Some(mark) {
+            return Err(refused("the volume is not this service's own"));
+        }
+        if config.get(KERNEL_RETIRING_KEY).is_some() {
+            return Err(refused("the volume is being removed"));
+        }
+        Ok(())
+    }
+
+    fn send_volume_snapshot(
+        &self,
+        project: &str,
+        pool: &str,
+        volume: &str,
+        snapshot: &str,
+    ) -> Result<(), IncusError> {
+        let url = format!(
+            "{}/snapshots?project={project}",
+            volume_path(project, pool, volume)?
+        );
+        let body = json!({ "name": snapshot });
+        let envelope = checked_envelope(self.send("POST", &url, Some(&body))?)?;
+        self.wait_for(&envelope)
+    }
+
+    fn send_volume_restore(
+        &self,
+        project: &str,
+        pool: &str,
+        volume: &str,
+        snapshot: &str,
+    ) -> Result<(), IncusError> {
+        let url = format!("{}?project={project}", volume_path(project, pool, volume)?);
+        let body = json!({ "restore": snapshot });
+        let envelope = checked_envelope(self.send("PUT", &url, Some(&body))?)?;
+        self.wait_for(&envelope)
+    }
+
+    fn send_removal(
+        &self,
+        fresh: &InstanceState,
+        part: &SnapshotPart,
+        snapshot: &str,
+    ) -> Result<(), IncusError> {
+        let url = snapshot_url(fresh, part, snapshot)?;
+        let envelope = checked_envelope(self.send("DELETE", &url, None)?)?;
+        self.wait_for(&envelope)
+    }
     /// Gives one stopped instance the root of another image, an OCI image by digest on a registry: Incus rebuilds the
     /// root disk and keeps the config, the devices (a data volume among them) and the uuid. `source` must be exactly
     /// the five fields of such an image. A registry that asks for a credential is named with it, in the address that is
@@ -671,6 +969,202 @@ impl StateChanger {
         }
         exchange(&self.socket, timeout, &request)
     }
+}
+
+/// The mark prefix of a service's own objects: the instance Arca made for the service `name` carries `service-<name>`.
+const SERVICE_ENTRY_PREFIX: &str = "service-";
+
+/// One part of an instance's snapshot: the instance itself (its root, its config and its devices), or one custom volume
+/// it mounts. Every part of one snapshot has the same name.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SnapshotPart {
+    Instance,
+    Volume { pool: String, volume: String },
+}
+
+impl fmt::Display for SnapshotPart {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Instance => write!(f, "the instance"),
+            Self::Volume { pool, volume } => write!(f, "the volume {volume} of the pool {pool}"),
+        }
+    }
+}
+
+/// One part a snapshot took, with when its operation ended, in milliseconds since the epoch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TakenPart {
+    pub part: SnapshotPart,
+    pub at_ms: u64,
+}
+
+/// A disk of the instance that no part of its snapshot holds, by its device name, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotTaken {
+    pub device: String,
+    pub why: &'static str,
+}
+
+/// What [`StateChanger::snapshot_with_volumes`] took: every part, in the order taken, and every disk not taken.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstanceSnapshot {
+    pub name: String,
+    pub taken: Vec<TakenPart>,
+    pub not_taken: Vec<NotTaken>,
+}
+
+/// A part that failed: its error, the parts the call had done before it (removed again after a snapshot's failure,
+/// restored after a restore's), and each part taken that could not be removed again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartFailure {
+    pub part: SnapshotPart,
+    pub error: IncusError,
+    pub done: Vec<SnapshotPart>,
+    pub left: Vec<(SnapshotPart, IncusError)>,
+}
+
+impl PartFailure {
+    /// A failure before any write.
+    fn before(part: SnapshotPart, error: IncusError) -> Box<Self> {
+        Box::new(Self {
+            part,
+            error,
+            done: Vec::new(),
+            left: Vec::new(),
+        })
+    }
+}
+
+impl fmt::Display for PartFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} failed ({})", self.part, self.error)?;
+        for (part, error) in &self.left {
+            write!(f, "; {part} was not removed ({error})")?;
+        }
+        Ok(())
+    }
+}
+
+/// Refuses, before any request, an instance that is not a service's of the node's own service project as Arca made it:
+/// another project, a tenant's, an adopted one, one without a uuid, one without a service's mark, one being removed.
+fn service_target(state: &InstanceState) -> Result<(), IncusError> {
+    if arca_kernel::ownership::tenant_of_project(&state.project).is_some() {
+        return Err(refused("a tenant's instance is not snapshotted here"));
+    }
+    let mark = state
+        .own_config
+        .get(KERNEL_ENTRY_KEY)
+        .map_or("", String::as_str);
+    if state
+        .project
+        .starts_with(crate::adopt::ADOPT_PROJECT_PREFIX)
+        || mark.starts_with(crate::adopt::ADOPT_ENTRY_PREFIX)
+    {
+        return Err(refused("an adopted instance is not snapshotted here"));
+    }
+    if state.project != crate::exec::SERVICE_PROJECT {
+        return Err(refused(
+            "only an instance of the node's own service project is snapshotted here",
+        ));
+    }
+    if mark.len() <= SERVICE_ENTRY_PREFIX.len() || !mark.starts_with(SERVICE_ENTRY_PREFIX) {
+        return Err(refused("the instance is not a service's that Arca made"));
+    }
+    if state.uuid.is_none() {
+        return Err(refused("the instance has no uuid"));
+    }
+    if state.own_config.contains_key(KERNEL_RETIRING_KEY) {
+        return Err(refused("the instance is being removed"));
+    }
+    Ok(())
+}
+
+/// The custom volumes an instance's disks name, in device order, and every other disk but the root. Its own devices
+/// are laid over the ones its profiles give it, as Incus expands them.
+fn disks(metadata: &Value) -> (Vec<SnapshotPart>, Vec<NotTaken>) {
+    let mut devices = metadata
+        .get("expanded_devices")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    if let Some(own) = metadata.get("devices").and_then(Value::as_object) {
+        devices.extend(own.clone());
+    }
+    let mut named: BTreeMap<String, Value> = devices.into_iter().collect();
+    named.retain(|_, device| device["type"] == "disk" && device["path"] != "/");
+    let mut volumes = Vec::new();
+    let mut not_taken = Vec::new();
+    for (device, disk) in named {
+        let pool = disk["pool"].as_str().unwrap_or("");
+        let source = disk["source"].as_str().unwrap_or("");
+        if !pool.is_empty() && plain_name(pool) && plain_name(source) {
+            let part = SnapshotPart::Volume {
+                pool: pool.to_string(),
+                volume: source.to_string(),
+            };
+            if !volumes.contains(&part) {
+                volumes.push(part);
+            }
+        } else if source.starts_with('/') {
+            not_taken.push(NotTaken {
+                device,
+                why: "a path of the host is in no Incus snapshot",
+            });
+        } else {
+            not_taken.push(NotTaken {
+                device,
+                why: "it is not a custom volume of a storage pool",
+            });
+        }
+    }
+    (volumes, not_taken)
+}
+
+/// Refuses a snapshot name that is not a plain path segment.
+fn named(snapshot: &str) -> Result<(), IncusError> {
+    if plain_name(snapshot) {
+        Ok(())
+    } else {
+        Err(refused("the snapshot name is not plain"))
+    }
+}
+
+/// The path of one part's snapshot, with its project.
+fn snapshot_url(
+    fresh: &InstanceState,
+    part: &SnapshotPart,
+    snapshot: &str,
+) -> Result<String, IncusError> {
+    let project = &fresh.project;
+    Ok(match part {
+        SnapshotPart::Instance => {
+            object_url(project, &fresh.name)?;
+            format!(
+                "/1.0/instances/{}/snapshots/{snapshot}?project={project}",
+                fresh.name
+            )
+        }
+        SnapshotPart::Volume { pool, volume } => format!(
+            "{}/snapshots/{snapshot}?project={project}",
+            volume_path(project, pool, volume)?
+        ),
+    })
+}
+
+/// The path of one custom volume, without its query.
+fn volume_path(project: &str, pool: &str, volume: &str) -> Result<String, IncusError> {
+    if !plain_name(project) || !plain_name(pool) || !plain_name(volume) {
+        return Err(refused("the project, pool or volume name is not plain"));
+    }
+    Ok(format!("/1.0/storage-pools/{pool}/volumes/custom/{volume}"))
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+        })
 }
 
 fn object_url(project: &str, name: &str) -> Result<String, IncusError> {
