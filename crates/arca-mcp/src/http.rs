@@ -8,8 +8,10 @@
 //! A caller whose terminal may be asked to approve ([`crate::elicit`]) is given an `Mcp-Session-Id` at `initialize`; a
 //! later request that carries a session id the server did not give that token, or has forgotten, is `404`, and
 //! `DELETE /mcp` with its id ends it (`204`). Such a caller, once its client declared elicitation, may open the server's
-//! own stream with `GET /mcp` (`text/event-stream`), where every plan that starts waiting is put to it. Every other
-//! `GET` or `DELETE` on `/mcp` is `405`, as the transport allows a server that offers no stream.
+//! own stream with `GET /mcp` (`text/event-stream`, [`crate::listen`]), where every plan that starts waiting and that does
+//! not delete or erase is put to it. A `GET` or `DELETE` on `/mcp` without a bearer is `401`; one by any other caller is
+//! `405` with `Allow: POST`, as the transport allows a server that offers that caller no stream. Every event of every
+//! stream carries an id of its own.
 //!
 //! A request carrying any `Origin` header is refused `403` before its body is read, whatever its method or path: a browser
 //! page is never a client. The unix socket is bound inside a fresh private directory, chmodded 0600 and renamed into place,
@@ -485,8 +487,23 @@ impl Server {
     }
 }
 
+/// `405` with `Allow: POST`: `/mcp` offers this caller no stream and no session to end.
+fn post_only() -> Response {
+    (StatusCode::METHOD_NOT_ALLOWED, [(header::ALLOW, "POST")]).into_response()
+}
+
+/// A priming event id no other stream of the session has: random, as [`crate::listen`]'s are.
+fn prime_event() -> Bytes {
+    let mut raw = [0u8; 16];
+    let _ = getrandom::fill(&mut raw);
+    Bytes::from(format!(
+        "id: {}.0\ndata:\n\n",
+        base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, raw)
+    ))
+}
+
 /// `GET /mcp`: the server's own stream, for a caller whose terminal may be asked and whose client declared elicitation
-/// ([`jsonrpc::listen`]). Anyone else is `405`, as before there was a stream.
+/// ([`crate::listen`]); `Last-Event-ID` resumes one the client lost. Anyone else is `405`.
 async fn listen(State(server): State<Arc<Server>>, headers: HeaderMap) -> Response {
     let Some(caller) = server.authenticate(&headers) else {
         return server.unauthorized(&headers);
@@ -499,17 +516,16 @@ async fn listen(State(server): State<Arc<Server>>, headers: HeaderMap) -> Respon
         .iter()
         .filter_map(|value| value.to_str().ok())
         .any(|value| value.contains("text/event-stream"));
-    let Some(messages) = streams.then(|| jsonrpc::listen(&server, &caller)).flatten() else {
-        return StatusCode::METHOD_NOT_ALLOWED.into_response();
+    let last_event = headers
+        .get("last-event-id")
+        .and_then(|value| value.to_str().ok());
+    let Some(events) = streams
+        .then(|| crate::listen::open(&server, &caller, last_event))
+        .flatten()
+    else {
+        return post_only();
     };
-    let prime = tokio_stream::once(Ok::<_, io::Error>(Bytes::from_static(b"id: 0\ndata:\n\n")));
-    let events = tokio_stream::wrappers::ReceiverStream::new(messages).map(|message| {
-        Ok::<_, io::Error>(Bytes::from(if message.is_null() {
-            ": keepalive\n\n".to_string()
-        } else {
-            format!("data: {message}\n\n")
-        }))
-    });
+    let events = tokio_stream::wrappers::ReceiverStream::new(events).map(Ok::<_, io::Error>);
     (
         StatusCode::OK,
         [
@@ -517,20 +533,23 @@ async fn listen(State(server): State<Arc<Server>>, headers: HeaderMap) -> Respon
             (header::CACHE_CONTROL, "no-cache"),
             (header::HeaderName::from_static("x-accel-buffering"), "no"),
         ],
-        axum::body::Body::from_stream(tokio_stream::StreamExt::chain(prime, events)),
+        axum::body::Body::from_stream(events),
     )
         .into_response()
 }
 
 /// `DELETE /mcp`: the client ends its session. `204` when it was one this server gave the caller, `404` for one it did
-/// not, and `405` without a session id or when the server gives none.
+/// not, and `405` without a session id or for a caller the server gives none.
 async fn end_session(State(server): State<Arc<Server>>, headers: HeaderMap) -> Response {
     let Some(caller) = server.authenticate(&headers) else {
         return server.unauthorized(&headers);
     };
     let (Some(terminal), Some(id)) = (server.terminal.as_ref(), headers.get(SESSION_HEADER)) else {
-        return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        return post_only();
     };
+    if terminal.approver.may_ask(&caller) == crate::elicit::Asking::No {
+        return post_only();
+    }
     if terminal.close_session(id.to_str().unwrap_or_default(), &caller.token_id) {
         StatusCode::NO_CONTENT.into_response()
     } else {
@@ -538,13 +557,14 @@ async fn end_session(State(server): State<Arc<Server>>, headers: HeaderMap) -> R
     }
 }
 
-/// An answer that streams: `200` with `text/event-stream`. The first event carries an id and an empty `data`, to prime the
-/// client's reconnect (the transport's SHOULD), then each message is one `data` event, and the stream ends after the last.
+/// An answer that streams: `200` with `text/event-stream`. The first event carries an id of its own and an empty `data`, to
+/// prime the client's reconnect (the transport's SHOULD), then each message is one `data` event, and the stream ends after
+/// the last.
 fn sse(answer: jsonrpc::Answer) -> Response {
     let Some(messages) = answer.stream else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
-    let prime = tokio_stream::once(Ok::<_, io::Error>(Bytes::from_static(b"id: 0\ndata:\n\n")));
+    let prime = tokio_stream::once(Ok::<_, io::Error>(prime_event()));
     let events = tokio_stream::wrappers::ReceiverStream::new(messages)
         .map(|message| Ok::<_, io::Error>(Bytes::from(format!("data: {message}\n\n"))));
     (

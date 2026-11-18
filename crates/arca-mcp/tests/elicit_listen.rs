@@ -54,9 +54,16 @@ struct Node {
     waiting: Mutex<Vec<PendingPlan>>,
     approved: Mutex<Vec<(String, u64, String)>>,
     declined: Mutex<Vec<(String, u64, String)>>,
+    /// The plans the node says may not be put to the stream or decided there (they erase).
+    kept_off: Mutex<Vec<String>>,
 }
 
 impl Node {
+    /// From now on `id` may not be put to the stream or decided there, as a plan that erases.
+    fn keep_off(&self, id: &str) {
+        self.kept_off.lock().expect("lock").push(id.to_string());
+    }
+
     /// Another agent proposes `id`: it waits for the owner from now on.
     fn propose(&self, id: &str, created_at: u64) {
         self.waiting.lock().expect("lock").push(PendingPlan {
@@ -116,6 +123,15 @@ impl TerminalApprover for Node {
             return Vec::new();
         }
         self.waiting.lock().expect("lock").clone()
+    }
+
+    fn approvable_on_stream(&self, plan: &str, _created_at: u64) -> bool {
+        !self
+            .kept_off
+            .lock()
+            .expect("lock")
+            .iter()
+            .any(|kept| kept == plan)
     }
 
     fn approve(&self, plan: &str, created_at: u64, caller: &Caller) -> Result<Value, CallError> {
@@ -289,11 +305,19 @@ struct Listen {
 
 impl Listen {
     fn open(fixture: &Fixture, session: &str) -> Listen {
+        Listen::resume(fixture, session, None)
+    }
+
+    /// Opens the stream again after a dropped one, naming the last event id it saw (`Last-Event-ID`).
+    fn resume(fixture: &Fixture, session: &str, last_event: Option<&str>) -> Listen {
         let mut stream = connect_unix(&fixture.socket);
+        let resume = last_event
+            .map(|id| format!("Last-Event-ID: {id}\r\n"))
+            .unwrap_or_default();
         stream
             .write_all(
                 format!(
-                    "GET /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {SESSION}\r\nAccept: text/event-stream\r\nMcp-Session-Id: {session}\r\nMcp-Protocol-Version: 2025-11-25\r\n\r\n"
+                    "GET /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {SESSION}\r\nAccept: text/event-stream\r\nMcp-Session-Id: {session}\r\nMcp-Protocol-Version: 2025-11-25\r\n{resume}\r\n"
                 )
                 .as_bytes(),
             )
@@ -327,6 +351,15 @@ impl Listen {
             self.seen
                 .push_str(&String::from_utf8_lossy(&buffer[..read]));
         }
+    }
+
+    /// The event ids seen so far, in order.
+    fn ids(&self) -> Vec<String> {
+        self.seen
+            .lines()
+            .filter_map(|line| line.strip_prefix("id: "))
+            .map(str::to_string)
+            .collect()
     }
 
     fn messages(&self) -> Vec<Value> {
@@ -447,6 +480,12 @@ fn a_no_declines_it_a_cancel_leaves_it_and_no_plan_is_asked_twice() {
             SESSION_ID.to_string()
         )]));
     assert!(fixture.approvals().is_empty());
+    // The no is told back; the cancel is not, as the owner closed it.
+    let words = told(&listen.nth(3));
+    assert!(
+        words.contains("declined") && words.contains("act-000000000001"),
+        "{words}"
+    );
     // The cancelled plan still waits on its card, and is not asked again, on this stream or on a new one.
     assert_eq!(fixture.node.waiting.lock().expect("lock").len(), 1);
     assert!(
@@ -695,5 +734,172 @@ fn a_listing_call_does_not_ask_a_plan_whose_question_is_open_on_the_stream() {
         "act-000000000001"
     );
     assert_eq!(fixture.answer(&session, &asked["id"], yes()).status, 202);
+    assert!(eventually(|| fixture.approvals().len() == 1));
+}
+
+/// The words of a message the stream told the owner, lowercased.
+fn told(message: &Value) -> String {
+    assert_eq!(message["method"], "elicitation/create", "{message}");
+    assert_eq!(message["params"]["mode"], "form", "{message}");
+    assert_eq!(
+        message["params"]["requestedSchema"]["properties"],
+        json!({}),
+        "a message to read, with nothing to fill in: {message}"
+    );
+    message["params"]["message"]
+        .as_str()
+        .expect("a message")
+        .to_lowercase()
+}
+
+#[test]
+fn the_stream_never_carries_a_plan_that_erases_and_checks_the_stored_plan_again_at_the_answer() {
+    let fixture = Fixture::start("listen-erasing", 1);
+    let session = fixture.initialize(form()).expect("a session id");
+    let mut listen = Listen::open(&fixture, &session);
+    // A plan the node keeps off the stream is never put to it, even when the node lists it as waiting.
+    fixture.node.keep_off("act-00000000000e");
+    fixture.node.propose("act-00000000000e", 1);
+    assert!(
+        listen.quiet_for(Duration::from_millis(1500)),
+        "{}",
+        listen.seen
+    );
+    // A plan put to the stream is checked again when its answer comes: kept off meanwhile, a yes runs nothing.
+    fixture.node.propose("act-000000000002", 2);
+    let asked = listen.nth(1);
+    assert!(
+        asked["params"]["message"]
+            .as_str()
+            .expect("a message")
+            .contains("act-000000000002")
+    );
+    fixture.node.keep_off("act-000000000002");
+    assert_eq!(fixture.answer(&session, &asked["id"], yes()).status, 202);
+    let words = told(&listen.nth(2));
+    assert!(words.contains("not run"), "{words}");
+    assert!(fixture.approvals().is_empty());
+    assert!(fixture.declines().is_empty());
+}
+
+#[test]
+fn the_owner_is_told_what_became_of_each_answer_given_on_the_stream() {
+    let fixture = Fixture::start("listen-told", 1);
+    let session = fixture.initialize(form()).expect("a session id");
+    let mut listen = Listen::open(&fixture, &session);
+    fixture.node.propose("act-000000000001", 1);
+    let asked = listen.nth(1);
+    assert_eq!(fixture.answer(&session, &asked["id"], yes()).status, 202);
+    let approved = listen.nth(2);
+    let words = told(&approved);
+    assert!(
+        words.contains("approved") && words.contains("act-000000000001"),
+        "{words}"
+    );
+    assert_eq!(
+        fixture
+            .answer(
+                &session,
+                &approved["id"],
+                json!({ "action": "accept", "content": {} })
+            )
+            .status,
+        202,
+        "the client's answer to the message is taken"
+    );
+    fixture.node.propose("act-000000000002", 2);
+    let asked = listen.nth(3);
+    assert_eq!(fixture.answer(&session, &asked["id"], no()).status, 202);
+    let words = told(&listen.nth(4));
+    assert!(
+        words.contains("declined") && words.contains("act-000000000002"),
+        "{words}"
+    );
+}
+
+#[test]
+fn a_yes_given_after_the_passkey_lapsed_brings_the_step_up_link_then_the_question_again() {
+    let fixture = Fixture::start("listen-late", 1);
+    let session = fixture
+        .initialize(json!({ "elicitation": { "form": {}, "url": {} } }))
+        .expect("a session id");
+    let mut listen = Listen::open(&fixture, &session);
+    fixture.node.propose("act-000000000001", 1);
+    let asked = listen.nth(1);
+    // The owner answers after the passkey stopped counting: nothing runs, and the step-up link comes.
+    fixture.node.mode.store(2, Ordering::SeqCst);
+    assert_eq!(fixture.answer(&session, &asked["id"], yes()).status, 202);
+    let step_up = listen.nth(2);
+    assert_eq!(step_up["params"]["mode"], "url", "{step_up}");
+    assert_eq!(step_up["params"]["url"], STEP_UP);
+    assert!(fixture.approvals().is_empty());
+    assert_eq!(
+        fixture
+            .answer(&session, &step_up["id"], json!({ "action": "accept" }))
+            .status,
+        202
+    );
+    // After the tap the same plan is asked again, and this yes runs it.
+    fixture.node.mode.store(1, Ordering::SeqCst);
+    assert_eq!(
+        listen.nth(3)["method"],
+        "notifications/elicitation/complete"
+    );
+    let again = listen.nth(4);
+    assert_ne!(again["id"], asked["id"]);
+    assert!(
+        again["params"]["message"]
+            .as_str()
+            .expect("a message")
+            .contains("act-000000000001")
+    );
+    assert_eq!(fixture.answer(&session, &again["id"], yes()).status, 202);
+    assert!(eventually(|| fixture.approvals().len() == 1));
+}
+
+#[test]
+fn revoking_the_session_ends_its_stream_even_with_a_question_open() {
+    let fixture = Fixture::start("listen-revoke", 1);
+    let session = fixture.initialize(form()).expect("a session id");
+    let mut listen = Listen::open(&fixture, &session);
+    fixture.node.propose("act-000000000001", 1);
+    let asked = listen.nth(1);
+    fixture.node.mode.store(0, Ordering::SeqCst);
+    listen.read_until(|seen| seen.ends_with("\r\n0\r\n\r\n"));
+    // The open question went with it: a late answer runs nothing, even once the node may ask again.
+    fixture.node.mode.store(1, Ordering::SeqCst);
+    let _ = fixture.answer(&session, &asked["id"], yes());
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(fixture.approvals().is_empty());
+}
+
+#[test]
+fn every_event_has_its_own_id_and_a_dropped_stream_resumes_with_its_open_question() {
+    let fixture = Fixture::start("listen-resume", 1);
+    let session = fixture.initialize(form()).expect("a session id");
+    let mut first = Listen::open(&fixture, &session);
+    fixture.node.propose("act-000000000001", 1);
+    let asked = first.nth(1);
+    let seen = first.ids();
+    assert!(
+        seen.len() >= 2,
+        "a priming id and the question's: {}",
+        first.seen
+    );
+    // A second stream of the same session, and a call's own stream, never repeat an id.
+    let second = Listen::open(&fixture, &session);
+    let mut all = seen.clone();
+    all.extend(second.ids());
+    let mut unique = all.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), all.len(), "ids repeat: {all:?}");
+    drop(second);
+    // The first stream drops before the owner answered; the client resumes from the priming event.
+    drop(first);
+    let mut resumed = Listen::resume(&fixture, &session, Some(&seen[0]));
+    let replayed = resumed.nth(1);
+    assert_eq!(replayed["id"], asked["id"], "the open question, as it was");
+    assert_eq!(fixture.answer(&session, &replayed["id"], yes()).status, 202);
     assert!(eventually(|| fixture.approvals().len() == 1));
 }

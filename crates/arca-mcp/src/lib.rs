@@ -1,7 +1,7 @@
 //! The Arca MCP server: the verb table served as MCP tools over streamable HTTP.
 //!
 //! It speaks two protocol versions on the one `POST /mcp` route. A caller the node may ask to approve also gets the
-//! server's own stream on `GET /mcp` ([`elicit`]). A request that declares `2026-07-28` is answered as
+//! server's own stream on `GET /mcp` ([`elicit`], `listen`). A request that declares `2026-07-28` is answered as
 //! that version asks: no handshake, the version and the method mirrored in headers, `server/discover`. Any other request
 //! is answered as `2025-11-25` always was, `initialize` included, so a client written for it needs no change. The
 //! [`version`] module decides which, from the request alone.
@@ -18,6 +18,7 @@ pub mod elicit;
 mod fresh;
 pub mod http;
 pub mod jsonrpc;
+mod listen;
 pub mod tools;
 pub mod version;
 

@@ -2037,6 +2037,58 @@ fn the_sessions_stream_is_put_every_waiting_plan_anyone_proposed_except_the_ones
     assert!(terminal.waiting_now(&session).is_empty());
 }
 
+#[test]
+fn no_stream_carries_an_erasing_plan_for_any_caller_and_the_admin_tokens_own_calls_ask_as_before() {
+    let (rig, key) = Rig::new("oauth-stream-erasing");
+    let (_, access, _) = rig.connected(&key, "Owner app", "viewer approvals");
+    let session = rig.caller(&access);
+    let admin = Caller {
+        token_id: "admin".to_string(),
+        scope: Scope::Admin,
+        tools: None,
+        limits: Default::default(),
+    };
+    let stop = rig.propose(
+        ActionKind::InstanceStop,
+        json!({ "project": "p1", "instance": "api" }),
+    );
+    let remove = rig.propose(ActionKind::ServiceRemove, json!({ "name": "demo" }));
+    let terminal = rig.terminal();
+    // The stream's list leaves the erasing plan out for the admin token too.
+    for caller in [&session, &admin] {
+        let listed: Vec<String> = terminal
+            .waiting_now(caller)
+            .into_iter()
+            .map(|plan| plan.id)
+            .collect();
+        assert_eq!(listed, vec![stop.clone()], "{}", caller.token_id);
+    }
+    // At the answer, the stored plan decides: one that erases, or one that is no longer there, is not decided there.
+    assert!(terminal.approvable_on_stream(&stop, created(&rig, &stop)));
+    assert!(!terminal.approvable_on_stream(&remove, created(&rig, &remove)));
+    assert!(!terminal.approvable_on_stream(&stop, created(&rig, &stop) + 1));
+    assert!(!terminal.approvable_on_stream("act-000000000000", 0));
+    // The admin token's own calls are asked exactly as before, erasing plans included.
+    assert!(
+        terminal
+            .pending("action_propose", &proposed(&rig, &remove), &admin)
+            .is_some()
+    );
+    let listing = rig
+        .pending_handler()
+        .call(json!({}), &admin)
+        .expect("listed");
+    let mut asked: Vec<String> = terminal
+        .waiting("owner_approval_pending", &listing, &admin)
+        .into_iter()
+        .map(|plan| plan.id)
+        .collect();
+    asked.sort();
+    let mut both = vec![stop.clone(), remove.clone()];
+    both.sort();
+    assert_eq!(asked, both, "{listing}");
+}
+
 // -------------------------------------------------------------------------------------------------------------------
 // The device authorization grant (RFC 8628): an agent away from the person's browser (in a container or on a server)
 // shows a short link and a code; the person approves on any device with the passkey; the agent polls for its token.

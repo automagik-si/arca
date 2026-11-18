@@ -5,9 +5,10 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 ## Unreleased
 
 The owner's signed-in session is asked about a plan another agent proposes as soon as it starts waiting, with nobody
-typing: its client opens `GET /mcp`, the node's own event stream, and each plan is put to it there once as a yes-or-no
-question. A yes approves and runs it, a no declines it; plans that erase keep the passkey card, and a session whose
-passkey is older than 12 hours is sent the step-up page first. `server/discover` offers such a caller `2025-11-25`
+typing: its client opens `GET /mcp`, the node's own event stream, and each plan is put to it there as a yes-or-no
+question, once while the node runs. A yes approves and runs it, a no declines it, and the session is told what became of
+it; the stream never carries a plan that erases, for any caller, and a session whose passkey is older than 12 hours is
+sent the step-up page first. `server/discover` offers such a caller `2025-11-25`
 alone, the version with requests from the node, so Claude Code opens the stream with no setting. Such a caller gets an
 `Mcp-Session-Id` at `initialize`. See docs/OPERATING.md.
 
