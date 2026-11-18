@@ -8,6 +8,11 @@
 //! ASCII letters, digits and `.` `_` `+` `~` `:` `-`, starting with a letter or a digit, so it is never read as an
 //! option. What the named program does with its arguments is the template's: a template that hands the version to a
 //! program which runs it (`env`, a shell with `-c`) has given it that power, and no rule here refuses that.
+//!
+//! A `system` container formula may instead name several components of one instance, in the order they are updated
+//! and restarted, each with the same three parts under the same rules, checked by the same code. Beside either form a
+//! formula may say what else in the instance the update restarts (`alsoRestarts`) and what it deliberately leaves
+//! alone (`notUpdated`). Those two are words an owner reads; nothing here acts on them.
 
 use serde::{Deserialize, Serialize};
 use std::ops::RangeInclusive;
@@ -30,9 +35,21 @@ pub const HEALTH_SECONDS_DEFAULT: u64 = 120;
 /// How long the version reader may run.
 pub const VERSION_SECONDS: RangeInclusive<u64> = 1..=60;
 pub const VERSION_SECONDS_DEFAULT: u64 = 15;
+/// At most this many components in a formula.
+pub const COMPONENTS_MAX: usize = 8;
+/// At most this many bytes in a component's name.
+pub const COMPONENT_NAME_MAX_BYTES: usize = 32;
+/// At most this many entries in `alsoRestarts`, and this many bytes in one.
+pub const ALSO_RESTARTS_MAX: usize = 16;
+pub const ALSO_RESTARTS_MAX_BYTES: usize = 80;
+/// At most this many entries in `notUpdated`, and this many bytes in one's name and in its reason.
+pub const NOT_UPDATED_MAX: usize = 16;
+pub const NOT_UPDATED_NAME_MAX_BYTES: usize = 64;
+pub const NOT_UPDATED_REASON_MAX_BYTES: usize = 200;
 
 /// A template's `appUpdate`. An OCI (by-digest) template has `health` and `version`, since its update is the move to
-/// another image digest. A system container template has `update`, `health` and `version`. No other kind has the field.
+/// another image digest. A system container template has `update`, `health` and `version`, or instead `components`.
+/// No other kind has the field.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppUpdate {
@@ -45,6 +62,45 @@ pub struct AppUpdate {
     /// The command that prints the app's version as the first line of its output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<Step>,
+    /// The components of one instance, in the order they are updated and restarted: never beside the three parts
+    /// above, and only on a system container template.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub components: Option<Vec<Component>>,
+    /// What else in the instance the update restarts, in plain words.
+    #[serde(
+        default,
+        rename = "alsoRestarts",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub also_restarts: Vec<String>,
+    /// What the update deliberately leaves alone, and why.
+    #[serde(default, rename = "notUpdated", skip_serializing_if = "Vec::is_empty")]
+    pub not_updated: Vec<NotUpdated>,
+}
+
+/// One component of a formula: its name, and the three parts of the single form under the same rules.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Component {
+    /// 1 to 32 bytes of lower-case letters, digits and `-`, the first a letter, unique in the formula.
+    pub name: String,
+    /// The command that moves this component to a version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update: Option<Step>,
+    /// The command whose exit code 0 says this component is healthy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health: Option<Step>,
+    /// The command that prints this component's version as the first line of its output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<Step>,
+}
+
+/// Something in the instance the update deliberately leaves alone, and why: words an owner reads.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NotUpdated {
+    pub name: String,
+    pub reason: String,
 }
 
 /// One part of a formula: a command as a list of arguments, and how long it may take.
@@ -97,6 +153,52 @@ impl AppUpdate {
     /// Whether the formula fits a template of `kind`, and every part its limits: `Err` with the plain words of what is
     /// wrong, naming the field.
     pub fn check(&self, kind: &str) -> Result<(), String> {
+        match &self.components {
+            None => self.check_single(kind)?,
+            Some(components) => self.check_components(kind, components)?,
+        }
+        if self.also_restarts.len() > ALSO_RESTARTS_MAX {
+            return Err(format!(
+                "appUpdate.alsoRestarts is a list of at most {ALSO_RESTARTS_MAX} entries"
+            ));
+        }
+        if !self
+            .also_restarts
+            .iter()
+            .all(|entry| words_ok(entry, ALSO_RESTARTS_MAX_BYTES))
+        {
+            return Err(format!(
+                "appUpdate.alsoRestarts: each entry is 1 to {ALSO_RESTARTS_MAX_BYTES} bytes of plain text, with no control or hidden character"
+            ));
+        }
+        if self.not_updated.len() > NOT_UPDATED_MAX {
+            return Err(format!(
+                "appUpdate.notUpdated is a list of at most {NOT_UPDATED_MAX} entries"
+            ));
+        }
+        for (at, entry) in self.not_updated.iter().enumerate() {
+            for (key, text, max) in [
+                ("name", &entry.name, NOT_UPDATED_NAME_MAX_BYTES),
+                ("reason", &entry.reason, NOT_UPDATED_REASON_MAX_BYTES),
+            ] {
+                if !words_ok(text, max) {
+                    return Err(format!(
+                        "appUpdate.notUpdated[{at}].{key} is 1 to {max} bytes of plain text, with no control or hidden character"
+                    ));
+                }
+            }
+        }
+        let size = serde_json::to_vec(self).map_or(usize::MAX, |bytes| bytes.len());
+        if size > FIELD_MAX_BYTES {
+            return Err(format!(
+                "appUpdate is at most {FIELD_MAX_BYTES} bytes as compact JSON, and this one is {size}"
+            ));
+        }
+        Ok(())
+    }
+
+    /// The single form: `update`, `health` and `version` at the top, the kind picking whether `update` stands.
+    fn check_single(&self, kind: &str) -> Result<(), String> {
         match (kind, &self.update) {
             ("oci", Some(_)) => {
                 return Err(
@@ -113,61 +215,67 @@ impl AppUpdate {
                 return Err("appUpdate is only for an OCI or a system container template".into());
             }
         }
-        let Some(health) = &self.health else {
-            return Err("appUpdate.health is required: the command whose exit code 0 says the app is healthy".into());
-        };
-        let Some(version) = &self.version else {
+        check_parts(
+            "appUpdate",
+            "app",
+            self.update.as_ref(),
+            self.health.as_ref(),
+            self.version.as_ref(),
+        )
+    }
+
+    /// The form with components: never beside the single parts, a system container's only, 1 to 8 components with
+    /// unique names, each with the single form's three parts checked by the same code.
+    fn check_components(&self, kind: &str, components: &[Component]) -> Result<(), String> {
+        if self.update.is_some() || self.health.is_some() || self.version.is_some() {
             return Err(
-                "appUpdate.version is required: the command that prints the app's version".into(),
+                "appUpdate has either update, health and version, or components, never both".into(),
             );
-        };
-        if let Some(update) = &self.update {
-            check_command("update", &update.command)?;
-            let occurrences: usize = update
-                .command
-                .iter()
-                .map(|element| element.matches(VERSION_PLACEHOLDER).count())
-                .sum();
-            if occurrences != 1 || update.command[0].contains(VERSION_PLACEHOLDER) {
-                return Err(format!(
-                    "appUpdate.update.command holds {VERSION_PLACEHOLDER} exactly once, in one argument that is not the first"
-                ));
+        }
+        match kind {
+            "system" => {}
+            "oci" => {
+                return Err(
+                    "appUpdate.components is only for a system container template: an OCI template's update is the move to another image digest".into(),
+                );
             }
-            if !update.seconds.is_some_and(|s| UPDATE_SECONDS.contains(&s)) {
-                return Err(format!(
-                    "appUpdate.update.seconds is required, from {} to {}",
-                    UPDATE_SECONDS.start(),
-                    UPDATE_SECONDS.end()
-                ));
+            _ => {
+                return Err("appUpdate is only for an OCI or a system container template".into());
             }
         }
-        for (part, step, range) in [
-            ("health", health, HEALTH_SECONDS),
-            ("version", version, VERSION_SECONDS),
-        ] {
-            check_command(part, &step.command)?;
-            if step
-                .command
+        if components.is_empty() || components.len() > COMPONENTS_MAX {
+            return Err(format!(
+                "appUpdate.components is a list of 1 to {COMPONENTS_MAX} components, in the order they are updated"
+            ));
+        }
+        for (at, component) in components.iter().enumerate() {
+            let field = format!("appUpdate.components[{at}]");
+            if !component_name_ok(&component.name) {
+                return Err(format!(
+                    "{field}.name is 1 to {COMPONENT_NAME_MAX_BYTES} bytes of lower-case letters, digits and -, the first a letter"
+                ));
+            }
+            if components[..at]
                 .iter()
-                .any(|element| element.contains(VERSION_PLACEHOLDER))
+                .any(|earlier| earlier.name == component.name)
             {
                 return Err(format!(
-                    "appUpdate.{part}.command does not hold {VERSION_PLACEHOLDER}: only update.command does"
+                    "{field}.name {} is the name of an earlier component: each name stands once",
+                    component.name
                 ));
             }
-            if step.seconds.is_some_and(|s| !range.contains(&s)) {
+            if component.update.is_none() {
                 return Err(format!(
-                    "appUpdate.{part}.seconds is from {} to {}",
-                    range.start(),
-                    range.end()
+                    "{field}.update is required: the command that moves the component to a version"
                 ));
             }
-        }
-        let size = serde_json::to_vec(self).map_or(usize::MAX, |bytes| bytes.len());
-        if size > FIELD_MAX_BYTES {
-            return Err(format!(
-                "appUpdate is at most {FIELD_MAX_BYTES} bytes as compact JSON, and this one is {size}"
-            ));
+            check_parts(
+                &field,
+                "component",
+                component.update.as_ref(),
+                component.health.as_ref(),
+                component.version.as_ref(),
+            )?;
         }
         Ok(())
     }
@@ -197,29 +305,136 @@ impl AppUpdate {
     /// inside its one argument: as many elements as the formula's, the first unchanged. `None` for a formula with no
     /// update part. Arca builds no command line from it and no shell reads it.
     pub fn update_arguments(&self, version: &AppVersion) -> Option<Vec<String>> {
-        let update = self.update.as_ref()?;
-        Some(
-            update
-                .command
-                .iter()
-                .enumerate()
-                .map(|(at, element)| {
-                    if at == 0 {
-                        element.clone()
-                    } else {
-                        element.replacen(VERSION_PLACEHOLDER, version.as_str(), 1)
-                    }
-                })
-                .collect(),
-        )
+        Some(replace_version(&self.update.as_ref()?.command, version))
+    }
+
+    /// The names of a checked formula's components, in the order they are updated: empty for the single form.
+    pub fn component_names(&self) -> Vec<&str> {
+        self.components
+            .iter()
+            .flatten()
+            .map(|component| component.name.as_str())
+            .collect()
+    }
+
+    /// The update command of the component `name` of a checked formula as the argument list Arca would start, made
+    /// exactly as [`AppUpdate::update_arguments`] makes the single form's. `None` when the formula has no component of
+    /// that name.
+    pub fn component_arguments(&self, name: &str, version: &AppVersion) -> Option<Vec<String>> {
+        let component = self
+            .components
+            .iter()
+            .flatten()
+            .find(|component| component.name == name)?;
+        Some(replace_version(
+            &component.update.as_ref()?.command,
+            version,
+        ))
     }
 }
 
-/// A command's list limits: 1 to 32 elements, each 1 to 512 bytes of plain text, the first an absolute path.
-fn check_command(part: &str, command: &[String]) -> Result<(), String> {
+/// A checked update command with `{version}` replaced inside its one argument: as many elements, the first unchanged.
+fn replace_version(command: &[String], version: &AppVersion) -> Vec<String> {
+    command
+        .iter()
+        .enumerate()
+        .map(|(at, element)| {
+            if at == 0 {
+                element.clone()
+            } else {
+                element.replacen(VERSION_PLACEHOLDER, version.as_str(), 1)
+            }
+        })
+        .collect()
+}
+
+/// The three parts of the single form or of one component, `field` naming them in a refusal (`appUpdate`, or
+/// `appUpdate.components[0]`) and `what` saying what they update (`app` or `component`): `health` and `version`
+/// required, each command within its list limits, `{version}` once in the update command and nowhere else, and each
+/// `seconds` within its range.
+fn check_parts(
+    field: &str,
+    what: &str,
+    update: Option<&Step>,
+    health: Option<&Step>,
+    version: Option<&Step>,
+) -> Result<(), String> {
+    let Some(health) = health else {
+        return Err(format!(
+            "{field}.health is required: the command whose exit code 0 says the {what} is healthy"
+        ));
+    };
+    let Some(version) = version else {
+        return Err(format!(
+            "{field}.version is required: the command that prints the {what}'s version"
+        ));
+    };
+    if let Some(update) = update {
+        check_command(&format!("{field}.update"), &update.command)?;
+        let occurrences: usize = update
+            .command
+            .iter()
+            .map(|element| element.matches(VERSION_PLACEHOLDER).count())
+            .sum();
+        if occurrences != 1 || update.command[0].contains(VERSION_PLACEHOLDER) {
+            return Err(format!(
+                "{field}.update.command holds {VERSION_PLACEHOLDER} exactly once, in one argument that is not the first"
+            ));
+        }
+        if !update.seconds.is_some_and(|s| UPDATE_SECONDS.contains(&s)) {
+            return Err(format!(
+                "{field}.update.seconds is required, from {} to {}",
+                UPDATE_SECONDS.start(),
+                UPDATE_SECONDS.end()
+            ));
+        }
+    }
+    for (part, step, range) in [
+        ("health", health, HEALTH_SECONDS),
+        ("version", version, VERSION_SECONDS),
+    ] {
+        check_command(&format!("{field}.{part}"), &step.command)?;
+        if step
+            .command
+            .iter()
+            .any(|element| element.contains(VERSION_PLACEHOLDER))
+        {
+            return Err(format!(
+                "{field}.{part}.command does not hold {VERSION_PLACEHOLDER}: only update.command does"
+            ));
+        }
+        if step.seconds.is_some_and(|s| !range.contains(&s)) {
+            return Err(format!(
+                "{field}.{part}.seconds is from {} to {}",
+                range.start(),
+                range.end()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Whether `name` is a component's name: 1 to 32 bytes of lower-case ASCII letters, digits and `-`, the first a letter.
+fn component_name_ok(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    bytes.len() <= COMPONENT_NAME_MAX_BYTES
+        && bytes.first().is_some_and(u8::is_ascii_lowercase)
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
+}
+
+/// Whether `text` is 1 to `max` bytes of plain text: the rule templates use for words an owner reads.
+fn words_ok(text: &str, max: usize) -> bool {
+    !text.is_empty() && text.len() <= max && crate::service::plain_text(text)
+}
+
+/// A command's list limits: 1 to 32 elements, each 1 to 512 bytes of plain text, the first an absolute path. `field`
+/// names the part, such as `appUpdate.health`.
+fn check_command(field: &str, command: &[String]) -> Result<(), String> {
     if command.is_empty() || command.len() > COMMAND_MAX_ELEMENTS {
         return Err(format!(
-            "appUpdate.{part}.command is a list of 1 to {COMMAND_MAX_ELEMENTS} arguments"
+            "{field}.command is a list of 1 to {COMMAND_MAX_ELEMENTS} arguments"
         ));
     }
     if !command.iter().all(|element| {
@@ -228,12 +443,12 @@ fn check_command(part: &str, command: &[String]) -> Result<(), String> {
             && crate::service::plain_text(element)
     }) {
         return Err(format!(
-            "appUpdate.{part}.command: each argument is 1 to {ELEMENT_MAX_BYTES} bytes of plain text, with no control or hidden character"
+            "{field}.command: each argument is 1 to {ELEMENT_MAX_BYTES} bytes of plain text, with no control or hidden character"
         ));
     }
     if !command[0].starts_with('/') {
         return Err(format!(
-            "appUpdate.{part}.command: the first argument is the absolute path of the program, such as /usr/bin/curl"
+            "{field}.command: the first argument is the absolute path of the program, such as /usr/bin/curl"
         ));
     }
     Ok(())

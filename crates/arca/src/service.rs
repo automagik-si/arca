@@ -1745,8 +1745,8 @@ pub struct Template {
     #[serde(default)]
     pub connector: Option<String>,
     /// The formula that updates the app inside the service ([`crate::app_formula::AppUpdate`]): `health` and `version`
-    /// on an OCI template, and `update` too on a system container template. No other kind sets it. Its own name, apart
-    /// from `update`, which is a virtual machine's pinned version.
+    /// on an OCI template, and `update` too, or instead ordered `components`, on a system container template. No other
+    /// kind sets it. Its own name, apart from `update`, which is a virtual machine's pinned version.
     #[serde(default)]
     pub app_update: Option<crate::app_formula::AppUpdate>,
 }
@@ -3068,15 +3068,27 @@ pub fn update_view(
 }
 
 /// What `service_status` answers under `appUpdate`: that the service has a formula, and where it comes from. Only a
-/// formula of the installed template exists now, so `formula` is `template`. `None` for a service whose installed
-/// template has none, cannot be read, or is gone, for an adopted instance and for a virtual machine: their answer
-/// carries no such key. No command is run for it and nothing is read but the template's file.
+/// formula of the installed template exists now, so `formula` is `template`. A formula with components adds their
+/// names in order, and one that says what else it restarts or what it leaves alone adds `alsoRestarts` or
+/// `notUpdated`; a formula of the single form with neither answers `{"formula": "template"}` alone. `None` for a
+/// service whose installed template has none, cannot be read, or is gone, for an adopted instance and for a virtual
+/// machine: their answer carries no such key. No command is run for it and nothing is read but the template's file.
 pub fn app_update_view(cfg: &ServiceConfig, template: Option<&Template>) -> Option<Value> {
     if cfg.adopted || cfg.vm.is_some() {
         return None;
     }
-    template?.app_update.as_ref()?;
-    Some(json!({ "formula": "template" }))
+    let formula = template?.app_update.as_ref()?;
+    let mut view = json!({ "formula": "template" });
+    if formula.components.is_some() {
+        view["components"] = json!(formula.component_names());
+    }
+    if !formula.also_restarts.is_empty() {
+        view["alsoRestarts"] = json!(formula.also_restarts);
+    }
+    if !formula.not_updated.is_empty() {
+        view["notUpdated"] = json!(formula.not_updated);
+    }
+    Some(view)
 }
 
 /// The Incus source for a template: an OCI image by digest, a system image by alias or fingerprint.

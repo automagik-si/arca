@@ -6118,6 +6118,42 @@ every other service answers as before, and `service_list` does not change. An Ar
 template that has the field, as it refuses any key it does not know: install such a template only on a node that runs
 this release or a later one, and before going back to an older build, install that build's own templates.
 
+**A formula of several components.** One instance may run several parts that are updated apart and in a fixed order,
+such as a message server, the runtime that uses it and the runtime's plugins. A `system` container formula may then
+name them under `components`, in that order, instead of `update`, `health` and `version` at the top:
+
+```json
+"appUpdate": {
+  "components": [
+    { "name": "queue",
+      "update":  { "command": ["/usr/local/sbin/queue-update", "{version}"], "seconds": 600 },
+      "health":  { "command": ["/usr/local/bin/queue-ready"] },
+      "version": { "command": ["/usr/local/bin/queue-version"] } },
+    { "name": "runtime",
+      "update":  { "command": ["/usr/local/sbin/runtime-update", "{version}"], "seconds": 900 },
+      "health":  { "command": ["/usr/bin/curl", "--fail", "--silent", "http://localhost:8080/ready"] },
+      "version": { "command": ["/usr/local/bin/runtime", "--version"] } }
+  ],
+  "alsoRestarts": ["the web dashboard", "the agents that run in this instance"],
+  "notUpdated": [{ "name": "the local policy bundle", "reason": "kept as the owner wrote it" }]
+}
+```
+
+`components` holds 1 to 8 components. Each has a `name`, 1 to 32 bytes of lower-case letters, digits and `-`, the
+first a letter, used once in the formula, and all three parts, `update` among them, under exactly the limits and the
+`{version}` rules of the table above. A formula has either the three parts at the top or `components`, never both;
+`components` on an OCI template is refused. Beside either form, `alsoRestarts` says in 0 to 16 entries of 1 to 80
+bytes of plain text what else in the instance the update restarts, and `notUpdated` lists in 0 to 16 entries what the
+update deliberately leaves alone, each a `name` of 1 to 64 bytes and a `reason` of 1 to 200 bytes of plain text, so
+that "latest" is not a silent half-truth. The whole field stays at most 8 KiB as compact JSON. This release reads,
+checks and shows these keys; nothing runs a component or acts on the two lists yet.
+
+`service_status` adds the component names, in order, as `"components"`, and `alsoRestarts` and `notUpdated` as the
+template writes them, each only when the formula has it (an empty list is not shown):
+`"appUpdate": { "formula": "template", "components": ["queue", "runtime"], "alsoRestarts": [...], "notUpdated": [...] }`.
+A formula of the single form with neither list answers `{ "formula": "template" }` as before. An Arca older than this
+release refuses a template with any of the three keys.
+
 ### What every virtual machine carries
 
 Whatever its network, a virtual machine Arca creates has two things more than its root disk and its NIC:

@@ -13,6 +13,13 @@ needs it. No verb uses this yet, so nothing changes on a node by this release al
 snapshots, `service_update` takes its own pre-update snapshot there and restores it on a rollback, and each update
 keeps one snapshot until a later release removes old ones.
 
+A `system` container template's `appUpdate` may name several `components` of one instance, in the order they are
+updated, each with its own `update`, `health` and `version` under the same rules as the single form, and either form
+may say what else the update restarts (`alsoRestarts`) and what it deliberately leaves alone (`notUpdated`).
+`service_status` shows the component names and both lists when the formula has them; a formula of the single form
+answers as before. Nothing runs a component yet, no shipped template has one, and releases before this one refuse a
+template with these keys. See OPERATING.md.
+
 A container template may carry `appUpdate`, a formula for updating the app inside its service: a `health` command and
 a `version` reader, and on a `system` container an `update` command that takes the version as one argument
 (`{version}`). Arca reads and checks it strictly when the template is read and `service_status` shows
