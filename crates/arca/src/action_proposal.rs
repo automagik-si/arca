@@ -772,6 +772,7 @@ impl ActionKind {
                                         .map(|parts| parts.join(", "))
                                 }),
                                 "kernelAccess" => port_words(value),
+                                _ if value.get("address").is_none() => port_words(value),
                                 _ => address_words(value),
                             };
                             rows.push(row(label, &format!(

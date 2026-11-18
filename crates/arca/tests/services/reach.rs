@@ -655,8 +655,9 @@ fn logs_privacy_preserves_earlier_output() {
     let (rig, key) = rig();
     connect(&rig, &key, Some("node-ts")).unwrap();
     let id = "syntheticSweep1234";
+    assert!(longest_visible_piece(id, "broken title ordinary line visit [sign-in link] after") < 4);
     let raw = format!(
-        "\u{1b}]0;synthetic title\n{}visit https://login.tailscale.com/a/{}\u{7}{}\nafter\n",
+        "\u{1b}]0;broken title\n{}visit https://login.tailscale.com/a/{}\u{7}{}\nafter\n",
         "ordinary line\n".repeat(40),
         &id[..5],
         &id[5..]

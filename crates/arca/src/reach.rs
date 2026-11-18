@@ -255,8 +255,7 @@ pub(crate) fn redact_login_links(text: &str) -> String {
 
 fn redact_connector_links(text: &str) -> String {
     static LINKS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        let gap =
-            r"(?:\x1b(?:\[[0-?]*[ -/]*[@-~]?|\][0-?]*)?|[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]|\r)*";
+        let gap = r"(?:\x1b(?:\[[0-?]*[ -/]*[@-~]?|\][0-?]*|[PX^_\\])?|[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]|\r|\p{Cf})*";
         let host = "login.tailscale.com/a/"
             .chars()
             .map(|ch| regex::escape(&ch.to_string()))
@@ -269,11 +268,19 @@ fn redact_connector_links(text: &str) -> String {
     });
     static STRINGS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(
-            r"(?s)(?:\x1b[PX^_]|[\x{90}\x{98}\x{9e}\x{9f}]).*?(?:\x1b\\|\x{9c})|(?:\x1b\]|\x{9d}).*?(?:\x07|\x1b\\|\x{9c})"
+            r"(?:\x1b[PX^_]|[\x{90}\x{98}\x{9e}\x{9f}])[^\x1b\x18\x1a\r\n\x{85}\x{2028}\x{2029}\x{9c}]*(?:\x1b\\|\x{9c})|(?:\x1b\]|\x{9d})[^\x1b\x07\x18\x1a\r\n\x{85}\x{2028}\x{2029}\x{9c}]*(?:\x07|\x1b\\|\x{9c})"
         ).expect("fixed connector console-string pattern")
     });
-    let text = STRINGS.replace_all(text, "");
-    LINKS.replace_all(&text, "[sign-in link]").into_owned()
+    let masked = LINKS.replace_all(text, "[sign-in link]");
+    STRINGS
+        .replace_all(&masked, |found: &regex::Captures| {
+            if found[0].contains("[sign-in link]") {
+                "[sign-in link]"
+            } else {
+                ""
+            }
+        })
+        .into_owned()
 }
 
 fn clean_console(text: &str) -> String {
