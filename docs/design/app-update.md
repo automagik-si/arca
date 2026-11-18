@@ -23,18 +23,28 @@ Every sentence about what Arca does **today** names a file and line at that base
 - The only update path is `service_update`. It moves a container to another image digest by rebuilding its root
   (`service_update.rs:1-16`). It refuses an adopted service, a virtual machine and a function
   (`service_update.rs:820-827`).
-- Arca runs commands inside an instance only from a closed list. No command takes a raw argument list, a path or a
-  shell program (`crates/arca-incus/src/exec.rs:76-104`; Rule 50, `docs/OWNERSHIP.md:851-857`). The path refuses an
-  adopted instance, an OCI container that is not the node's edge, and a stopped instance (`service_exec.rs:152-168`,
-  `service_exec.rs:186-188`), and reaches only the node's own service project
+- A service verb runs a command inside a service's instance only from a closed list: serve's service exec, under Rule
+  50 (`docs/OWNERSHIP.md:851-857`). No command of that list takes a raw argument list, a path or a shell program
+  (`crates/arca-incus/src/exec.rs:76-104`). That path refuses an adopted instance, a stopped instance, and an OCI
+  container that is not the node's edge, save for one connector status read (`service_exec.rs:152-168`,
+  `service_exec.rs:186-188`). It reaches only the node's own service project
   (`crates/arca-incus/src/exec.rs:318-328`).
+- Other writers start commands of their own, fixed in code, in machines and helpers that are not a service's
+  instance. Two of them: a runner pool starts one in its own job machine through the Incus agent, detached, and waits
+  on the operation (Rule 77, `docs/OWNERSHIP.md:1752-1758`; `crates/arca-incus/src/runner_vm.rs:238-293`), and the
+  folder snapshot helper runs one fixed script (`crates/arca-incus/src/folder.rs:717-745`).
 - `service_update` takes the new digest as an argument and keeps the repository the service's record names
   (`service_update.rs:794-800`, `service_update.rs:242-253`). `service_status` shows the digest a service was created
   with beside the one its installed template names now (`service.rs:3018-3023`).
-- Every project Arca makes is restricted (Rule 30, `docs/OWNERSHIP.md:334-335`), and a restricted project refuses an
-  Incus snapshot. `service_update` asks for one, gets the refusal, and goes on without (`service_update.rs:1534-1545`,
-  `docs/OPERATING.md:1959-1961`). Its rollback then rebuilds the old root from the old image
-  (`service_update.rs:1720-1732`).
+- The service project does not allow Incus snapshots. The provider pins `restricted` on every kernel project it
+  creates and lets a plugin set no other guarded key (`crates/arca-providers/src/incus.rs:599-605`; Rule 30,
+  `docs/OWNERSHIP.md:334-344`), and Incus refuses a snapshot in a restricted project that does not set
+  `restricted.snapshots` to `allow`. `service_update` asks for one, gets the refusal, and goes on without
+  (`service_update.rs:1534-1545`, `docs/OPERATING.md:1959-1961`). Its rollback then rebuilds the old root from the
+  old image (`service_update.rs:1720-1732`). Other projects differ: an adoption project is restricted and allows
+  snapshots (`crates/arca-incus/src/adopt.rs:433-447`), a tenant's project forbids them unless it allows them
+  (`crates/arca-incus/src/lifecycle.rs:315-317`), and `arcak-snapshots` sets no `restricted` key
+  (`crates/arca-incus/src/snapshot.rs:147-158`).
 - `service_update` never snapshots the data volume, so a rollback keeps what the new version wrote there
   (`service_update.rs:33-34`, `docs/OPERATING.md:2106-2107`).
 - `snapshot_create` is another thing: an owner-approved copy onto a disk the owner plugged in, kept in the project
@@ -78,14 +88,15 @@ The second example is a system container with the same app installed from its Li
 as it was done by hand. Its `appUpdate` has the same `health` and `version` and one more part, the command:
 
 ```json
-"update": { "command": ["/usr/bin/env", "DEBIAN_FRONTEND=noninteractive", "/bin/sh", "-ec",
-                        "apt-get update && apt-get install --yes gitlab-ce={version}-ce.0"],
-            "seconds": 3600 }
+"update": { "command": ["/usr/local/sbin/gitlab-package-update", "{version}"], "seconds": 3600 }
 ```
 
-`app_update {name, version: "19.4.8"}` runs the command with `gitlab-ce=19.4.8-ce.0`. GitLab's upgrade page gives
-`sudo apt update && sudo apt install gitlab-ce=<version>-ce.0` for a named version of the Linux package, and says the
-package backs up its database before it installs a newer one (`docs.gitlab.com/update/package/`).
+`app_update {name, version: "19.4.8"}` starts that file with `19.4.8` as its one argument. The file is the template's
+own script inside the container. It holds the two commands GitLab's upgrade page gives for a named version of the
+Linux package, `apt update` and `apt install gitlab-ce=<version>-ce.0`, with its argument in the place of `<version>`
+(`docs.gitlab.com/update/package/`). The same page says the package backs up its database before it installs a newer
+one. A formula of one command needs no script: `["/usr/bin/apt-get", "install", "--yes",
+"gitlab-ce={version}-ce.0"]`.
 
 **A gap this design does not fill.** A container service has no create-time setting today: a template's `settings`
 and `createSettings` are a virtual machine's only (`service.rs:1701-1708`, `service.rs:2144-2150`). So a value the
@@ -94,9 +105,9 @@ and before the first start (`docs/OPERATING.md:1047-1062`). Section 7 lists it.
 
 | Field | Required | Meaning | Limits |
 |---|---|---|---|
-| `update.command` | system container: yes. By-digest: never, the field is refused. | The command that moves the app to a version. A list of arguments, never one line. | 1 to 32 elements, each 1 to 512 bytes of plain text. The first is an absolute path. `{version}` appears at least once, never in the first element. |
+| `update.command` | system container: yes. By-digest: never, the field is refused. | The command that moves the app to a version. A list of arguments, never one line. | 1 to 32 elements, each 1 to 512 bytes of plain text. The first is an absolute path. `{version}` stands in exactly one element, once, never the first. |
 | `update.seconds` | with `update.command` | How long the command may run. | 10 to 7200. No default: the template's author knows the app. |
-| `health.command` | yes | Exit code 0 means the app is healthy. Tried every 5 seconds. | Same list limits. No `{version}`. One try may take 30 seconds. |
+| `health.command` | yes | Exit code 0 means the app is healthy. Tried every 5 seconds. | Same list limits. No `{version}`. A try is cut at 30 seconds, or at what is left of `health.seconds` when that is less. |
 | `health.seconds` | no | How long health has to come, in all. | 1 to 900, 120 when absent: the range and default of `service_update`'s `timeoutSeconds` today (`service_update.rs:50-53`). |
 | `version.command` | yes | Prints the app's version as the first line of its output. | Same list limits. No `{version}`. |
 | `version.seconds` | no | How long the reader may run. | 1 to 60, 15 when absent. |
@@ -117,28 +128,29 @@ is the field on a virtual-machine template (section 2).
 check falls back to "the instance stayed running for 10 seconds" for most services (`service_update.rs:1239-1252`,
 `docs/OPERATING.md:1971-1974`). A command inside the instance can ask the app itself.
 
-### A version can never become shell text
+### What a version can and cannot do
 
-Two rules together give that.
+The construction, decided:
 
-1. **Arca builds no command line.** `update.command` is a list. Arca replaces the exact text `{version}` inside each
-   element and sends the list to Incus as a list, the way it sends its closed commands today
-   (`crates/arca-incus/src/exec.rs:239-242`). No shell reads it unless the template names a shell as its own program,
-   as the example does. One element stays one argument. The first element is fixed text, so a version never picks the
-   program.
-2. **A version is a plain word.** The verb takes a version only when all of this holds:
-   - it is 1 to 64 bytes;
-   - its first byte is an ASCII letter or digit;
-   - every other byte is an ASCII letter, a digit, or one of `.` `_` `+` `-` `~` `:`;
-   - `~` never comes straight after `:`.
+1. **No shell.** `update.command` is a list of arguments. Arca starts its first element, a fixed absolute path, and
+   passes the rest as arguments, the way it sends its closed commands today
+   (`crates/arca-incus/src/exec.rs:239-242`). Arca builds no command line, and no shell reads the list.
+2. **One argument.** `{version}` stands in exactly one element, never the first. Arca replaces that exact text, and
+   the element stays one argument whatever the version is. `{version}` is the only placeholder.
+3. **A plain version string.** 1 to 64 bytes, each an ASCII letter, a digit, or one of `.` `_` `+` `~` `:` `-`. The
+   first byte is a letter or a digit, so a version that fills a whole argument is never read as an option
+   (`--force`). The set covers package versions with an epoch and a revision, such as `5:27.0.3-1~ubuntu.24.04`.
+   Anything else is refused as an invalid argument before any step.
+4. **A formula that needs a shell names its own script file.** More than one command, a pipe, a variable: those are
+   written in a script inside the instance. The formula names that file, and the version reaches it as one argument.
+   No formula puts `{version}` inside the text of a program, and no example here does.
 
-   None of those characters ends a word, quotes, or starts a substitution in a shell. A first byte that is a letter
-   or digit means a version is never read as an option (`--force`). The last rule is there because some shells expand
-   `~` after `:` in a word that looks like an assignment. The set covers package versions with an epoch and a
-   revision, such as `5:27.0.3-1~ubuntu.24.04`.
-
-Anything else is refused as an invalid argument before any step. `{version}` is the only placeholder. There is no
-escaping and no quoting to get wrong, because nothing outside the set is ever let in.
+What this promises: a version never picks the program Arca starts, never becomes a second argument, and is read by no
+shell on its way in. What it does not promise is what the named program does with its arguments. A template that
+names a program which runs one of its arguments as a program (`env`, a shell with `-c`, `xargs`) and puts the version
+there has given the version that power. The rules above do not catch that. It is a wrong template, and pull request
+1's tests carry it as a known case the rules do not refuse. The same holds for a script that uses its argument
+carelessly; by rule 3 that argument has no space, no quote and no `$` in it.
 
 ### An older Arca
 
@@ -152,7 +164,7 @@ replaced by that build's own (`arca templates install`, `cmd_templates.rs:1`).
 
 ## 2. The verb: `app_update`
 
-`app_update` takes `{name}`, a `version` or a `digest`, and the optional `confirm` every interrupting verb takes
+`app_update` takes `{name}`, a `version` or a `digest`, and the optional `confirm` every destructive verb takes
 (`docs/OPERATING.md:2237`). `name` is the service. It needs a `doctor` token, like `service_update` today
 (`crates/arca-api/src/verbs.rs:537-542`). What names the target depends on the kind of service:
 
@@ -163,22 +175,39 @@ replaced by that build's own (`arca templates install`, `cmd_templates.rs:1`).
   `service_update.rs:242-253`). With no `digest` it is the one the installed template names (`service.rs:2985-2999`),
   so `app_update {name}` is enough once a newer template is installed. `version` is optional here and never picks the
   image. It is what the caller expects to find, and it is answered as `asked` beside the version read. When the two
-  do not agree the digest stands and the update is good, by the rule of step 7.
+  do not agree the digest stands, the update is good by the rule of step 7, and the message says in words that the
+  version read is not the one asked.
+
+**Where a digest comes from.** Arca cannot turn a version into a digest for this app: its one lookup of a registry's
+tags is for another image, for a card's label (`image_version.rs:1-3`). So "update it to 19.4.8" becomes a call in
+one of two ways. A newer template is installed, by an Arca release or `arca templates install`, and the call is
+`app_update {name}`. Or Doctor has the digest of that version from the publisher, and the call is `app_update {name,
+digest, version: "19.4.8"}`. A digest is always pulled from the repository in the service's record. If the installed
+template names another repository, its digest is not found there: the rebuild fails at the pull and the update rolls
+back with nothing lost.
 
 The answer of a good update of a by-digest service:
 
 ```json
-{ "updated": true, "service": "gitlab", "digest": { "from": "sha256:<old>", "to": "sha256:<new>" },
-  "version": { "asked": null, "before": "19.3.5", "after": "19.4.8" },
+{ "updated": true, "service": "gitlab", "update": "<update id>",
+  "digest": { "from": "sha256:<old>", "to": "sha256:<new>" },
+  "version": { "asked": null, "before": "19.3.5", "after": "19.4.8" }, "notSnapshotted": [],
   "snapshot": "pre-app-update-<time>", "volumes": ["gitlab-data"], "healthBefore": true,
   "message": "service gitlab was updated from 19.3.5 to 19.4.8 and its health check passed" }
 ```
 
 A system container's answer has no `digest` and adds `output` and `outputCut`, the last lines of the update command
-(below). A call for the digest the service already runs, or for the version the reader already prints, changes
-nothing and answers `updated: false`, as `service_update` does today (`service_update.rs:875-882`). The call answers
-when the update ends, which can be an hour. A caller that stops waiting loses nothing: the run goes on to its end,
-and `service_status` shows it (below).
+(below). `update` is the id every journal line of this run carries; `app_rollback` takes it (section 4).
+
+**A call that has nothing to do.** A by-digest call for the digest the service already runs changes nothing and
+answers `updated: false`, as `service_update` does today (`service_update.rs:875-882`). For a system container the
+version asked is compared, as text, with what the reader prints, when the instance runs. Equal: nothing changes, and
+the answer is `updated: false`. Not equal, or a stopped instance: the update runs. A reader that prints a suffix
+(`19.4.8-ce.0` for `19.4.8`) never compares equal; the package manager then finds nothing to do, and the cost is one
+snapshot.
+
+The call answers when the update ends, which can be an hour. A caller that stops waiting loses nothing: the run goes
+on to its end, and `service_status` shows it (below).
 
 ### Steps, in order
 
@@ -187,6 +216,10 @@ Each step is one line in a new journal file, `app-updates.jsonl`, in the state d
 in a private file that is set aside at 8 MiB (`service_update.rs:331-345`). It is a new file so that
 `service-updates.jsonl` keeps its own promise that no line holds a secret (`service_update.rs:4-5`).
 
+The two kinds differ in when the snapshot is taken. A good update never stops a system container, so its snapshot is
+taken while it runs. A by-digest service is stopped by its own move, so its snapshot is taken just after that stop:
+decided. Both begin the same way.
+
 0. **Checks, nothing written.** The service exists and has a formula (section 3 says where it is read from). The
    version or digest is valid. No other update of this service runs: one claim per service, as today
    (`service_update.rs:106-128`). The instance is the one Arca's record names, by its uuid
@@ -194,55 +227,76 @@ in a private file that is set aside at 8 MiB (`service_update.rs:331-345`). It i
    writes (`service_update.rs:820-933`), answered in its words, save the one for a declared port: the formula's
    health check replaces the port check. The version reader runs if the instance runs.
 1. **`begin`.** One line with the version or digest asked, the version read, the digest the service runs, whether the
-   instance ran, the snapshot's name and the SHA-256 of the formula. If it cannot be written, the call is refused, as
-   today (`service_update.rs:984-986`).
-2. **`snapshot`.** Taken of the instance **as it is, running or stopped**. Arca stops nothing for it, so an update
-   adds no downtime of its own. First an Incus snapshot of the instance, named `pre-app-update-<time>`, then one of
-   the same name of each custom volume the instance mounts (for a service, its data volume, `service.rs:666-674`).
-   The instance snapshot holds its root, config and devices (`crates/arca-incus/src/lifecycle.rs:343-344`). The line
-   names every part taken, in order, with the time of each.
-3. **`start`**, only for a system container that was stopped: no command runs in a stopped instance today
-   (`service_exec.rs:186-188`). It was snapshotted in step 2 while still stopped, so nothing wrote during its
-   snapshot. A stopped by-digest service is not started here: its move starts it.
-4. **`health before`.** The health check, journalled and answered (`healthBefore`), never judged. Decided: an app
-   that is unhealthy before its update is still updated, since an update is often the fix. An instance that already
-   ran gets one try. A system container just started gets tries until `health.seconds` have passed, so the app is up
-   first. A stopped by-digest service gets none.
-5. **The update step.** Its first line says the step starts, and it must be written: the read at a restart depends on
-   it. Then, for a system container, **`command`**: the update command runs with the version in place, and its line
-   has the exit code, how long it ran, and the kept output. For a by-digest service, **`move`**: the steps
-   `service_update` makes today, each its own line: the stop, the rebuild of the root from the new digest, the start
-   (`service_update.rs:1525-1526`, `service_update.rs:1554-1563`). Incus keeps the config, the devices and the data
-   volume (`service_update.rs:9-11`). `service_update`'s own snapshot is not taken: step 2's stands in. Each of these
-   has the deadline `service_update` gives a step, 600 seconds (`service_update.rs:56-57`).
-6. **`health`.** The health command is tried every 5 seconds until it exits 0 or `health.seconds` have passed. For a
-   by-digest service it runs in the new root.
-7. **`version`.** The reader runs. Its answer is reported, not judged. Decided: a version that differs from the one
-   asked, with health passing, is a good update, and the answer shows both. Package versions carry suffixes, so the
-   two often differ in text.
-8. **`record`**, by-digest only: the new digest is written to the service's record, after the health check and never
-   before, as today (`service_update.rs:1567-1568`, `service_update.rs:1683-1684`).
-9. **`drop snapshot`**, when an older pre-update snapshot of this service exists (see "The pre-update snapshot").
-10. **`end`.**
+   instance ran, the snapshot's name, the parts the snapshot will have, and the SHA-256 of the formula. If it cannot
+   be written, the call is refused, as today (`service_update.rs:984-986`).
 
-A failure from the update step on rolls back **by itself**: stop, restore the instance snapshot, restore each volume
-snapshot, start again if it ran before, run the health check for at most 30 seconds (the time `service_update` gives
-an old version today, `service_update.rs:60-61`), read the version. Each is a journal line. The call is then refused
-with the code `rolled_back` and says what happened. A stopped service is left running after a good update; after a
-rollback it is stopped again as it was.
+**A by-digest service** then goes on like this:
+
+2. **`health before`.** One try of the health check if the instance runs. It is journalled and answered
+   (`healthBefore`), never judged. Decided: an app that is unhealthy before its update is still updated, since an
+   update is often the fix.
+3. **`move starts`**, a line that must be written: the read at a restart depends on it. Then **`stop`**, the stop
+   `service_update` makes today (`service_update.rs:1525-1526`).
+4. **`snapshot`**, of the stopped instance. First an Incus snapshot of the instance, named `pre-app-update-<time>`,
+   then one of the same name of each custom volume the instance mounts (for a service, its data volume,
+   `service.rs:666-674`). The instance snapshot holds its root, config and devices
+   (`crates/arca-incus/src/lifecycle.rs:343-344`). The app has shut down in its own order and nothing writes, so the
+   snapshot is exact. No stop is added for it: the move's own stop lasts as much longer as the snapshots take.
+   `service_update`'s own snapshot (`service_update.rs:1527-1533`) is not taken; this one stands in. The line names
+   every part taken, with its time, and every disk not taken (below).
+5. **`rebuild`** of the root from the new digest, then **`start`**: the steps `service_update` makes today
+   (`service_update.rs:1554-1563`). Incus keeps the config, the devices and the data volume
+   (`service_update.rs:9-11`). Each has the deadline `service_update` gives a step, 600 seconds
+   (`service_update.rs:56-57`).
+6. **`health`.** The health command is tried every 5 seconds until it exits 0 or `health.seconds` have passed. It
+   runs in the new root.
+7. **`version`.** The reader runs. Its answer is reported, not judged. Decided: a version that differs from the one
+   asked, with health passing, is a good update, and the answer shows both.
+8. **`record`.** The new digest is written to the service's record, after the health check and never before, as today
+   (`service_update.rs:1567-1568`, `service_update.rs:1683-1684`).
+9. **`drop snapshot`**, when the snapshot of an earlier good update of this service exists (see "The pre-update
+   snapshot"). Then **`end`**.
+
+**A system container** goes on like this:
+
+2. **`snapshot`**, of the instance as it is, running or stopped, with the same parts and names as above. Arca stops
+   nothing for it, so an update adds no downtime of its own.
+3. **`start`**, only for one that was stopped: no command runs in a stopped instance today
+   (`service_exec.rs:186-188`). It was snapshotted while still stopped, so nothing wrote during its snapshot.
+4. **`health before`**, as above. An instance that already ran gets one try. One just started gets tries until
+   `health.seconds` have passed, so the app is up first.
+5. **`command starts`**, a line that must be written. Then **`command`**: the update command runs with the version in
+   place. Its line has the exit code, how long it ran, and the kept output.
+6. **`health`**, **`version`**, **`drop snapshot`** and **`end`**, as above. Package versions carry suffixes, so the
+   version asked and the one read often differ in text.
+
+**The rollback.** A failure after the root or the app was touched (from `rebuild`, or from `command`) is rolled back
+**inside the same run**, straight after the step that failed: stop, restore the instance snapshot, restore each
+volume snapshot, start again if it ran before, run the health check for at most 30 seconds (the time `service_update`
+gives an old version today, `service_update.rs:60-61`), read the version. Each is a journal line. The call is then
+refused with the code `rolled_back` and says what happened. A stopped service is left running after a good update;
+after a rollback it is stopped again as it was. This is the only restore Arca makes with no person. Every later one
+is `app_rollback`, on the owner's card (section 4).
 
 **Why a by-digest update gets this rollback.** Such an app changes its stored data when a new version first starts:
 the example's image "reconfigures and upgrades itself" on its first run. Today's rollback puts the old root back and
 keeps what the new version wrote on the data volume (`service_update.rs:33-34`), so the old version would start on
-data it may no longer read. Here both go back: the instance snapshot holds the old root, config and devices
-(`crates/arca-incus/src/lifecycle.rs:343-344`), and the volume snapshot holds the data.
+data it may no longer read. Here both go back: the instance snapshot holds the old root, config and devices, and the
+volume snapshot holds the data.
 
-**The snapshot is crash-consistent.** The instance and each volume are snapshotted one after the other while the app
-runs, not at one instant, and nothing asks the app to pause or to flush. After a rollback the app starts as it would
-after a power cut, with its disks a few moments apart. Arca promises that each disk comes back as Incus held it at
-its own snapshot, and it journals the order and the times. Arca does not promise that the app recovers: that is the
-app's own crash recovery, and the rollback's health check reports whether it did. For a by-digest service, which the
-move stops anyway, question 3 asks whether the snapshot should wait for that stop.
+**A system container's snapshot is crash-consistent.** The instance and each volume are snapshotted one after the
+other while the app runs, not at one instant, and nothing asks the app to pause or to flush. After a rollback the app
+starts as it would after a power cut, with its disks a few moments apart. Arca promises that each disk comes back as
+Incus held it at its own snapshot, and it journals the order and the times. Arca does not promise that the app
+recovers: that is the app's own crash recovery, and the rollback's health check reports whether it did. A by-digest
+service's snapshot has no such limit: its app was stopped.
+
+**What a snapshot does not hold.** It holds the instance's root and each custom volume the instance mounts. A disk
+that is a path of the host is in no Incus snapshot (*inferred*: Incus's behaviour, not read here); an adoption
+project may allow such disks today (`crates/arca-incus/src/adopt.rs:81-82`). The `snapshot` line and the answer list
+every disk that was not snapshotted (`notSnapshotted`). After a rollback, what the new version wrote there stays.
+That is the gap `service_update` has for its data volume today (`docs/OPERATING.md:2106-2107`). It is recorded, not
+refused.
 
 **`service_update` stays as it is**, for every service, with a formula or without: the same move, its own port check,
 and its own rollback, which keeps the new version's writes on the volume. No refusal is added to a call that works
@@ -250,58 +304,92 @@ today. For a service with a formula its answer gains one line that names `app_up
 and `follow` stay `service_update`'s alone. One thing changes around it. Once the service project allows snapshots,
 `service_update` takes its own instance snapshot there, as its code does wherever a project allows one
 (`service_update.rs:1527-1533`), and its rollback restores it in place of a rebuild (`service_update.rs:1710-1719`).
-Nothing at this base removes that snapshot (*inferred*: a search found no removal), so the 7-day look of this design
-removes those too.
+Nothing at this base removes that snapshot (*inferred*: a search found no removal), so the look that removes old
+snapshots in this design removes those too, at 7 days.
+
+**What else may touch the service meanwhile.** A run can last hours. `app_update`, and its read at a restart, take
+the one claim that `service_update` and `service_reconfigure` take for a service (`service_update.rs:106-128`,
+`service_update.rs:883-884`, `service_reconfigure.rs:741-742`), so none of them runs beside another on one service.
+`instance_start`, `instance_stop`, `instance_restart` and `service_remove` take no such claim (*inferred*: a search
+found it taken in those two files only), and this design adds none. A stop or a restart during the update command
+ends the command, which is a failed step and so a rollback. A `service_remove` during the run takes the instance
+away; each write of the state changer reads the instance again and refuses one that is gone or was made again
+(`crates/arca-incus/src/lifecycle.rs:323-327`, `crates/arca-incus/src/lifecycle.rs:346-350`), and the update ends
+with that failure in its journal.
 
 ### When a step fails or hangs
 
 | What fails | What Arca does | The service is left | What the caller gets |
 |---|---|---|---|
 | A check in step 0, or `begin` cannot be written | Nothing. | As it was. | A refusal that ends "Nothing was changed". |
-| The snapshot cannot be taken: Incus refuses, the project does not allow one, there is no room | Removes the parts already taken. | As it was. A running service never stopped. | A refusal with Incus's reason, "Nothing was changed". There is no update without a snapshot: a package install cannot be undone by rebuilding the root from an image, and what a new version wrote on a data volume cannot be undone at all. |
-| Incus does not finish the snapshot within its deadline (one hour) | Incus may still be at work, so no part is removed now. Writes `end`. | As it was, running or stopped. | `update_unsettled`: the code `service_update` uses when Incus may still be at work (`service_update.rs:1356-1368`). The refusal names the snapshot. Parts left under that name go in the next update's `drop snapshot` step, or at 7 days. |
+| The line that says the update step starts cannot be written | System container: removes the snapshot, and stops the instance again if it was stopped. | As it was. | A refusal, "Nothing was changed". |
+| By-digest: the stop fails | Starts it again if it ran. | As it was. | A refusal, "Nothing was changed", as `service_update` answers it today (`service_update.rs:1370-1387`). |
+| The snapshot cannot be taken: Incus refuses, or there is no room | Removes the parts already taken. By-digest: starts the instance again if it ran. | As it was. A running system container never stopped. | A refusal with Incus's reason, "Nothing was changed". There is no update without a snapshot: a package install cannot be undone by rebuilding the root from an image, and what a new version wrote on a data volume cannot be undone at all. |
+| Incus does not finish the snapshot within its deadline (one hour) | Incus may still be at work, so no part is removed and nothing is started now. Writes `end`. | System container: as it was. By-digest: stopped, with its old root. | `update_unsettled`: the code `service_update` uses when Incus may still be at work (`service_update.rs:1356-1368`). The refusal names the snapshot and, for a by-digest service, `instance_start`. Nothing inside was changed, so the parts left are not a way back: the next look removes them once Incus has ended. |
 | A stopped system container cannot be started for the update | Stops what Incus left half started. Removes the snapshot. | Stopped, as it was. | A refusal, "Nothing was changed". |
-| The line that says the update step starts cannot be written | Removes the snapshot. Stops the instance again if it was stopped. | As it was. | A refusal, "Nothing was changed". |
-| By-digest: the stop before the rebuild fails | Starts it again if it ran. Removes the snapshot. | As it was. | A refusal, "Nothing was changed", as `service_update` answers it today (`service_update.rs:1370-1387`). |
-| By-digest: the rebuild, the start or the record fails | Rolls back. | The old version on the old data, as at the snapshot. | `rolled_back`, with Incus's reason. |
-| By-digest: Incus does not finish the rebuild in time | Rolls nothing back, so as not to rebuild and restore at once, as today (`service_update.rs:1356-1368`). Keeps the snapshot. | As Incus leaves it. | `update_unsettled`. The refusal names `app_rollback`, which needs no card here. |
-| The update command exits non-zero | Rolls back. | The old version, as it was at the snapshot. | `rolled_back`, with the exit code and the kept output. |
-| The update command runs past `update.seconds` | The command is killed inside the instance at its limit, as every command Arca runs is today (`crates/arca-incus/src/exec.rs:230-237`). Rolls back. | The old version, as it was. | `rolled_back`, "ran past N seconds", with the kept output. |
-| Incus does not answer about the command by Arca's own deadline | Rolls back. The stop ends what still runs inside. | The old version, as it was. | `rolled_back`. |
+| By-digest: the rebuild, the start or the record fails | Rolls back. | The old version on the old data, exactly as at the snapshot. | `rolled_back`, with Incus's reason. |
+| By-digest: Incus does not finish the rebuild in time | Rolls nothing back, so as not to rebuild and restore at once, as today (`service_update.rs:1356-1368`). Keeps the snapshot. | Stopped, with the root as Incus leaves it. | `update_unsettled`. The update is left unfinished (below). |
+| System container: the update command exits non-zero | Rolls back. | The old version, as it was at the snapshot. | `rolled_back`, with the exit code and the kept output. |
+| System container: the update command runs past `update.seconds` | The command is killed inside the instance at its limit, as every Rule 50 command is today (`crates/arca-incus/src/exec.rs:230-237`). Rolls back. | The old version, as it was. | `rolled_back`, "ran past N seconds", with the kept output. |
+| Incus does not answer about a formula's command by Arca's own deadline: the update command, a health try or the version read | The step has failed. Rolls back. The rollback's stop ends what still runs inside. | The old version, as it was. | `rolled_back`. |
 | Health never comes within `health.seconds` | Rolls back. | The old version, as it was. | `rolled_back`, with the last lines of the health command. |
 | The version reader fails after a good health check | Nothing: the update is good. | The new version, running. | `updated: true`, `version.after: null`, and the message says the version could not be read. |
 | After a rollback the old version does not pass health in 30 seconds | Nothing more. | The old version, running. | `rolled_back`, with a note, as `service_update` notes it today (`service_update.rs:1416-1418`). An app that did not recover from a crash-consistent snapshot shows here. |
-| The rollback itself fails: the stop, a restore, or the start | Stops trying. Keeps every snapshot. Journals which parts were restored. | Stopped. | `rollback_failed`, with both failures and the snapshot's name: `service_update`'s code for this (`service_update.rs:1424-1444`). `app_rollback` tries the restore again (section 4). |
+| The rollback itself fails or does not end in time: the stop, a restore, or the start | Stops trying, in this run and after it. Keeps the snapshot. Journals which parts were restored. | Stopped, if the stop worked. If the stop is what failed: as it is, which can be the new version running. | `rollback_failed`, with both failures, the snapshot's name and the update's id: `service_update`'s code for this (`service_update.rs:1424-1444`). The update is left unfinished (below). |
+| The `drop snapshot` step fails after a good update | Nothing: the update is good. | The new version, running. | `updated: true`. The older snapshot is still there; the next look removes it. |
 | Any other journal line cannot be written after `begin` | Goes on, and says so on Arca's own log, as today (`service_update.rs:357-363`). | - | - |
 
-**An update left unfinished.** After `rollback_failed`, or after an unsettled rebuild, the kept snapshot is the way
-back. `app_rollback` puts it back with no card (section 4). A new `app_update` of that service does the same first
-and then goes on, so it never takes its snapshot of a half-updated instance.
+**An update left unfinished.** That is an update that ended `rollback_failed`, or `update_unsettled` in its rebuild,
+or that a restart cut after its update step began. Arca makes no restore for it by itself, at any later time: the app
+may have served people since. Three things are then true.
+
+- **The service stays as it was left**, until a person or Doctor acts. Arca starts nothing, stops nothing and
+  restores nothing. That can be a stopped instance, the new version running, or a system container half way through
+  its packages.
+- **Its snapshot is kept.** Decided: no time limit ever removes the snapshot of an unfinished update.
+- **`service_status` says so**: the update's id, how it ended, the state of the instance as Incus reports it, the
+  snapshot's name and that it is kept because the update is unfinished, and whether a rollback of it waits for the
+  owner.
+
+There are two ways on. Going back is `app_rollback {name, update}`: it is proposed, the owner approves it with the
+passkey, and it restores exactly the snapshot that update's `begin` line names (section 4). While the card waits,
+nothing changes. Going forward is a new `app_update`. It runs as any update does, with its own snapshot of the
+service as it stands, and when it ends good its `drop snapshot` step removes the unfinished update's snapshot with
+the others. A restore that Incus is still working on makes a later one fail with Incus's own reason, and nothing is
+changed by it.
 
 **Arca restarts in the middle.** The claim is in memory today (`service_update.rs:106-110`) and nothing at this base
 reads the update journal back at a start (*inferred*: a search found only writers of that file). `app_update` adds a
-read at start. For each `begin` in `app-updates.jsonl` with no `end`:
+read at start, for each `begin` in `app-updates.jsonl` with no `end`. It holds the service's claim while it works. An
+Incus operation outlives an Arca restart, so the read first waits until no operation that Incus still runs names the
+instance or its volumes, by the listing Rule 44 uses today (`docs/OWNERSHIP.md:603-607`). Arca removes no snapshot
+and starts no instance under a running operation. Then:
 
-- no line that says the update step starts: nothing inside the instance was changed, and Arca never stopped it. Arca
-  removes any snapshot that carries the name in `begin`, stops the instance again if `begin` says it was stopped, and
-  writes `end` with `interrupted: true`;
-- that line and no good `health` line: the update is of unknown state. Arca rolls it back by itself, exactly as the
-  verb does, and writes `end` with `interrupted: true` and whether the rollback worked. A command still running
-  inside the instance is ended by the rollback's stop. A rebuild Incus is still at makes the restore fail, and the
-  update is then one left unfinished, as above;
-- a good `health` line: the update was good. Arca writes the digest to the record if the run had not, then the `end`.
+- no line that says the update step starts: nothing inside the instance was changed, and Arca stopped nothing. Arca
+  removes any snapshot that carries the name in `begin`, stops a system container again if `begin` says it was
+  stopped, and writes `end` with `interrupted: true`;
+- that line, by-digest, and a snapshot that is not whole: the rebuild never began, since it only follows a whole
+  snapshot. Arca looks at the snapshot itself for this, not at the journal. It removes the parts, starts the instance
+  if `begin` says it ran, and writes `end` with `interrupted: true`. Nothing is restored;
+- that line and no good `health` line, in every other case: the update is of unknown state, and no check of it has
+  failed. Arca restores nothing. It writes `end` with `interrupted: true`, and the update is left unfinished, as
+  above. A system container's command that still runs inside goes on to its own time limit;
+- a good `health` line: the update was good. Arca finishes what was left of it: the digest in the record for a
+  by-digest service, the `drop snapshot` step, the `end`.
 
-The read runs beside the start, never in front of it: a slow restore does not keep Arca from serving. The service
-refuses a second `app_update` until its `end` is written.
+The read runs beside the start, never in front of it, so it does not keep Arca from serving.
 
 ### What Doctor and the owner see
 
 Doctor gets the answer or the refusal above. `service_status` gains an `appUpdate` block for a service with a
 formula: where the formula comes from (`template` or `record`), the last version Arca read and when, the update that
-runs now and its step, and the last update's outcome (`updated`, `rolled_back`, `rollback_failed`, `nothing_changed`,
-`unsettled`, `interrupted`) with its snapshot's name. Arca runs no command for a status read: the version shown is
-the one the last update read. The owner is asked nothing for an update. The owner sees what Doctor says, and the
-service's state where services are listed. After `rollback_failed` that state is `stopped`.
+runs now and its step, and the last update's id and outcome (`updated`, `rolled_back`, `rollback_failed`,
+`nothing_changed`, `unsettled`, `interrupted`). It also lists each pre-update snapshot the service holds: its name,
+the update it belongs to, its date, and why it is kept (the last good update's, with the day it goes; or an
+unfinished update's, kept until a rollback or a later good update settles it). Arca runs no command for a status
+read: the version shown is the one the last update read. The owner is asked nothing for an update. The owner sees
+what Doctor says, and the service's state where services are listed. After an update left unfinished that state is
+whatever Incus reports, and the `appUpdate` block says why.
 
 ### What is kept of the command's output
 
@@ -310,7 +398,7 @@ Today a command's output is capped at 64 KiB and a longer one is an error (`crat
 audit holds no arguments and no output (`docs/OWNERSHIP.md:854-855`). A package manager prints far more, and its last
 lines are what explain a failure. So for a formula's commands:
 
-- Arca reads both outputs as a stream and keeps the **last 64 KiB**. A longer output is never an error; the journal
+- Arca keeps the **last 64 KiB** of the command's two outputs. A longer output is never an error; the journal
   and the answer say `outputCut: true`.
 - That text is masked the way `service_logs` masks a log today (`handlers.rs:8699-8735`): every PEM block is hidden
   whole first, then each line is cleaned of control bytes (`clean_log`, `service.rs:4185-4212`) and has the node's
@@ -327,63 +415,102 @@ lines are what explain a failure. So for a formula's commands:
 
 ### The pre-update snapshot
 
-It is kept after a good update, so that the owner can still go back (section 4). Decided: it is kept until the next
-good update of that service, and at most 7 days. Arca removes it, with no card, in three cases:
+Each snapshot belongs to one update, by the update's id in the journal. A good update's snapshot is kept, so that the
+owner can still go back (section 4). Decided: it is kept until the next good update of that service, and at most 7
+days. Arca removes a snapshot, with no card, in these cases:
 
-- after a rollback that worked, since the instance is then what the snapshot holds;
-- when the **next** good update of the same service passes its health check, in that update's `drop snapshot` step;
-- when it is 7 days old. Arca looks at each start and once an hour after, and writes the removal as a line in
-  `app-updates.jsonl`.
+- after a rollback that worked, in the run or by `app_rollback`, since the instance is then what the snapshot holds;
+- when the **next** good update of the same service passes its health check: its `drop snapshot` step removes the
+  snapshots of the updates before it, an unfinished one's among them;
+- when a good update's snapshot is 7 days old. Arca looks at each start and once an hour after, and writes the
+  removal as a line in `app-updates.jsonl`. The same look removes three other things: a snapshot a failed `drop
+  snapshot` step left, the parts a snapshot left when Incus did not finish it in time, once Incus has ended, and
+  `service_update`'s own `pre-update-<time>` snapshots at 7 days.
 
-So a service has at most one, plus the one of an update that is running. After a removal, `app_rollback` changes
-nothing and answers that the service has no pre-update snapshot, with the date the last one was removed and which of
-the three cases removed it. The 7 days count for the snapshot of an update that ended good. After an update left
-unfinished (`rollback_failed`, or an unsettled rebuild) the snapshot is the only way back to a working service, so in
-this design it stays until that rollback is finished. That is question 2. Removing the service removes its snapshots
-with it (*inferred* from Incus deleting an instance's and a volume's snapshots with them).
+Decided: that look never takes the snapshot of an update left unfinished. It stays until a rollback or a later good
+update settles it (above).
+
+So "at most one" holds for good updates only. A service can hold the snapshot of its last good update; beside it, the
+snapshot of an update that is running or was left unfinished; and, until the next look, parts Incus left.
+`app_rollback` names the update it goes back to, so it never has to choose between them. For an update whose snapshot
+is gone it changes nothing and answers that there is none, with the date it was removed and which case removed it.
+Removing the service removes its snapshots with it (*inferred* from Incus deleting an instance's and a volume's
+snapshots with them).
 
 These are Incus's own snapshots, inside the instance's project. They are not `snapshot_create` copies and
-`snapshot_list` does not show them.
+`snapshot_list` does not show them; `service_status` does.
+
+**A snapshot under a newer one.** A service can hold a newer snapshot above the one a rollback names:
+`service_update`'s own, or a later update's. Incus's storage documentation says a ZFS pool restores only an
+instance's newest snapshot unless the pool is set to remove the newer ones, which it is not by default
+(`linuxcontainers.org/incus/docs/main/reference/storage_zfs/`). Which drivers a service project's pool may have was
+not established here. So this is a named risk, not a decided behaviour: on such a pool an `app_rollback` past a newer
+snapshot fails with Incus's reason and changes nothing. The rollback inside a run always restores the newest
+snapshot, its own. Pull request 3's test on a real Incus restores past a newer snapshot and records what happens.
 
 ### Container and virtual machine
 
 **Containers only in the first build**: an OCI container or a `system` container of the node's own service project.
 An adopted container comes later (section 3).
 
-A virtual machine is left out, for three reasons. Arca has never run a command in a guest; its log read avoids it
-because "an exec needs a guest agent the image may not run" (`handlers.rs:8654`). A virtual-machine template's
-version today is its `update.pin` (`service.rs:2985-2997`), and #241 is about to change how that works. And the live
+A virtual machine is left out, for three reasons. The new command type is for containers of the service project. No
+service verb starts a command in a service's guest today, and the log read avoids one because "an exec needs a guest
+agent the image may not run" (`handlers.rs:8654`); the one guest command Arca starts is a runner machine's, by
+another writer in another project (Rule 77, `docs/OWNERSHIP.md:1752-1758`). A virtual-machine template's version
+today is its `update.pin` (`service.rs:2985-2997`), and #241 is about to change how that works. And the first real
 case is a container. The formula's shape is the same for a machine, so adding it later changes no template. A service
-in a tenant is left out too: no command is run inside a tenant's instance today
+in a tenant is left out too: no service command is run inside a tenant's instance today
 (`crates/arca-incus/src/exec.rs:330-334`).
 
 ### What changes under the verb
 
-- **A second kind of command.** Rule 50's closed list stays closed, and it goes on refusing an OCI container
+- **A second kind of service command.** The closed list stays closed, and it goes on refusing an OCI container
   (`service_exec.rs:165-168`). Beside it, one new type holds a formula's command: built only from a formula that
-  passed section 1's limits and a version that passed its rules, with no environment added and run as root, as today
-  (`crates/arca-incus/src/exec.rs:239-242`). It runs in a `system` container and in an OCI container of the node's
-  own service project. It is refused for an adopted instance (until section 3 is built), a tenant's instance and a
-  stopped one, and it keeps Rule 50's identity checks and its audit. Its time limit is the same in-instance
+  passed section 1's limits and a version that passed its rules, with no environment added and run as root, as a Rule
+  50 command is (`crates/arca-incus/src/exec.rs:239-242`). It runs in a `system` container and in an OCI container of
+  the node's own service project. It makes the checks Rule 50 makes there (the owner's mark, the uuid before and
+  after, no tombstone, a running instance) and writes the same audit. It is refused for an adopted instance (section
+  3 says what would change that), a tenant's instance and a stopped one. Its time limit is the same in-instance
   `/usr/bin/timeout` (`crates/arca-incus/src/exec.rs:230-237`), so an image must carry that program: without it no
-  check of the formula passes, and `health before` shows that first. It is a new rule in `OWNERSHIP.md`.
+  check of the formula passes, and `health before` shows that first.
+- **Rule 50 is edited, and a rule is added.** Rule 50 says today that serve may execute only the closed enum, that it
+  refuses OCI instances, and that a recording is capped at 64 KiB (`docs/OWNERSHIP.md:851-854`). Its first sentence
+  has to name the second type, and the new rule states that type's own limits: which containers, the kept tail in
+  place of the cap, the checks above.
+- **No hung mark.** Today a command that passes Arca's own deadline marks the instance's uuid hung, in memory, and
+  every later command but a cleanup is refused until the uuid changes (`service_exec.rs:218-227`,
+  `service_exec.rs:314-321`). A restore and a rebuild keep the uuid, so that mark would refuse the rollback's own
+  health check and every later update. The new type does not set or read it. The mark is there because a command may
+  still run in the instance; here the rollback's stop follows at once and ends everything in it. If that stop fails,
+  the update is left unfinished and no formula command runs until a person acts.
+- **How that command is run.** It takes the way a runner machine's command is run today: started detached, with no
+  websocket, then waited on through its Incus operation in bounded waits
+  (`crates/arca-incus/src/runner_vm.rs:238-293`). The reason is the length: a command of up to two hours should not
+  hang on one request, and the operation's id is journalled as soon as Incus gives it. It does not use that writer.
+  `RunnerVms` writes only a pool's own machines in the pool's project, takes its caller's environment and records no
+  output (Rule 77, `docs/OWNERSHIP.md:1752-1758`); a formula's command is a service's, has no environment added, and
+  has its output recorded.
 - **Snapshots in the service project.** Decided: the service project allows Incus snapshots. Its owner entry gains
   one more widening step in Rule 55's table (`docs/OWNERSHIP.md:956-965`): `restricted.snapshots` set to `allow`,
-  written by Arca the first time an app update needs it, with no card. An adoption project already allows snapshots
-  (`crates/arca-incus/src/adopt.rs:433-447`).
+  written by Arca the first time an app update needs it, with no card. The provider has to learn it too. Today it
+  refuses a patch of any guarded project key but three named allowances (`crates/arca-providers/src/incus.rs:96-126`,
+  `crates/arca-providers/src/incus.rs:1923-1942`; Rule 30, `docs/OWNERSHIP.md:339-344`). This is a fourth: an entry
+  that may own the service project, that project, `restricted.snapshots`, the value `allow`.
 - **Volume snapshots and their restore**, and the removal of a pre-update snapshot: new, narrow writes beside the
   state changer that snapshots and restores an instance today (`crates/arca-incus/src/lifecycle.rs:315-361`).
 
 ## 3. An adopted instance gets a formula (#244)
 
-**For later.** Decided: the first real case does not come through adoption. It is a service made from the `gitlab`
-template, so nothing in the first build needs this section. It is the design for an adopted instance and the last
-pull request of section 6. Its question, which adoption path (question 1), stays open and holds nothing else back.
+**For later, and not buildable under today's rules.** Decided: the first real case does not come through adoption. It
+is a service made from the `gitlab` template, so nothing in the first build needs this section. Until its question is
+answered, `app_update` refuses an adopted service, as `service_update` does today (`service_update.rs:820-822`). What
+follows is the design for the day it is answered, and the last pull request of section 6.
 
 **Today.** A service record of an adopted instance is built from the other manager's three keys on the instance (its
 template name, address and ports), with `adopted: true` (`handlers.rs:7094-7106`, `handlers.rs:7154-7184`). Arca
 reads no template for it (`handlers.rs:6613-6615`), and its record writes nothing to the instance
-(`service.rs:1286-1290`). A record that exists is kept as it is on later reads (`handlers.rs:7269-7294`).
+(`service.rs:1286-1290`). A record that exists is kept on later reads, save its `kernelAccess`, which follows the
+instance's device (`handlers.rs:7269-7294`).
 
 **Where the formula lives.** The service record gains one optional field, `appUpdate`, of section 1's
 system-container shape, written only when set, so every other record reads and writes as before. A service has one
@@ -396,64 +523,88 @@ take it off) for an adopted service. It checks the formula by section 1's limits
 takes an optional `appUpdate`, so that an import and its formula are one card: an import already needs the owner's
 approval (`docs/OPERATING.md:5046-5054`), and the card then shows the three commands.
 
-**How the verb updates it.** `app_update {name, version}` runs the same steps. The lines are masked with the
-credential shapes and PEM blocks only, since Arca stores no secret for an adopted service. `service_status` shows the
-`appUpdate` block and no `update` block, as today (`handlers.rs:6613-6615`).
+**How the verb updates it.** `app_update {name, version}` runs a system container's steps. The output is masked
+exactly as in section 2, the instance's own environment values included: those are on the instance whoever made it,
+and `service_logs` hides them today (`handlers.rs:8699-8709`). `service_status` shows the `appUpdate` block and no
+`update` block, as today (`handlers.rs:6613-6615`).
 
 **An older Arca.** A service record is strict too (`service.rs:410-412`), so a build older than this feature cannot
 read a record that carries a formula. Before going back to an older build, take the formula off each adopted service.
 The same is asked today of imports before a downgrade (`docs/OPERATING.md:5087-5089`).
 
-**What stands in the way today** (this is question 1). A hand-made container cannot be imported: `service_import`
-takes only an instance that already carries the other manager's service keys, in a project of that manager
-(`docs/OPERATING.md:5016`, `docs/OPERATING.md:5037-5039`), and a plain container with an app installed by hand
-carries none (*inferred*: nothing hand-made sets them). An imported instance also stays in the other manager's
-project, where the one write Arca makes is one key (Rule 52, `docs/OWNERSHIP.md:891-893`) and every other writer
-refuses that project (`docs/OWNERSHIP.md:905-907`), while an update has to snapshot the instance, run a command in
-it, and maybe stop and restore it. The other path, `arca adopt`, fits better: it takes a container out of the default
-project into its own adoption project (`docs/OPERATING.md:4820-4821`), which Arca owns and which already allows
-snapshots (`docs/OPERATING.md:4864`). But it makes no service record for a container without those keys, since a
-record is built only from them (`handlers.rs:7094-7106`), and it is run from a terminal today
-(`docs/OPERATING.md:4836-4848`).
+**What each adoption path needs.** This is question 1, and it is undecided because neither path can carry an update
+under today's rules.
+
+- **`service_import`.** It takes only an instance that already carries the other manager's service keys, in a project
+  of that manager that the node's config lists under `kernel.importServices` (`docs/OPERATING.md:5016`,
+  `docs/OPERATING.md:5037-5039`, `config.rs:485-489`). A plain container with an app installed by hand carries no
+  such key (*inferred*: nothing hand-made sets them). The instance stays in that project, where the one write Arca
+  makes is one key (Rule 52, `docs/OWNERSHIP.md:891-893`) and every other writer refuses the project
+  (`docs/OWNERSHIP.md:905-907`). So this path needs: an import that takes an instance with no service keys; the
+  owner's edit of the node's config for each instance; and Rule 52 gaining a snapshot, a restore, a stop, a start and
+  a declared command in a project that is another manager's.
+- **`arca adopt`.** It takes a container out of the default project into its own adoption project
+  (`docs/OPERATING.md:4820-4821`), which already allows snapshots (`docs/OPERATING.md:4864`). But `AdoptWriter` is
+  the only path that writes there, through a closed table of steps (Rule 45, `docs/OWNERSHIP.md:656-663`); the state
+  changer refuses a project outside the kernel's family before any request
+  (`crates/arca-incus/src/lifecycle.rs:571-576`); `serve` refuses a config that lists an adoption, and the adoption
+  is run from a terminal (`docs/OPERATING.md:4822`, `docs/OPERATING.md:4836-4848`); and no service record is made for
+  a container without the service keys (`handlers.rs:7094-7106`). So this path needs: new steps in Rule 45's table,
+  or the state changer's family widened to adoption projects, for the snapshot, the restore, the stop and the start;
+  a service record for such a container; and a way for `serve` to act on an adoption.
+- **Both** need the rule for declared commands to reach past the node's service project, which the exec target and
+  the path of its recordings are fixed to today (`crates/arca-incus/src/exec.rs:318-328`,
+  `crates/arca-incus/src/exec.rs:422-425`), and past the refusal of an adopted instance that Rule 50 and the service
+  exec make (`docs/OWNERSHIP.md:851-852`, `service_exec.rs:152-154`). Both also need an identity source. Rule 50
+  takes identity from the newest live instance effect (`docs/OWNERSHIP.md:852-853`), and step 0 reads the uuid Arca
+  journalled when it created the instance (`service_update.rs:915-918`); an adopted instance has no such effect. An
+  adoption's own record holds the container's uuid (Rule 45, `docs/OWNERSHIP.md:656-660`); an import has nothing like
+  it yet.
 
 ## 4. The approval model
 
-The owner's rule, word for word: "work first, make safe later, so an update needs no passkey and a rollback that
-loses data does."
+The approval principle of this design, given for issue #240: an update needs no passkey, and a rollback that loses
+data needs one. It adds no exception to the approval rule Arca has today. Issue #240 itself asks only for the
+rollback Arca makes by itself. The kept snapshot and the later `app_rollback` go beyond the issue; they are here for
+the second half of the principle.
 
-**Today.** `service_update` needs a `doctor` token and asks the owner for nothing (`docs/OPERATING.md:1953-1954`).
-A `viewer` token only reads and proposes (`docs/OPERATING.md:36`); the owner then approves on the card, or in the
-owner's signed-in session, where a passkey tap counts for 12 hours (`docs/OPERATING.md:2551`). An action that
-deletes or erases is never approved in the session: it keeps the passkey card (`action_proposal.rs:286-301`,
-`action_proposal.rs:1885-1889`).
+**Today.** `service_update` needs a `doctor` token and asks the owner for nothing (`docs/OPERATING.md:1953-1954`). A
+`viewer` token only reads and proposes (`docs/OPERATING.md:36`); the owner then approves on the card, or in the
+owner's signed-in session, where a passkey tap counts for 12 hours (`docs/OPERATING.md:2551`). An action that deletes
+or erases is never approved in the session: it keeps the passkey card (`action_proposal.rs:286-301`,
+`action_proposal.rs:1885-1889`). Whether an action erases is decided from its kind and its arguments alone;
+`service_remove` erases by its kind (`action_proposal.rs:288-297`).
 
 | The call | Who | What it needs |
 |---|---|---|
-| `app_update`, called by a `doctor` token | Doctor | **No card.** This covers its snapshot, its command or its image move, its health check, its own rollback, the first widening of the project for snapshots, and the removal of an older pre-update snapshot. |
-| The rollback inside `app_update`, after a failed step, and the same rollback at a restart | Arca | **No card, no person** (issue #240's acceptance). |
-| `app_formula_set`, called by a `doctor` token (section 3, later) | Doctor | **No card.** Decided. |
+| `app_update`, called by a `doctor` token | Doctor | **No card.** This covers its snapshot, its command or its image move, its health check, the rollback inside the same run, the first widening of the project for snapshots, and the removal of older pre-update snapshots. |
+| The rollback inside an `app_update` run, straight after its failed step | Arca | **No card, no person** (issue #240's acceptance). It is the only restore without a card. |
+| `app_rollback {name, update}`, in every case: after a restart cut the update, after an unsettled rebuild, after a rollback that failed or whose stop failed, and past an update that ended good | the owner | **The passkey card.** It runs only from an approved proposal and is never approved in the session: its action erases by its kind, as `service_remove`'s does. |
 | `service_update`, on a service with a formula or without | Doctor | As today: no card (`docs/OPERATING.md:1953-1954`). Unchanged. |
+| `app_formula_set`, called by a `doctor` token (section 3, later) | Doctor | **No card.** Decided. |
 | `service_status` with its `appUpdate` block | any token | Nothing: a read. |
 | `app_update` or `app_formula_set`, proposed by a `viewer` token through `action_propose` | the signed-in owner | **One yes in the owner's signed-in session**, or the card. No passkey beyond the session's own. A viewer writes nothing by itself today either. |
-| `service_import` with a formula | the owner | What an import needs today: the owner's approval of its card (`docs/OPERATING.md:5054`). |
-| `app_rollback` of an update that ended good | the owner | **The passkey card.** Never asked in the session. |
-| `app_rollback` of an update left unfinished: its own rollback failed, or its rebuild ended unsettled | Doctor | **No card**: it finishes the rollback that was already Arca's to make. |
+| `service_import` with a formula (section 3, later) | the owner | What an import needs today: the owner's approval of its card (`docs/OPERATING.md:5054`). |
 
-**When a rollback "loses data".** A rollback puts the instance and its volumes back to the moment of the snapshot.
-Everything the app wrote after that moment is erased.
+**Where the line is.** A rollback puts the instance and its volumes back to the moment of the snapshot. Everything
+the app wrote after that moment is erased.
 
-- The rollback **inside the verb** runs minutes after the snapshot, on an update that failed its own check. What it
-  erases is what the app wrote in that window, most of it by a version that never became healthy. No person accepted
-  that version. It runs by itself.
-- A rollback **asked for later** is different. The update ended good, the verb answered, and the app went on
-  serving. People used it. Putting the snapshot back erases every write since, and nothing brings them back. That is
-  a rollback that loses data in the rule's sense. It is its own verb, `app_rollback {name}`, it runs only from an
-  approved proposal, and its action counts as one that erases, so the signed-in session lists it and never approves
-  it. Its card says in words that everything the app stored since the update, with the update's date, is erased.
+- The rollback **inside the run** comes straight after a step of that same update failed. What it erases is what the
+  app wrote between the snapshot and the failure, most of it by a version that never became healthy; for a by-digest
+  service only the new version wrote at all, since the old one was stopped before the snapshot. No person accepted
+  that version, and the verb has not answered. It needs no card.
+- **Every later restore** is `app_rollback`, and it is an erasing plan like any other today. That is plain past a
+  good update: people used the app, and the restore erases every write since. It is also the rule after a restart, an
+  unsettled rebuild or a failed rollback. No check failed straight before, time has passed, and the service may have
+  run and served in between, so Arca cannot say that nothing would be lost.
 
-`app_rollback` stops the instance, restores the one pre-update snapshot the service has, starts it, then runs the
-health check and reads the version. For a by-digest service it also writes the old digest back to the service's
-record. With no such snapshot it changes nothing and says why (section 2).
+**`app_rollback`.** It always names one update by its id and restores exactly the snapshot that update's `begin` line
+names, never another. Doctor proposes it; the card says in words that everything the app stored since that update,
+with the update's date, is erased. Approved, it stops the instance, restores the snapshot of the instance and of each
+volume, starts it, then runs the health check and reads the version. For a by-digest service it also writes that
+update's old digest back to the service's record. For an update whose snapshot is gone it changes nothing and says
+why (section 2). While the card waits the service stays as it was left, and `service_status` shows the unfinished
+update and that its rollback waits for the owner.
 
 Nothing else in this design asks the owner for anything, and no guard is added beyond what the steps need to end in a
 known state.
@@ -479,45 +630,66 @@ new app would use section 1's shape as it is.
 
 ## 6. Build plan
 
-Each pull request is inside the size band (at most 25 files and 2,000 handwritten insertions) and stands on its own.
+Each pull request is meant to fit the size band (at most 25 files and 2,000 handwritten insertions) and to stand on
+its own. The sizes are estimates: nothing is written yet, and pull request 4 is the tightest.
 
 | # | What it builds | What it proves alone | Tests |
 |---|---|---|---|
-| 1 | The `appUpdate` field on a template, in both shapes: parsing, limits, which kind takes which shape, the version rules, the `{version}` replacement. `service_status` shows where a formula comes from. No command is run. | The shape is fixed, and a version cannot leave its argument. | Unit tests of every limit, of each shape on the wrong kind, and of hostile versions (spaces, quotes, `$(`, `;`, a leading `-`, `:~`). Every shipped template still reads the same. |
-| 2 | The formula command in `arca-incus`, for a `system` container and for an OCI container of the node's own project: the new command type, the stream read that keeps a tail, the masking. The new rule in `OWNERSHIP.md`. | A declared command runs in an owned container of either kind, is bounded in time, and its output is kept short and masked. | The fake Incus: exit codes, a command past its time, an output over the cap, a secret and a cut key in the output, an instance that changed meanwhile, the refusals that stay. The closed list's own tests unchanged, its OCI refusal among them. |
-| 3 | Snapshots: an instance with its volumes, taken with no stop; the restore of both; the removal; the service project allows snapshots (Rule 55's new row). | A running instance is snapshotted without a stop, and it and its data volume come back as each was at its snapshot. | The fake Incus for each request and refusal, and that a snapshot sends no stop and no start. One test on a real Incus: a running instance that writes, snapshot, change both disks, restore, compare; the same for a stopped one. |
-| 4 | `app_update` for a by-digest service: the target digest, the steps, `app-updates.jsonl`, the image move, the rollback of root and volume, the answers and refusals, the run that outlives its caller, the `appUpdate` block's `running` and `last`. Its section in `OPERATING.md`. | The by-digest rows of section 2's table. `service_update` answers as before. | One scenario test per row on the fake Incus, each asserting the journal lines, the answer and the state left. The digest from the argument and from the template. `service_update`'s own tests unchanged. |
-| 5 | `app_update` for a system container: the start of a stopped one, the command step, the output in the answer and the journal. | The system-container rows of the table. A good update never stops the instance. | One scenario test per row on the fake Incus, and that a stop is sent only by a rollback. A stopped service: snapshot before its start. |
-| 6 | The read at start of interrupted updates, and the finishing of an update left unfinished. | An update cut at any step ends in a known state with no person. | A journal cut after each line, for each kind, then a start: the expected lines and state. Cut before the line that says the update step starts: no stop, no restore. Cut after it: a rollback. |
-| 7 | `app_rollback`, its card and its action; the retention of pre-update snapshots, `service_update`'s own among them. | A later rollback runs only from the passkey card, and says what it erases. A snapshot goes at 7 days. | The card's words; the session never approves it; the restore run; the finish of an unfinished update with no card; a snapshot 7 days old is removed and `app_rollback` then answers that there is none; the one of a failed rollback stays. |
-| 8 | The proof on a real Incus. First the `gitlab` case end to end, with a small stand-in of the same shape: an image by digest with one data volume, whose newer version rewrites its data at its first start. It is moved to the newer digest and reports its version; with a health check that fails, the old root and the old data are back with no person. Then #240's two acceptance lines for a container with a small package-installed app. | The first real case, and the issue's acceptance. | Real-Incus tests beside the ones the repository already has for snapshots. They also assert that a good update of the system container never stopped it. |
-| 9 | Adopted services: the `appUpdate` field on a record, `app_formula_set`, the optional `appUpdate` of `service_import`, the formula command on an adopted container. Waits for the answer to question 1. | #244: an adopted instance is updated by the same verb. | The fake Incus for the record writes and the import card; every existing record still reads the same; the path question 1 picks, on a real Incus. |
+| 1 | The `appUpdate` field on a template, in both shapes: parsing, limits, which kind takes which shape, the version rules, the `{version}` replacement. `service_status` shows where a formula comes from. No command is run. | The shape is fixed, and a version stays one plain argument. | Unit tests of every limit, of each shape on the wrong kind, and of hostile versions (spaces, quotes, `$(`, `;`, a leading `-`). One test that documents what the rules do not refuse: a template that hands its version to a program that runs it. Every shipped template still reads the same. |
+| 2 | The formula command in `arca-incus`, for a `system` container and for an OCI container of the node's own project: the new command type, the detached start and the bounded waits on its operation, the kept tail, the masking, no hung mark. The edit of Rule 50 and the new rule in `OWNERSHIP.md`. | A declared command runs in an owned container of either kind, is bounded in time, and its output is kept short and masked. | The fake Incus: exit codes, a command past its time, a command Incus does not answer for, an output over the cap, a secret and a cut key in the output, an instance that changed meanwhile, the refusals that stay. The closed list's own tests unchanged, its OCI refusal and its hung mark among them. |
+| 3 | Snapshots: an instance with its volumes, taken as it is; the restore of both; the removal; the list of disks not taken. The service project allows snapshots: Rule 55's new row and the provider's fourth allowance. | A running instance is snapshotted without a stop, a stopped one exactly, and each comes back with its data volume as it was at its snapshot. `service_update`'s snapshot branch, live in an Arca project for the first time, works there. | The fake Incus for each request and refusal, and that a snapshot sends no stop and no start. The provider: the one new allowance passes, every other guarded key is still refused. On a real Incus: a running instance that writes, snapshot, change both disks, restore, compare; the same for a stopped one; a rebuild from another image and then a restore of the snapshot taken before it; `service_update` with a failing health check, restored from its own snapshot; a restore past a newer snapshot, with what the pool's driver answers. |
+| 4 | `app_update` for a by-digest service: the target digest, the steps with the snapshot after the stop, `app-updates.jsonl`, the rollback of root and volume, the answers and refusals, the run that outlives its caller, the `appUpdate` block. Its section in `OPERATING.md`. | The by-digest rows of section 2's table. `service_update` answers as before. | One scenario test per row on the fake Incus, each asserting the journal lines, the answer and the state left, and that the snapshot is asked for only after the stop. The digest from the argument and from the template. `service_update`'s own tests unchanged. |
+| 5 | `app_update` for a system container: the snapshot while it runs, the start of a stopped one, the command step, the output in the answer and the journal, the call that has nothing to do. | The system-container rows of the table. A good update never stops the instance. | One scenario test per row on the fake Incus, and that a stop is sent only by a rollback. A stopped service: snapshot before its start. A stop and a remove from outside during the command. |
+| 6 | The read at start of interrupted updates. | An update cut at any step ends in a known, stated state, and nothing is restored without a person. | A journal cut after each line, for each kind, then a start: the expected lines and state, the finished `drop snapshot` step among them. A cut after the update step began: no restore, the update shown as unfinished. A running Incus operation on the instance: nothing is removed or started until it ends. A `service_update` asked during the read meets the claim. |
+| 7 | `app_rollback {name, update}`, its card and its action; the retention of pre-update snapshots, `service_update`'s own among them; the snapshot list and the unfinished state in `service_status`. | Every restore after the run needs the passkey card and says what it erases. It restores its own update's snapshot and no other. | The card's words; the session never approves it; a `doctor` token alone cannot run it; with two snapshots held, each call restores the one its update names; a good update's snapshot goes at 7 days and `app_rollback` then answers that there is none; an unfinished update's snapshot is still there after 7 days and `service_status` says why; a later good update removes it. |
+| 8 | The proof on a real Incus. First the shape of the `gitlab` case end to end, with a small stand-in: an image by digest with one data volume, whose newer version rewrites its data at its first start. It is moved to the newer digest and reports its version; with a health check that fails, the old root and the old data are back with no person. Then #240's two acceptance lines for a container with a small package-installed app. | The first real case's shape, and the issue's acceptance. The real image is proven by the template's own pull request, which also checks the three *inferred* facts of section 1. | Real-Incus tests beside the ones the repository already has for snapshots. They also assert that a good update of the system container never stopped it. |
+| 9 | Adopted services: what question 1's answer needs in the rules (section 3), the `appUpdate` field on a record, `app_formula_set`, the optional `appUpdate` of `service_import`, the formula command on an adopted container. Waits for the answer to question 1, and may need to be split in two to stay inside the band. | #244: an adopted instance is updated by the same verb. | The fake Incus for the record writes and the import card; every existing record still reads the same; the path question 1 picks, on a real Incus. |
 
-1, 2 and 3 do not depend on each other. 4 needs all three. 5, 6 and 7 need 4. 8 needs 4 and 5, and is the pull
-request that proves the `gitlab` case end to end. 9 is last: it needs 5 and the answer to question 1, and nothing
-before it waits for that answer. The shipped `gitlab` template and the move of the app's data are not in this plan:
-they are a separate pull request. That template can carry its formula once 1 is merged, and `app_update` works on the
-real service once 4 is.
+1, 2 and 3 do not depend on each other. 4 needs all three. 5 and 7 need 4. 6 needs 4 and 5. 8 needs 4 and 5, and is
+the pull request that proves the `gitlab` case's shape end to end. 9 is last: it needs 5 and the answer to question
+1, and nothing before it waits for that answer. The shipped `gitlab` template and the move of the app's data are not
+in this plan: they are a separate pull request. That template can carry its formula once 1 is merged, and
+`app_update` works on the real service once 4 is.
+
+**Why a new verb, and what was set aside.** The nearest smaller change is a data-volume snapshot inside
+`service_update`. It was set aside for three reasons. `service_update` would gain a refusal it does not have today
+(no update without a snapshot) and a rollback that erases what the volume gained, for every caller it already has. It
+has no place for a health check that asks the app, or for a version. And it does nothing for an app that is updated
+from inside its container. `snapshot_create` copies were set aside too: they need storage the owner plugged in and
+the owner's approval, and Arca cannot restore one (`docs/OPERATING.md:24`). What is new is kept to one verb for both
+kinds, one template field, one journal, and the image move `service_update` already makes.
+
+**Risks.** A system container's snapshot is crash-consistent, so its rollback is as good as the app's own crash
+recovery. A pool may refuse to restore a snapshot under a newer one (section 2). An update left unfinished stays as
+it is until a person acts. Snapshots take pool space until they are removed. And a run of hours holds one service's
+claim for that long.
 
 ## 7. Open questions
 
-Five questions of the first draft are decided and now stand in the text (sections 1 to 4). Three are open, and one
-gap is listed.
+Decided, and now in the text: snapshots in the service project; how long a pre-update snapshot is kept; that the
+snapshot of an unfinished update is never removed by age; when a by-digest service is snapshotted; no card for a
+formula set over MCP; a version that differs from the one asked; an app unhealthy before its update; no shell in a
+formula; and the passkey card for every restore after the run. One question is open.
 
 1. **Which adoption path carries a hand-made instance (#244)?** Not needed for the first build. (a) `arca adopt`: the
    container moves into its own adoption project, and Arca then makes a service record for it. (b) `service_import`:
-   it stays where it is, the import learns to take an instance with no service keys, and Rule 52 gains the writes an
-   update needs in another manager's project. **Recommend (a).** Arca already owns an adoption project and it already
-   allows snapshots; (b) turns "one key" into snapshot, command, stop and restore in a project that is not Arca's.
-2. **Does the 7-day limit also remove the snapshot of an update left unfinished?** (a) No: it stays until
-   `app_rollback` finishes that rollback, or the service is removed (the design as written). (b) Yes: every
-   pre-update snapshot goes at 7 days. **Recommend (a).** The service is then stopped or half updated and that
-   snapshot is the only way back to a working one. It is not a copy kept for a change of mind.
-3. **For a by-digest service, when is the snapshot taken?** (a) While it runs, before the move's stop (the design as
-   written): the only downtime is the move. (b) Just after the stop the move makes anyway: the app has shut down in
-   its own order, so the snapshot is exact, and the downtime grows by the time the snapshots take. **Recommend (b).**
-   The stop cannot be avoided here, and for the time of two snapshots it turns a power-cut copy of a database into a
-   clean one. A system container keeps (a): it has no stop to wait for.
+   it stays where it is, in another manager's project. Section 3 lists what each needs in the rules; both need
+   changes, and neither is small. **Recommend (a).** Every new write then stays inside a project Arca made for that
+   one instance. (b) puts a snapshot, a restore, a stop and a command into a project that is another manager's, and
+   asks the owner to edit the node's config for each instance.
+
+**Not decided, and not in the design.** Each of these would add a refusal or a new behaviour, so none is built unless
+it is asked for.
+
+- A limit, when a template is read, on where `{version}` may stand or on which programs a formula may name.
+- At a restart, running the health check on an update that was cut, and finishing it forward when the check passes.
+- Refusing a new `app_update` while an earlier one is left unfinished, in place of letting it go forward.
+- Refusing a by-digest call that names a `version` and no `digest`, since Arca cannot tell which version a digest
+  holds before it runs.
+- Refusing at step 0 a template digest from another repository than the service's record names, in place of the
+  failed pull and the rollback.
+- Refusing an `app_rollback` early when a newer snapshot stands above the one it names, in place of Incus's own
+  answer.
 
 **Gap, not built here.** A container service has no create-time setting (section 1). Until it has one, a value the
 owner must give goes in as a secret before the first start.
