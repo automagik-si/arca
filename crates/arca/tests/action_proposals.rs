@@ -1068,6 +1068,14 @@ fn configured_image_database_details_show_plain_requests_or_a_fallback() {
         details[2].value,
         "Asked for: 198.51.100.8 port 5432, 198.51.100.9 port 5433. Not used: this node makes its database from its configured image."
     );
+    let details = action.details(&json!({
+        "name": "orders", "image": TEST_PG_IMAGE, "privatePort": { "port": 7422 }
+    }));
+    assert_eq!(details[2].label, "Private port");
+    assert_eq!(
+        details[2].value,
+        "Asked for: port 7422. Not used: this node makes its database from its configured image."
+    );
     for (field, label) in [
         ("destinations", "Private network"),
         ("kernelAccess", "Kernel access"),

@@ -554,7 +554,12 @@ fn logs_privacy_every_link_offset() {
     );
 }
 
-fn privacy_additional_sweep(id: &str, offsets: std::ops::RangeInclusive<usize>, inserts: &[&str]) {
+fn privacy_additional_sweep(
+    id: &str,
+    offsets: std::ops::RangeInclusive<usize>,
+    inserts: &[&str],
+    expected_rows: usize,
+) {
     let url = format!("https://login.tailscale.com/a/{id}");
     let (rig, key) = rig();
     connect(&rig, &key, Some("node-ts")).unwrap();
@@ -578,6 +583,7 @@ fn privacy_additional_sweep(id: &str, offsets: std::ops::RangeInclusive<usize>, 
         }
     }
     assert_private(&rig, id);
+    assert_eq!(rows, expected_rows);
     println!("additional privacy sweep rows={rows}");
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
@@ -621,6 +627,7 @@ fn logs_privacy_additional_identifier_continuations() {
             "\u{9f}payload\u{9c}",
             "\u{9d}payload\u{7}",
         ],
+        600,
     );
 }
 
@@ -639,7 +646,56 @@ fn logs_privacy_short_login_links() {
             "\r",
             "\u{7}",
         ],
+        259,
     );
+}
+
+#[test]
+fn logs_privacy_preserves_earlier_output() {
+    let (rig, key) = rig();
+    connect(&rig, &key, Some("node-ts")).unwrap();
+    let id = "syntheticSweep1234";
+    let raw = format!(
+        "\u{1b}]0;synthetic title\n{}visit https://login.tailscale.com/a/{}\u{7}{}\nafter\n",
+        "ordinary line\n".repeat(40),
+        &id[..5],
+        &id[5..]
+    );
+    let lines = privacy_log_lines(&rig, "node-ts", &raw);
+    assert_eq!(
+        lines.iter().filter(|line| *line == "ordinary line").count(),
+        40
+    );
+    assert!(longest_visible_piece(id, &lines.concat()) < 4, "{lines:?}");
+    assert!(lines.iter().any(|line| line == "visit [sign-in link]"));
+    assert_eq!(lines.last().map(String::as_str), Some("after"));
+    assert_eq!(
+        privacy_log_lines(&rig, "edge", &raw),
+        privacy_non_connector_lines(&raw)
+    );
+}
+
+#[test]
+fn logs_privacy_preserves_ordinary_content() {
+    let (rig, key) = rig();
+    connect(&rig, &key, Some("node-ts")).unwrap();
+    for raw in [
+        "\u{1b}Ppayload\nline two keeps\nline three keeps\n\u{1b}]8;;\u{1b}\\tail text\n",
+        "\u{1b}Ppayload \u{1b}[1mimportant text\u{1b}[0m more \u{1b}\\ after\n",
+    ] {
+        let lines = privacy_log_lines(&rig, "node-ts", raw);
+        if raw.contains("line two") {
+            for expected in ["payload", "line two keeps", "line three keeps"] {
+                assert!(lines.iter().any(|line| line == expected), "{lines:?}");
+            }
+        } else {
+            assert_eq!(lines, ["payload important text more fter"]);
+        }
+        assert_eq!(
+            privacy_log_lines(&rig, "edge", raw),
+            privacy_non_connector_lines(raw)
+        );
+    }
 }
 
 #[test]
