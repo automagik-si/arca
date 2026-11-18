@@ -1,7 +1,9 @@
 # App update: one verb to update an app, by a new image or from packages
 
-**Status: not built.** This is a design for issue #240. Nothing in it exists in the code. It was written against
-`dev` at `1c68d8c2`.
+**Status: not built.** This is a design for issue #240. Nothing in it existed in the code when it was written
+against `dev` at `1c68d8c2`. Sections 8 and 9 (issues #266 and #265) were added against `4bff60b4`, where row 1 of the
+plan is merged (`crates/arca/src/app_formula.rs`); their citations, and those of the lines changed in sections 3 and
+4, are at that base.
 
 The live case, in general words: GitLab CE inside a plain Ubuntu container was upgraded by hand. A person took a
 snapshot, ran `apt-get install gitlab-ce=<version>`, and checked the app. Arca has no verb for that. This design adds
@@ -606,9 +608,10 @@ in a tenant is left out too: no service command is run inside a tenant's instanc
 ## 3. An adopted instance gets a formula (#244)
 
 **For later, and not buildable under today's rules.** Decided: the first real case does not come through adoption. It
-is a service made from the `gitlab` template, so nothing in the first build needs this section. Until its question is
-answered, `app_update` refuses an adopted service, as `service_update` does today (`service_update.rs:820-822`). What
-follows is the design for the day it is answered, and the last pull request of section 6.
+is a service made from the `gitlab` template, so nothing in the first build needs this section. Decided for #244: a
+hand-made instance is carried by `arca adopt` into its own adoption project, and Arca then makes a service record for
+it. `service_import` is not widened. Until row 9 of section 6 makes the rule changes listed below, `app_update`
+refuses an adopted service, as `service_update` does today (`service_update.rs:820-822`).
 
 **Today.** A service record of an adopted instance is built from the other manager's three keys on the instance (its
 template name, address and ports), with `adopted: true` (`handlers.rs:7094-7106`, `handlers.rs:7154-7184`). Arca
@@ -623,9 +626,9 @@ corrected command reaches every such service with no further step. An adopted se
 
 **Who may attach or change it.** A new verb, `app_formula_set`, takes `{name, appUpdate}` (or `appUpdate: null` to
 take it off) for an adopted service. It checks the formula by section 1's limits and writes the record. It needs a
-`doctor` token and no card. Decided: a formula set over MCP is not shown to the owner first. `service_import` also
-takes an optional `appUpdate`, so that an import and its formula are one card: an import already needs the owner's
-approval (`docs/OPERATING.md:5046-5054`), and the card then shows the three commands.
+`doctor` token and no card. Decided: a formula set over MCP is not shown to the owner first. `app_formula_set` takes
+an adopted service of an adoption project only. `service_import` gains no argument: a service it imports stays in
+another manager's project, where `app_update` keeps refusing it.
 
 **How the verb updates it.** `app_update {name, version}` runs a system container's steps. The output is masked
 exactly as in section 2, the instance's own environment values included: those are on the instance whoever made it,
@@ -636,34 +639,34 @@ and `service_logs` hides them today (`handlers.rs:8699-8709`). `service_status` 
 read a record that carries a formula. Before going back to an older build, take the formula off each adopted service.
 The same is asked today of imports before a downgrade (`docs/OPERATING.md:5087-5089`).
 
-**What each adoption path needs.** This is question 1, and it is undecided because neither path can carry an update
-under today's rules.
+**What the decided path needs.** Decided (#244, the former question 1): `arca adopt`. It takes a container out of
+the default project into its own adoption project (`docs/OPERATING.md:4864-4865`), which already allows snapshots
+(`docs/OPERATING.md:4908`). Every new write then stays inside a project Arca made for that one instance. Today it
+cannot carry an update, for these reasons, and row 9 makes each change (line numbers in this list are at `4bff60b4`):
 
-- **`service_import`.** It takes only an instance that already carries the other manager's service keys, in a project
-  of that manager that the node's config lists under `kernel.importServices` (`docs/OPERATING.md:5016`,
-  `docs/OPERATING.md:5037-5039`, `config.rs:485-489`). A plain container with an app installed by hand carries no
-  such key (*inferred*: nothing hand-made sets them). The instance stays in that project, where the one write Arca
-  makes is one key (Rule 52, `docs/OWNERSHIP.md:891-893`) and every other writer refuses the project
-  (`docs/OWNERSHIP.md:905-907`). So this path needs: an import that takes an instance with no service keys; the
-  owner's edit of the node's config for each instance; and Rule 52 gaining a snapshot, a restore, a stop, a start and
-  a declared command in a project that is another manager's.
-- **`arca adopt`.** It takes a container out of the default project into its own adoption project
-  (`docs/OPERATING.md:4820-4821`), which already allows snapshots (`docs/OPERATING.md:4864`). But `AdoptWriter` is
-  the only path that writes there, through a closed table of steps (Rule 45, `docs/OWNERSHIP.md:656-663`); the state
-  changer refuses a project outside the kernel's family before any request
-  (`crates/arca-incus/src/lifecycle.rs:571-576`); `serve` refuses a config that lists an adoption, and the adoption
-  is run from a terminal (`docs/OPERATING.md:4822`, `docs/OPERATING.md:4836-4848`); and no service record is made for
-  a container without the service keys (`handlers.rs:7094-7106`). So this path needs: new steps in Rule 45's table,
-  or the state changer's family widened to adoption projects, for the snapshot, the restore, the stop and the start;
-  a service record for such a container; and a way for `serve` to act on an adoption.
-- **Both** need the rule for declared commands to reach past the node's service project, which the exec target and
-  the path of its recordings are fixed to today (`crates/arca-incus/src/exec.rs:318-328`,
-  `crates/arca-incus/src/exec.rs:422-425`), and past the refusal of an adopted instance that Rule 50 and the service
-  exec make (`docs/OWNERSHIP.md:851-852`, `service_exec.rs:152-154`). Both also need an identity source. Rule 50
-  takes identity from the newest live instance effect (`docs/OWNERSHIP.md:852-853`), and step 0 reads the uuid Arca
-  journalled when it created the instance (`service_update.rs:915-918`); an adopted instance has no such effect. An
-  adoption's own record holds the container's uuid (Rule 45, `docs/OWNERSHIP.md:656-660`); an import has nothing like
-  it yet.
+- `AdoptWriter` is the only path that writes in an adoption project, through a closed table of steps (Rule 45,
+  `docs/OWNERSHIP.md:656-663`), and the state changer refuses a project outside the kernel's family before any request
+  (`crates/arca-incus/src/lifecycle.rs:571-576`). **Change:** new steps in Rule 45's table, or the state changer's
+  family widened to adoption projects, for the snapshot, the restore, the stop and the start.
+- No service record is made for a container without the other manager's template, address and ports keys
+  (`handlers.rs:7155-7169`). **Change:** a service record for an adopted container, made by Arca once the adoption is
+  done.
+- `serve` refuses a config that lists an adoption, and the adoption is run from a terminal, with the service stopped
+  (`docs/OPERATING.md:4866`, `docs/OPERATING.md:4878-4888`). **Change:** a way for `serve` to act on an adoption.
+- The rule for declared commands is fixed to the node's service project: the exec target and the path of its
+  recordings (`crates/arca-incus/src/exec.rs:318-328`, `crates/arca-incus/src/exec.rs:422-425`), and Rule 50 and the
+  service exec refuse an adopted instance (`docs/OWNERSHIP.md:851-852`, `service_exec.rs:152-154`). **Change:** the
+  new command type of section 2 reaches an adoption project too.
+- Rule 50 takes identity from the newest live instance effect (`docs/OWNERSHIP.md:852-853`), and step 0 reads the uuid
+  Arca journalled when it created the instance (`service_update.rs:915-918`); an adopted instance has no such effect.
+  **Change:** the identity source is the adoption's own record, which holds the container's uuid (Rule 45,
+  `docs/OWNERSHIP.md:656-660`).
+
+Set aside: `service_import`. It takes only an instance that already carries the other manager's service keys, in a
+project of that manager that the node's config lists (`docs/OPERATING.md:180`, `docs/OPERATING.md:5080-5082`,
+`config.rs:485-489`), and it would have needed an import of an instance with no keys, the owner's edit of the node's
+config for each instance, and Rule 52 widened to a snapshot, a restore, a stop, a start and a command in another
+manager's project (`docs/OWNERSHIP.md:891-893`, `docs/OWNERSHIP.md:905-907`).
 
 ## 4. The approval model
 
@@ -683,7 +686,8 @@ or erases is never approved in the session: it keeps the passkey card (`action_p
 
 | The call | Who | What it needs |
 |---|---|---|
-| `app_update`, called by a `doctor` token | Doctor | **No card.** This covers its snapshot, its command or its image move, its health check, the rollback inside the same run, the first widening of the project for snapshots, and the removal of older pre-update snapshots. |
+| `app_update`, called by a `doctor` token, on a formula that declares nothing in `alsoRestarts` | Doctor | **No card.** This covers its snapshot, its command or its image move, its health check, the rollback inside the same run, the first widening of the project for snapshots, and the removal of older pre-update snapshots. |
+| `app_update` on a formula that declares `alsoRestarts` (section 8) | the owner | **The card**, which says what else restarts. It runs only from an approved proposal. It does not erase, so one yes in the owner's signed-in session approves it, or the card with the passkey, as for any action that does not erase today. Decided. |
 | The rollback inside an `app_update` run, straight after its failed step | Arca | **No card, no person** (issue #240's acceptance). |
 | The restore at a restart, of an update cut after its snapshot, when the instance has not run since that snapshot | Arca | **No card, no person.** Nothing was written after the snapshot, so nothing an app stored is erased. |
 | `app_rollback {name, update}`, in every other case: after a restart cut an update whose instance ran since its snapshot or Arca cannot tell, after an unsettled rebuild, after a rollback that failed or whose stop failed, and past an update that ended good | the owner | **The passkey card.** It runs only from an approved proposal and is never approved in the session: its action erases by its kind, as `service_remove`'s does. |
@@ -691,7 +695,6 @@ or erases is never approved in the session: it keeps the passkey card (`action_p
 | `app_formula_set`, called by a `doctor` token (section 3, later) | Doctor | **No card.** Decided. |
 | `service_status` with its `appUpdate` block | any token | Nothing: a read. |
 | `app_update` or `app_formula_set`, proposed by a `viewer` token through `action_propose` | the signed-in owner | **One yes in the owner's signed-in session**, or the card. No passkey beyond the session's own. A viewer writes nothing by itself today either. |
-| `service_import` with a formula (section 3, later) | the owner | What an import needs today: the owner's approval of its card (`docs/OPERATING.md:5054`). |
 
 **Where the line is.** A rollback puts the instance and its volumes back to the moment of the snapshot. Everything
 the app wrote after that moment is erased.
@@ -717,8 +720,8 @@ update's old digest back to the service's record. For an update whose snapshot i
 why (section 2). While the card waits the service stays as it was left, and `service_status` shows the unfinished
 update and that its rollback waits for the owner.
 
-Nothing else in this design asks the owner for anything, and no guard is added beyond what the steps need to end in a
-known state.
+Nothing else in this design asks the owner for anything, save the card of a shared instance (section 8), and no guard
+is added beyond what the steps need to end in a known state.
 
 ## 5. How this sits with #241 and #245
 
@@ -755,13 +758,31 @@ its own. The sizes are estimates: nothing is written yet, and pull request 4 is 
 | 6 | The read at start of interrupted updates. | An update cut at any step ends in exactly one recorded state, and a run that was rolling back is never read as updated. Arca restores by itself only an instance that has not run since its snapshot. | A journal cut after each line, for each kind, the rollback's own lines among them, then a start: the expected lines and state, the finished `drop snapshot` step among them. A by-digest cut after its snapshot with an instance that has not run since: restored and started with no person. The same with a moved `last_used_at`, a status that is not `Stopped`, or a `snapshot` line without the time: no restore, the update shown as unfinished. A system container cut after its command began: no restore. A running Incus operation on the instance: nothing is removed or started until it ends. A `service_update` asked during the read meets the claim. |
 | 7 | `app_rollback {name, update}`, its card and its action; the retention of pre-update snapshots, `service_update`'s own among them; the snapshot list and the unfinished state in `service_status`. | Every restore after the run needs the passkey card and says what it erases. It restores its own update's snapshot and no other. | The card's words; the session never approves it; a `doctor` token alone cannot run it; with two snapshots held, each call restores the one its update names; a good update's snapshot goes at 7 days and `app_rollback` then answers that there is none; an unfinished update's snapshot is still there after 7 days and `service_status` says why; a later good update removes it. |
 | 8 | The proof on a real Incus. First the shape of the `gitlab` case end to end, with a small stand-in: an image by digest with one data volume, whose newer version rewrites its data at its first start. It is moved to the newer digest and reports its version; with a health check that fails, the old root and the old data are back with no person. Then #240's two acceptance lines for a container with a small package-installed app. | The first real case's shape, and the issue's acceptance. The real image is proven by the template's own pull request, which also checks the three *inferred* facts of section 1. | Real-Incus tests beside the ones the repository already has for snapshots. They also assert that a good update of the system container never stopped it, and that a start moves `last_used_at` while a rebuild and a restore do not. |
-| 9 | Adopted services: what question 1's answer needs in the rules (section 3), the `appUpdate` field on a record, `app_formula_set`, the optional `appUpdate` of `service_import`, the formula command on an adopted container. Waits for the answer to question 1, and may need to be split in two to stay inside the band. | #244: an adopted instance is updated by the same verb. | The fake Incus for the record writes and the import card; every existing record still reads the same; the path question 1 picks, on a real Incus. |
+| 9 | Adopted services by the decided path, `arca adopt` (section 3): the rule changes listed there, the service record Arca makes after an adoption, the `appUpdate` field on a record, `app_formula_set`, the formula command in an adoption project. `service_import` is unchanged. May need to be split in two to stay inside the band. | #244: a hand-made instance, adopted, is updated by the same verb. | The fake Incus for the new Rule 45 steps and the record writes; `app_formula_set` on an imported service is refused; every existing record still reads the same; an adopted container updated and rolled back on a real Incus. |
 
 1, 2 and 3 do not depend on each other. 4 needs all three. 5 and 7 need 4. 6 needs 4 and 5. 8 needs 4 and 5, and is
-the pull request that proves the `gitlab` case's shape end to end. 9 is last: it needs 5 and the answer to question
-1, and nothing before it waits for that answer. The shipped `gitlab` template and the move of the app's data are not
-in this plan: they are a separate pull request. That template can carry its formula once 1 is merged, and
-`app_update` works on the real service once 4 is.
+the pull request that proves the `gitlab` case's shape end to end. 9 needs 5; its path is decided (section 3). The
+shipped `gitlab` template and the move of the app's data are not in this plan: they are a separate pull request. That
+template can carry its formula once 1 is merged, and `app_update` works on the real service once 4 is.
+
+**Rows 10 to 17**, for #266 (section 8) and #265 (section 9). The same band and the same caveat: every size is an
+estimate, and 11 and 16 are the tightest.
+
+| # | What it builds | What it proves alone | Tests |
+|---|---|---|---|
+| 10 | `appUpdate.components` (1 to 8, in order, system container only), `alsoRestarts` and `notUpdated`: parsing, limits, the per-component `{version}` replacement, and the `appUpdate` block of `service_status`. Runs nothing. Being built now. | The shape is fixed, and each component's parts are the single form's, checked by the same code. | Every limit at its edge and one past it; duplicate, empty and malformed names; both forms in one formula; `components` on an OCI template; each component's parts refused exactly as the single form's are; the replacement changes one element only; every shipped template and record reads as before; `service_status` unchanged byte for byte without the new keys. |
+| 11 | The verb runs the asked components in the formula's order under one snapshot: the `versions` argument, the lines per component, `health all`, the rollback of the whole instance when any component fails, the table in the answer, the refusal and `service_status`, and the read at a restart taking `health all` for case 4. | A failure of component N puts the whole instance back, components 1 to N-1 with it, and the run ends in one recorded state with a table that says what each component did. | On the fake Incus: a failure at each component's command, at its health, and at `health all`; a component not asked; each row's `before`, `after` and `state` for each outcome; a journal cut after each new line, then a start, where no cut run is read as `updated` without a good `health all`. Section 2's single-form tests unchanged. |
+| 12 | `latest` per component and in the single form, `app_latest {name}`, its `check` line, `update.state` per component in `service_status`, and `differs` in `service_list`. | A component's latest version is read inside the instance; the kernel opens no new way to the network. | A reader that prints a version, prints none, prints a link, fails, or runs past its time; a stopped or marked instance answers `unknown`, with why; status after a restart shows the last check; a `service_list` row is unchanged for a service with no `latest`. |
+| 13 | `integrity` per component: the `sha256` map and the fixed hash command, `verify`, and `fetch` if question 1 of section 7 is answered (a); the step's place in the run; the words of section 2's new rule in `OWNERSHIP.md`. | A mismatch or a failed `verify` ends the run `nothing_changed`: before the snapshot of a running instance, and before any update command of a stopped one. | A match; a mismatch; a missing file; a hash command that fails or does not answer (the mark); a version with no digest; `verify` exiting non-zero; for a running instance no snapshot is asked for after a failure; for a stopped one the snapshot is removed and the instance stopped again; the hash command's arguments are fixed whatever the path holds. |
+| 14 | The card of a shared instance: `app_update` on a formula with `alsoRestarts` runs only from an approved proposal; the card's rows and words; the formula's digest in the card's arguments; the answer once `begin` is written. | A shared instance is never updated without the owner's yes, and that yes needs no passkey. | A `doctor` call is refused `NotApproved` and writes nothing; the card's exact words; the session's yes runs it; the passkey card runs it; a formula changed after the card is refused before `begin`; a lapsed plan runs nothing; a formula without `alsoRestarts` still needs no card. |
+| 15 | `signIn` on a template (on a record with row 9): the pattern and the command, read strictly; the masking of the declared link in `service_logs`, in every kept output of a formula command, in every `app-updates.jsonl` line and in every answer. Nothing is shown to anyone yet. Merged before rows 4 and 5 reach a live node. | The declared link leaves Arca in no text it writes or answers. | One test per place of section 9's masking table, each with a link the app prints in that place. A template without `signIn` reads, logs and answers as before. |
+| 16 | The owner gets the link: the app rows and the button on the approval page, the page sign-in admitting the one new route, `app_sign_in_link`, the URL-mode request to the session, and the linked node's socket route. | Only a browser signed in with the owner's passkey ever holds the link; an agent that asks for it gets none of it. | The route without the sign-in, with a lapsed one, and with a live one; the read at that moment and nothing kept after it; `app_sign_in_link`'s answer, the session's request and the page notice, none of them holding the link; a linked node through the page host's route, and the door refusing it as a tool with `node`; each outcome line of the log. |
+| 17 | The notice after an update: derived from each run's lines, on the page's app card and, for the node's own runs, in a message on the session's stream. | After a run that may have restarted the app, the owner is told the old link no longer works and gets the new one the same way. | One test per row of section 9's restart table, each with the words shown; a restart of Arca between `end` and the message still shows the notice on the page; no notice for a run that stopped and started nothing; a linked node's notice on the page host. |
+
+10 needs 1. 11 needs 5 and 10. 12 needs 2 and 10. 13 needs 2 and 11, since its step sits in the run. 14 needs 4 and
+10, and shows components once 11 is merged. 15 needs 1 and 2. 16 needs 15. 17 needs 16 and 5, and reads the `end`
+lines that 6 and 7 write. Decided: 15 is merged before 4 or 5 is deployed to a live node, so that the first real update
+never keeps the app's fresh link in its output.
 
 **Why a new verb, and what was set aside.** The nearest smaller change is a data-volume snapshot inside
 `service_update`. It was set aside for three reasons. `service_update` would gain a refusal it does not have today
@@ -783,14 +804,36 @@ snapshot of an unfinished update is never removed by age; when a by-digest servi
 formula set over MCP; a version that differs from the one asked; an app unhealthy before its update; no shell in a
 formula; and the passkey card for every restore after the run, save the one at a restart for an instance that has not
 run since its snapshot. Also decided: every run ends in exactly one recorded state, and the new command type keeps
-the hung mark, which Arca clears by a stop. One question is open.
+the hung mark, which Arca clears by a stop.
 
-1. **Which adoption path carries a hand-made instance (#244)?** Not needed for the first build. (a) `arca adopt`: the
-   container moves into its own adoption project, and Arca then makes a service record for it. (b) `service_import`:
-   it stays where it is, in another manager's project. Section 3 lists what each needs in the rules; both need
-   changes, and neither is small. **Recommend (a).** Every new write then stays inside a project Arca made for that
-   one instance. (b) puts a snapshot, a restore, a stop and a command into a project that is another manager's, and
-   asks the owner to edit the node's config for each instance.
+Decided since, and now in the text: a hand-made instance is carried by `arca adopt`, and `service_import` is not
+widened (section 3, #244). Components, a latest reader inside the instance, integrity before the snapshot, the card of
+a shared instance, and no scheduled time in the first build: that is a later row (section 8, #266). The sign-in link:
+how it is read, who sees it, the linked node, the notice after an update, and its masking merged before the verb
+reaches a live node (section 9, #265).
+
+Three questions are open. None of them is needed by rows 10, 11, 12, 14 or 15.
+
+1. **Where does the file that integrity checks come from (section 8, row 13)?** (a) A component may name a `fetch`
+   command, run before its integrity check: it downloads into the instance, and the check reads what it wrote. It is
+   the only write a run makes before its snapshot; a run that ends there says `nothing_changed` and names what `fetch`
+   left. (b) No `fetch`: the `sha256` form checks only a file the instance already holds, and a download is a
+   `verify` command's own work, which fetches and checks in one. **Recommend (a).** The decided check is Arca's own
+   hash, and with (b) Arca's hash covers only files that some other step put there; (a) keeps the download and the
+   check in the formula, in that order, before anything is installed.
+2. **Whom does a linked node trust that the owner is signed in (section 9, row 16)?** (a) The linked node answers its
+   socket route to the page host's relay token, the token it is already given for the page's relays, and trusts that
+   the page host checked its own passkey sign-in. (b) The owner signs in on the linked node's own approval page,
+   and the link is read and shown there; the page host only links to it. (c) The page host relays a passkey proof for
+   each read, which the linked node checks itself, as it checks approvals today. **Recommend (a).** The decision is
+   no passkey each time, which rules out (c), and (b) needs the linked node's page to be reachable from the owner's
+   browser, which the page host is there to spare. What (a) widens is stated in section 9: the page host's relay
+   token then reads a link, where today it carries nothing the linked node does not check itself.
+3. **What is shown when the app prints a link the owner cannot open, such as one on a loopback address?** (a) The
+   template sets the app's public address, so the app prints a link the owner can open; Arca shows the link as the app
+   printed it. (b) `signIn` gains a part that keeps the link's path and query and puts the service's published route
+   address in front. **Recommend (a)** for the first build. It adds nothing to Arca, and most apps that print a link
+   take the address they print from a setting. (b) is the way if a real app cannot.
 
 **Not decided, and not in the design.** Each of these would add a refusal or a new behaviour, so none is built unless
 it is asked for.
@@ -804,6 +847,474 @@ it is asked for.
   failed pull and the rollback.
 - Refusing an `app_rollback` early when a newer snapshot stands above the one it names, in place of Incus's own
   answer.
+- A rollback of one component alone, which would leave the others at their new versions.
+- Arca running the latest readers by itself, on a timer or for a status read.
+- Telling the owner of a new link after every restart of the app (`instance_restart`, `service_update`, a host's
+  restart, the app's own), and not only after an update's.
+- Telling the page host's signed-in session about a linked node's update, or about a link asked for on a linked
+  node; the page host's approval page shows both.
+- Sealing the link to the owner's browser on the linked path, so that the page host never holds it in memory.
+- Refusing a `signIn.pattern` that matches more than a link, or that matches nothing in a sample text.
+- Keeping a digest of the last link, to tell whether an update really changed it.
 
 **Gap, not built here.** A container service has no create-time setting (section 1). Until it has one, a value the
 owner must give goes in as a secret before the first start.
+
+## 8. Several components in one instance (#266)
+
+**Not built.** Row 10 (the field, nothing run) is being built now; rows 11 to 14 follow (section 6).
+
+Two instances were updated by hand to see what a formula has to cover. In general words: one runs several parts that
+are updated apart and in a fixed order, a server, a runtime and its plugins, each with its own way to tell its
+latest version and its own check that a download is genuine. The other is shared: the same runtime and server also
+serve other apps and working agents in that instance, so an update restarts what other people depend on. Section 1's
+formula is one app, one version and one command, and fits neither.
+
+Decided: `appUpdate.components` is an ordered list of 1 to 8 components for a system container, each with its own
+update command, health check and version reader, under the single form's limits. `alsoRestarts` and `notUpdated` are
+lists of plain words. One snapshot covers the whole run, and a failed component rolls the instance back. The answer
+and the status carry a before and after table per component. Each component's latest version is printed by a
+declared command inside the instance. Integrity is checked by Arca before the snapshot. Only a formula that declares
+`alsoRestarts` makes `app_update` a card. A scheduled time is not in the first build.
+
+### The field
+
+```json
+"appUpdate": {
+  "components": [
+    { "name": "server",
+      "update":  { "command": ["/usr/local/sbin/server-update", "{version}"], "seconds": 600 },
+      "health":  { "command": ["/usr/bin/curl", "--fail", "--silent", "--max-time", "5",
+                               "http://localhost:8081/health"] },
+      "version": { "command": ["/usr/local/bin/server", "--version"] },
+      "latest":  { "command": ["/usr/local/sbin/server-latest"] },
+      "integrity": { "fetch":  { "command": ["/usr/local/sbin/server-fetch", "{version}"], "seconds": 300 },
+                     "sha256": { "file": "/var/cache/server/server-{version}.tar.gz",
+                                 "digests": { "2.4.1": "<64 hex digits>" } } } },
+    { "name": "runtime",
+      "update":  { "command": ["/usr/local/sbin/runtime-update", "{version}"], "seconds": 600 },
+      "health":  { "command": ["/usr/local/bin/runtime", "status"] },
+      "version": { "command": ["/usr/local/bin/runtime", "--version"] },
+      "latest":  { "command": ["/usr/local/sbin/runtime-latest"] },
+      "integrity": { "verify": { "command": ["/usr/local/sbin/runtime-verify", "{version}"], "seconds": 120 } } }
+  ],
+  "alsoRestarts": ["the chat bridge", "the working agents of this instance"],
+  "notUpdated":   [{ "name": "plugin runtime", "reason": "pinned to 22 until the plugins move" }]
+}
+```
+
+The names and paths are an example; no shipped template carries this. The shape is row 10's:
+
+- **`components`:** 1 to 8, in the order they are updated. `name` is unique in the formula, 1 to 32 bytes of lower-case
+  letters, digits and `-`, the first a letter. `update`, `health` and `version` are each exactly the single form's
+  part, with its limits and its `{version}` rules: row 10 calls the check that row 1 built for each part
+  (`app_formula.rs:99-173`, `app_formula.rs:218-240`), not a copy of it. A formula has the single form's parts or
+  `components`, never both, and `components` is refused on an OCI template.
+- **`alsoRestarts`:** 0 to 16 entries, each 1 to 80 bytes of plain text, the rule templates use for words an owner
+  reads (`service.rs:2788-2792`). What else in the instance the update restarts.
+- **`notUpdated`:** 0 to 16 entries, `name` 1 to 64 bytes and `reason` 1 to 200 bytes of plain text. What the formula
+  leaves alone on purpose, and why. Arca runs nothing for it.
+- Both lists may also stand beside the single form, on either kind of template.
+- **`latest`** (row 12) and **`integrity`** (row 13) are optional keys of a component, below. `latest` may also stand in
+  the single form. Each component stays a strict object (`app_formula.rs:36-38` is the single form's), so a later key
+  is refused by an Arca that does not know it, as section 1 says of the whole field.
+- The whole field stays at most 8 KiB as compact JSON (`app_formula.rs:22`, `app_formula.rs:166-171`). Eight full
+  components with long digest maps can pass that; such a formula is refused when the template is read.
+
+### The call
+
+`app_update {name, versions}` for a formula with components. `versions` maps a component's name to the version it
+goes to, each by section 1's version rule (`app_formula.rs:84-94`). It names at least one component and only names the
+formula has. A component it does not name is **not asked**: no command of its runs but its `health` and its `version`.
+`version` is an invalid argument for such a formula, and `versions` for a single-form one. Each asked component's
+update command is its own argument list with its own version in place: the replacement row 1 built
+(`app_formula.rs:196-215`), once per component.
+
+**A call that has nothing to do.** Each asked version is compared, as text, with what that component's reader prints
+(section 2). If every asked component is equal, nothing changes and the answer is `updated: false`. Otherwise the run
+updates every asked component, the equal ones too: their package manager then finds nothing to do.
+
+### The order of run and of restart
+
+A run with components is section 2's run for a system container, with these steps in place of its steps 4 to 6:
+
+0. **Checks.** As section 2's step 0, with each component's version reader run when the instance runs.
+1. **`begin`** names the asked components with their versions, every component's version read, and the formula's
+   SHA-256.
+2. **Integrity** (row 13, below): for a running instance, here, before the snapshot.
+3. **`snapshot`**, one, of the instance and every custom volume it mounts, as section 2 takes it.
+4. **`start`**, only for a stopped instance, then its integrity check (below).
+5. **`health before`**: each component's health check once, in the formula's order, journalled and never judged; for an
+   instance just started, tried until each one's `health.seconds` have passed.
+6. **For each asked component, in the formula's order:** `command starts` with the component's name (a line that must
+   be written, as in section 2), then `command`, then `health` (its own check, every 5 seconds until it passes or its
+   `health.seconds` have passed), then `version`. Every line carries the component's name.
+7. **`health all`:** every component's health check, asked or not, in the formula's order, each tried until it passes
+   or its own `health.seconds` have passed. A later component's update can stop an earlier one working, since they
+   share the instance; this step is where that shows.
+8. **`drop snapshot`** and **`end`**, as in section 2.
+
+**Restarts.** Arca restarts no component between steps. A component's own update command restarts what it updated;
+the formula's order is therefore also the order of restart, and the template's author writes it in the command or in
+the script it names. Arca's own stops and starts are only section 2's: the start of a stopped instance (step 4), the
+rollback's `rollback stop` and `start old`, and the clearing stop of a marked instance. Each of those restarts every
+component and everything `alsoRestarts` names. So the whole list of restarts of a run is: each asked component's
+command, as its formula declares; and those three of Arca's own. The card of a shared instance names both (below).
+
+A failure of the update command or the health check of component N, or of `health all`, is a failed step of section
+2: a rollback. The hung mark, the kept output, the masking and every row of section 2's failure table apply to each
+component's commands as they apply to the single form's.
+
+### A failure of component N
+
+There is one snapshot, so a rollback restores the whole instance as it was before the first component's command.
+Components 1 to N-1, which had passed their own health checks, go back too, with N and every component after it. Arca
+never leaves some components new and others old: it has no way back per component, and none is in this build (the
+"not decided" list of section 7). A rollback's steps are section 2's. `old answers` runs each component's health
+check in the formula's order, within the one 30-second budget section 2 gives it, only after `start old`; `old version`
+reads each component's version. The run's state is section 2's: `rolled_back_healthy` when every component's `old
+answers` passed, `rolled_back_unhealthy` otherwise, and `kept_for_owner` when the rollback itself failed.
+
+**The table.** The answer, the refusal and the last update in `service_status` carry one row per component:
+
+```json
+"components": [
+  { "name": "server",  "asked": "2.4.1",   "before": "2.3.9",   "after": "2.3.9", "state": "rolled_back" },
+  { "name": "runtime", "asked": "1.104.7", "before": "1.102.0", "after": "1.102.0", "state": "failed", "at": "health" },
+  { "name": "plugins", "asked": null,      "before": "0.9.3",   "after": "0.9.3", "state": "not_asked" }
+]
+```
+
+| `state` | When |
+|---|---|
+| `updated` | The run ended `updated`, and this component was asked. |
+| `not_asked` | `versions` did not name it. Its row still carries `before` and `after`. |
+| `failed` | Its step named in `at` failed (`command`, `health`, or `health all`) and began the rollback. Exactly one row of a rolled-back run says `failed`. |
+| `rolled_back` | It was asked, and it ran or was about to run when another component's step failed; the instance went back. |
+| `unknown` | The run ended `kept_for_owner`: the instance is as it was left, and no reader runs. |
+| `not_changed` | The run ended `nothing_changed`. |
+
+`before` is the version read at step 0, `null` when the instance was stopped or the reader failed. `after` is the
+version read at that component's `version` step for `updated` and `not_asked` after a good run, at `old version` after
+a rollback, and `null` for `unknown`. A component after N that never ran says `rolled_back` too: the restore changes
+nothing of it, and its row says so by `after` equal to `before`.
+
+**The read at a restart (section 2).** Its cases are unchanged, with two words read for components. The line that says
+the update step starts is the first `command starts`. Case 4, the update was good, needs a good **`health all`** line
+with no failed `record` line and no rollback line after it: a component's own `health` line is not the run's health
+check. A run cut after a component's good `health` and before `health all` is case 5, and for a system container that
+is `kept_for_owner`, since the instance has run since its snapshot.
+
+### The latest version of a component
+
+`latest` is `{ "command": [...], "seconds": N }`: the limits of `version` (no `{version}`; 1 to 60 seconds, 15 when
+absent). It prints the newest version the component could go to, as the first line of its output, and that line is
+taken by section 1's version rule, `null` otherwise. It runs inside the instance with section 2's command type, so the
+kernel itself fetches no address; its one lookup of a registry today is for a card's label and another image
+(`image_version.rs:1-3`). The command can ask whatever the instance can reach.
+
+A new verb, **`app_latest {name}`**, runs every component's `version` and `latest` readers, in order, in a running
+instance, and answers one row per component and `notUpdated`; a single-form formula answers one row, named `app`:
+
+```json
+{ "service": "workspace", "checkedAt": "<time>",
+  "components": [ { "name": "server", "installed": "2.3.9", "latest": "2.4.1", "state": "differs" },
+                  { "name": "runtime", "installed": "1.104.7", "latest": "1.104.7", "state": "same" } ],
+  "notUpdated": [ { "name": "plugin runtime", "reason": "pinned to 22 until the plugins move" } ] }
+```
+
+- `state` is `same` when the two texts are equal, `differs` when they are not, and `unknown` when either is `null`. Like
+  today's `update` block (`service.rs:3033-3067`), it says nothing about which is newer. A reader that prints a suffix
+  the other does not makes `differs` for good; the author makes the two print the same form.
+- It needs a `doctor` token, as every verb that runs a formula's command does, and no card, even on a shared formula:
+  it runs only readers and restarts nothing.
+- A stopped instance answers every row `unknown`, since no command runs in one today (`service_exec.rs:186-188`). A
+  marked instance (section 2's hung mark) answers `unknown` with the reason: `app_latest` never makes the clearing stop,
+  which only an update or a rollback makes. A reader Incus does not answer for sets the mark, as section 2 says of
+  every formula command.
+- It writes one `check` line to `app-updates.jsonl`, with the table. A `check` line is not a run: it has no `begin` and
+  no `end`, and the read at a start passes over it.
+- `service_status` shows the last check under each component, `update: { state, installed, latest, checkedAt }`.
+  `service_list` adds `update: { "state": "differs" }` when any component differs, the key and value it already adds
+  when a service's installed template names another version (`handlers.rs:8543-8549`), so a row looks as it does today.
+  A status read runs no command (section 2), so what it shows is the last check, with its time.
+
+### Integrity, before the snapshot
+
+A component may carry `integrity`, with exactly one of two forms.
+
+- **`sha256`:** `{ "file": "<absolute path>", "digests": { "<version>": "<64 hex digits>", ... } }`. `file` is 1 to 512
+  bytes of plain text, starts with `/`, and may hold `{version}` once; `digests` has 1 to 16 entries, each a version by
+  section 1's rule and a SHA-256 as 64 lower-case hex digits. Arca itself runs the hash with a fixed argument list it
+  builds, `["/usr/bin/sha256sum", "--", <file with the version in place>]`, through section 2's command type, reads the
+  first 64 hex digits it prints, and compares them in the kernel with the digest for the asked version. A version with
+  no entry cannot be checked, and is an invalid argument at step 0: nothing is written.
+- **`verify`:** `{ "command": [...], "seconds": N }`, with the update command's limits and `{version}` rules. It is a
+  checksum list's check or an attestation's, written by the template's author; exit code 0 passes.
+
+The closed list of today holds no command that takes a path (`crates/arca-incus/src/exec.rs:76-104`), and this does
+not add one to it: the hash is a command of section 2's new type, whose rule in `OWNERSHIP.md` row 13 extends with that
+one fixed argument list. What the check proves: the file the instance holds has the formula's digest, as the
+instance's own `sha256sum` reports it. It is no defence against an instance that is already taken over; nothing that
+runs inside the instance is.
+
+**Its place.** For a running instance, integrity runs after `begin` and before the snapshot: one `verify` line per asked
+component, in the formula's order, every one before any snapshot and any update command. So a mismatch in the third
+component ends the run before the first is touched. A stopped instance runs no command (`service_exec.rs:186-188`), and
+section 2 takes its snapshot while it is still stopped, so there integrity runs straight after its `start` and before
+the first `command starts`. Where the file comes from is question 1 of section 7: with (a), each component's `fetch`
+runs straight before its own check.
+
+| What fails | What Arca does | The service is left | What the caller gets |
+|---|---|---|---|
+| Running instance: a digest differs, the file is missing, `verify` exits non-zero, or the hash command fails | No snapshot is taken. Writes `end` with `nothing_changed`. | As it was, running. | A refusal, `integrity_failed`, naming the component, and for `sha256` the digest named and the digest found (digests are not secrets), "Nothing was changed". |
+| Running instance: Incus does not answer about the hash or `verify` command by Arca's deadline | Marks the instance hung (section 2). No snapshot. Writes `end` with `nothing_changed`. | Running, marked; a `verify` command may still run inside until its own limit. The next update or rollback makes the clearing stop. | The same refusal, saying the command did not answer. |
+| Stopped instance: any of the above, after its start | Stops the instance again. Removes the snapshot. Writes `end` with `nothing_changed`. If that stop fails, the snapshot is still removed and `end` says the instance was left running. | Stopped, as it was; or running, unchanged inside, when the stop failed. | The same refusal. When it was left running, the refusal and `service_status` say so and name `instance_stop`, as section 2 names `instance_start` for an instance left stopped. |
+| With question 1 (a): `fetch` exits non-zero or runs past its time | As the row for its case above. What `fetch` wrote stays in the instance; the `end` line names the component and that its `fetch` ran. | As above, with that download in place. | The same refusal, saying what `fetch` may have left. |
+
+The read at a restart takes a run cut in this step as section 2's case 2: no line says the update step starts, so Arca
+removes any snapshot, stops a system container again if `begin` says it was stopped, and writes `nothing_changed`.
+
+### A shared instance: the card
+
+A formula that declares `alsoRestarts` makes `app_update` a card. A `doctor` call is refused before anything, with the
+code and words Arca gives today for an action that runs only from an approved proposal: `NotApproved`, "this action
+runs only from an approved proposal: propose it with action_propose, and it runs once the owner approves it"
+(`handlers.rs:8001-8006`). No claim is taken and no line is written, so it is not a run.
+
+Doctor proposes it with `action_propose {action: "app_update", args: {name, versions}}`. The proposal fills in the
+formula's SHA-256 from the installed template, as a proposal fills in a template's `kernelAccess` today
+(`crates/arca-api/src/verbs.rs:5722`), so the yes is bound to the formula whose words the card shows. A run whose
+installed formula has another digest by then is refused before `begin`: "the formula of <service> changed since this
+card was shown; nothing was changed; propose it again". The card's rows:
+
+| Row | Words |
+|---|---|
+| Name | `<service>` |
+| Updates | `<component> to <version>`, one line per asked component, in the order they run |
+| Also restarts | each `alsoRestarts` entry, one per line, as the formula writes it |
+| Not updated | `<name>: <reason>`, one line per `notUpdated` entry |
+| Effect | "Arca takes one snapshot of the instance, then updates these parts in this order. Updating them restarts what is listed under Also restarts. If a part fails, Arca puts the whole instance back as it was at the snapshot, which restarts them again. Approving starts the update now." |
+| Undo | "After a good update, app_rollback can put the instance back until the next good update, at most 7 days. It needs your passkey and erases what the apps stored since." |
+
+**How it fits section 4 with no new exception.** Today a proposal whose action does not delete or erase is approved by
+one yes in the owner's signed-in session or on its card with the passkey, and only an erasing one keeps the passkey
+card (`action_proposal.rs:286-301`, `action_proposal.rs:1888`; `docs/OPERATING.md:2606-2608`). `app_update` does not
+erase by its kind: its rollback in the run erases only what a version nobody accepted wrote (section 4), and every
+later restore is `app_rollback`, which keeps the passkey. So this card is an ordinary non-erasing proposal; what is new
+is only that such a formula makes the verb need one, which is the decision. A plan waits 15 minutes, or up to 24 hours
+while a session with `approvals` is live (`docs/OPERATING.md:2609-2614`). A `viewer` proposes the same card, as for any
+`app_update` (section 4's table).
+
+**The moment.** The yes starts the run then. There is no later time in this build: the owner picks the moment by when
+the yes is given. A scheduled time is a later row. An approved run answers once its `begin` is written, with the
+update's id, and goes on to its end; the page's relay and the session do not wait hours for an answer
+(`docs/OPERATING.md:4506-4514`). The session is told what became of the plan, as today (`docs/OPERATING.md:2589-2590`):
+started, with the update's id. The end is in `service_status`, and for a service with `signIn` in the notice of
+section 9.
+
+### `notUpdated` in status
+
+`service_status` lists `notUpdated` in the `appUpdate` block whenever the formula has it (row 10), and so do the answer
+of every `app_update` and `app_latest` and the shared card. They are the author's words, shown as data. With them, a
+row that says `same` is never read as "everything is the newest".
+
+### What each piece reuses, and what is later
+
+- **Row 1:** each component's parts are checked by row 1's code, and replaced by its replacement.
+- **Row 2:** every command here runs as its type: update, health, version, latest, `verify`, `fetch`, and the fixed hash
+  argument list, with its kept tail, its masking, its hung mark and its time limit.
+- **Row 3:** the one snapshot of the instance and its volumes, and its restore.
+- **Rows 4 and 5:** the steps, the journal, the claim, the rollback and its names, the four recorded states and
+  `nothing_changed`, the failure table. Row 11 adds lines; it adds no state.
+- **Row 6:** the read at a start, with `health all` for case 4.
+- **Row 7:** `app_rollback` is unchanged: it restores the whole instance, whatever the components.
+- **Today's proposals and the owner's session:** the shared card.
+- **Later:** a scheduled time for a shared update; components on an OCI template; and the items of section 7's "not
+  decided" list.
+
+## 9. The owner's sign-in link (#265)
+
+**Not built.** Rows 15 to 17 (section 6).
+
+Some apps print a fresh sign-in link, with a token in it, each time they start, and answer 401 without it. Today an
+agent has to open a shell in the instance, read the app's log and copy the link to the owner by hand: a terminal step,
+and a secret through a chat. Every update restarts the app and changes the link, so the verb without this leaves the
+owner locked out.
+
+Decided: a service declares how its link is read, by a command or by a line pattern of its log. The owner gets the
+link in the owner's own signed-in session, on the page element that shows a connector's sign-in link today, with no
+passkey check each time. An agent may ask for it to be issued and never sees it. The link never appears in a journal,
+a card another agent can read, `service_logs`, the update's kept output, or any verb's answer. After an update
+restarts the app, the owner is told the old link no longer works and gets the new one the same way. It works through a
+linked node. The masking is merged before the verb reaches a live node.
+
+### Today: the connector's link
+
+Arca hands over one sign-in link today, a connector's.
+
+- **The read.** `reach_sign_in` reads the connector's status through the closed `ConnectorStatus` command and keeps its
+  `AuthURL` only when the connector is not running and the link has the vendor's shape (`reach.rs:206-247`,
+  `reach.rs:249-258`). "Only the passkey-checked page route calls this; no tool handler returns its result"
+  (`reach.rs:205`), and the link "never enters a status row, error, journal or log" (`reach.rs:2`).
+- **The route.** `POST /approve/reach/sign-in` first answers a statement to sign, then takes the passkey's proof for the
+  action `ReachSignIn`, checks it, reads the link and answers `{signInUrl}` (`approve_page.rs:1252-1304`). The reads
+  behind it store nothing: "Neither handle stores its answer" (`approve_page.rs:309-314`).
+- **The page element.** The approval page's `reach` section (`approve_page.html:388-390`) shows one card per connector:
+  its name, a state line, and for one waiting for sign-in a button, "Sign in to Tailscale", with a warning line under
+  it. The click opens a blank tab with no opener, sends the proof, and then puts the link in that tab
+  (`approve_page.html:1419-1475`).
+- **The masking.** `service_logs` of a connector replaces the vendor's login links by `[sign-in link]` and the
+  identifiers it found by `[secret]`, in a last pass over each finished line (`handlers.rs:8778-8806`,
+  `reach.rs:276-296`, `reach.rs:398-412`).
+- **The card.** A connector's create card says that "the sign-in link is never shown to an assistant"
+  (`action_proposal.rs:975`).
+
+Two things differ for an app's link: the connector's link is in one known shape, read by one closed command, and each
+read takes a passkey tap. An app's link has a shape its template declares, and the owner reads it with no tap each
+time.
+
+### The field
+
+`signIn` is a template's optional field beside `appUpdate`, on an OCI or a system container template, never a virtual
+machine's; row 9 lets an adopted record carry it too. It is read strictly, as the rest of a template is
+(`service.rs:1645-1647`).
+
+```json
+"signIn": {
+  "pattern": "(?P<link>https://workspace\\.example/\\?token=[A-Za-z0-9_-]{16,})",
+  "command": { "command": ["/usr/local/bin/workspace", "print-link"], "seconds": 15 }
+}
+```
+
+| Field | Required | Meaning | Limits |
+|---|---|---|---|
+| `pattern` | yes | Finds the link, and masks it everywhere. What its group `link` matches is the link. | 1 to 256 bytes of plain text. A regular expression of the `regex` crate Arca already uses for its log masks (`reach.rs:263-296`): no look-around and no back-reference, so its time is linear in the text. Exactly one named group, `link`. |
+| `command` | no | Prints text in which `pattern` finds the link. Without it, the link is read from the app's log. | Section 1's list limits, no `{version}`; `seconds` 1 to 60, 15 when absent. |
+
+The whole field is at most 1 KiB as compact JSON. A match is a link only if it starts `https://` or `http://`, is 1 to
+2,048 bytes, and holds no space and no control byte; any other match is no link. An older Arca refuses a template with
+`signIn`, as section 1 says of `appUpdate`.
+
+### How the link is read
+
+- **With `command`:** the command runs with section 2's command type, in a running instance of the node's own service
+  project, and `pattern` is applied to what it printed. The last match wins. The output is read in memory and dropped:
+  its recordings are deleted from the instance and the audit line holds only sizes and the outcome, as today
+  (`service_exec.rs:287-304`, `service_exec.rs:311`).
+- **Without it:** from the app's log, by the read `service_logs` makes today: the journal through the closed `Journal`
+  command for a system container, and the console log otherwise (`handlers.rs:8718-8765`). Arca reads the last 200
+  lines, the most `service_logs` reads (`handlers.rs:8699-8707`), and the last match wins.
+- No link found: the page says "This app shows no sign-in link now". A stopped instance: "The app is not running".
+
+The read runs only at the moment the owner asks for the link on the page (below), never on a timer and never for a
+status read.
+
+### Where it is kept
+
+Nowhere. It is read when the owner asks, answered to the owner's browser, and dropped, as the connector's read is
+today (`approve_page.rs:309-314`). The page's rows of apps hold no link, so the cache the connector rows use
+(`approve_page.rs:1228-1240`) holds none either. The page host's log gets one line per ask, with its outcome alone:
+`arca: sign-in link of <service> on <host>: shown`, `none`, `not running` or `refused <code>`, as the approval page
+logs its outcomes today (`docs/OPERATING.md:4518-4521`).
+
+### Who may ask, who may see
+
+- **Who sees it:** only a browser signed in on the approval page with the owner's passkey. The page already has that
+  sign-in: one passkey tap makes a session of 12 hours (`canvas.rs:46`, `canvas.rs:236`), which today admits only the
+  canvas's own addresses (`canvas.rs:4-5`). Row 16 admits one more route with it, `POST /approve/apps/sign-in`. So
+  there is no passkey check each time: one tap counts for 12 hours, as the owner's MCP session's passkey counts for 12
+  hours (`docs/OPERATING.md:2571`). A browser without the sign-in, or with a lapsed one, is shown the passkey sign-in
+  first.
+- **Who may ask:** any `doctor` or `viewer` token, with a new verb, `app_sign_in_link {name}`. It reads nothing and runs
+  nothing. It marks the service's card on the page ("Your assistant asked for the sign-in link of <service> at
+  <time>"), a mark kept in memory until the owner opens the link or the node restarts. To each of the owner's
+  sessions with `approvals` that has the node's stream open, it sends a URL-mode request to the page, the way the step-up page is sent today (`crates/arca-mcp/src/listen.rs:416-440`). It answers
+  `{ "asked": true, "service": "<name>", "page": "<the approval page's address>", "sessionAsked": <true or false> }`,
+  never the link. The page's address is no secret: what it shows needs the passkey sign-in.
+- **The owner's MCP session never carries the link.** It is told where to look and sent to the page; the link reaches
+  only the browser. This is the sense in which the owner gets it "in the owner's own signed-in session": the session
+  signed in on the approval page with the passkey.
+
+### The page element
+
+The `reach` section gains, beside each connector, one card per service whose template or record declares `signIn`,
+built the way a connector's card is (`approve_page.html:1419-1475`): the service's name as the title; a state line
+("Running", "Not running", or the notice below); the same primary button, "Open the sign-in link"; and a warning line
+under it, "Open the link only yourself: anyone who has it can sign in to <service>." A click opens a blank tab with no
+opener, posts `{name}` (and `host` for a linked node) to `/approve/apps/sign-in` with the page's sign-in, and puts the
+answered link in that tab, as the connector's button does, without the passkey proof. `GET /approve/reach` gains an
+`apps` list with each such service's name, host, whether it runs, the last ask and the last notice; it holds no link.
+The section's heading, "Tailscale" today (`approve_page.html:389`), becomes "Sign-in links".
+
+### Through a linked node
+
+Today the page lists the waiting plans of each linked kernel by reading it over its socket with the token in its
+`tokenFile`, and relays the owner's signed approval to it, which that kernel checks itself (`docs/OPERATING.md:193`,
+`docs/OPERATING.md:4501-4514`; `approve_page.rs:24-27`). The door relays tools with `node` the same way
+(`docs/OPERATING.md:2346-2362`). The owner's session is never asked about a plan that waits on another node
+("this kernel's terminal is never asked about a plan that waits on another node",
+`docs/OPERATING.md:2361-2362`). And a route that only a node's own socket carries exists today: `POST
+/local/setup-code` (`approve_page.rs:13-17`).
+
+- The page host lists each linked node's apps by the same relayed read it makes for plans, and shows them in the same
+  section with the node's name.
+- The button posts `{name, host}` to the page host's own route. The page host checks its own passkey sign-in, then
+  calls the linked node's socket route `POST /local/app-sign-in {name}` with the token from that node's `tokenFile`.
+  The linked node reads the link as above and answers it; the page host hands it to the browser and writes it nowhere.
+- That route is not a tool. The door relays only tools with `node`, and refuses a write that names one
+  (`docs/OPERATING.md:2369`), so no agent reaches the route through the door.
+- `app_sign_in_link` is asked on the node that runs the app, by an agent that talks to that node. Its mark shows on
+  that node's app card on the page host. The page host's session is not told of it (section 7's "not decided" list).
+- What this widens: the linked node gives a link to the page host's relay token, trusting that the page host checked
+  its own sign-in; today that token carries nothing the linked node does not check itself. Question 2 of section 7.
+
+### After an update: the notice
+
+The notice is made from each run's own lines in `app-updates.jsonl`, not from a message, so a restart of Arca between
+`end` and the message loses nothing: the page shows it from the journal. It goes for each run that stopped or started
+the instance or began its update step: a run with a `stop`, `start`, `clearing stop`, `command starts`, `move starts`,
+`rollback stop` or `start old` line. No notice goes for a run that did none of these.
+
+| What restarted the app | Notice | Words on the page card and in the message |
+|---|---|---|
+| A by-digest update: the move's stop and start | yes | "<service> was restarted by its update at <time> (<state>). Its sign-in link from before no longer works; open the new one here." |
+| A system container's update command, which may restart the app (Arca cannot tell) | yes | The same words. If the command did not restart the app, the link the owner gets is still the old one; the read shows the newest the app printed. |
+| A rollback in the run, `start old` | yes, as part of that run | The same words, with `rolled_back_healthy` or `rolled_back_unhealthy`. |
+| A run that started a stopped instance and leaves it stopped as it was: a rollback, a failed start, or an integrity failure | yes | "<service> is stopped, as it was before its update at <time>. It shows no sign-in link until it starts." |
+| A run left unfinished (`kept_for_owner`) | yes | "<service>'s update at <time> did not finish (<reason>). The app may be stopped or half way; its sign-in link from before may no longer work." |
+| A by-digest run that stopped and started the app again and ended `nothing_changed` (a failed snapshot) | yes | The first row's words, with `nothing_changed`. |
+| The read at a restart that restores and starts the old version | yes, from the `end` it writes | The first row's words. |
+| `app_rollback` (row 7), from its own lines | yes | The first row's words, naming the rollback. |
+| `instance_restart`, `instance_stop` and `instance_start`, `service_update`, a restart of the host, the app's own | no, in this build | The page reads the current link whenever the owner asks (section 7's "not decided" list). |
+
+For the node's own runs, the message goes on the session's stream once `end` is written, with no link, naming the
+page: the stream already carries the node's word to the session about what became of a plan
+(`docs/OPERATING.md:2589-2590`). If no stream is open, the page alone shows it. For a linked node's run, the page host
+shows the notice on that node's card, from the relayed read.
+
+### Every place the link is masked
+
+Masking, row 15: in each text below, what the declared `pattern`'s group `link` matches is replaced by `[sign-in
+link]`, the placeholder the connector's masking uses (`reach.rs:276-280`). It is applied to each line after it is
+cleaned and its secrets are hidden, where the connector's last pass sits in `service_logs` today
+(`handlers.rs:8796-8806`). It is decided that this is merged before rows 4 and 5 reach a live node. A link that the
+app breaks across two lines, or prints in a form the pattern does not match, is not masked; row 15's tests carry that
+as a known case, as row 1's tests carry a template the rules do not refuse.
+
+| Where | How it is kept out | The test that proves it |
+|---|---|---|
+| `service_logs` | The pattern, on each finished line. | A log line with the link: the answer holds `[sign-in link]`, and no piece of 4 or more bytes of the link's token is left, the measure the connector tests use (`crates/arca/tests/services/reach.rs:507-513`, `crates/arca/tests/services/reach.rs:709`). |
+| The update command's kept output: the answer, the refusal and the `command` line | Row 2's chain (section 2, "What is kept"), then the pattern on each kept line. | An update command that prints the link before it exits 0, and one that prints it and exits 1: the answer, the refusal and the journal hold none of it. |
+| A health check's last 5 lines, on failure | The same. | A failing health command that prints the link. |
+| The version and latest readers | Their first line is kept only when it passes section 1's version rule, which admits no `/` (`app_formula.rs:84-94`), so no link passes; otherwise `null`. | A reader that prints the link: `null`, and nothing of it in the journal. |
+| `verify`, `fetch` and the hash command | Row 2's chain and the pattern, as the update command's. | Each of them printing the link. |
+| Every line of `app-updates.jsonl`, `check` lines among them | Each line is made only of the texts above. | After runs in which every command prints the link, the whole file holds none of it. |
+| Every verb's answer: `app_update`, `app_rollback`, `app_latest`, `app_sign_in_link`, `service_status`, `service_list` | Made of the texts above; `service_status` runs no command; `app_sign_in_link` reads nothing. | Each answer, after such runs, holds none of it. |
+| A card another agent can read (`plan_list`, the shared card) | A card shows the formula's words, never a command's output. | `plan_list` after a shared card is proposed during such runs. |
+| The session's stream: the URL-mode request and the notice | Made of fixed words, the service's name and the page's address. | The messages sent, captured. |
+| The page host's log and Arca's own log | The outcome alone. A journal line that cannot be written is said on Arca's log, as today (`service_update.rs:357-363`); that it names the file and not the line's text is *inferred* there, and the test checks it. | The captured log after each outcome of the route and a run whose journal write fails. |
+| The linked node's route, and the page host in between | The page host writes the answer nowhere and logs the outcome alone. | A linked read: the page host's log and state directory hold none of it. |
+
+The only place the link is ever written is the answer of `POST /approve/apps/sign-in` to a signed-in browser, and of the
+linked node's socket route to the page host.
