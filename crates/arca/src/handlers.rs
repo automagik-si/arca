@@ -6666,6 +6666,27 @@ fn service_update(
     crate::service::update_view(service, template.as_ref())
 }
 
+/// What a service's view says under `appUpdate` ([`crate::service::app_update_view`]), from the template installed on
+/// this node, read once per call through `templates`. An adopted instance's template is not read at all.
+fn service_app_update(
+    cfg: &NodeConfig,
+    templates: &mut BTreeMap<
+        String,
+        Result<crate::service::Template, crate::service::TemplateError>,
+    >,
+    service: &crate::service::ServiceConfig,
+) -> Option<Value> {
+    if service.adopted {
+        return None;
+    }
+    let template = templates
+        .entry(service.template.clone())
+        .or_insert_with(|| {
+            crate::service::load_template(&cfg.state_dir.join("templates"), &service.template)
+        });
+    crate::service::app_update_view(service, template.as_ref().ok())
+}
+
 fn service_template_error(error: crate::service::TemplateError) -> CallError {
     if error.not_found {
         service_not_found(error.message)
@@ -8618,8 +8639,14 @@ impl ServiceHandler {
                         view["follow"] = json!(config.follows_automagik());
                     }
                     // The version it was created with beside the one its installed template names now.
-                    if let Some(update) = service_update(&self.cfg, &mut BTreeMap::new(), &config) {
+                    let mut templates = BTreeMap::new();
+                    if let Some(update) = service_update(&self.cfg, &mut templates, &config) {
                         view["update"] = update;
+                    }
+                    // That it has a formula to update its app, and where the formula comes from: its installed
+                    // template. A service without one answers as it always did.
+                    if let Some(formula) = service_app_update(&self.cfg, &mut templates, &config) {
+                        view["appUpdate"] = formula;
                     }
                     // Whether the access its record names is the one that stands: the device on the instance, and
                     // the listener of this server.

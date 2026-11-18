@@ -13,6 +13,7 @@
 
 pub mod action_proposal;
 pub mod adoptions;
+pub mod app_formula;
 pub mod approval_requests;
 pub mod approve_page;
 pub mod canvas;

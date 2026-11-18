@@ -13,6 +13,13 @@ needs it. No verb uses this yet, so nothing changes on a node by this release al
 snapshots, `service_update` takes its own pre-update snapshot there and restores it on a rollback, and each update
 keeps one snapshot until a later release removes old ones.
 
+A container template may carry `appUpdate`, a formula for updating the app inside its service: a `health` command and
+a `version` reader, and on a `system` container an `update` command that takes the version as one argument
+(`{version}`). Arca reads and checks it strictly when the template is read and `service_status` shows
+`"appUpdate": { "formula": "template" }` for a service whose template has one; no verb runs a formula yet, no shipped
+template has one, and every other service answers as before. Releases before this one refuse a template with the
+field. See OPERATING.md.
+
 The shipped `gitlab` template pins GitLab CE 19.4.8 by the publisher's image index digest and keeps configuration,
 data and logs on one volume. Create it stopped and supply `GITLAB_EXTERNAL_URL` before starting it. The new
 [migration runbook](docs/GITLAB-MIGRATION.md) covers an empty-service rehearsal, backup and restore, edge routing,
