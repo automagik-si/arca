@@ -288,7 +288,7 @@ fn a_restore_puts_back_the_parts_it_names_and_only_those() {
         .expect("the volume by its own write");
     assert_eq!(counts(), (2, 3));
 
-    // A part that holds no snapshot of that name is refused before anything is restored.
+    // A part without that snapshot, the instance or the volume alone, is refused before anything is restored.
     let before = rig.fake.writes().len();
     let both = [SnapshotPart::Instance, volume("cold-data")];
     let missing = c
@@ -296,6 +296,16 @@ fn a_restore_puts_back_the_parts_it_names_and_only_those() {
         .expect_err("none");
     assert_eq!(missing.part, SnapshotPart::Instance);
     assert_eq!(rig.fake.writes().len(), before);
+    c.remove_volume_snapshot(&seen, "pool1", "cold-data", "pre-app-update-1")
+        .expect("removed");
+    let before = rig.fake.writes().len();
+    let missing = c
+        .restore_with_volumes(&seen, "pre-app-update-1", &both)
+        .expect_err("none");
+    assert_eq!(
+        (missing.part, rig.fake.writes().len()),
+        (volume("cold-data"), before)
+    );
     assert!(rig.fake.state_actions(PROJECT, "cold").is_empty());
 }
 

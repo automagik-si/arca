@@ -4790,9 +4790,11 @@ fn either_owner_of_the_service_project_may_let_it_hold_snapshots_and_no_other_en
     // Every other guarded restriction Incus has, by either owner, at a create and by a patch. The keys other rules
     // admit for these owners (the proxy and NIC allowances, the bridge grant) are left to their own tests.
     let others = "backups cluster.groups cluster.target containers.interception containers.lowlevel \
-        containers.nesting containers.privilege devices.disk devices.disk.paths devices.gpu devices.infiniband \
-        devices.pci devices.unix-block devices.unix-char devices.unix-hotplug devices.usb idmap.gid idmap.uid \
-        networks.integrations networks.subnets networks.uplinks networks.zones virtual-machines.lowlevel";
+        containers.nesting containers.privilege devices.disk devices.disk.paths devices.gpu \
+        devices.infiniband devices.pci devices.unix-block devices.unix-char devices.unix-hotplug \
+        devices.usb idmap.gid idmap.uid images.servers networks.integrations networks.subnets \
+        networks.uplinks networks.zones storage-pools.access virtual-machines.lowlevel \
+        virtual-machines.nesting";
     for owner in [net, br] {
         for key in others
             .split_whitespace()
