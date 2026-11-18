@@ -604,6 +604,10 @@ mod tests {
             terminal.on_stream(&plan),
             "claimed but not yet open on the stream"
         );
+        assert!(
+            !terminal.claim_for_call(&plan, 11),
+            "a call does not take it"
+        );
     }
 
     #[test]

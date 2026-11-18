@@ -903,3 +903,57 @@ fn every_event_has_its_own_id_and_a_dropped_stream_resumes_with_its_open_questio
     assert_eq!(fixture.answer(&session, &replayed["id"], yes()).status, 202);
     assert!(eventually(|| fixture.approvals().len() == 1));
 }
+
+#[test]
+fn a_plan_that_went_through_the_step_up_page_once_brings_it_again_when_the_passkey_lapses_before_its_yes()
+ {
+    let fixture = Fixture::start("listen-lapse-twice", 2);
+    let session = fixture
+        .initialize(json!({ "elicitation": { "form": {}, "url": {} } }))
+        .expect("a session id");
+    let mut listen = Listen::open(&fixture, &session);
+    // The passkey is too old when the plan starts waiting: the owner is sent to the page and taps.
+    fixture.node.propose("act-000000000001", 1);
+    let first = listen.nth(1);
+    assert_eq!(first["params"]["mode"], "url", "{first}");
+    assert_eq!(
+        fixture
+            .answer(&session, &first["id"], json!({ "action": "accept" }))
+            .status,
+        202
+    );
+    fixture.node.mode.store(1, Ordering::SeqCst);
+    assert_eq!(
+        listen.nth(2)["method"],
+        "notifications/elicitation/complete"
+    );
+    let asked = listen.nth(3);
+    // The question stays open past the new passkey window; the yes runs nothing and brings the page again.
+    fixture.node.mode.store(2, Ordering::SeqCst);
+    assert_eq!(fixture.answer(&session, &asked["id"], yes()).status, 202);
+    let again = listen.nth(4);
+    assert_eq!(again["params"]["mode"], "url", "{again}");
+    assert_eq!(again["params"]["url"], STEP_UP);
+    assert!(fixture.approvals().is_empty());
+    assert_eq!(
+        fixture
+            .answer(&session, &again["id"], json!({ "action": "accept" }))
+            .status,
+        202
+    );
+    // After the second tap the plan is asked again, and this yes runs it.
+    fixture.node.mode.store(1, Ordering::SeqCst);
+    assert_eq!(
+        listen.nth(5)["method"],
+        "notifications/elicitation/complete"
+    );
+    let anew = listen.nth(6);
+    assert!(
+        anew["params"]["message"]
+            .as_str()
+            .expect("a message")
+            .contains("act-000000000001")
+    );
+    assert_eq!(fixture.answer(&session, &anew["id"], yes()).status, 202);
+    assert!(eventually(|| fixture.approvals().len() == 1));
+}

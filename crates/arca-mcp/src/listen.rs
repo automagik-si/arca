@@ -337,7 +337,8 @@ async fn push(server: Arc<Server>, caller: Caller, modes: Modes, stream: Arc<Str
         stream.end();
         return;
     };
-    // The plans the owner was sent to the step-up page for on this stream, and that page's open request.
+    // The plans the owner was sent to the step-up page for on this stream since the passkey last counted, and that page's
+    // open request. A later lapse is another step-up: each plan it finds waiting brings the page again.
     let mut stepped: HashSet<(String, u64)> = HashSet::new();
     let mut confirming: Option<String> = None;
     loop {
@@ -356,6 +357,9 @@ async fn push(server: Arc<Server>, caller: Caller, modes: Modes, stream: Arc<Str
             if !stream.send(complete, None) {
                 break;
             }
+        }
+        if asking == Asking::Yes {
+            stepped.clear();
         }
         // While nobody reads the stream, no plan is claimed for it: another stream may ask it.
         let plans = if stream.connected() {
