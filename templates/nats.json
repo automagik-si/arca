@@ -6,6 +6,7 @@
   "digest": "sha256:311da47e2f31c26e99c623cd78d486a1e8ab039c49b32652770bb91a4f70512e",
   "entrypoint": ["/bin/sh", "-ec", { "file": "nats.sh" }, "nats"],
   "ports": [4222, 7422, 8222],
+  "health": { "port": 4222 },
   "data": { "path": "/data", "uid": 0, "gid": 0, "size": "10GiB" },
   "env": { "NATS_LEAF_PASSWORD": "{{secret:NATS_LEAF_PASSWORD}}", "NATS_DOMAIN": "{{name}}" },
   "secrets": ["NATS_LEAF_PASSWORD"],

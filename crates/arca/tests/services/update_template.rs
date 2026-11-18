@@ -483,26 +483,6 @@ fn without_the_flag_an_update_keeps_the_record_and_answers_as_before() {
     );
 }
 
-/// The node's handlers again, with `clock` and `probe` of the test's own.
-fn handlers_with(
-    rig: &mut Rig,
-    clock: Arc<dyn Fn() -> u64 + Send + Sync>,
-    probe: arca::handlers::UpdateProbe,
-) {
-    rig.handlers = service_handlers_updating(
-        rig.kernel.clone(),
-        clock,
-        rig.cfg.clone(),
-        None,
-        UpdateOptions {
-            probe,
-            pace: Duration::from_millis(10),
-        },
-    )
-    .into_iter()
-    .collect();
-}
-
 /// The template of a service reached at its address on `droidd`, one of `ports`: no lan proxy.
 fn direct(ports: [u16; 2], droidd: u16) -> Value {
     let mut template = first();
@@ -530,7 +510,7 @@ fn the_health_check_looks_at_the_port_the_template_moves_the_service_to_never_th
     handlers_with(
         &mut rig,
         Arc::new(|| NOW),
-        Arc::new(move |_, port, _| {
+        Arc::new(move |_, port, _, _, _| {
             log.lock().unwrap().push(port);
             port == 9090
         }),
@@ -538,13 +518,23 @@ fn the_health_check_looks_at_the_port_the_template_moves_the_service_to_never_th
     let mut moved = direct([9090, 8080], 8080);
     moved["entrypoint"] = json!(["/bin/sh", "-ec", SHELL_SCRIPT]);
     rig.template("app", moved);
-    let proposed = propose_update(&rig, with_template()).expect("proposed");
+    let proposed = propose_update(
+        &rig,
+        json!({ "name": "app", "digest": NEW, "withTemplate": true }),
+    )
+    .expect("proposed");
     assert!(
         proposed["args"]["changes"].get("ports").is_some(),
         "{proposed}"
     );
     let done = approve(&rig, &key, &proposed).expect("the new version runs");
     assert_eq!(done["updated"], true, "{done}");
+    assert!(
+        done["message"]
+            .as_str()
+            .unwrap()
+            .contains("kept running for 10 s")
+    );
     assert!(probed.lock().unwrap().is_empty(), "{:?}", probed.lock());
     assert_eq!(rig.service_config("app").ports, vec![9090, 8080]);
 
@@ -563,7 +553,7 @@ fn the_health_check_looks_at_the_port_the_template_moves_the_service_to_never_th
     handlers_with(
         &mut rig,
         Arc::new(|| NOW),
-        Arc::new(move |address, port, forwarded| {
+        Arc::new(move |address, port, forwarded, _, _| {
             log.lock()
                 .unwrap()
                 .push((address.to_string(), port, forwarded));
@@ -634,7 +624,7 @@ fn a_secret_set_while_the_update_runs_leaves_the_template_unwritten_and_the_roll
             NOW
         })
     };
-    handlers_with(&mut rig, clock, Arc::new(|_, _, _| true));
+    handlers_with(&mut rig, clock, Arc::new(|_, _, _, _, _| true));
     assert!(
         setter
             .set(Arc::clone(&rig.handlers["service_secret_set"]))

@@ -1266,6 +1266,7 @@ fn source_template(kind: &str, image: &str, digest: Option<&str>) -> service::Te
         entrypoint: None,
         generate: std::collections::BTreeMap::new(),
         droidd_port: None,
+        health: None,
         limits: None,
         autostart: false,
         data: None,
@@ -4397,6 +4398,7 @@ fn a_node_with_the_automagik_server_of_before_keeps_its_service_and_a_new_one_pu
     // The template as it shipped before: another description and another digest.
     let text = fs::read_to_string(templates.join("automagik-server.json")).unwrap();
     let old_text = text
+        .replace("  \"health\": { \"port\": 3081 },\n", "")
         .replace(AUTOMAGIK_3_136_4, BEFORE)
         .replace(
             "Automagik server 3.136.4 (ghcr.io/automagik-si/automagik-server pinned by digest; Automagik's published image, the default way to run a new Automagik)",

@@ -418,6 +418,9 @@ pub struct ServiceConfig {
     pub instance: String,
     pub ipv4: String,
     pub ports: Vec<u16>,
+    /// The port check applied at create or by the last update.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health: Option<PortHealth>,
     #[serde(default)]
     pub links: Vec<ServiceLink>,
     #[serde(default)]
@@ -663,6 +666,14 @@ impl DataVolumeLocator {
     }
 }
 impl ServiceConfig {
+    fn has_health_proxy(&self, port: u16) -> bool {
+        self.lan.as_ref().is_some_and(|proxy| proxy.port == port)
+            || self
+                .private_port
+                .as_ref()
+                .is_some_and(|proxy| proxy.port == port)
+    }
+
     pub fn data_locator(&self) -> DataVolumeLocator {
         self.data_volume
             .clone()
@@ -1028,6 +1039,19 @@ pub fn ingress(cfg: &ServiceConfig) -> Vec<Value> {
             "protocol": "tcp",
             "destination_port": port.to_string(),
             "description": format!("droidd from the host bridge address to port {port}"),
+            "state": "enabled"
+        })));
+    }
+    if let Some(port) = cfg.health.as_ref().map(|health| health.port)
+        && Some(port) != cfg.droidd_port
+        && !cfg.has_health_proxy(port)
+    {
+        rules.push(rule(json!({
+            "action": "allow",
+            "source": format!("{}/32", cfg.gateway),
+            "protocol": "tcp",
+            "destination_port": port.to_string(),
+            "description": format!("health check from the host bridge address to port {port}"),
             "state": "enabled"
         })));
     }
@@ -1655,6 +1679,8 @@ pub struct Template {
     #[serde(default)]
     pub ports: Vec<u16>,
     #[serde(default)]
+    pub health: Option<PortHealth>,
+    #[serde(default)]
     pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub provides: Option<Value>,
@@ -1749,6 +1775,16 @@ pub struct Template {
     /// from `update`, which is a virtual machine's pinned version.
     #[serde(default)]
     pub app_update: Option<crate::app_formula::AppUpdate>,
+}
+
+/// The port the node checks after starting a container during an image update.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PortHealth {
+    pub port: u16,
+    /// An HTTP GET request target. Without it the node checks the TCP connection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_path: Option<String>,
 }
 
 /// A service's connector kind, including a service made before its record carried the kind.
@@ -2115,6 +2151,19 @@ pub const IMAGE_RUNNING: &str = " running ";
 
 fn validate_template(template: &Template, dir: &Path) -> Result<(), TemplateError> {
     let name = &template.name;
+    if let Some(health) = &template.health
+        && (template.is_vm()
+            || health.port == 0
+            || health.http_path.as_ref().is_some_and(|path| {
+                !path.starts_with('/')
+                    || path.contains('#')
+                    || path.parse::<axum::http::uri::PathAndQuery>().is_err()
+            }))
+    {
+        return Err(TemplateError::refused(format!(
+            "template {name}: health is for a container, with a port from 1 to 65535 and an optional HTTP path starting with /"
+        )));
+    }
     if let Some(key) = template.limits.as_ref().and_then(Limits::invalid_io_limit) {
         return Err(TemplateError::refused(format!(
             "template {name}: invalid limits.{key}: use a positive integer in Incus byte/s or iops units for disk, bit/s units for network, within signed 64-bit range"

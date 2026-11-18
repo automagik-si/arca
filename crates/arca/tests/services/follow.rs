@@ -155,7 +155,7 @@ fn rig(up: &Arc<AtomicBool>) -> Rig {
 
 fn update_options(up: Arc<AtomicBool>) -> UpdateOptions {
     UpdateOptions {
-        probe: Arc::new(move |_, _, _| up.load(Ordering::SeqCst)),
+        probe: Arc::new(move |_, _, _, _, _| up.load(Ordering::SeqCst)),
         pace: Duration::from_millis(10),
     }
 }
