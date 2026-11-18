@@ -4,6 +4,13 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 
 ## Unreleased
 
+A container template may carry `appUpdate`, a formula for updating the app inside its service: a `health` command and
+a `version` reader, and on a `system` container an `update` command that takes the version as one argument
+(`{version}`). Arca reads and checks it strictly when the template is read and `service_status` shows
+`"appUpdate": { "formula": "template" }` for a service whose template has one; no verb runs a formula yet, no shipped
+template has one, and every other service answers as before. Releases before this one refuse a template with the
+field. See OPERATING.md.
+
 `service_labels_set` merges a service's plain labels, with null removing a key. `service_status` and `service_list`
 rows now include the label map. Writes use ownership checks, If-Match and read-back outside the effect journal;
 uncertain answers carry an explicit code. Label keeping during snapshot rollback is best effort and never prevents

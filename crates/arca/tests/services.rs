@@ -1284,6 +1284,7 @@ fn source_template(kind: &str, image: &str, digest: Option<&str>) -> service::Te
         edge: false,
         connector: None,
         update: None,
+        app_update: None,
     }
 }
 
@@ -4197,6 +4198,8 @@ fn service_remove_deletes_a_running_service_with_owner_approval() {
     );
 }
 
+#[path = "services/app_formula.rs"]
+mod app_formula;
 #[path = "services/approval_requests.rs"]
 mod approval_requests;
 #[path = "services/create_digest.rs"]

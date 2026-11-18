@@ -5808,7 +5808,21 @@ fn service_status_params_base() -> Value {
 }
 
 fn service_status_result() -> Value {
-    service_details_schema(service_observation_schema())
+    let mut view = service_details_schema(service_observation_schema());
+    view["properties"]["appUpdate"] = json!({
+        "additionalProperties": false,
+        "description": "Present only for a service whose installed template has an appUpdate formula: the formula that updates the app inside the service (a health check and a version reader, and for a system container the update command). It says that the formula exists and where it comes from; no command is run for it and nothing is read but the template's file. Absent for every other service.",
+        "properties": {
+            "formula": {
+                "description": "Where the formula comes from: template, the service's installed template.",
+                "enum": ["template"],
+                "type": "string"
+            }
+        },
+        "required": ["formula"],
+        "type": "object"
+    });
+    view
 }
 
 fn service_details_schema(mut view: Value) -> Value {
