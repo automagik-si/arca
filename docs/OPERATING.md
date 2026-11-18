@@ -1311,6 +1311,27 @@ The `postgres-autopg`, `nats` and `omni-api` templates state a data volume of th
 disk against its cap). A service made from them up to 0.22.0 keeps its data on its root disk and gets no volume:
 `templates install` changes the template, not the services already made.
 
+### GitLab CE: gitlab
+
+`gitlab` pins the publisher's GitLab CE 19.4.8 image by its multi-architecture index digest. One 100GiB volume at
+`/data` holds `config`, `data` and `logs`, linked to `/etc/gitlab`, `/var/opt/gitlab` and `/var/log/gitlab` before the
+image's own init runs. Restarts and image rebuilds keep that volume. The template requests 8 CPUs, 16GiB memory and
+a 40GiB root; size the data volume for the source instance and restore working space before creating it.
+
+Propose `service_create` with `template: "gitlab"` and `start: false`, get the owner's approval, set the required
+`GITLAB_EXTERNAL_URL` through `service_secret_set`, then start. There is no URL default or container create-time
+setting. Arca generates `GITLAB_ROOT_PASSWORD` for a fresh installation. The URL is treated as a secret, so
+`service_logs` replaces it with `[secret]`. The entrypoint rejects an absent or invalid http/https URL in one line.
+
+Port 80 is first for an edge link and an approved route; the edge serves external HTTPS. The template declares
+443 too, but no SSH port, `lan` or `privatePort`, so these declarations create no host listener. Web and Git over
+HTTPS are the supported outside paths; Git over SSH is not served. The edge upstream is HTTP and cannot forward
+SSH. A private port requires a configured host address even to create the service; the
+[GitLab migration runbook](GITLAB-MIGRATION.md) gives an optional owner-local variant on 2222 and the
+changes existing SSH remotes need. There is no template readiness field: Arca's update check only watches the
+process with this template. Check `/-/readiness` explicitly. **Not yet run on a live node:** complete the runbook's
+empty-service readiness rehearsal before moving data.
+
 ### A database
 
 `postgres_create` takes a name and nothing else. The image is the node's, never the call's, through both doors: a
