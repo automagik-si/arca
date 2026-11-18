@@ -381,10 +381,10 @@ pub(crate) fn connector_log(text: &str, secrets: &[String]) -> (String, service:
         .iter()
         .filter(|value| {
             values.contains(value)
-                || !values[secrets.len()..]
+                || !values
                     .iter()
                     .chain(&detected)
-                    .any(|other| partial_identifier_overlap(value, other))
+                    .any(|other| overlapping_values_in_answer(value, other, &answer))
         })
         .cloned()
         .collect();
@@ -393,13 +393,19 @@ pub(crate) fn connector_log(text: &str, secrets: &[String]) -> (String, service:
     (answer, service::values_to_hide(&values))
 }
 
-fn partial_identifier_overlap(left: &str, right: &str) -> bool {
+fn overlapping_values_in_answer(left: &str, right: &str, answer: &str) -> bool {
     if left.contains(right) || right.contains(left) {
         return false;
     }
-    let (left, right) = (left.as_bytes(), right.as_bytes());
     (1..left.len().min(right.len())).any(|len| {
-        left[left.len() - len..] == right[..len] || right[right.len() - len..] == left[..len]
+        (left.as_bytes()[left.len() - len..] == right.as_bytes()[..len]
+            && right
+                .get(len..)
+                .is_some_and(|tail| answer.contains(format!("{left}{tail}").as_str())))
+            || (right.as_bytes()[right.len() - len..] == left.as_bytes()[..len]
+                && left
+                    .get(len..)
+                    .is_some_and(|tail| answer.contains(format!("{right}{tail}").as_str())))
     })
 }
 
@@ -561,6 +567,36 @@ mod tests {
                 "REMOREMORE",
                 "token [secret]MOREMOREMORE end"
             ]
+        );
+    }
+
+    #[test]
+    fn connector_privacy_stored_value_preservation() {
+        let secret = "syntheticSecret12345";
+        assert_eq!(secret.len(), 20);
+        let raw = "\u{1b}]0;x //h.io/a/ret12345Mo\u{7}reSyntheticSuffix\ntoken syntheticSecret12345MoreSyntheticSuffix end\n";
+        let (text, hidden) = connector_log(raw, &[secret.to_string()]);
+        let lines: Vec<_> = text
+            .split(['\n', '\r'])
+            .filter(|line| !line.trim().is_empty())
+            .map(service::clean_log)
+            .filter(|line| !line.is_empty())
+            .map(|line| finish_connector_log(&service::redact_hidden(&line, &hidden)))
+            .collect();
+        assert_eq!(
+            lines,
+            ["reSyntheticSuffix", "token [secret]MoreSyntheticSuffix end"]
+        );
+    }
+
+    #[test]
+    fn connector_privacy_independent_value_preservation() {
+        let raw = "https://login.tailscale.com/a/syntheticOther99s\n\u{1b}]0;visit https://l\u{7};ogin.tailscale.com/a/syntheticSweep1234 done\n";
+        let lines = rendered_connector_lines(raw);
+        assert!(visible_identifier_piece("syntheticSweep1234", &lines.concat()) < 4);
+        assert_eq!(
+            lines,
+            ["[sign-in link]", ";ogin.tailscale.com/a/[secret] done"]
         );
     }
 
