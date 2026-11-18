@@ -43,6 +43,7 @@ fn network_home_and_project_are_owned_and_retry_skips_existing_objects() {
         virtual_machines: 0,
         shared_project: false,
         host_bridges: false,
+        snapshots: false,
     };
     let error = NetProject::apply(
         &mut Ctx::new(
@@ -201,6 +202,7 @@ fn the_bridged_project_is_created_alone_with_no_network_or_profile_and_a_retry_s
         memory: "64GiB".into(),
         disk: "1TiB".into(),
         managed: false,
+        snapshots: false,
     };
     let cfg = caps(PROJECT);
     // Another entry id, or another project, is refused before any request.
@@ -316,6 +318,7 @@ fn the_bridged_project_is_created_alone_with_no_network_or_profile_and_a_retry_s
         virtual_machines: 0,
         shared_project: true,
         host_bridges: false,
+        snapshots: false,
     };
     let before = fake.requests().len();
     for _ in 0..2 {
@@ -393,6 +396,7 @@ fn the_network_entry_widens_its_own_project_for_virtual_machines_and_host_bridge
         virtual_machines: 0,
         shared_project: false,
         host_bridges: false,
+        snapshots: false,
     };
     let mut apply = |cfg: &NetProjectConfig| {
         NetProject::apply(
@@ -440,4 +444,167 @@ fn the_network_entry_widens_its_own_project_for_virtual_machines_and_host_bridge
     assert_eq!(project()["user.arcakernel.entry"], "net-arcak-svc");
     assert_eq!(fake.writes().len(), writes + 2);
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn an_owner_entry_an_earlier_kernel_wrote_reads_and_writes_back_byte_for_byte() {
+    for written in [
+        r#"{"project":"arcak-svc","bridge":"arcak-svcbr","cidr":"192.0.2.0/24","virtualMachines":0}"#,
+        r#"{"project":"arcak-svc","bridge":"arcak-svcbr","cidr":"192.0.2.0/24","virtualMachines":4,"sharedProject":true,"hostBridges":true}"#,
+    ] {
+        let parsed: NetProjectConfig = serde_json::from_str(written).unwrap();
+        assert!(!parsed.snapshots);
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), written);
+    }
+    for written in [
+        r#"{"project":"arcak-svc","virtualMachines":4,"cpu":8,"memory":"64GiB","disk":"1TiB"}"#,
+        r#"{"project":"arcak-svc","virtualMachines":4,"cpu":8,"memory":"64GiB","disk":"1TiB","managed":true}"#,
+    ] {
+        let parsed: BridgedProjectConfig = serde_json::from_str(written).unwrap();
+        assert!(!parsed.snapshots);
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), written);
+    }
+    // The new step is written only when it is set, and reads back.
+    let set = r#"{"project":"arcak-svc","virtualMachines":4,"cpu":8,"memory":"64GiB","disk":"1TiB","snapshots":true}"#;
+    let parsed: BridgedProjectConfig = serde_json::from_str(set).unwrap();
+    assert!(parsed.snapshots);
+    assert_eq!(serde_json::to_string(&parsed).unwrap(), set);
+    let set = r#"{"project":"arcak-svc","bridge":"arcak-svcbr","cidr":"192.0.2.0/24","virtualMachines":0,"snapshots":true}"#;
+    let parsed: NetProjectConfig = serde_json::from_str(set).unwrap();
+    assert!(parsed.snapshots);
+    assert_eq!(serde_json::to_string(&parsed).unwrap(), set);
+}
+
+#[test]
+fn each_owner_lets_its_project_hold_snapshots_once_its_entry_has_the_step() {
+    let dir =
+        std::env::temp_dir().join(format!("arca-netproject-snapshots-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir(&dir).unwrap();
+    let start = |tag: &str| {
+        let dir = dir.join(tag);
+        std::fs::create_dir(&dir).unwrap();
+        let fake = FakeIncus::start(
+            &dir,
+            FakeState {
+                server: json!({}),
+                projects: vec![],
+                instances: vec![],
+                pools: vec![],
+                networks: vec![],
+            },
+        )
+        .unwrap();
+        fake.add_profile(
+            "default",
+            json!({"name":"default","config":{},"devices":{"root":{"pool":"pool1"}}}),
+        );
+        let provider = IncusProvider::new(
+            fake.socket().into(),
+            Family {
+                projects: vec![PROJECT.into()],
+                scratch: false,
+                droidd_projects: vec!["other".into()],
+                reserved_cidrs: vec![],
+            },
+            dir.join("secrets"),
+            RetainedSet::empty(),
+        )
+        .unwrap();
+        (fake, provider)
+    };
+    let held = |fake: &FakeIncus| {
+        UnixIncus::new(fake.socket().into())
+            .get(&format!("/1.0/projects/{PROJECT}?project={PROJECT}"))
+            .unwrap()["config"]
+            .clone()
+    };
+
+    // The network entry: a project made before the step, then widened once by a patch, and not written again.
+    let (fake, mut provider) = start("net");
+    let mut journal = Journal::open(MemJournal::default()).unwrap();
+    let manifest = NetProject::manifest();
+    let mut cfg = NetProjectConfig {
+        project: PROJECT.into(),
+        bridge: BRIDGE.into(),
+        cidr: "192.0.2.0/24".into(),
+        virtual_machines: 0,
+        shared_project: false,
+        host_bridges: false,
+        snapshots: false,
+    };
+    let mut apply = |cfg: &NetProjectConfig| {
+        NetProject::apply(
+            &mut Ctx::new(
+                EntryId("net-arcak-svc".into()),
+                &manifest,
+                &mut provider,
+                &mut journal,
+                0,
+            ),
+            cfg,
+        )
+        .unwrap();
+    };
+    apply(&cfg);
+    assert!(held(&fake).get(SNAPSHOTS_KEY).is_none());
+    cfg.snapshots = true;
+    let writes = fake.writes().len();
+    apply(&cfg);
+    apply(&cfg);
+    assert_eq!(held(&fake)[SNAPSHOTS_KEY], "allow");
+    assert_eq!(held(&fake)["restricted"], "true");
+    assert_eq!(held(&fake)["restricted.devices.proxy"], "allow");
+    assert_eq!(fake.writes().len(), writes + 1, "one write, and none again");
+
+    // The bridged entry: once by a patch of the project it made, and at the create of a project made with the step.
+    for made_with_it in [false, true] {
+        let (fake, mut provider) = start(if made_with_it {
+            "bridged-create"
+        } else {
+            "bridged-patch"
+        });
+        let mut journal = Journal::open(MemJournal::default()).unwrap();
+        let manifest = BridgedProject::manifest();
+        let mut cfg = BridgedProjectConfig {
+            project: PROJECT.into(),
+            virtual_machines: 4,
+            cpu: 8,
+            memory: "64GiB".into(),
+            disk: "1TiB".into(),
+            managed: false,
+            snapshots: made_with_it,
+        };
+        let mut apply = |cfg: &BridgedProjectConfig| {
+            BridgedProject::apply(
+                &mut Ctx::new(
+                    EntryId(BRIDGED_ENTRY.into()),
+                    &manifest,
+                    &mut provider,
+                    &mut journal,
+                    0,
+                ),
+                cfg,
+            )
+            .unwrap();
+        };
+        apply(&cfg);
+        assert_eq!(held(&fake).get(SNAPSHOTS_KEY).is_some(), made_with_it);
+        cfg.snapshots = true;
+        let writes = fake.writes().len();
+        apply(&cfg);
+        apply(&cfg);
+        assert_eq!(held(&fake)[SNAPSHOTS_KEY], "allow");
+        assert_eq!(
+            held(&fake)["limits.containers"],
+            "0",
+            "nothing else changes"
+        );
+        assert_eq!(
+            fake.writes().len(),
+            writes + usize::from(!made_with_it),
+            "written once, when it was missing"
+        );
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
 }

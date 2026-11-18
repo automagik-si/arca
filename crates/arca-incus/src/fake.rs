@@ -59,7 +59,8 @@
 //! else a fresh one the start leases ([`FakeIncus::set_lease`]; `/1.0/networks/<n>/leases`). A lease a start pins, or one
 //! [`FakeIncus::set_static_lease`] gives, is listed as static, as Incus lists the lease a NIC's `ipv4.address` names; any other
 //! as dynamic. Snapshots and backups are
-//! served under `/1.0/instances/<i>/snapshots` and `/1.0/instances/<i>/backups`. A POST to an instance moves it to the project
+//! served under `/1.0/instances/<i>/snapshots` and `/1.0/instances/<i>/backups`, and a custom volume's snapshots under
+//! `/1.0/storage-pools/<p>/volumes/custom/<v>/snapshots`, restored by a PUT of the volume naming `restore`. A POST to an instance moves it to the project
 //! its body names: it must be stopped, the target project must exist, and, as on Incus 7.5, the move is a copy that gets a new
 //! `volatile.uuid`. When a PATCH or a move takes a device out of the expanded devices, or changes it in more than its addresses, the fake clears that device's `volatile.<dev>.*` keys as Incus's `deviceVolatileReset`
 //! does: every one when the device goes or changes type, and otherwise each one whose key the new device sets. A restricted
@@ -247,6 +248,8 @@ struct Shared {
     rebuild_refusals: Mutex<BTreeMap<(String, String), bool>>,
     /// The snapshots each instance was restored to, in order.
     restores: Mutex<BTreeMap<(String, String), Vec<String>>>,
+    /// The snapshots each custom volume was restored to, in order, by project and `<pool>/<volume>`.
+    volume_restores: Mutex<BTreeMap<(String, String), Vec<String>>>,
     /// The power changes each instance was asked for, in order: `start`, `stop` or `restart`, whatever Incus answered.
     state_actions: Mutex<BTreeMap<(String, String), Vec<String>>>,
     counter: AtomicU64,
@@ -386,6 +389,8 @@ enum Route {
     InstanceRebuild(Address),
     Console(Address),
     InstanceSnapshots(Address),
+    /// One custom volume's snapshots: `/1.0/storage-pools/<pool>/volumes/custom/<volume>/snapshots`.
+    VolumeSnapshots(Address),
     InstanceBackups(Address),
     ListOperations,
     Operation(String),
@@ -408,13 +413,14 @@ impl Route {
             Route::ImageAliases(_, None) => &["POST"],
             Route::ImageAliases(_, Some(_)) => &["GET", "DELETE"],
             Route::Object(address) if address.kind == "volume" => {
-                &["GET", "POST", "PATCH", "DELETE"]
+                &["GET", "POST", "PUT", "PATCH", "DELETE"]
             }
             Route::Object(_) => &["GET", "PATCH", "DELETE"],
             Route::InstanceState(_) => &["GET", "PUT"],
             Route::InstanceRebuild(_) => &["POST"],
             Route::Console(_) => &["GET"],
             Route::InstanceSnapshots(_) => &["GET", "POST"],
+            Route::VolumeSnapshots(_) => &["POST"],
             Route::InstanceBackups(_) => &["GET", "POST"],
             _ => &["GET"],
         }
@@ -512,6 +518,7 @@ impl Shared {
             rebuilds: Mutex::new(BTreeMap::new()),
             rebuild_refusals: Mutex::new(BTreeMap::new()),
             restores: Mutex::new(BTreeMap::new()),
+            volume_restores: Mutex::new(BTreeMap::new()),
             state_actions: Mutex::new(BTreeMap::new()),
             counter: AtomicU64::new(1),
             resources: Mutex::new(None),
@@ -595,6 +602,14 @@ impl FakeIncus {
     pub fn restores(&self, project: &str, name: &str) -> Vec<String> {
         lock(&self.shared.restores)
             .get(&(project.to_string(), name.to_string()))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// The snapshots the custom volume `volume` of the pool `pool` in `project` was restored to, in order.
+    pub fn volume_restores(&self, project: &str, pool: &str, volume: &str) -> Vec<String> {
+        lock(&self.shared.volume_restores)
+            .get(&(project.to_string(), format!("{pool}/{volume}")))
             .cloned()
             .unwrap_or_default()
     }
@@ -1734,6 +1749,27 @@ fn parse(target: &str) -> Option<Route> {
         ["storage-pools", pool, "volumes", "custom", name] => {
             Route::Object(address("volume", pool, name))
         }
+        [
+            "storage-pools",
+            pool,
+            "volumes",
+            "custom",
+            name,
+            "snapshots",
+        ] => Route::VolumeSnapshots(address("volume-snapshot", &format!("{pool}/{name}"), "")),
+        [
+            "storage-pools",
+            pool,
+            "volumes",
+            "custom",
+            name,
+            "snapshots",
+            snapshot,
+        ] => Route::Object(address(
+            "volume-snapshot",
+            &format!("{pool}/{name}"),
+            snapshot,
+        )),
         ["storage-pools", pool, "buckets"] => Route::Collection(address("bucket", pool, "")),
         ["storage-pools", pool, "buckets", name] => Route::Object(address("bucket", pool, name)),
         ["operations"] if query == "all-projects=true&recursion=1" => Route::ListOperations,
@@ -2078,6 +2114,12 @@ fn dispatch(shared: &Shared, request: &Request, route: Route) -> (u16, String, V
         }
         ("POST", Route::InstanceBackups(address)) => {
             snapshot_or_backup(shared, store, request, &address, "backup")
+        }
+        ("POST", Route::VolumeSnapshots(address)) => {
+            volume_snapshot(shared, store, request, &address)
+        }
+        ("PUT", Route::Object(address)) if address.kind == "volume" => {
+            restore_volume(shared, store, request, &address)
         }
         ("POST", Route::Object(address)) if address.kind == "volume" => {
             match serde_json::from_slice::<Value>(&request.body) {
@@ -3331,7 +3373,7 @@ fn delete(shared: &Shared, store: &mut Store, address: &Address) -> (u16, String
 fn is_async(kind: &str, method: &str) -> bool {
     matches!(
         kind,
-        "instance" | "volume" | "image" | "snapshot" | "backup"
+        "instance" | "volume" | "image" | "snapshot" | "backup" | "volume-snapshot"
     ) && method != "PATCH"
 }
 
@@ -4288,6 +4330,112 @@ fn change_state(
         }
         _ => bad("the fake takes only a start, a stop or a restart"),
     }
+}
+
+/// Takes a snapshot of one custom volume. Its body is exactly `{"name": <snapshot>}`, kept as sent. A restricted project
+/// refuses it unless its `restricted.snapshots` is `allow`, as Incus refuses a volume snapshot there.
+fn volume_snapshot(
+    shared: &Shared,
+    store: &mut Store,
+    request: &Request,
+    address: &Address,
+) -> Answer {
+    let (pool, volume) = address.parent.split_once('/').unwrap_or_default();
+    let held = Address {
+        kind: "volume",
+        project: address.project.clone(),
+        parent: pool.to_string(),
+        name: volume.to_string(),
+    };
+    if store.find(&held).is_none() {
+        return (404, String::new(), error_envelope(404, "not found"));
+    }
+    if store.restricted(&address.project) && !store.allows(&address.project, "restricted.snapshots")
+    {
+        let message = format!(
+            "Project \"{}\" doesn't allow for snapshot creation",
+            address.project
+        );
+        return (500, String::new(), error_envelope(500, &message));
+    }
+    let sent = serde_json::from_slice::<Value>(&request.body).unwrap_or(Value::Null);
+    let name = sent["name"].as_str().unwrap_or_default().to_string();
+    if sent.as_object().is_none_or(|fields| fields.len() != 1)
+        || name.is_empty()
+        || name.contains('/')
+    {
+        return (
+            400,
+            String::new(),
+            error_envelope(
+                400,
+                "the fake takes a volume snapshot body of its name alone",
+            ),
+        );
+    }
+    let place = Address {
+        name: name.clone(),
+        ..address.clone()
+    };
+    if store.find(&place).is_some() {
+        return (
+            409,
+            String::new(),
+            error_envelope(409, "the snapshot already exists"),
+        );
+    }
+    store.objects.push(Stored {
+        kind: "volume-snapshot".to_string(),
+        project: address.project.clone(),
+        name,
+        parent: address.parent.clone(),
+        body: sent,
+    });
+    answered(shared, store, "volume-snapshot", "POST", Ok(()))
+}
+
+/// Puts one custom volume back to a snapshot it holds, for a PUT whose body is exactly `{"restore": <snapshot>}`. Any
+/// other PUT of a volume is answered 405, as before.
+fn restore_volume(
+    shared: &Shared,
+    store: &mut Store,
+    request: &Request,
+    address: &Address,
+) -> Answer {
+    let sent = serde_json::from_slice::<Value>(&request.body).unwrap_or(Value::Null);
+    if sent.get("restore").is_none() {
+        return (
+            405,
+            String::new(),
+            error_envelope(405, "method not allowed"),
+        );
+    }
+    let snapshot = sent["restore"].as_str().unwrap_or_default().to_string();
+    if sent.as_object().is_none_or(|fields| fields.len() != 1) || snapshot.is_empty() {
+        return (
+            400,
+            String::new(),
+            error_envelope(
+                400,
+                "the fake restores a volume from a body of the snapshot's name alone",
+            ),
+        );
+    }
+    let parent = format!("{}/{}", address.parent, address.name);
+    let held = Address {
+        kind: "volume-snapshot",
+        project: address.project.clone(),
+        parent: parent.clone(),
+        name: snapshot.clone(),
+    };
+    if store.find(address).is_none() || store.find(&held).is_none() {
+        return (404, String::new(), error_envelope(404, "not found"));
+    }
+    lock(&shared.volume_restores)
+        .entry((address.project.clone(), parent))
+        .or_default()
+        .push(snapshot);
+    answered(shared, store, "volume", "PUT", Ok(()))
 }
 
 /// Takes a snapshot of an instance, or a backup, which the fake does not keep. A restricted project refuses either unless its
