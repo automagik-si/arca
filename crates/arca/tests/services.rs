@@ -2854,7 +2854,7 @@ fn refuses_to_read_or_remove_an_unmarked_instance_before_sending_a_log_or_delete
 }
 
 #[test]
-fn the_fifteen_templates_and_nothing_else_load_and_are_pinned() {
+fn the_sixteen_templates_and_nothing_else_load_and_are_pinned() {
     use std::path::Path;
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../templates");
     let mut names: Vec<String> = std::fs::read_dir(&dir)
@@ -2873,6 +2873,7 @@ fn the_fifteen_templates_and_nothing_else_load_and_are_pinned() {
             "automagik-workspace",
             "cloudflare-tunnel",
             "github-runner-pool",
+            "gitlab",
             "gitlab-runner-pool",
             "gitlab-runner-pool-large",
             "nats",
@@ -4829,6 +4830,7 @@ fn every_shipped_entrypoint_reaches_init_as_its_own_words_on_either_liblxc() {
             "arca-edge",
             "automagik-server",
             "cloudflare-tunnel",
+            "gitlab",
             "nats",
             "nats-primary",
             "nats-replica",
@@ -5386,7 +5388,8 @@ fn templates_install_puts_every_shipped_template_and_its_script_in_place_in_one_
         service::entrypoint(&loaded, &dir).expect("its entrypoint script is installed with it");
         service::first_boot(&loaded, &dir).expect("its first-boot script is installed with it");
     }
-    assert_eq!(templates, 15);
+    assert_eq!(templates, 16);
+    assert!(installed.contains(&"gitlab.sh"));
     assert!(installed.contains(&"postgres-autopg.sh"));
     // One script serves nats and nats-primary; the replica has its own.
     assert!(installed.contains(&"nats.sh"));

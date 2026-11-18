@@ -11,6 +11,11 @@ a `version` reader, and on a `system` container an `update` command that takes t
 template has one, and every other service answers as before. Releases before this one refuse a template with the
 field. See OPERATING.md.
 
+The shipped `gitlab` template pins GitLab CE 19.4.8 by the publisher's image index digest and keeps configuration,
+data and logs on one volume. Create it stopped and supply `GITLAB_EXTERNAL_URL` before starting it. The new
+[migration runbook](docs/GITLAB-MIGRATION.md) covers an empty-service rehearsal, backup and restore, edge routing,
+an optional SSH listener and rollback. It has not yet been run on a live node.
+
 `service_labels_set` merges a service's plain labels, with null removing a key. `service_status` and `service_list`
 rows now include the label map. Writes use ownership checks, If-Match and read-back outside the effect journal;
 uncertain answers carry an explicit code. Label keeping during snapshot rollback is best effort and never prevents

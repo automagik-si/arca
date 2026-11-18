@@ -468,7 +468,7 @@ fn a_formula_that_hands_its_version_to_a_shell_or_to_env_is_accepted() {
 #[test]
 fn every_shipped_template_reads_as_before_with_no_formula() {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../templates");
-    let mut read = 0;
+    let mut read = Vec::new();
     for entry in std::fs::read_dir(&dir).unwrap() {
         let name = entry.unwrap().file_name().into_string().unwrap();
         let Some(name) = name.strip_suffix(".json") else {
@@ -481,9 +481,11 @@ fn every_shipped_template_reads_as_before_with_no_formula() {
         assert!(template.app_update.is_none(), "{name}");
         let text = std::fs::read_to_string(dir.join(format!("{name}.json"))).unwrap();
         assert!(!text.contains("appUpdate"), "{name}");
-        read += 1;
+        read.push(name.to_string());
     }
-    assert_eq!(read, 15);
+    assert_eq!(read.len(), 16);
+    // The GitLab CE template, the first app a formula is meant for, ships without one until its own change adds it.
+    assert!(read.iter().any(|name| name == "gitlab"), "{read:?}");
 }
 
 /// `service_status` of `name`.
