@@ -632,10 +632,17 @@ fn a_formula_of_the_single_form_reads_and_writes_back_as_before() {
     assert_eq!(serde_json::to_value(&read).unwrap(), value);
 }
 
-/// `service_status` of `name`.
+/// `service_status` of `name`, which must meet the verb's result schema: the door checks every answer against it, and
+/// a keyword outside its subset fails every answer.
 fn status(rig: &Rig, name: &str) -> Value {
-    rig.call("service_status", json!({ "name": name }))
-        .expect("status")
+    let answer = rig
+        .call("service_status", json!({ "name": name }))
+        .expect("status");
+    let verb = arca_api::verb("service_status").expect("verb");
+    if let Err(why) = arca_api::conforms(&(verb.result)(), &answer) {
+        panic!("the answer does not meet its schema: {why}: {answer}");
+    }
+    answer
 }
 
 #[test]

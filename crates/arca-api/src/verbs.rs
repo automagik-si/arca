@@ -5814,17 +5814,15 @@ fn service_status_result() -> Value {
         "description": "Present only for a service whose installed template has an appUpdate formula: the formula that updates the app inside the service (a health check and a version reader, and for a system container the update command, or instead several components each with all three). It says that the formula exists and where it comes from, and names its components and what it says it restarts or leaves alone; no command is run for it and nothing is read but the template's file. Absent for every other service.",
         "properties": {
             "alsoRestarts": {
-                "description": "Present only when the formula names them: what else in the instance the update restarts, in the formula's plain words.",
+                "description": "Present only when the formula names them, so never empty: what else in the instance the update restarts, in the formula's plain words.",
                 "items": { "maxLength": 80, "minLength": 1, "type": "string" },
                 "maxItems": 16,
-                "minItems": 1,
                 "type": "array"
             },
             "components": {
-                "description": "Present only for a formula with components: their names, in the order they are updated and restarted.",
+                "description": "Present only for a formula with components, so never empty: their names, in the order they are updated and restarted.",
                 "items": { "maxLength": 32, "minLength": 1, "pattern": "^[a-z][a-z0-9-]*$", "type": "string" },
                 "maxItems": 8,
-                "minItems": 1,
                 "type": "array"
             },
             "formula": {
@@ -5833,7 +5831,7 @@ fn service_status_result() -> Value {
                 "type": "string"
             },
             "notUpdated": {
-                "description": "Present only when the formula names them: what the update deliberately leaves alone, each with the formula's plain reason.",
+                "description": "Present only when the formula names them, so never empty: what the update deliberately leaves alone, each with the formula's plain reason.",
                 "items": {
                     "additionalProperties": false,
                     "properties": {
@@ -5844,7 +5842,6 @@ fn service_status_result() -> Value {
                     "type": "object"
                 },
                 "maxItems": 16,
-                "minItems": 1,
                 "type": "array"
             }
         },
