@@ -4,6 +4,8 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 
 ## Unreleased
 
+## 0.37.0 (2026-11-18)
+
 A container template may carry `appUpdate`, a formula for updating the app inside its service: a `health` command and
 a `version` reader, and on a `system` container an `update` command that takes the version as one argument
 (`{version}`). Arca reads and checks it strictly when the template is read and `service_status` shows
@@ -55,6 +57,19 @@ word elsewhere in the log when terminal formatting intervenes.
 Database approval cards on nodes with a configured image show requested private destinations, kernel access and
 private ports in plain words, and say that they are not used because this node makes its database from its configured
 image. A request that names only a private port shows that port.
+
+- Merge PR 262: the owner's signed-in session is asked about a waiting plan on the node's own stream
+- Merge PR 263: read and check a template's appUpdate formula
+- Merge PR 253: connector log masks detected sign-in identifiers in a last pass
+- Merge PR 255: GitLab CE 19.4.8 service template and migration runbook
+- Merge PR 252: app update design for #240
+- Merge PR 239: kernel review LOWs batch 2, connector log masking and plain card words
+- Merge PR 238: kernel review LOWs batch 1
+- Merge origin/dev v0.36.0 release into local dev
+- Merge PR 237: reach_disconnect and the Tailscale sign-in behind the owner's passkey
+- fix(merge): tenant image import reads the journal through its own import
+- Merge PR 227: tenant image import copies an approved image into a tenant with guarded property writes
+- Merge PR 234: services carry owner labels, set through service_labels_set, and label reads are marked untrusted
 
 ## 0.36.0 (2026-11-17)
 
