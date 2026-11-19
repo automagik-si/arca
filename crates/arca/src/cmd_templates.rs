@@ -223,6 +223,15 @@ pub const EARLIER: &[(&str, &str)] = &[
         "gitlab-runner-pool.sh",
         "9792af0cb048e8efcce28859eb4e4063ba479d52675d6cd074bef7954ac5204f",
     ),
+    // 0.30.0 to 0.37.0: before JIT slots started each job with empty stores by default.
+    (
+        "github-runner-pool.json",
+        "47cd6ead1a7fcdd907d188a932e07f4fbf44d79656798695d9365c0c17fd0684",
+    ),
+    (
+        "github-runner-pool.sh",
+        "7cc2cde111624ad8483546fc43a14b3b1f278a7d38e59a84d9bcd4a1b1cb902d",
+    ),
     // 0.14.0 to 0.29.0: before the runner image was built with aptPackages added.
     (
         "github-runner-pool.json",

@@ -367,7 +367,8 @@ fn a_template_lists_only_keys_of_its_own_settings_and_only_a_virtual_machine_lis
             "only a virtual-machine template has a firstBoot, settings or createSettings"
         )
     );
-    // The shipped runner pool lets a create set its registration, slot sizes, memory policy and runner packages.
+    // The shipped runner pool lets a create set its scope, slot sizes, memory policy, runner packages,
+    // registration mode and cache policy.
     let shipped = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../templates");
     let pool =
         service::load_template(&shipped, "github-runner-pool").expect("the shipped template");
@@ -381,7 +382,8 @@ fn a_template_lists_only_keys_of_its_own_settings_and_only_a_virtual_machine_lis
             "memory",
             "aptPackages",
             "registration",
-            "runnerGroup"
+            "runnerGroup",
+            "keepBetweenJobs"
         ]
     );
     assert_eq!(

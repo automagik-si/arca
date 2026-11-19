@@ -7,6 +7,12 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 Owners can change a VM's named `createSettings` in place by approving a `service_update` card. The card and
 service update journal show each changed value. Arca writes the guest settings file and restarts a running VM.
 
+GitHub runner pool slots start each job with clean Docker, tool and dependency caches. `jit` also checks that
+the old work, socket and home layer are gone before it requests a runner. In `registration-token` mode the
+completed hook waits for a replacement Docker daemon and cleared caches. The started hook checks the fresh
+daemon before workflow steps. The persistent runner keeps its registration, and changes to its files can
+still affect its later jobs. Set `keepBetweenJobs: true` at create to reuse caches within their shares in either mode.
+
 ## 0.38.0 (2026-11-19)
 
 Arca can now take an Incus snapshot of a service's instance together with each custom volume it mounts, under one
