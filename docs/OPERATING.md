@@ -1086,13 +1086,14 @@ template that is created stopped whatever the call says ("No: it is created stop
 
 A new Automagik starts from Automagik's published image, and nothing is built on the node. Two templates run it, each
 pinned to one of Automagik's releases by its digest: `automagik-server`, a container on the node reachable on its LAN
-address at port 3081, at 3.136.4 (`ghcr.io/automagik-si/automagik-server@sha256:49e997e3…`, one linux/amd64 image,
+address at port 3081, at 3.156.3 (`ghcr.io/automagik-si/automagik-server@sha256:6eb1b616…`, one linux/amd64 image,
 about 190 MiB to pull), and `automagik-workspace`, a virtual machine of its own reached through a Cloudflare Tunnel or
-the tailnet, at 3.146.5 (`…@sha256:cc804cb0…`; see "An Automagik workspace in its own virtual machine"). For `automagik-server`, Incus pulls the image from the
+the tailnet, at 3.156.3 (`…@sha256:6eb1b616…`; see "An Automagik workspace in its own virtual machine"). For `automagik-server`, Incus pulls the image from the
 registry by that digest at the create. A workspace is created stopped, and Docker inside its machine pulls the image
 by its digest when the keeper first starts the server, after `instance_start`, once the image's GitHub build
-provenance verifies; the machine needs a route to `ghcr.io` then. Omni channels are not in 3.136.4: in Automagik's design the welcome installs Omni, and 3.136.4 has a bug
-that loses the plugin. They come through the welcome once Automagik's fixed release is pinned here. The hand-built
+provenance verifies; the machine needs a route to `ghcr.io` then. Omni channels work from Automagik 3.136.9 on: the welcome installs Omni, and 3.136.4 has a bug that loses the
+plugin because the image drops its vendor tarballs after building the profile. 3.156.3 is pinned here, so they come
+through the welcome. The hand-built
 `automagik` template below stays as it is for what the published image does not give today: the Omni channels plugin
 until then, and being published on the tailnet with `service_publish`, which an OCI service cannot be. Build
 `automagik` when you need either.
@@ -1304,7 +1305,7 @@ bind exposes the port on every host IPv4 interface, including a tailnet interfac
 host address" below is the way to publish a port on one address only. The service project
 remains restricted; Arca sets and reconciles only `restricted.devices.proxy=allow` to permit these proxy devices. Disk
 restrictions retain Incus' managed default.
-The `automagik-server` template pins the OCI server image (Automagik's release 3.136.4, by digest), mounts `/data` owned
+The `automagik-server` template pins the OCI server image (Automagik's release 3.156.3, by digest), mounts `/data` owned
 by uid/gid 1000, overrides the profile to 4 CPU / 4GiB, enables autostart, and exposes port 3081 through this proxy.
 The `postgres-autopg`, `nats` and `omni-api` templates state a data volume of their own (20GiB at
 `/var/lib/autopg/data`, 10GiB at `/data`, 10GiB at `/app/data`; each has a size, which a tenant needs to count the
@@ -6679,7 +6680,7 @@ create to choose.
 | `publicUrl` | With `reach` `tailnet`, the machine's own `https://<machine>.<tailnet>.ts.net`. Otherwise the workspace's exact public origin, as a browser writes it, and a name, never an IP address: `https://` and a host name in lower case; no path and no closing slash; a port only when it is not 443 (1 to 65535, without a leading 0). The gate gets it as `AUTOMAGIK_GATE_ORIGIN` and stops on any other spelling, so the script refuses those first. The server is not given it. It ships empty, which means "not set": the server then starts alone, no gate is started, and every status line says so. |
 | `accessTeamDomain`, `accessAudience`, `accessEmails` | Your Cloudflare Access application for that address: the team's host name alone (`<team>.cloudflareaccess.com`, no `https://`, and no other domain), the application's audience tag, and the e-mail addresses that may sign in: text, one address or several separated by commas (`"owner@example.com, second@example.com"`, 1 to 16). A create that gives a list is refused (`settings.accessEmails: expected a string, the type of the template's default`); a workspace made before with a list keeps it, and its own keeper reads it. None is a secret. Set all three or none; they need `publicUrl`. They ship empty. The gate gets them as `AUTOMAGIK_GATE_ACCESS_TEAM_DOMAIN`, `AUTOMAGIK_GATE_ACCESS_AUD` and `AUTOMAGIK_GATE_ACCESS_EMAILS`: the text unchanged (the gate trims each address and compares without regard to case). An address the script does not take stops the workspace with `settings.accessEmails is 1 to 16 e-mail addresses ...`. |
 | `automagikPnpm` | Required absolute path of pnpm 10 baked into the server image, supplied by its owner. Passed as `AUTOMAGIK_PNPM`, with no fallback. Explicitly pins `/usr/local/bin/pnpm` from the image contract; an empty or missing setting refuses startup. Reconfirm the path for the final reviewed image. |
-| `serverImage` | The Automagik server's public image, pinned by digest (Automagik 3.146.5). The server and the gate both run from this one value: to move to another build, replace it. A workspace needs a build that has the gate and its Cloudflare Access sign-in (see below), and one with GitHub build provenance from `automagik-si/automagik` (see "The image's provenance" below). |
+| `serverImage` | The Automagik server's public image, pinned by digest (Automagik 3.156.3). The server and the gate both run from this one value: to move to another build, replace it. A workspace needs a build that has the gate and its Cloudflare Access sign-in (see below), and one with GitHub build provenance from `automagik-si/automagik` (see "The image's provenance" below). |
 
 | `reach` | How people reach the workspace: `cloudflare` (the steps above; also when the setting is left out) or `tailnet` (see "On a tailnet instead" below). |
 
