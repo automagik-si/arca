@@ -6185,6 +6185,27 @@ template writes them, each only when the formula has it (an empty list is not sh
 A formula of the single form with neither list answers `{ "formula": "template" }` as before. An Arca older than this
 release refuses a template with any of the three keys.
 
+**How a formula's command runs.** This release can run a formula's command inside its service's container, though no
+verb does so yet. It runs in a `system` container and in an OCI container of the node's own service project, never in an
+adopted instance, a tenant's instance, a virtual machine or a stopped instance. Arca starts the program the formula
+names, with the formula's arguments, as root, with no environment of its own added and no shell. The command runs under
+the image's `/usr/bin/timeout`, which ends it at its `seconds`, so an image without that program fails every check of
+its formula. A health try is cut at 30 seconds, or sooner when less of `health.seconds` is left. Arca waits on the
+command for its `seconds` and 5 more. The last 64 KiB of each of its two outputs is kept, and a longer output is no
+error: the answer says the output was cut. That text is masked as `service_logs` masks a log, so a key, a stored secret,
+one of the instance's own environment values or a credential shows as `[secret]`. What is kept of a longer output begins
+wherever the cut fell, so when it falls inside a secret or a key, the part after the cut can show, until #292 masks a
+cut tail; no verb runs a formula's command before then. Of the update command the last 60 lines are kept, each cut at
+300 characters, and of a failed health check the last 5. Of the version reader only its first line is kept, and only
+when it is a plain version. The recordings are deleted from the instance every time, and the exec audit holds no
+argument and no output. If Incus does not answer for a command by Arca's deadline, the instance is marked hung, and so
+it is when Arca loses the answer in any other way once the command was started (a cut connection, an error in place of
+the operation, an answer that is not the operation), since the command may still run; and so it is when the owner check
+the start makes just before sending it times out, which errs toward the mark. An operation Incus reports failed is an
+answer and marks nothing. No formula command runs in a marked instance, and no command of Rule 50's closed list but its
+cleanups (removing the tailnet key directory, stopping the daemon). The mark stays until Arca sees the instance stopped,
+since a stopped instance runs nothing, or until the instance's uuid changes, since that is another instance.
+
 ### What every virtual machine carries
 
 Whatever its network, a virtual machine Arca creates has two things more than its root disk and its NIC:

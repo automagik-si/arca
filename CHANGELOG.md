@@ -14,6 +14,15 @@ routes and firewall rules, and replaces the Docker daemon. The persistent runner
 changes to its files can still affect its later jobs. Set `keepBetweenJobs: true` at create to reuse caches within
 their shares in either mode.
 
+Arca can now run a formula's command inside its service's container: a `system` container or an OCI container of the
+node's own service project. It is started as the formula names it, as root and with no environment added, under the
+image's `/usr/bin/timeout`, and waited on until its `seconds` and 5 more. The last 64 KiB of each output is kept, a
+longer output is no error, and what is kept is masked as `service_logs` masks a log. When the kept tail starts inside a
+secret or a key, it can still show part of it; issue #292 closes that, and it must land before any verb runs a formula
+command. A command whose end Incus does not show, by the deadline or because its answer was lost, marks the instance
+hung until Arca sees it stopped. No verb runs a formula yet, so nothing changes on a node by this release alone. See
+OPERATING.md.
+
 ## 0.38.0 (2026-11-19)
 
 Arca can now take an Incus snapshot of a service's instance together with each custom volume it mounts, under one

@@ -1,7 +1,7 @@
 //! Closed service commands and file destinations. This power is outside the effect journal and is never exposed by Provider.
 //! Every command uses an absolute binary in the system template and an in-instance timeout; Arca adds no environment.
 
-use crate::read::{check_path, checked_envelope, exchange_capped};
+use crate::read::{Tail, check_path, checked_envelope, exchange_capped, exchange_tail};
 use crate::write::operation_id;
 use crate::{IncusError, Owned, UnixIncusWriter};
 use arca_kernel::ownership::IncusKind;
@@ -23,6 +23,24 @@ fn exec_error(error: IncusError) -> IncusError {
 }
 fn bad() -> IncusError {
     IncusError::Decode("invalid service exec answer".into())
+}
+
+/// The id of the task operation an exec's answer names.
+fn exec_operation(answer: &Value) -> Result<String, IncusError> {
+    // Incus's exec endpoint returns the task operation directly, rather than an async envelope.
+    let op = if answer.get("id").is_some() {
+        answer
+    } else {
+        answer.get("metadata").ok_or_else(bad)?
+    };
+    if op["class"] != "task" {
+        return Err(bad());
+    }
+    op["id"]
+        .as_str()
+        .filter(|id| operation_id(id))
+        .map(str::to_owned)
+        .ok_or_else(bad)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -242,6 +260,101 @@ impl ExecCommand {
     }
 }
 
+/// The most arguments a formula's command holds, the program among them.
+pub const FORMULA_ELEMENTS_MAX: usize = 32;
+/// The most bytes in one argument of a formula's command, after its version is filled in: the 512 bytes a template's
+/// argument may hold, less the 9 of `{version}`, plus the 64 of the longest version. So every argument a formula takes
+/// still runs with any version a call may name.
+pub const FORMULA_ELEMENT_MAX_BYTES: usize = 512 - "{version}".len() + 64;
+/// The longest a formula's command may run inside the instance: the longest `update.seconds` a formula takes.
+pub const FORMULA_SECONDS_MAX: u64 = 7200;
+
+/// The second kind of service command, beside the closed [`ExecCommand`] list: a command a template's formula declares
+/// (Rule 82). It is a list of arguments whose first is an absolute path, and it is started as it is, with no shell, so
+/// Arca builds no command line from it. The arguments are checked again here, whoever built them: 1 to 32, each 1 to
+/// 567 bytes with no control character, the first an absolute path, and a limit of 1 to 7200 seconds. The service
+/// module makes one only from a checked formula (`arca::service_exec::DeclaredCommand`).
+/// ```compile_fail
+/// use arca_incus::exec::FormulaCommand;
+/// let command = FormulaCommand { argv: vec!["/bin/true".into()], seconds: 1 };
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FormulaCommand {
+    argv: Vec<String>,
+    seconds: u64,
+}
+
+impl FormulaCommand {
+    /// The command, or a refusal when the list or the limit is not one a formula may hold.
+    pub fn new(argv: Vec<String>, seconds: u64) -> Result<Self, IncusError> {
+        let plain = |element: &String| {
+            !element.is_empty()
+                && element.len() <= FORMULA_ELEMENT_MAX_BYTES
+                && !element.chars().any(char::is_control)
+        };
+        if argv.is_empty()
+            || argv.len() > FORMULA_ELEMENTS_MAX
+            || !argv.iter().all(plain)
+            || !argv[0].starts_with('/')
+            || !(1..=FORMULA_SECONDS_MAX).contains(&seconds)
+        {
+            return Err(refused());
+        }
+        Ok(Self { argv, seconds })
+    }
+    /// How long the command may run inside the instance.
+    pub fn seconds(&self) -> u64 {
+        self.seconds
+    }
+    /// The same command with a shorter limit, never a longer one, and at least one second.
+    pub fn within(mut self, seconds: u64) -> Self {
+        self.seconds = self.seconds.min(seconds.max(1));
+        self
+    }
+    /// The argument list Incus starts: the formula's own under the in-instance `/usr/bin/timeout` every service command
+    /// has, which ends it at its limit and kills it two seconds later.
+    pub fn argv(&self) -> Vec<String> {
+        let mut wrapped = vec![
+            "/usr/bin/timeout".into(),
+            "-k".into(),
+            "2".into(),
+            self.seconds.to_string(),
+        ];
+        wrapped.extend(self.argv.iter().cloned());
+        wrapped
+    }
+    /// Started detached: no websocket and no terminal, both outputs recorded, as root, with no environment added.
+    pub fn body(&self) -> Value {
+        json!({"command":self.argv(), "environment":{}, "wait-for-websocket":false,
+            "record-output":true, "interactive":false, "width":0, "height":0, "user":0,"group":0,"cwd":""})
+    }
+}
+
+/// What a wait on a formula's command found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FormulaState {
+    /// The command still runs.
+    Running,
+    /// The command ended with this exit code.
+    Exited(i64),
+    /// Incus reports the operation failed (a status of 400 to 599 in its metadata): the command did not run, or ended.
+    Failed,
+}
+
+/// Why a formula's command gave no operation to wait on. Before its request went out, or when Incus answered it with an
+/// error, no command was started. Any other failure leaves it unknown whether the command runs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FormulaStart {
+    NotStarted(IncusError),
+    Unknown(IncusError),
+}
+
+/// `/usr/bin/timeout`'s exit codes for a command it ended at its limit: 124 when the command ended on the signal, 137
+/// when it had to be killed.
+pub fn past_limit(exit: i64) -> bool {
+    matches!(exit, 124 | 137)
+}
+
 /// Where a virtual machine's secrets are written inside its guest: a directory of root's, mode 0700, on the guest's own
 /// disk, with one file of root's, mode 0600, per secret. Incus writes both through the guest agent.
 pub const GUEST_SECRETS_DIR: &str = "/etc/arca-secrets";
@@ -324,6 +437,24 @@ pub enum GuestSecretsDir {
 pub fn valid_operation_id(id: &str) -> bool {
     operation_id(id)
 }
+/// The request for one recording of a command, by its fixed path in the node's own project.
+fn recording_request(
+    instance: &str,
+    id: &str,
+    stderr: bool,
+    method: &str,
+) -> Result<String, IncusError> {
+    if !node_ok(instance) || !operation_id(id) {
+        return Err(refused());
+    }
+    let extension = if stderr { "stderr" } else { "stdout" };
+    let path = format!(
+        "/1.0/instances/{instance}/logs/exec-output/exec_{id}.{extension}?project={SERVICE_PROJECT}"
+    );
+    Ok(format!(
+        "{method} {path} HTTP/1.1\r\nHost: incus\r\nConnection: close\r\n\r\n"
+    ))
+}
 fn target(owned: &Owned) -> Result<String, IncusError> {
     if owned.target().kind != IncusKind::Instance
         || owned.target().project != SERVICE_PROJECT
@@ -363,6 +494,56 @@ impl UnixIncusWriter {
         command: &ExecCommand,
         timeout: Duration,
     ) -> Result<String, IncusError> {
+        self.start_exec(owned, &command.body(), timeout)
+    }
+    /// Starts a formula's command on this entry's freshly checked instance, by the same checks and the same request as
+    /// [`Self::start_service_exec`]. The caller audits its returned id before it waits ([`Self::formula_exec_state`]).
+    /// An error tells whether the command was started ([`FormulaStart`]): only a request that was never sent, or that
+    /// Incus answered with an error, is known not to have started one.
+    pub fn start_formula_exec(
+        &self,
+        owned: &Owned,
+        command: &FormulaCommand,
+        timeout: Duration,
+    ) -> Result<String, FormulaStart> {
+        let path = self.exec_path(owned).map_err(FormulaStart::NotStarted)?;
+        let framed = self
+            .send_checked(
+                "POST",
+                &format!("{path}/exec?project={SERVICE_PROJECT}"),
+                None,
+                Some(&command.body()),
+                timeout,
+            )
+            .map_err(|error| match error {
+                IncusError::Refused(_) => FormulaStart::NotStarted(error),
+                _ => FormulaStart::Unknown(error),
+            })?;
+        let answer = checked_envelope(&framed.into_raw()).map_err(|error| match error {
+            IncusError::Status { .. } => FormulaStart::NotStarted(error),
+            _ => FormulaStart::Unknown(error),
+        })?;
+        exec_operation(&answer).map_err(FormulaStart::Unknown)
+    }
+    fn start_exec(
+        &self,
+        owned: &Owned,
+        body: &Value,
+        timeout: Duration,
+    ) -> Result<String, IncusError> {
+        let path = self.exec_path(owned)?;
+        let framed = self.send_checked(
+            "POST",
+            &format!("{path}/exec?project={SERVICE_PROJECT}"),
+            None,
+            Some(body),
+            timeout,
+        )?;
+        let answer = checked_envelope(&framed.into_raw()).map_err(exec_error)?;
+        exec_operation(&answer)
+    }
+    /// The instance's path for an exec, once this entry's owner mark and the uuid were read again just now.
+    fn exec_path(&self, owned: &Owned) -> Result<String, IncusError> {
         let path = target(owned)?;
         if owned.entry() != self.entry() {
             return Err(refused());
@@ -371,28 +552,7 @@ impl UnixIncusWriter {
         if fresh.uuid() != owned.uuid() || fresh.tombstone().is_some() {
             return Err(refused());
         }
-        let framed = self.send_checked(
-            "POST",
-            &format!("{path}/exec?project={SERVICE_PROJECT}"),
-            None,
-            Some(&command.body()),
-            timeout,
-        )?;
-        let answer = checked_envelope(&framed.into_raw()).map_err(exec_error)?;
-        // Incus's exec endpoint returns the task operation directly, rather than an async envelope.
-        let op = if answer.get("id").is_some() {
-            &answer
-        } else {
-            answer.get("metadata").ok_or_else(bad)?
-        };
-        if op["class"] != "task" {
-            return Err(bad());
-        }
-        op["id"]
-            .as_str()
-            .filter(|id| operation_id(id))
-            .map(str::to_owned)
-            .ok_or_else(bad)
+        Ok(path)
     }
     pub fn wait_service_exec(&self, id: &str) -> Result<i64, IncusError> {
         self.wait_on_in(id, Some(SERVICE_PROJECT))
@@ -400,6 +560,61 @@ impl UnixIncusWriter {
             .as_i64()
             .filter(|n| (0..=255).contains(n))
             .ok_or_else(bad)
+    }
+    /// One bounded wait on a formula's command: Incus is asked to answer within `wait` (whole seconds, at least one), and
+    /// the request itself is cut five seconds later. A command that still runs is [`FormulaState::Running`]; the caller
+    /// waits again while its own deadline allows. An operation that failed, such as a program that could not be
+    /// started, is [`FormulaState::Failed`]. Every error leaves it unknown whether the command still runs.
+    pub fn formula_exec_state(&self, id: &str, wait: Duration) -> Result<FormulaState, IncusError> {
+        if !operation_id(id) {
+            return Err(refused());
+        }
+        let seconds = wait.as_secs().max(1);
+        let framed = self.send_checked(
+            "GET",
+            &format!("/1.0/operations/{id}/wait?timeout={seconds}&project={SERVICE_PROJECT}"),
+            None,
+            None,
+            Duration::from_secs(seconds + 5),
+        )?;
+        let answer = checked_envelope(&framed.into_raw()).map_err(|error| match error {
+            IncusError::Timeout => IncusError::Timeout,
+            _ => bad(),
+        })?;
+        let op = answer.get("metadata").ok_or_else(bad)?;
+        if op["id"].as_str() != Some(id) {
+            return Err(bad());
+        }
+        match op["status_code"].as_u64() {
+            Some(100..=199) => Ok(FormulaState::Running),
+            Some(200) if op["status"] == "Success" => op["metadata"]["return"]
+                .as_i64()
+                .filter(|n| (0..=255).contains(n))
+                .map(FormulaState::Exited)
+                .ok_or_else(bad),
+            Some(400..=599) => Ok(FormulaState::Failed),
+            _ => Err(bad()),
+        }
+    }
+    /// Reads one recording of a formula's command as a stream and keeps its last [`OUTPUT_CAP`] bytes, however long it
+    /// is. Its contents never enter IncusError.
+    pub fn formula_output(
+        &self,
+        owned: &Owned,
+        id: &str,
+        stderr: bool,
+    ) -> Result<Tail, IncusError> {
+        let request = recording_request(&owned.target().name, id, stderr, "GET")?;
+        let (status, tail) = exchange_tail(
+            &self.socket,
+            self.request_timeout(Duration::from_secs(10)),
+            request.as_bytes(),
+            OUTPUT_CAP,
+        )?;
+        if !(200..300).contains(&status) {
+            return Err(bad());
+        }
+        Ok(tail)
     }
     /// Reads just one capped recording. Its contents never enter IncusError.
     pub fn service_output(
@@ -425,16 +640,8 @@ impl UnixIncusWriter {
         stderr: bool,
         delete: bool,
     ) -> Result<Vec<u8>, IncusError> {
-        if !node_ok(instance) || !operation_id(id) {
-            return Err(refused());
-        }
-        let extension = if stderr { "stderr" } else { "stdout" };
-        let path = format!(
-            "/1.0/instances/{instance}/logs/exec-output/exec_{id}.{extension}?project={SERVICE_PROJECT}"
-        );
         let method = if delete { "DELETE" } else { "GET" };
-        let request =
-            format!("{method} {path} HTTP/1.1\r\nHost: incus\r\nConnection: close\r\n\r\n");
+        let request = recording_request(instance, id, stderr, method)?;
         let framed = exchange_capped(
             &self.socket,
             self.request_timeout(Duration::from_secs(3)),

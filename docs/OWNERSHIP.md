@@ -848,8 +848,9 @@ netproject apply retry without adopting a foreign object. No other route is admi
 tests: `own_project_and_network_observe_are_scoped`, `own_project_and_network_observe_refuses_foreign_and_other_routes`.
 
 
-**Rule 50.** Serve may execute only the service module's closed command enum, outside the effect journal and unavailable to
-plugins or Provider. It refuses adopted, OCI, foreign, retained, retiring, stopped and UUID-mismatched instances. Identity
+**Rule 50.** Serve may execute only the service module's closed command enum, and the one second type a formula declares
+(Rule 82, which states that type's own limits), outside the effect journal and unavailable to plugins or Provider. For the
+closed enum it refuses adopted, OCI, foreign, retained, retiring, stopped and UUID-mismatched instances. Identity
 comes from the newest live class-B instance effect, and a post-exec UUID check discards output from a changed instance.
 Every step has an in-instance SIGKILL timeout, a client deadline, a 64 KiB recording cap, and a synced private exec audit with
 no argv or output. Client deadlines mark that UUID hung; only key cleanup and daemon stop remain permitted. Recordings are
@@ -1811,6 +1812,44 @@ snapshot_with_volumes, restore_with_volumes}` and `service_target` in
 `crates/arca-incus/src/lifecycle.rs`; the fake's `volume_snapshot` and `restore_volume` in `crates/arca-incus/src/fake.rs`;
 tests in `crates/arca-incus/tests/service_snapshots.rs`; by hand on a test node, the ignored tests of
 `crates/arca-incus/tests/service_snapshot_real_incus.rs`.
+
+## A formula's command
+
+**Rule 82.** The second type of service command is a command a template's formula declares (`appUpdate`): its update
+command, one try of its health check, or its version reader. It is made only from a formula that passes its checks for
+the template's kind, and the update command only with a version that passes the version rule, so the version is one
+argument and never the program. Its argument list is checked again where the request is built: 1 to 32 arguments, each 1
+to 567 bytes (a template's 512, less `{version}`, plus the longest version) with no control character, the first an
+absolute path, and a limit of 1 to 7200 seconds. It runs in a `system` container and in an OCI container of the node's
+own service project, and is refused, before any exec request, for an adopted instance, a tenant's instance, a virtual
+machine, another project, a record whose instance is not its own, a missing or changed uuid, a foreign or retained
+owner, a tombstone and a stopped instance. It keeps Rule 50's identity: the same freshly checked uuid before the start
+and the same post-exec uuid check, which discards the output of a changed instance. It is started detached (no
+websocket, no terminal), as root, with no environment added, under the in-instance `/usr/bin/timeout -k 2` with the
+formula's seconds, and waited on through its operation in the node's own project in bounded waits until a client
+deadline 5 seconds past that limit. Its two recordings are read as a stream and the last 64 KiB of each is kept in place
+of Rule 50's cap; a longer output is never an error and is reported as cut. The kept text is masked as a whole output
+is, as a service's log is (every PEM block whole, then per line control bytes, stored secret values, the instance's own
+environment values and credential shapes). A kept tail that the 64 KiB cut begins inside a secret or a key can show part
+of it, until #292 masks a cut tail; no verb runs a command of this type before then. Only a bounded tail is returned:
+the update command's last 60 lines of at most 300 characters, a failed health check's last 5, the version reader's first
+line only when it is a plain version. Both recordings are deleted on every outcome, and the audit is Rule 50's, with no
+argument and no output. Once Arca has passed its checks and tries to send the start request, any outcome that does not
+show the command ended sets the same hung mark Rule 50 sets, since the command may still run: no answer by the client
+deadline, a wait whose connection is refused, reset or cut, a wait answered with an error status (a 404 for the
+operation among them), a malformed or foreign operation, a start request whose connection fails or whose answer is cut
+or is not an operation, or an audit row that cannot be written once the command started. Only an operation Incus reports
+ended is an answer: one that succeeded, or one that failed (a status of 400 to 599 in its metadata), which sets no mark;
+nor does a start request Arca refused before trying to send it, or that Incus answered with an error status. A timeout
+on the owner re-read the start request makes before it is sent marks the instance as the deadline does; that errs toward
+the mark. Rule 50's own commands are still marked only at the deadline. The mark is kept in memory; no command of this
+type runs in a marked instance, nor any closed command but a cleanup. The mark is cleared when Arca reads the instance,
+with the same uuid, stopped, and otherwise only as Rule 50 drops it, when the uuid changes; clearing it makes no stop.
+No rule here limits which program a formula names.
+Source: `FormulaCommand`, `FormulaState`, `FormulaStart`, `UnixIncusWriter::{start_formula_exec, formula_exec_state,
+formula_output}` in `crates/arca-incus/src/exec.rs` and `exchange_tail` in `crates/arca-incus/src/read.rs`;
+`DeclaredCommand` and `ServiceExec::{run_formula, hung, clear_hung_after_stop}` in `crates/arca/src/service_exec.rs`;
+tests in `crates/arca/tests/services/formula_exec.rs`.
 
 ## Out of scope
 

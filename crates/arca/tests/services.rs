@@ -4214,6 +4214,8 @@ mod destinations;
 mod external;
 #[path = "services/follow.rs"]
 mod follow;
+#[path = "services/formula_exec.rs"]
+mod formula_exec;
 #[path = "services/golden.rs"]
 mod golden;
 #[path = "services/kernel_access.rs"]
