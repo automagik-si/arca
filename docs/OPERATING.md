@@ -6952,7 +6952,7 @@ since it is where the pool's credential will be used.
 | `aptPackages` | yes | The Ubuntu packages added to the runner image, which the machine builds once ("The runner image's packages" below). The default is `["libatomic1", "build-essential", "zstd", "wget", "skopeo", "xz-utils", "zip", "rsync", "gh"]`. Given at create, it replaces the whole list, so name the defaults too when you add one; `[]` runs the runner image as it is. |
 | `registration` | yes | `jit` (the default): a just-in-time runner per job, registered with the pool's App or token. `registration-token`: no GitHub credential at all; each slot is registered once with a registration token and keeps its runner between jobs ("Without a GitHub credential" below). |
 | `runnerGroup` | yes | With `registration-token`, the runner group's name as GitHub shows it (config.sh names a group by name). Required for an organisation. |
-| `keepBetweenJobs` | yes | In `jit` mode, `false` (the default) clears the slot's Docker store, tool cache and dependency cache after each job. `true` keeps cached images, build layers and tools within their shares. `registration-token` always keeps per-slot state. |
+| `keepBetweenJobs` | yes | `false` (the default) gives each job clean Docker, tool and dependency caches in both modes. `true` lets slots reuse those caches within their shares. |
 | `allowDefaultRunnerGroup` | no | `true` lets a `jit` pool start on the organisation's default runner group (the registration-token mode does not read it; it takes the default group with a warning). Leave it out. |
 | `reserveMemory` | no | Memory kept back for the virtual machine itself. The slots share what is left. |
 | `dockerCache`, `dependencyCache` | no | The disk the Docker layer caches and the dependency caches may use, over all slots. |
@@ -7098,14 +7098,15 @@ What the pool does with it:
   can be deleted as unneeded while every slot still looks registered. If a slot then waits for a token, run
   `instance_start` again within the token's hour: Arca writes the stored token again and the slot registers with it.
 
-**This mode keeps per-slot state between jobs.** The slot's runner is persistent: it takes job after job in the same
-container, beside the same Docker daemon, with the same work directory (`_work`), the same Docker layer cache, the
-same tool cache and the same files any job left in the runner's home. The slot checks the two cache budgets after
-each job. A job can see what an earlier job on that slot left and can leave something for a later one. Use this
-mode only for repositories that trust each other. Each job is
-still recorded in `jobs.tsv` with its name, result and seconds, but its memory peak is the slot's since its runner
-started (a slice's peak cannot be set back while it runs), and its CPU time is the slot's since the job began. This
-mode is a bridge until each job runs in a fresh machine of its own.
+**The runner keeps its container, work directory and home between jobs.** A read-only job-started hook clears the
+slot's Docker objects, tool cache and dependency cache before workflow steps run. The hook uses the existing Docker
+daemon because GitHub can assign the next job as soon as the runner is ready. If cleanup fails, the hook stops that
+job's worker. Set `keepBetweenJobs: true` to skip the hook and trim caches under the existing budgets.
+
+A job can change its own persistent runner's files and affect later jobs on that runner, even with cache cleanup
+enabled. Use this mode only for repositories that trust each other. In `jit` mode the pool replaces the runner and
+its work directory after each job. Each job is recorded in `jobs.tsv` with its name, result and seconds. The memory
+peak is the slot's since its runner started, and CPU time is the slot's since the job began.
 
 ### Who can reach what
 
@@ -7226,14 +7227,14 @@ neither has been measured on the pool itself.
   from each other the way two virtual machines are ("Who can reach what" above). One shared daemon would have reused
   more cache and separated jobs less; a daemon without root would separate them more and refuse the jobs that need
   privileged containers.
-- **Caches.** By default, a `jit` slot keeps nothing from a finished job. It replaces its Docker store, including
-  images, build cache and volumes, its tool cache (`RUNNER_TOOL_CACHE` at `/opt/hostedtoolcache`) and its dependency
-  cache (`POOL_CACHE_DIR` at `/var/cache/pool`) with empty directories before registering the next runner. If the
-  reset fails, the slot logs the failure and retries before registering. Each job pulls its images and sets up its
-  tools and dependencies again until a read-only cache is available. With `keepBetweenJobs: true`, images, build
-  cache and the two filesystem caches can survive jobs and restarts. Each slot has an equal share of `dockerCache`
-  and `dependencyCache`. The pool trims and logs any cache that exceeds its share after a job. A later job on the
-  same slot can read what an earlier job left in those caches.
+- **Caches.** By default, a `jit` slot replaces its Docker store, tool cache (`RUNNER_TOOL_CACHE` at
+  `/opt/hostedtoolcache`) and dependency cache (`POOL_CACHE_DIR` at `/var/cache/pool`) with empty directories
+  before registering the next runner. If the reset fails, the slot logs the failure and retries before
+  registering. In `registration-token` mode the job-started hook clears those caches before each job. In both
+  modes each job pulls its images and sets up its tools and dependencies again until a read-only cache is
+  available. With `keepBetweenJobs: true`, images, build cache and the two filesystem caches can survive jobs
+  and restarts. Each slot has an equal share of `dockerCache` and `dependencyCache`. The pool trims and logs any
+  cache that exceeds its share after a job. A later job on the same slot can read what an earlier job left there.
 - **Where the credential lives.** In Arca's private `secrets/` directory, and in the virtual machine in
   `/etc/arca-secrets`, readable by root there. It is not in Incus's config, in Arca's journals or in any log. The
   controller makes every short-lived token from it by itself and prints none. A runner's one-job registration is
@@ -8557,8 +8558,8 @@ the workflow (`CI_SLOT_CPUS`). On a hosted runner it tells them nothing.
 
 The setup step uses `POOL_CACHE_DIR` for rustup, the cargo registry, the target directory, npm's cache and the test
 browser, and the runner's tool cache for Node. A pool with `keepBetweenJobs: true` reuses them on the same slot
-until they exceed its share of `dependencyCache`. The setup step prints what the cache holds. With the `jit`
-default, each job sets them up again.
+until they exceed its share of `dependencyCache`. The setup step prints what the cache holds. With the default
+cache policy, each job sets them up again.
 
 **Comparing with GitHub's runners.** `.github/workflows/bench.yml` is started by hand only. It runs the `test` job
 twice on one commit, on `ubuntu-latest` and on the pool, and writes for each, in the run's summary: the CPU model,

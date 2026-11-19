@@ -14,9 +14,9 @@
 #   self-hosted runner) and put in the secret GITHUB_REGISTRATION_TOKEN, as a persistent runner: config.sh, not
 #   --ephemeral. The runner's own registration (.runner, .credentials, .credentials_rsaparams) is kept per slot in
 #   /var/lib/arca-runner-pool/registered, which only root enters, and the slot's runner takes job after job: its
-#   container, its Docker daemon, its work directory and its caches stay between jobs. The token is deleted once every
-#   slot is registered, or after an hour, when GitHub's own has ended. A slot that has its registration starts without
-#   one. This mode keeps per-slot state between jobs: it is a bridge until each job runs in a machine of its own.
+#   container, its Docker daemon and its work directory stay between jobs. By default a job-started hook clears the
+#   slot's Docker objects and caches before each job. The token is deleted once every slot is registered, or after an
+#   hour, when GitHub's own has ended. A slot that has its registration starts without one.
 #
 # What it reads:
 # - /etc/arca/settings.json: the service's settings (the template's, with what its service_create replaced), written
@@ -684,7 +684,44 @@ slot_failed() {
   say "slot $slot (${SLOT_CLASS[$slot]}) failed: $*. Slots start again in $pause seconds"
 }
 
-slot_keeps_caches() { [ -n "$REG" ] || [ "$KEEP_BETWEEN_JOBS" = true ]; }
+slot_keeps_caches() { [ "$KEEP_BETWEEN_JOBS" = true ]; }
+
+# The controller runs as root. Replace the file atomically so a runner with the old file mounted can finish safely.
+write_job_started_hook() {
+  local hook="$POOL_RUN/tmp/job-started.sh"
+  cat >"$hook" <<'HOOK' && chmod 555 "$hook" && mv -f "$hook" "$POOL_RUN/job-started.sh"
+#!/bin/bash
+set -u
+PATH=/usr/bin:/bin
+unset DOCKER_CONTEXT DOCKER_TLS DOCKER_TLS_VERIFY DOCKER_CERT_PATH DOCKER_API_VERSION
+
+slot_docker() { docker --host=unix:///var/run/docker.sock --config=/run/arca "$@"; }
+
+clear_docker() {
+  local containers ids=()
+  containers=$(slot_docker ps -aq) || return 1
+  if [ -n "$containers" ]; then
+    mapfile -t ids <<<"$containers"
+    slot_docker rm -fv "${ids[@]}" || return 1
+  fi
+  slot_docker system prune -af --volumes &&
+    slot_docker volume prune -af &&
+    slot_docker builder prune -af
+}
+
+stop_job() {
+  printf "arca-runner-pool: could not clear the slot's %s before the job\n" "$1" >&2
+  # An ordinary failed step still allows always() steps. Runner.Worker launches this shell directly.
+  kill -KILL "$PPID"
+  exit 1
+}
+
+clear_docker >/dev/null 2>&1 || stop_job 'Docker store'
+# The runner has passwordless sudo, so the hook can remove files a job wrote as root too.
+sudo -n /usr/bin/find /opt/hostedtoolcache /var/cache/pool -xdev -mindepth 1 -delete >/dev/null 2>&1 ||
+  stop_job 'tool or dependency cache'
+HOOK
+}
 
 # Docker's remove can fail because a container is already gone. Check that no old container can write to the stores.
 slot_remove_containers() {
@@ -707,7 +744,7 @@ slot_clear_caches() {
   fi
 }
 
-# Takes away the job's containers and files. A JIT slot starts its next job with empty stores by default.
+# Takes away the job's containers and files when the runner exits.
 slot_reap() {
   local slot=$1 dir runner daemon
   dir=$(slot_dir "$slot")
@@ -832,11 +869,12 @@ persistent_look() {
     read -r peak cpu_mark <<<"$(slot_usage "$slot")"
     set_state "$slot" busy "$name ${job:+job \"$job\"}"
   elif [ "$begun" -le "$recorded" ] && [ "$ended" -gt 0 ] && [ "$updating" != 1 ]; then
-    # While it waits for its next job, the persistent runner keeps its caches under their budgets.
     if [ "$(cut -f1 "$POOL_RUN/slots/$slot" 2>/dev/null)" = busy ]; then
       set_state "$slot" idle "$name"
-      slot_trim_docker "$slot" "$daemon"
-      slot_trim_dependencies "$slot"
+      if slot_keeps_caches; then
+        slot_trim_docker "$slot" "$daemon"
+        slot_trim_dependencies "$slot"
+      fi
     fi
   fi
 }
@@ -1006,12 +1044,18 @@ slot_begin() {
   home=()
   [ -z "$layered" ] || home=(-v "$dir/layer/home:/home/runner")
   if [ -n "$REG" ]; then
+    local hook_args=()
+    if ! slot_keeps_caches; then
+      hook_args=(-e ACTIONS_RUNNER_HOOK_JOB_STARTED=/run/arca/job-started.sh
+        -v "$POOL_RUN/job-started.sh:/run/arca/job-started.sh:ro")
+    fi
     # The persistent runner: its registration is mounted read-only from the slot's root-only folder and copied into
     # the runner's home, where run.sh reads it; run.sh then takes job after job until the container is stopped.
     # shellcheck disable=SC2016
     if ! docker run -d --name "$runner" --label "arca.pool=$POOL_NAME" \
       --cgroup-parent "$slice" --network "container:$daemon" \
       -e DOCKER_HOST=unix:///var/run/docker.sock \
+      "${hook_args[@]}" \
       -e RUNNER_TOOL_CACHE=/opt/hostedtoolcache -e POOL_CACHE_DIR=/var/cache/pool \
       -v "$(slot_registration "$slot"):/run/arca/registration:ro" \
       -v "$dir/sock:/var/run" "${home[@]}" -v "$dir/work:/home/runner/_work" \
@@ -1895,6 +1939,10 @@ pool() {
   mkdir -p "$POOL_STATE/slots" "$POOL_LOGS" "$POOL_RUN/slots" "$POOL_RUN/tmp" "$POOL_RUN/jit" "$POOL_RUN/retire"
   chmod 700 "$POOL_RUN" "$POOL_RUN/tmp" "$POOL_RUN/jit"
   rm -f "${POOL_RUN:?}"/slots/* "${POOL_RUN:?}"/jit/* "${POOL_RUN:?}/jobs" "${POOL_RUN:?}/failures" "${POOL_RUN:?}/updates" "${POOL_RUN:?}/backoff" "${POOL_RUN:?}/backoff-until" "${POOL_RUN:?}/plain-home" "${POOL_RUN:?}"/tmp/* "${POOL_RUN:?}"/retire/*
+  if [ -n "$REG" ] && ! slot_keeps_caches && ! write_job_started_hook; then
+    say "registration-token mode: the job-started cache cleanup hook could not be installed"
+    return 1
+  fi
   load_pool_id
   JOBS_HEADER=$(printf 'finished\tslot\tclass\tlabels\tjob\tresult\tseconds\tpeak_memory_bytes\tcpu_seconds\trunner')
   [ -s "$POOL_LOGS/jobs.tsv" ] || printf '%s\n' "$JOBS_HEADER" >"$POOL_LOGS/jobs.tsv"
@@ -1974,7 +2022,9 @@ pool() {
   # In registration-token mode the pool has none and asks GitHub nothing: each runner registers and connects itself.
   local pause=0 verdict
   if [ -n "$REG" ]; then
-    GROUP_NOTE="${GROUP_NAME:+runner group \"$GROUP_NAME\", }registration-token mode: one persistent runner per slot, registered once, which keeps its container, work directory and caches between jobs"
+    local kept='its container and work directory between jobs, with caches cleared before each job'
+    if slot_keeps_caches; then kept='its container, work directory and caches between jobs'; fi
+    GROUP_NOTE="${GROUP_NAME:+runner group \"$GROUP_NAME\", }registration-token mode: one persistent runner per slot, registered once, which keeps $kept"
     # The default group is taken, as an organisation without others has no choice, and said in every status block:
     # every repository it admits can send jobs to these runners.
     if [ "${GROUP_NAME,,}" = default ]; then

@@ -22,7 +22,7 @@ use std::collections::VecDeque;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -4818,6 +4818,93 @@ fn mode(pool: &Pool, path: &str) -> u32 {
         & 0o777
 }
 
+#[test]
+fn a_persistent_runner_clears_job_cache_residue_unless_keeping_is_enabled() {
+    for keep in [false, true] {
+        let scratch = scratch_dir();
+        let github = Github::start(&scratch, &format!("/orgs/{ORG}"));
+        github.state().registration_token = Some(REGISTRATION_TOKEN.to_string());
+        let mut pool = registration_pool(1, |settings| {
+            if keep {
+                settings["keepBetweenJobs"] = json!(true);
+            }
+        });
+        pool.secret("GITHUB_REGISTRATION_TOKEN", REGISTRATION_TOKEN);
+        pool.start(&github);
+        github.queue(&["arca"], "write caches", 0.1);
+        wait_for(&pool, "the first job wrote its caches", || {
+            pool.jobs().len() == 1
+        });
+        github.queue(&["arca"], "read caches", 0.1);
+        wait_for(&pool, "the same runner checked its caches", || {
+            pool.jobs().len() == 2
+        });
+        let expected = if keep { "7" } else { "0" };
+        assert_eq!(pool.read("docker/pool1-s0.residue").trim(), expected);
+        assert!(pool.jobs().iter().all(|job| job[5] == "Succeeded"));
+        assert_eq!(github.state().registered.len(), 1);
+        let calls = pool.read("docker/calls.log");
+        let mut starts = calls
+            .lines()
+            .filter(|line| line.starts_with("run -d --name pool1-s0-run "));
+        let start = starts.next().expect("one persistent runner");
+        assert!(starts.next().is_none(), "{calls}");
+        assert_eq!(
+            start.contains("-e ACTIONS_RUNNER_HOOK_JOB_STARTED=/run/arca/job-started.sh "),
+            !keep
+        );
+        assert_eq!(
+            start.contains("/run/job-started.sh:/run/arca/job-started.sh:ro "),
+            !keep
+        );
+        if !keep {
+            assert_eq!(mode(&pool, "run/job-started.sh"), 0o555);
+            let owner = |path| fs::metadata(pool.dir.join(path)).expect(path).uid();
+            assert_eq!(owner("run/job-started.sh"), owner("run"));
+        }
+        assert_eq!(pool.stop(), Some(0));
+        let _ = fs::remove_dir_all(scratch);
+    }
+}
+
+#[test]
+fn a_failed_job_started_hook_prevents_steps_on_a_persistent_runner() {
+    let scratch = scratch_dir();
+    let github = Github::start(&scratch, &format!("/orgs/{ORG}"));
+    github.state().registration_token = Some(REGISTRATION_TOKEN.to_string());
+    let mut pool = registration_pool(1, |_| {});
+    pool.secret("GITHUB_REGISTRATION_TOKEN", REGISTRATION_TOKEN);
+    pool.start(&github);
+    github.queue(&["arca"], "write caches", 0.1);
+    wait_for(&pool, "the first job wrote its caches", || {
+        pool.jobs().len() == 1
+    });
+
+    let refused = pool.dir.join("docker/refuse-hook-cleanup");
+    fs::write(&refused, "").expect("make the daemon refuse cleanup");
+    github.queue(&["arca"], "read caches", 0.1);
+    wait_for(&pool, "the job failed at startup", || {
+        pool.jobs().len() == 2
+    });
+    assert_eq!(pool.jobs()[1][5], "Failed");
+    assert!(!pool.dir.join("docker/pool1-s0.residue").exists());
+    assert!(
+        pool.read("docker/containers/pool1-s0-run/log")
+            .contains("could not clear the slot's Docker store before the job")
+    );
+
+    fs::remove_file(refused).expect("allow the next hook to clean the slot");
+    github.queue(&["arca"], "read caches", 0.1);
+    wait_for(&pool, "the next job started with clean stores", || {
+        pool.jobs().len() == 3
+    });
+    assert_eq!(pool.jobs()[2][5], "Succeeded");
+    assert_eq!(pool.read("docker/pool1-s0.residue").trim(), "0");
+    assert_eq!(github.state().registered.len(), 1);
+    assert_eq!(pool.stop(), Some(0));
+    let _ = fs::remove_dir_all(scratch);
+}
+
 /// The person's policy forbids a key that can register runners anywhere in the organisation. An owner makes one
 /// registration token instead; the pool registers each slot once with it, as a persistent runner in the named group
 /// with the class's labels, keeps each runner's registration where only root reads it, deletes the token, and asks
@@ -4977,7 +5064,7 @@ fn a_registration_token_github_refuses_is_said_and_deleted_after_its_hour_and_th
     // The default group is taken, for an organisation that has no other, and said in every status block.
     let mut pool = registration_pool(1, |settings| settings["runnerGroup"] = json!("Default"));
     pool.start(&github);
-    let warning = "runner group \"Default\", registration-token mode: one persistent runner per slot, registered once, which keeps its container, work directory and caches between jobs, WARNING: the default runner group: every repository it admits can send jobs to these persistent runners; a group limited to selected repositories is safer";
+    let warning = "runner group \"Default\", registration-token mode: one persistent runner per slot, registered once, which keeps its container and work directory between jobs, with caches cleared before each job, WARNING: the default runner group: every repository it admits can send jobs to these persistent runners; a group limited to selected repositories is safer";
     wait_for(&pool, "the default group's warning at the start", || {
         pool.output()
             .contains(&format!("registering runners in {warning}"))

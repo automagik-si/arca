@@ -4,9 +4,10 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 
 ## Unreleased
 
-GitHub runner pool slots in `jit` mode start each job with an empty Docker store, tool cache and dependency cache.
-Jobs pull images and set up tools again. Set `keepBetweenJobs: true` at create to keep reusing caches within their
-shares. The persistent `registration-token` mode keeps its per-slot state.
+GitHub runner pool slots start each job with clean Docker, tool and dependency caches. `jit` resets them after
+each job. `registration-token` clears them with a job-started hook on the same persistent runner. Later jobs on
+that runner can still be affected by changes to its files. Jobs pull images and set up tools again. Set
+`keepBetweenJobs: true` at create to reuse caches within their shares in either mode.
 
 Arca can now take an Incus snapshot of a service's instance together with each custom volume it mounts, under one
 name, without stopping or starting it; restore the parts it names on a stopped instance; and remove them. A disk that
