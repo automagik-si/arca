@@ -80,7 +80,8 @@ impl Rig {
             (PROJECT, "stray", "", ""),
             (PROJECT, "imported", "adopt-imported", ""),
             (ADOPTION, "old", "adopt-old", ""),
-            (TENANT, "app", "service-app", "app-data"),
+            (TENANT, "app", "t-abcdefgh-service-app", "app-data"),
+            (TENANT, "alien", "t-zzzzzzzz-service-alien", "alien-data"),
             (ELSEWHERE, "far", "service-far", ""),
         ] {
             let status = if matches!(name, "cold" | "mixed") {
@@ -112,7 +113,8 @@ impl Rig {
             (PROJECT, "web-logs", "service-web"),
             (PROJECT, "cold-data", "service-cold"),
             (PROJECT, "db-data", "service-db"),
-            (TENANT, "app-data", "service-app"),
+            (TENANT, "app-data", "t-abcdefgh-service-app"),
+            (TENANT, "alien-data", "t-zzzzzzzz-service-alien"),
         ] {
             let body = json!({ "config": { MARK: mark } });
             fake.add_volume(project, "pool1", volume, body);
@@ -470,7 +472,7 @@ fn a_project_that_refuses_snapshots_refuses_the_first_part_and_nothing_is_left()
 }
 
 #[test]
-fn every_new_write_refuses_a_target_that_is_not_a_service_of_the_nodes_own_project_before_any_request()
+fn every_new_write_refuses_a_target_that_is_not_a_service_of_the_nodes_or_a_tenants_project_before_any_request()
  {
     let rig = Rig::new(true);
     let cases = [
@@ -479,7 +481,6 @@ fn every_new_write_refuses_a_target_that_is_not_a_service_of_the_nodes_own_proje
             "far",
             "the project is outside the kernel's family",
         ),
-        (TENANT, "app", "a tenant's instance is not snapshotted here"),
         (
             ADOPTION,
             "old",
@@ -493,6 +494,11 @@ fn every_new_write_refuses_a_target_that_is_not_a_service_of_the_nodes_own_proje
         (
             PROJECT,
             "stray",
+            "the instance is not a service's that Arca made",
+        ),
+        (
+            TENANT,
+            "alien",
             "the instance is not a service's that Arca made",
         ),
     ];
@@ -522,6 +528,12 @@ fn every_new_write_refuses_a_target_that_is_not_a_service_of_the_nodes_own_proje
             (
                 "snapshot_with_volumes",
                 c.snapshot_with_volumes(&seen, s)
+                    .map(|_| ())
+                    .map_err(|f| f.error),
+            ),
+            (
+                "snapshot_own_volumes",
+                c.snapshot_own_volumes(&seen, s)
                     .map(|_| ())
                     .map_err(|f| f.error),
             ),
@@ -588,4 +600,102 @@ fn an_instance_made_again_since_it_was_read_is_refused() {
         Err(IncusError::Refused("the snapshot name is not plain".into()))
     );
     assert!(rig.fake.writes().is_empty());
+}
+
+#[test]
+fn an_update_snapshot_takes_the_services_own_volumes_and_never_the_instance() {
+    let rig = Rig::new(true);
+    let seen = rig.seen(PROJECT, "web");
+    let taken = rig
+        .changer
+        .snapshot_own_volumes(&seen, "pre-update-1")
+        .expect("taken");
+    let parts: Vec<SnapshotPart> = taken.taken.iter().map(|t| t.part.clone()).collect();
+    assert_eq!(parts, [volume("web-data"), volume("web-logs")]);
+    assert!(
+        taken
+            .not_taken
+            .iter()
+            .any(|not| not.device == "host" && not.why.contains("path of the host"))
+    );
+    assert_eq!(
+        rig.writes(),
+        [
+            format!("POST {}?project={PROJECT}", volume_snapshots("web-data")),
+            format!("POST {}?project={PROJECT}", volume_snapshots("web-logs")),
+        ]
+    );
+    assert!(rig.get(&instance_snapshot("web", "pre-update-1")).is_none());
+    assert_eq!(rig.changer.instance_snapshots(&seen), Ok(vec![]));
+
+    // A mounted volume that is not the service's own is named, and not taken.
+    let mixed = rig.seen(PROJECT, "mixed");
+    let taken = rig
+        .changer
+        .snapshot_own_volumes(&mixed, "pre-update-1")
+        .expect("nothing to take");
+    assert!(taken.taken.is_empty());
+    assert_eq!(
+        taken.not_taken,
+        [NotTaken {
+            device: "db-data".into(),
+            why: "it is not this service's own volume",
+        }]
+    );
+}
+
+#[test]
+fn the_snapshots_an_instance_holds_are_listed_by_name() {
+    let rig = Rig::new(true);
+    let seen = rig.seen(PROJECT, "cold");
+    assert_eq!(rig.changer.instance_snapshots(&seen), Ok(vec![]));
+    rig.changer
+        .snapshot_with_volumes(&seen, "one")
+        .expect("taken");
+    rig.changer
+        .snapshot_with_volumes(&seen, "two")
+        .expect("taken");
+    assert_eq!(
+        rig.changer.instance_snapshots(&seen),
+        Ok(vec!["one".to_string(), "two".to_string()])
+    );
+}
+
+#[test]
+fn a_tenants_service_volume_is_snapshotted_restored_and_removed_in_its_own_project() {
+    let rig = Rig::new(true);
+    let seen = rig.seen(TENANT, "app");
+    let taken = rig
+        .changer
+        .snapshot_own_volumes(&seen, "pre-update-1")
+        .expect("taken");
+    assert_eq!(taken.taken.len(), 1);
+    assert_eq!(taken.taken[0].part, volume("app-data"));
+    assert!(
+        rig.get(&format!(
+            "{}/pre-update-1?project={TENANT}",
+            volume_snapshots("app-data")
+        ))
+        .is_some()
+    );
+    // A tenant's project that does not let it hold snapshots refuses it as Incus does.
+    let closed = Rig::new(false);
+    let refused = closed
+        .changer
+        .snapshot_own_volumes(&closed.seen(TENANT, "app"), "pre-update-1")
+        .expect_err("refused");
+    assert!(
+        matches!(&refused.error, IncusError::Status { message, .. } if message.contains("doesn't allow for snapshot creation")),
+        "{refused}"
+    );
+    rig.changer
+        .remove_volume_snapshot(&seen, "pool1", "app-data", "pre-update-1")
+        .expect("removed");
+    assert!(
+        rig.get(&format!(
+            "{}/pre-update-1?project={TENANT}",
+            volume_snapshots("app-data")
+        ))
+        .is_none()
+    );
 }

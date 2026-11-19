@@ -545,6 +545,8 @@ mod room_at_propose;
 mod run_tmpfs;
 #[path = "tenants/template_binding.rs"]
 mod template_binding;
+#[path = "tenants/update_snapshot.rs"]
+mod update_snapshot;
 
 /// The listings of instances with their live state the fake was asked for.
 fn listings_with_state(fake: &FakeIncus) -> usize {

@@ -6,8 +6,8 @@
 //! renames or reconfigures an instance, never forces a stop, and refuses a project outside the kernel family it was built
 //! with before any request. Whether the instance is the kernel's own is the caller's check, made on the row this module
 //! read. The one exception is a service's snapshots ([`StateChanger::snapshot_with_volumes`] and the writes beside it):
-//! they take, restore and remove Incus snapshots of a service instance of the node's own service project and of the
-//! custom volumes it mounts, check the instance's mark and each volume's themselves, and send no stop and no start.
+//! they take, restore and remove Incus snapshots of a service instance of the node's own service project or of a tenant's,
+//! and of the custom volumes it mounts, check the instance's mark and each volume's themselves, and send no stop and no start.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -191,8 +191,10 @@ impl StateChanger {
 
     /// Sends one state change for the instance `seen` was read from, waits for its operation and reads the instance back.
     /// A stop and a restart are graceful: Incus gives the instance [`GRACE_SECONDS`] to shut down and fails the operation
-    /// after that, leaving it running. The instance is read again first, and one that was recreated since `seen` is refused
-    /// before any write. Returns the instance as the read-back shows it.
+    /// after that, leaving it running. The instance is read again first, and one that was recreated since `seen`, or whose
+    /// owner's mark changed, is refused before any write. A read-back that shows another instance or another mark is
+    /// [`IncusError::AppliedUnconfirmed`]: the change was sent, and what it landed on is not the instance that was asked
+    /// for. Returns the instance as the read-back shows it.
     pub fn change(
         &self,
         seen: &InstanceState,
@@ -202,6 +204,9 @@ impl StateChanger {
         let fresh = self.read(&seen.project, &seen.name)?;
         if fresh.uuid != seen.uuid || fresh.kind != seen.kind {
             return Err(refused("the instance was recreated since it was read"));
+        }
+        if fresh.own_config.get(KERNEL_ENTRY_KEY) != seen.own_config.get(KERNEL_ENTRY_KEY) {
+            return Err(refused("the instance's owner changed since it was read"));
         }
         let url = state_url(&seen.project, &seen.name)?;
         let body = match action {
@@ -213,26 +218,41 @@ impl StateChanger {
         let envelope = checked_envelope(self.send("PUT", &url, Some(&body))?)?;
         self.wait_for(&envelope)?;
         let after = self.read(&seen.project, &seen.name)?;
+        // The change was sent and its operation ended: whatever the read-back shows, it is not a refusal. Another
+        // instance, or another owner's mark, is not the one that was asked for, and its state is not handed back as if
+        // it were. The target names the instance asked for; the uuid is the one the read-back showed.
+        let unconfirmed = |reason: &str| {
+            IncusError::AppliedUnconfirmed(Box::new(crate::read::Unconfirmed {
+                target: crate::read::Target {
+                    kind: arca_kernel::ownership::IncusKind::Instance,
+                    project: seen.project.clone(),
+                    parent: None,
+                    name: seen.name.clone(),
+                    uuid: seen.uuid.clone(),
+                },
+                uuid: after.uuid.clone(),
+                owner: None,
+                reason: reason.to_string(),
+            }))
+        };
+        if after.uuid != seen.uuid || after.kind != seen.kind {
+            return Err(unconfirmed(
+                "another instance took the instance's place while its state changed",
+            ));
+        }
+        if after.own_config.get(KERNEL_ENTRY_KEY) != seen.own_config.get(KERNEL_ENTRY_KEY) {
+            return Err(unconfirmed(
+                "the instance's owner changed while its state changed",
+            ));
+        }
         let wanted = match action {
             StateAction::Start | StateAction::Restart => after.is_running(),
             StateAction::Stop => after.is_stopped(),
         };
         if !wanted {
-            return Err(IncusError::AppliedUnconfirmed(Box::new(
-                crate::read::Unconfirmed {
-                    target: crate::read::Target {
-                        kind: arca_kernel::ownership::IncusKind::Instance,
-                        project: seen.project.clone(),
-                        parent: None,
-                        name: seen.name.clone(),
-                        uuid: after.uuid.clone(),
-                    },
-                    uuid: after.uuid.clone(),
-                    owner: None,
-                    reason: "the read-back does not show the state the change asked for"
-                        .to_string(),
-                },
-            )));
+            return Err(unconfirmed(
+                "the read-back does not show the state the change asked for",
+            ));
         }
         Ok(after)
     }
@@ -356,7 +376,10 @@ impl StateChanger {
     pub fn restore_snapshot(&self, seen: &InstanceState, snapshot: &str) -> Result<(), IncusError> {
         self.allow(&seen.project)?;
         let fresh = self.read(&seen.project, &seen.name)?;
-        if fresh.uuid != seen.uuid || fresh.kind != seen.kind {
+        if fresh.uuid != seen.uuid
+            || fresh.kind != seen.kind
+            || fresh.own_config.get(KERNEL_ENTRY_KEY) != seen.own_config.get(KERNEL_ENTRY_KEY)
+        {
             return Err(refused("the instance was recreated since it was read"));
         }
         if !fresh.is_stopped() {
@@ -457,17 +480,101 @@ impl StateChanger {
                     .map_err(early(part.clone()))?;
             }
         }
+        let parts: Vec<SnapshotPart> = std::iter::once(SnapshotPart::Instance)
+            .chain(volumes)
+            .collect();
+        let taken = self.take_parts(&fresh, snapshot, parts)?;
+        Ok(InstanceSnapshot {
+            name: snapshot.to_string(),
+            taken,
+            not_taken,
+        })
+    }
+
+    /// Snapshots the custom volumes of the service instance `seen` that carry its own mark, under the one name `snapshot`,
+    /// and not the instance itself: Incus 7.6 refuses to rebuild an instance that holds a snapshot, and a custom volume's
+    /// snapshot does not stand in the way of a rebuild. It sends no stop and no start. Every check is made before the
+    /// first write, as [`StateChanger::snapshot_with_volumes`] makes them; a mounted volume that is not the service's own
+    /// is named as not taken, by its volume name, as is every disk that is not a custom volume. When a volume fails, the
+    /// ones already taken are removed again. A service with no volume of its own answers no part taken.
+    pub fn snapshot_own_volumes(
+        &self,
+        seen: &InstanceState,
+        snapshot: &str,
+    ) -> Result<InstanceSnapshot, Box<PartFailure>> {
+        let early = |part: SnapshotPart| move |error| PartFailure::before(part, error);
+        named(snapshot).map_err(early(SnapshotPart::Instance))?;
+        let (fresh, metadata) = self
+            .owned_service(seen)
+            .map_err(early(SnapshotPart::Instance))?;
+        let (volumes, mut not_taken) = disks(&metadata);
+        let mark = fresh.own_config[KERNEL_ENTRY_KEY].clone();
+        let mut own = Vec::new();
+        for part in volumes {
+            if let SnapshotPart::Volume { pool, volume } = &part {
+                match self.volume_of(&fresh.project, &mark, pool, volume) {
+                    Ok(()) => own.push(part),
+                    Err(IncusError::Refused(_)) => not_taken.push(NotTaken {
+                        device: volume.clone(),
+                        why: "it is not this service's own volume",
+                    }),
+                    Err(error) => return Err(PartFailure::before(part.clone(), error)),
+                }
+            }
+        }
+        let taken = self.take_parts(&fresh, snapshot, own)?;
+        Ok(InstanceSnapshot {
+            name: snapshot.to_string(),
+            taken,
+            not_taken,
+        })
+    }
+
+    /// The names of the Incus snapshots the instance `seen` holds, in the order Incus lists them. It reads the list of
+    /// names, not the recursive one: Incus 7.6 leaves a snapshot it cannot render out of the recursive list and still
+    /// answers it with success, while the names come from its database alone and a failure to read them is an error.
+    pub fn instance_snapshots(&self, seen: &InstanceState) -> Result<Vec<String>, IncusError> {
+        self.allow(&seen.project)?;
+        object_url(&seen.project, &seen.name)?;
+        let url = format!(
+            "/1.0/instances/{}/snapshots?project={}",
+            seen.name, seen.project
+        );
+        let listed = checked_metadata(self.send("GET", &url, None)?)?;
+        let rows = listed
+            .as_array()
+            .ok_or_else(|| decode("the snapshot list is not a list"))?;
+        let prefix = format!("/1.0/instances/{}/snapshots/", seen.name);
+        rows.iter()
+            .map(|row| {
+                row.as_str()
+                    .and_then(|url| url.strip_prefix(&prefix))
+                    .map(|name| name.split('?').next().unwrap_or(name).to_string())
+                    .filter(|name| !name.is_empty())
+                    .ok_or_else(|| decode("a snapshot is not named by its address"))
+            })
+            .collect()
+    }
+
+    /// Takes each part's snapshot in the order given. When a part fails, the parts already taken are removed again, the
+    /// last first, and the failure names the part, what was removed and what could not be.
+    fn take_parts(
+        &self,
+        fresh: &InstanceState,
+        snapshot: &str,
+        parts: Vec<SnapshotPart>,
+    ) -> Result<Vec<TakenPart>, Box<PartFailure>> {
         let mut taken: Vec<TakenPart> = Vec::new();
-        for part in std::iter::once(SnapshotPart::Instance).chain(volumes) {
+        for part in parts {
             let sent = match &part {
-                SnapshotPart::Instance => self.snapshot_instance(&fresh, snapshot),
+                SnapshotPart::Instance => self.snapshot_instance(fresh, snapshot),
                 SnapshotPart::Volume { pool, volume } => {
                     self.send_volume_snapshot(&fresh.project, pool, volume, snapshot)
                 }
             };
             if let Err(error) = sent {
                 let done: Vec<SnapshotPart> = taken.iter().map(|t| t.part.clone()).collect();
-                let (done, left) = self.remove_parts(&fresh, snapshot, &done);
+                let (done, left) = self.remove_parts(fresh, snapshot, &done);
                 return Err(Box::new(PartFailure {
                     part,
                     error,
@@ -480,11 +587,7 @@ impl StateChanger {
                 at_ms: now_ms(),
             });
         }
-        Ok(InstanceSnapshot {
-            name: snapshot.to_string(),
-            taken,
-            not_taken,
-        })
+        Ok(taken)
     }
 
     /// Puts the parts `parts` of the stopped service instance `seen` back to their snapshot `snapshot`: the instance first
@@ -669,7 +772,10 @@ impl StateChanger {
         registry: Option<&crate::write::RegistryCredential>,
     ) -> Result<(), IncusError> {
         let fresh = self.read(&seen.project, &seen.name)?;
-        if fresh.uuid != seen.uuid || fresh.kind != seen.kind {
+        if fresh.uuid != seen.uuid
+            || fresh.kind != seen.kind
+            || fresh.own_config.get(KERNEL_ENTRY_KEY) != seen.own_config.get(KERNEL_ENTRY_KEY)
+        {
             return Err(refused("the instance was recreated since it was read"));
         }
         if !fresh.is_stopped() {
@@ -719,7 +825,10 @@ impl StateChanger {
         source: &Value,
     ) -> Result<(), IncusError> {
         let fresh = self.read(&seen.project, &seen.name)?;
-        if fresh.uuid != seen.uuid || fresh.kind != seen.kind {
+        if fresh.uuid != seen.uuid
+            || fresh.kind != seen.kind
+            || fresh.own_config.get(KERNEL_ENTRY_KEY) != seen.own_config.get(KERNEL_ENTRY_KEY)
+        {
             return Err(refused("the instance was recreated since it was read"));
         }
         if !fresh.is_stopped() {
@@ -1045,12 +1154,11 @@ impl fmt::Display for PartFailure {
     }
 }
 
-/// Refuses, before any request, an instance that is not a service's of the node's own service project as Arca made it:
-/// another project, a tenant's, an adopted one, one without a uuid, one without a service's mark, one being removed.
+/// Refuses, before any request, an instance that is not a service's of the node's own service project or of a tenant's
+/// project as Arca made it: another project, an adopted one, one without a uuid, one without a service's mark, one being
+/// removed. A tenant's project is reached only by a changer built for it, as every other write of this module is.
 fn service_target(state: &InstanceState) -> Result<(), IncusError> {
-    if arca_kernel::ownership::tenant_of_project(&state.project).is_some() {
-        return Err(refused("a tenant's instance is not snapshotted here"));
-    }
+    let tenant = arca_kernel::ownership::tenant_of_project(&state.project);
     let mark = state
         .own_config
         .get(KERNEL_ENTRY_KEY)
@@ -1062,12 +1170,17 @@ fn service_target(state: &InstanceState) -> Result<(), IncusError> {
     {
         return Err(refused("an adopted instance is not snapshotted here"));
     }
-    if state.project != crate::exec::SERVICE_PROJECT {
+    if tenant.is_none() && state.project != crate::exec::SERVICE_PROJECT {
         return Err(refused(
-            "only an instance of the node's own service project is snapshotted here",
+            "only an instance of the node's own service project or of a tenant's is snapshotted here",
         ));
     }
-    if mark.len() <= SERVICE_ENTRY_PREFIX.len() || !mark.starts_with(SERVICE_ENTRY_PREFIX) {
+    // A tenant's service is the entry `t-<id>-service-<name>`, of the tenant whose project holds it.
+    let prefix = match tenant {
+        Some(id) => format!("t-{id}-{SERVICE_ENTRY_PREFIX}"),
+        None => SERVICE_ENTRY_PREFIX.to_string(),
+    };
+    if mark.len() <= prefix.len() || !mark.starts_with(&prefix) {
         return Err(refused("the instance is not a service's that Arca made"));
     }
     if state.uuid.is_none() {

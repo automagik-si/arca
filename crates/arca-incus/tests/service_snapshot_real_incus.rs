@@ -182,19 +182,31 @@ fn a_stopped_instance_is_snapshotted_exactly_and_both_disks_come_back() {
 
 #[test]
 #[ignore = "touches a real Incus; run by hand with ARCA_REAL_INCUS_PROOF=1"]
-fn a_rebuild_from_another_image_is_undone_by_the_snapshot_taken_before_it() {
+fn a_rebuild_is_refused_past_an_instance_snapshot_and_a_volume_snapshot_undoes_what_the_new_root_wrote()
+ {
     let Some(proof) = proof() else { return };
     let image = env("ARCA_PROOF_IMAGE").expect("ARCA_PROOF_IMAGE");
     let (alias, fingerprint) = image.split_once('@').expect("<alias>@<fingerprint>");
+    let source = json!({ "type": "image", "alias": alias, "fingerprint": fingerprint });
     proof.mark("before");
     proof.power(StateAction::Stop);
-    let parts = proof.parts("arca-proof-rebuild");
+    // Incus 7.6 refuses to rebuild an instance that holds a snapshot of its own.
+    let held = proof.parts("arca-proof-held");
+    let refused = proof.changer.rebuild_from_local(&proof.seen(), &source);
+    eprintln!("a rebuild past an instance snapshot answered {refused:?}");
+    assert!(refused.is_err(), "the rebuild is refused");
+    proof.remove("arca-proof-held", &held);
+    // A snapshot of the data volume alone does not stand in its way, and undoes what the new root wrote there.
+    let taken = proof
+        .changer
+        .snapshot_own_volumes(&proof.seen(), "arca-proof-rebuild")
+        .expect("taken");
+    eprintln!("taken {:?}, not taken {:?}", taken.taken, taken.not_taken);
+    let parts: Vec<SnapshotPart> = taken.taken.into_iter().map(|t| t.part).collect();
+    assert!(!parts.is_empty() && !parts.contains(&SnapshotPart::Instance));
     proof
         .changer
-        .rebuild_from_local(
-            &proof.seen(),
-            &json!({ "type": "image", "alias": alias, "fingerprint": fingerprint }),
-        )
+        .rebuild_from_local(&proof.seen(), &source)
         .expect("rebuilt");
     let rebuilt = proof.read_marks();
     eprintln!("after the rebuild: {rebuilt:?}");
@@ -202,7 +214,7 @@ fn a_rebuild_from_another_image_is_undone_by_the_snapshot_taken_before_it() {
     assert_eq!(rebuilt.1, "before", "the volume is kept by the rebuild");
     proof.mark("after");
     proof.restore("arca-proof-rebuild", &parts);
-    assert_eq!(proof.read_marks(), ("before".into(), "before".into()));
+    assert_eq!(proof.read_marks().1, "before", "the volume is back");
     proof.remove("arca-proof-rebuild", &parts);
 }
 

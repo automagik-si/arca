@@ -9,11 +9,25 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 Arca can now take an Incus snapshot of a service's instance together with each custom volume it mounts, under one
 name, without stopping or starting it; restore the parts it names on a stopped instance; and remove them. A disk that
 is a path of the host is listed as not snapshotted. If one part fails, the parts already taken are removed and the
-answer names the failing part. The node's service project may now hold snapshots: its owner's entry gains a
-`snapshots` step that sets `restricted.snapshots` to `allow`, written with no card the first time such a snapshot
-needs it. No verb uses this yet, so nothing changes on a node by this release alone. Once a node's project holds
-snapshots, `service_update` takes its own pre-update snapshot there and restores it on a rollback, and each update
-keeps one snapshot until a later release removes old ones.
+answer names the failing part. The node's service project and each tenant's project may now hold snapshots: the
+owner's entry (the tenant's entry, for a tenant's project) gains a `snapshots` step that sets `restricted.snapshots`
+to `allow`, written with no card the first time a snapshot needs it.
+
+`service_update` now keeps the service's data safe across a failed update. Before the rebuild it snapshots the
+service's data volume, `pre-update-<time>`, and never its instance: Incus 7.6 refuses to rebuild an instance that
+holds a snapshot, while a volume's snapshot does not stop a rebuild. A rollback rebuilds the old digest, then restores
+the volume to that snapshot, so what the new version wrote there is undone. Before, an update in a project Arca made
+rolled back with no snapshot at all and left the new version's writes in the data volume. The first update whose
+snapshot the project refuses gives the project its `snapshots` step, in the node's service project and in a tenant's
+alike. A service with volumes of its own is never rebuilt without their snapshot. A rollback writes only to the
+instance the update began with, starts the old version on a root it could not rebuild only when neither image was
+fetched, and a volume restore is on file from before its first volume until its last, so one that fails part way is
+finished by the next update before it does anything else. One update of a service runs at a time, and holds the
+service before it reads what an earlier one left; a rollback rebuilds the root the service ran, not a digest saved just
+before it failed, and an answer never says the service runs a digest its record names while its root runs another.
+Each update
+keeps its volume snapshot until a later release removes old ones. An instance that already holds an Incus snapshot is
+refused before anything is changed, in words that name each snapshot; Arca has no step that removes them yet.
 
 A `system` container template's `appUpdate` may name several `components` of one instance, in the order they are
 updated, each with its own `update`, `health` and `version` under the same rules as the single form, and either form
@@ -55,8 +69,8 @@ alone, the version with requests from the node, so Claude Code opens the stream 
 
 `service_labels_set` merges a service's plain labels, with null removing a key. `service_status` and `service_list`
 rows now include the label map. Writes use ownership checks, If-Match and read-back outside the effect journal;
-uncertain answers carry an explicit code. Label keeping during snapshot rollback is best effort and never prevents
-the rollback or changes its result.
+uncertain answers carry an explicit code. A failed update's rollback restores only the data volume, so labels stay
+as they were written.
 Both reads are marked as carrying untrusted text because labels are caller data.
 
 `tenant_image_import` uses an approved card to copy an exact image from the node's store into a tenant and add its

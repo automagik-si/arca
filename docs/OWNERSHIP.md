@@ -133,16 +133,10 @@ claims that the change was not applied.
 
 The whole string map lives in the one exact instance config key `user.arca.labels`. Only an already matched service
 instance gets this exact allowance in `classify_object`; no prefix is exempted, and adoption's `classify` is unchanged.
-Reconcile, reconfigure and image rebuild preserve the key because it is outside desired state. Failed-update snapshot
-rollback keeps labels best effort without taking the node write gate: it reads the snapshot's label value, captures
-the current map immediately before restore, then repairs only this key under If-Match and reads it back. Put-back
-writes only while the stored value is exactly the snapshot's, absence included; a different value is left alone as
-a post-restore write, including after re-reading a 412. An identical rewrite cannot be distinguished by this rule.
-A label write that lands while the restore itself is running can be lost; this rare metadata window is accepted.
-A failed label pre-read still runs the restore; a failed label repair after a successful restore leaves the rollback
-successful. Each failure logs one line naming the service without label values; labels may then read as of the
-snapshot. Label keeping never prevents a rollback or changes the restore's result. When keeping succeeds, labels
-written before restore survive; every other key still restores from the snapshot. Status and list read it
+Reconcile, reconfigure and image rebuild preserve the key because it is outside desired state. A failed
+`service_update` rolls back by rebuilding the old root and restoring only the service's custom volumes (Rule 81): it
+restores no instance snapshot, so it never puts the instance's config back, and labels written before or during the
+update stay as they are, with every other config key. Status and list read it
 from the instance, or show an empty map when none is present. Imported and adopted services may show existing labels,
 but label writes remain refused under the existing read-only rule. Recorded host programs show an empty map and take no
 label writes. Labels are plain data, never secrets and never rendered into configuration. A `hold` key has no special
@@ -160,9 +154,7 @@ Source: `crates/arca/src/service_labels.rs`; tests `service_labels_merge_remove_
 `label_writes_obey_bound_tenants_and_service_limits_before_the_handler`,
 `adopted_services_show_labels_but_still_refuse_label_writes`,
 `labels_survive_reconfigure_and_hold_changes_no_boot_policy`,
-`labels_set_before_and_during_a_failed_update_survive_snapshot_rollback`,
-`rollback_still_succeeds_when_label_pre_read_fails`, `rollback_still_succeeds_when_label_put_back_fails`,
-`rollback_preserves_a_post_restore_label_writer_after_412`, and
+`labels_set_before_and_during_a_failed_update_survive_its_rollback`, and
 `an_update_rebuilds_from_the_new_digest_keeps_the_data_and_records_the_digest`.
 
 ## Writes
@@ -341,7 +333,8 @@ on a project create only to the value the kernel pins it at, with one exception:
 bridges the project may use and is checked as Rule 41 states. Any other value is refused, and so is a key the kernel does not pin,
 whatever its value, so `restricted.containers.privilege` set to `allow`, `features.images` set to `false` and `features.networks`
 set to anything are all refused. A project patch may not change any such key, whatever its value, and the refusal is made before
-any request; the one exception is the widening of the service project by the entry that owns it (Rule 55). A project is named by its own name. Whatever the provider allows, no request can PATCH a project: `exchange`, the one
+any request; the exceptions are the widening of the service project by the entry that owns it (Rule 55) and a
+tenant's entry setting `restricted.snapshots=allow` on its own project (Rule 62). A project is named by its own name. Whatever the provider allows, no request can PATCH a project: `exchange`, the one
 function every request of the read client and the writer passes through, refuses a PATCH whose path is `/1.0/projects` or under
 it, percent-decoded, with `IncusError::Refused("a project is never sent a PATCH")`, before it connects, so no byte reaches the
 socket (Rule 43).
@@ -963,7 +956,7 @@ is exactly the entry an earlier kernel wrote.
 | `net-arcak-svc` | `virtualMachines: <cap>` | the first virtual machine, and any later virtual-machine create that finds the configured cap changed | sets `limits.virtual-machines` to the cap |
 | `bridged-arcak-svc` | `virtualMachines`, `cpu`, `memory`, `disk` | a virtual-machine create that finds the configured caps changed | sets `limits.virtual-machines`, and while `managed` is unset `limits.cpu`, `limits.memory` and `limits.disk`, to the caps |
 | `net-arcak-svc` | `hostBridges: true` | the first virtual machine on a host bridge | sets `restricted.devices.nic` to `allow`; unsets `restricted.networks.access` |
-| either owner | `snapshots: true` | the first snapshot of a service's instance with its volumes (Rule 81) | sets `restricted.snapshots` to `allow` |
+| either owner | `snapshots: true` | the first update whose snapshot of a service's volume the project refuses (Rule 81) | sets `restricted.snapshots` to `allow` |
 
 The caps Incus holds follow the node's configured caps, for both owners alike, and nothing is set by hand. A
 virtual-machine create that has passed Arca's own cap check (Rule 58) writes the configured caps into the owner's entry when
@@ -1000,8 +993,10 @@ Source: `BridgedProject::apply` and `NetProject::apply` in `crates/arca-netproje
 `crates/arca-providers/tests/incus_provider.rs`, `each_owner_lets_its_project_hold_snapshots_once_its_entry_has_the_step`
 and `an_owner_entry_an_earlier_kernel_wrote_reads_and_writes_back_byte_for_byte` in
 `crates/arca-netproject/tests/netproject.rs`,
-`a_project_arca_let_hold_snapshots_gives_service_update_its_snapshot_and_its_restore` and
-`no_existing_verb_asks_for_the_service_project_to_hold_snapshots` in `crates/arca/tests/services/update.rs`,
+`a_project_arca_let_hold_snapshots_gives_service_update_a_volume_snapshot_and_its_restore`,
+`a_project_that_holds_no_snapshot_yet_is_given_its_step_by_the_first_update_which_restores_the_volume` and
+`only_an_update_that_snapshots_a_volume_asks_for_the_service_project_to_hold_snapshots` in
+`crates/arca/tests/services/update.rs`,
 `the_bridged_project_is_created_alone_with_no_network_or_profile_and_a_retry_skips_it` and
 `the_network_entry_widens_its_own_project_for_virtual_machines_and_host_bridges` in
 `crates/arca-netproject/tests/netproject.rs`, the two tests of Rule 54, and for the caps
@@ -1274,12 +1269,19 @@ carry the mark `net-arcak-svc`. The project is restricted like every kernel proj
 keys, each at its tighter value, which the provider admits for a tenant's entry in its own project and for nothing else:
 `restricted.devices.proxy=block`, `restricted.devices.gpu=block`, `restricted.devices.disk=managed`,
 `restricted.devices.nic=managed`, `restricted.containers.nesting=block`, `restricted.containers.privilege=unprivileged`,
-`restricted.containers.lowlevel=block` and `restricted.virtual-machines.lowlevel=block`. A scratch run never makes the
-bridge: it joins the one the node has, or the create is refused.
-Source: `Tenant::apply` and `RESTRICTIONS` in `crates/arca-netproject/src/tenant.rs`; `tenant_restriction`, `tenant_owns`
-and `prepared_create` in `crates/arca-providers/src/incus.rs`. Test
+`restricted.containers.lowlevel=block` and `restricted.virtual-machines.lowlevel=block`. The one widening a tenant's
+entry may write is the `snapshots` step the service project's owner has (Rule 55): `snapshots: true` in the entry sets
+`restricted.snapshots=allow` on its own project, at the create or by a patch, and the provider admits it for that entry
+in that project alone. Arca writes it, with no card, the first time an update's snapshot of a volume of a service in
+the tenant is refused (Rule 81). A scratch run never makes the bridge: it joins the one the node has, or the create is
+refused.
+Source: `Tenant::apply` and `RESTRICTIONS` in `crates/arca-netproject/src/tenant.rs`; `tenant_restriction`, `tenant_owns`,
+`service_snapshot_allowance` and `prepared_create` in `crates/arca-providers/src/incus.rs`; `allow_tenant_snapshots` in
+`crates/arca/src/tenants.rs`. Tests
 `a_tenant_is_one_restricted_project_on_the_managed_bridge_with_its_caps_and_profile` in
-`crates/arca/tests/tenants/admission.rs`.
+`crates/arca/tests/tenants/admission.rs`, and
+`a_tenants_failed_update_restores_its_data_volume_and_leaves_the_old_digest_running` in
+`crates/arca/tests/tenants/update_snapshot.rs`.
 
 **Rule 63.** A tenant's caps are its project's own `limits.instances`, `limits.containers`, `limits.virtual-machines`,
 `limits.cpu`, `limits.memory` and `limits.disk`. They are set at the project's create and, when the entry's caps change,
@@ -1788,9 +1790,10 @@ tests in `crates/arca/tests/tenants/image_import.rs`.
 
 **Rule 81.** A service's instance and the custom volumes it mounts are snapshotted, restored and their snapshots removed only
 through the state changer's snapshot writes, outside the desired-state journal, and only for a container or virtual machine
-of the node's own service project `arcak-svc` whose own config carries a service's mark (`service-<name>`) and no tombstone.
-A target outside the family, a tenant's project, an adoption project, an instance whose mark is an adoption's, an instance
-with no service mark and one being removed are refused from the instance the caller read, before any request; the instance
+of the node's own service project `arcak-svc`, or of a tenant's project through a changer built for that tenant, whose own
+config carries a service's mark (`service-<name>`; in a tenant's project `t-<id>-service-<name>` of that tenant) and no
+tombstone. A target outside the family, an adoption project, an
+instance whose mark is an adoption's, an instance with no service mark and one being removed are refused from the instance the caller read, before any request; the instance
 is then read again and refused when its uuid, its type or its mark changed. A volume is written only when the instance
 mounts it (its own devices laid over its profiles') and the volume's own config carries the instance's mark and no
 tombstone. The requests are a `POST .../instances/<i>/snapshots` of `{name, stateful: false}`, a
@@ -1800,15 +1803,41 @@ sends a stop or a start: the caller decides when a snapshot is taken. The call f
 every part before its first write, takes the instance and then each volume under one name, and names every other disk but
 the root (a path of the host is in no Incus snapshot); when a part fails, it removes the parts it took, the last first,
 and names the failing part and any part it could not remove. A part whose own request failed is left as Incus left it. A
-restore is not undone when a later part fails; its failure names the parts already restored. The service project holds
-snapshots only after its owner's `snapshots` step (Rule 55), which Arca writes, with no card, the first time such a
-snapshot needs it; no verb asks for one yet. Once a node has it, `service_update` takes its own pre-update snapshot of the
-instance there and restores it on a rollback, and nothing yet removes those snapshots.
+restore is not undone when a later part fails; its failure names the parts already restored. The call for a service's own
+volumes takes, under one name, each mounted volume that carries the instance's mark, and not the instance, naming every
+other volume and disk as not taken. A project holds snapshots only after its owner's `snapshots` step (Rule 55; a
+tenant's entry for a tenant's project, Rule 62), which Arca writes, with no card, the first time `service_update`'s
+snapshot is refused there, that is, refused in Incus's own words for that restriction (`doesn't allow for snapshot
+creation`). `service_update` snapshots only the service's own volumes, `pre-update-<time>`, before its rebuild, since
+Incus 7.6 refuses to rebuild an instance that holds a snapshot; a service that has volumes of its own is never rebuilt
+without their snapshot, so a project that still refuses it, or a step that cannot be written, ends the update before the
+rebuild. A name a volume already holds is taken again with a suffix only once every volume snapshotted under it was
+removed again; otherwise the update stops and names the snapshot and what was not removed. One claim per service is
+held from before anything an earlier update left is read until the call ends. A rollback sends every step only to the
+instance the update began with (uuid, kind and mark): a state change refuses another before its write, and a read-back
+that shows another is applied but unconfirmed, never a refusal; a rebuild's last read refuses another; the template's
+record is put back only while a read under the node's write gate finds that instance, and a read after it that finds
+another ends the rollback saying the settings may have reached it. It rebuilds the root the instance ran when the update
+began (the record's source, or the one a rollback's record names) and then restores each volume. It starts the old
+version on a root it could not rebuild only when both rebuilds failed on fetching their image, before Incus took a root
+away. A volume restore is on file, synced with its folder, with the snapshot, the volumes, the root's source and the
+instance's project, name, uuid and mark, from before its first volume is put back; once the last one is, it is rewritten
+as finished, which puts nothing back again, and comes off file when the service's record names the root that runs. Each
+call syncs the folder before it reads it. The next update finishes an unfinished one, once the service is stopped,
+before it takes a snapshot of its own, also for the digest the record already names, and goes on only once the record
+says finished. A record kept for another instance is removed unused. An update of an instance that
+holds an instance snapshot is refused, naming them, before any write, from the list of snapshot names (Incus's
+recursive list leaves out a snapshot it cannot render). Arca has no step that removes those snapshots yet.
 Source: `StateChanger::{snapshot_volume, restore_volume, remove_instance_snapshot, remove_volume_snapshot,
-snapshot_with_volumes, restore_with_volumes}` and `service_target` in
-`crates/arca-incus/src/lifecycle.rs`; the fake's `volume_snapshot` and `restore_volume` in `crates/arca-incus/src/fake.rs`;
-tests in `crates/arca-incus/tests/service_snapshots.rs`; by hand on a test node, the ignored tests of
-`crates/arca-incus/tests/service_snapshot_real_incus.rs`.
+snapshot_with_volumes, snapshot_own_volumes, instance_snapshots, restore_with_volumes}` and `service_target` in
+`crates/arca-incus/src/lifecycle.rs`; `Claim`, `Run::volume_snapshot`, `Run::finish_pending`, `Run::settle`, `Run::reread`,
+`Run::put_template_back` and `Run::root_back` and `Pending` in `crates/arca/src/service_update.rs`;
+the fake's `volume_snapshot`, `restore_volume` and its rebuild refusal in `crates/arca-incus/src/fake.rs`;
+tests in `crates/arca-incus/tests/service_snapshots.rs`,
+`an_instance_that_holds_a_snapshot_is_refused_before_any_change_naming_each_snapshot` in
+`crates/arca/tests/services/update.rs`, the tests of `crates/arca/tests/services/update_safety.rs` and
+`crates/arca/tests/tenants/update_snapshot.rs`; by hand on a test node, the
+ignored tests of `crates/arca-incus/tests/service_snapshot_real_incus.rs`.
 
 ## Out of scope
 

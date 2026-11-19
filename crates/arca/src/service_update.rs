@@ -4,8 +4,11 @@
 //! The steps, each journalled in [`SERVICE_UPDATES_FILE`] (an append-only file of JSON lines in the state directory,
 //! one `begin` line before anything is sent to Incus, one line per step and one `end` line; no line holds a secret):
 //!
-//! 1. the instance is stopped, when it runs, and a snapshot of it is taken where the project allows one (an Arca
-//!    project never does, so on a node as Arca makes it there is none);
+//! 1. the instance is stopped, when it runs, and each custom volume of the service's own (its data volume) is
+//!    snapshotted, `pre-update-<time>`; the instance itself is not, since Incus 7.6 refuses to rebuild an instance that
+//!    holds a snapshot, and a volume's snapshot does not stand in a rebuild's way. A project Arca makes holds no snapshot
+//!    until its owner's entry (the service project's, or the tenant's) has its `snapshots` step: the first update whose
+//!    snapshot the project refuses writes it, with no card, and takes the snapshot then;
 //! 2. its root is rebuilt from the new digest, or, for a local image, from the project's own copy of the new
 //!    fingerprint. Incus keeps the config, the devices (the data volume among them), the uuid, the secrets and the
 //!    firewall rules; only the root is the new image's;
@@ -27,17 +30,20 @@
 //! node writes its config before the one start: one interruption for the image and the settings. A failure after that
 //! write puts the old record back too, before the old version is started.
 //!
-//! A failure at any step puts the old version back: the snapshot is restored (or, in a project that does not allow
-//! snapshots, the root is rebuilt from the old digest), the old version is started when it was running, and the answer
-//! is the error and the words "rolled back". Nothing is asked of the owner: the verb is a doctor's, and works in a
-//! tenant as it does outside one. The snapshot holds the root, the config and the devices of the instance; the data
-//! volume is the service's own and is not snapshotted, so what the new version wrote there stays.
+//! An instance that already holds an Incus snapshot is refused before anything is written, naming its snapshots: the
+//! rebuild would fail in the middle of the run. Removing them is a plan of its own, on the owner's passkey card.
+//!
+//! A failure at any step puts the old version back: the root is rebuilt from the old digest, then each volume snapshot
+//! is restored, so what the new version wrote to the data volume is undone; the old version is started when it was
+//! running, and the answer is the error and the words "rolled back". The volume snapshot is kept either way. Nothing
+//! is asked of the owner: the verb is a doctor's, and works in a tenant as it does outside one.
 use super::service_reconfigure::{self, Doing, Ready, Written};
 use super::*;
 use crate::service::ServiceConfig;
-use arca_incus::{IncusError, InstanceState, StateAction, StateChanger};
+use arca_incus::{IncusError, InstanceState, SnapshotPart, StateAction, StateChanger};
 use arca_kernel::desired::Entry;
-use std::cell::Cell;
+use arca_kernel::ownership::KERNEL_ENTRY_KEY;
+use std::cell::{Cell, RefCell};
 use std::fs::{self, OpenOptions};
 use std::io::{Read as _, Write as _};
 use std::net::{SocketAddr, TcpStream};
@@ -57,6 +63,8 @@ const CONNECT_WAIT: Duration = Duration::from_secs(2);
 pub const STEP_DEADLINE: Duration = Duration::from_secs(600);
 /// A service the node cannot reach has to stay running this long (at most the call's timeout).
 const STAY_RUNNING_SECONDS: u64 = 10;
+/// How many names an update tries for its volume snapshot when earlier updates kept the ones before.
+const MAX_SNAPSHOT_NAMES: u32 = 100;
 /// The old version, started again after a rollback, is given this long to answer.
 pub const OLD_ANSWERS_SECONDS: u64 = 30;
 
@@ -282,6 +290,8 @@ struct Failure {
     why: String,
     /// Incus did not answer within its deadline: what it was asked may still be going on.
     unsettled: bool,
+    /// A rebuild that failed before it touched the root: Incus could not fetch the image.
+    root_untouched: bool,
 }
 
 impl Failure {
@@ -290,6 +300,7 @@ impl Failure {
             step,
             why: incus_words(error),
             unsettled: matches!(error, IncusError::Timeout),
+            root_untouched: false,
         }
     }
 
@@ -298,8 +309,18 @@ impl Failure {
             step,
             why,
             unsettled: false,
+            root_untouched: false,
         }
     }
+}
+
+/// Whether a rebuild failed on the image it was to fetch, which Incus does before it takes the old root away: its own
+/// words when the registry gives no image (`Failed getting remote image info`) and when the store holds none (`Image
+/// not provided for instance rebuild`). Any other failure may have come after the old root was deleted.
+fn image_not_fetched(error: &IncusError) -> bool {
+    matches!(error, IncusError::Status { message, .. }
+        if message.contains("Failed getting remote image info")
+            || message.contains("Image not provided for instance rebuild"))
 }
 
 fn incus_words(error: &IncusError) -> String {
@@ -308,6 +329,17 @@ fn incus_words(error: &IncusError) -> String {
         IncusError::Timeout => "Incus did not answer in time".to_string(),
         IncusError::Refused(why) => why.clone(),
         other => format!("Incus: {other}"),
+    }
+}
+
+/// A call's refusal in words, for a step that failed on one.
+fn call_words(error: &CallError) -> String {
+    match error {
+        CallError::Invalid(why) => why.clone(),
+        CallError::Refused { message, .. }
+        | CallError::UntrustedRefused { message, .. }
+        | CallError::RefusedWith { message, .. } => message.clone(),
+        _ => "the node could not write it".to_string(),
     }
 }
 
@@ -497,11 +529,38 @@ fn template_conflicts(args: &Value, with: bool) -> Result<(), CallError> {
     Ok(())
 }
 
-/// The refusal of `withTemplate` for the digest the service already runs: there is no rebuild to ride on.
-fn same_digest_with_template(name: &str) -> CallError {
-    refused(format!(
-        "update service {name}: the service already runs this digest, so there is no new image for withTemplate to go in with: service_reconfigure applies its template alone. Nothing was changed"
-    ))
+/// The refusal of `withTemplate` for the digest the service's record names: there is no rebuild to ride on. With a
+/// rollback's record that still says something (`pending`), the service may not run that digest, and the refusal says
+/// how to finish it, since a card for the template does not.
+fn same_digest_with_template(name: &str, pending: Option<&Pending>) -> CallError {
+    match pending {
+        Some(pending) => refused(format!(
+            "update service {name}: an earlier update's rollback left a record that is not finished: {}. A card for the template does not finish it: call service_update with this digest and without withTemplate (it finishes that first), then propose the template again. Nothing was changed",
+            pending_words(pending)
+        )),
+        None => refused(format!(
+            "update service {name}: the service already runs this digest, so there is no new image for withTemplate to go in with: service_reconfigure applies its template alone. Nothing was changed"
+        )),
+    }
+}
+
+/// What a rollback's record says, in words. Its list of the volumes put back is as last recorded: an attempt that
+/// could not write its own progress left the list before it.
+fn pending_words(pending: &Pending) -> String {
+    let root = pending.source["alias"]
+        .as_str()
+        .or_else(|| pending.source["fingerprint"].as_str())
+        .unwrap_or("the old image");
+    if pending.whole() {
+        format!("the service's root runs {root}, which its record does not name")
+    } else {
+        format!(
+            "its volumes were to go back to the snapshot {} (put back, as last recorded: {}; to put back: {}), under the root of {root}",
+            pending.snapshot,
+            volume_words(&pending.restored),
+            volume_words(&pending.parts),
+        )
+    }
 }
 
 /// What a proposal of `service_update` is held to when it is made, so the owner is never shown a card for an update
@@ -532,7 +591,7 @@ pub(super) fn check_proposal(
     };
     let scope = tenants::tenant_arg(cfg, payload, entries)?;
     let scoped = tenants::scoped_entries(entries, scope.as_ref());
-    let Some((_, config)) = service_entries(&scoped)
+    let Some((entry, config)) = service_entries(&scoped)
         .into_iter()
         .find(|(_, config)| config.name == name)
     else {
@@ -551,7 +610,14 @@ pub(super) fn check_proposal(
     let mut payload = payload.clone();
     if with {
         if !moves {
-            return Err(same_digest_with_template(name));
+            // Read for its words only: the run reads it again under the service's claim.
+            let pending = Pending::read(cfg, &entry.id.0).ok().flatten();
+            return Err(same_digest_with_template(
+                name,
+                pending
+                    .as_ref()
+                    .filter(|pending| !pending.settled(&config.source)),
+            ));
         }
         payload["changes"] =
             service_reconfigure::plan(Doing::Update, cfg, &scoped, &config, &BTreeSet::new())?
@@ -653,12 +719,241 @@ fn conflicts(args: &Value) -> Result<(), CallError> {
     Ok(())
 }
 
-/// How an update puts the old version back.
-enum Back {
-    /// The snapshot taken before the rebuild.
-    Snapshot(String),
-    /// A project that does not allow snapshots: the root is rebuilt from the old image.
-    OldImage,
+/// How an update puts the old version back: the root is rebuilt from the old image, then each volume in `volumes` is
+/// restored to the snapshot `snapshot` taken before the rebuild. A service with no volume of its own has none to restore.
+struct Back {
+    volumes: Option<(String, Vec<SnapshotPart>)>,
+}
+
+/// The file that keeps a rollback's restore of a service's volumes that did not finish, for the service entry `id`.
+fn pending_path(cfg: &NodeConfig, id: &str) -> PathBuf {
+    cfg.state_dir
+        .join(format!("service-update-restore-{id}.json"))
+}
+
+/// What a rollback left on file: the snapshot its restore puts the volumes back to, every volume it is to put back, the
+/// ones it did, the source of the root the instance runs (the old version's), and the instance it was for (its project,
+/// name, uuid and mark). It is on file before the first volume is put back. Until every volume is back the volumes may
+/// hold data of two versions, so the next update finishes the restore first, from the same snapshot, before it takes a
+/// snapshot of its own. Once every one is back the record is whole and puts nothing back again: it stays only while the
+/// service's record names another image than the root runs (one saved just before the rollback), so that no answer
+/// says the service runs that image and a later rollback rebuilds the root it really ran.
+#[derive(Clone)]
+struct Pending {
+    snapshot: String,
+    parts: Vec<SnapshotPart>,
+    restored: Vec<SnapshotPart>,
+    source: Value,
+    project: String,
+    instance: String,
+    uuid: Option<String>,
+    mark: Option<String>,
+}
+
+impl Pending {
+    fn new(
+        of: &InstanceState,
+        snapshot: &str,
+        parts: &[SnapshotPart],
+        restored: &[SnapshotPart],
+        source: &Value,
+    ) -> Pending {
+        Pending {
+            snapshot: snapshot.to_string(),
+            parts: parts.to_vec(),
+            restored: restored.to_vec(),
+            source: source.clone(),
+            project: of.project.clone(),
+            instance: of.name.clone(),
+            uuid: of.uuid.clone(),
+            mark: of.own_config.get(KERNEL_ENTRY_KEY).cloned(),
+        }
+    }
+
+    /// Whether every volume is back: the record then puts nothing back again.
+    fn whole(&self) -> bool {
+        self.parts.iter().all(|part| self.restored.contains(part))
+    }
+
+    /// Whether it says nothing an update needs: every volume is back, and the service's record (`desired`) names the
+    /// image the root runs.
+    fn settled(&self, desired: &Value) -> bool {
+        self.whole() && same_image(&self.source, desired)
+    }
+
+    /// Whether it was kept for the instance `seen`: the same project, name, uuid and mark.
+    fn is_for(&self, seen: &InstanceState) -> bool {
+        self.project == seen.project
+            && self.instance == seen.name
+            && self.uuid == seen.uuid
+            && self.mark.as_ref() == seen.own_config.get(KERNEL_ENTRY_KEY)
+    }
+
+    /// Reads the record, after the state directory is synced: a rename or removal of it that an earlier call made and
+    /// whose sync failed is then on disk, or the read is refused. Neither a record nor its absence is trusted before.
+    fn read(cfg: &NodeConfig, id: &str) -> Result<Option<Pending>, String> {
+        sync_dir(&cfg.state_dir).map_err(|error| {
+            format!("the node's state directory could not be synced, so what is on file there is not known to stay ({error})")
+        })?;
+        let path = pending_path(cfg, id);
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.to_string()),
+        };
+        let row: Value = serde_json::from_str(&text).map_err(|error| error.to_string())?;
+        let parts_of = |key: &str| -> Result<Vec<SnapshotPart>, String> {
+            row[key]
+                .as_array()
+                .ok_or_else(|| format!("it names no {key}"))?
+                .iter()
+                .map(
+                    |volume| match (volume["pool"].as_str(), volume["volume"].as_str()) {
+                        (Some(pool), Some(name)) => Ok(SnapshotPart::Volume {
+                            pool: pool.to_string(),
+                            volume: name.to_string(),
+                        }),
+                        _ => Err(format!("a volume of its {key} has no pool or name")),
+                    },
+                )
+                .collect()
+        };
+        let text_of = |key: &str| -> Result<String, String> {
+            row[key]
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| format!("it names no {key}"))
+        };
+        Ok(Some(Pending {
+            snapshot: text_of("snapshot")?,
+            parts: parts_of("volumes")?,
+            restored: parts_of("restored")?,
+            source: row
+                .get("source")
+                .filter(|source| source.is_object())
+                .cloned()
+                .ok_or("it names no source")?,
+            project: text_of("project")?,
+            instance: text_of("instance")?,
+            uuid: row["uuid"].as_str().map(str::to_string),
+            mark: row["mark"].as_str().map(str::to_string),
+        }))
+    }
+
+    /// Puts it on file, in place of any record before it, and syncs it.
+    fn write(&self, cfg: &NodeConfig, id: &str, update: &str) -> std::io::Result<()> {
+        let row = json!({
+            "update": update,
+            "snapshot": self.snapshot,
+            "volumes": volume_names(&self.parts),
+            "restored": volume_names(&self.restored),
+            "source": self.source,
+            "project": self.project,
+            "instance": self.instance,
+            "uuid": self.uuid,
+            "mark": self.mark,
+        });
+        let path = pending_path(cfg, id);
+        let mut aside = path.clone().into_os_string();
+        aside.push(".new");
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&aside)?;
+        file.write_all(&serde_json::to_vec(&row).map_err(std::io::Error::other)?)?;
+        file.sync_all()?;
+        fs::rename(&aside, &path)?;
+        sync_dir(&cfg.state_dir)
+    }
+
+    /// Takes the record off file, and syncs the directory, also when it was already gone. A failure is said, and the
+    /// record may stay.
+    fn remove(cfg: &NodeConfig, id: &str) -> std::io::Result<()> {
+        match fs::remove_file(pending_path(cfg, id)) {
+            Ok(()) => sync_dir(&cfg.state_dir),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => sync_dir(&cfg.state_dir),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+/// Syncs a directory, so a file created, renamed or removed in it stays so.
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    fs::File::open(dir)?.sync_all()
+}
+
+/// The volumes `parts` in words: `app-data (pool1), more (pool1)`, or `none`.
+fn volume_words(parts: &[SnapshotPart]) -> String {
+    let named: Vec<String> = parts
+        .iter()
+        .filter_map(|part| match part {
+            SnapshotPart::Volume { pool, volume } => Some(format!("{volume} ({pool})")),
+            SnapshotPart::Instance => None,
+        })
+        .collect();
+    if named.is_empty() {
+        "none".to_string()
+    } else {
+        named.join(", ")
+    }
+}
+
+/// A restore of `parts` to `snapshot` that failed, in words: which went back, which failed and which were not tried.
+fn restore_words(
+    snapshot: &str,
+    parts: &[SnapshotPart],
+    failure: &arca_incus::PartFailure,
+) -> String {
+    let untried: Vec<SnapshotPart> = parts
+        .iter()
+        .filter(|part| **part != failure.part && !failure.done.contains(part))
+        .cloned()
+        .collect();
+    format!(
+        "the volumes were to go back to the snapshot {snapshot}: put back: {}; failed: {} ({}); not tried: {}",
+        volume_words(&failure.done),
+        volume_words(std::slice::from_ref(&failure.part)),
+        incus_words(&failure.error),
+        volume_words(&untried),
+    )
+}
+
+/// The refusal of an update of a service whose instance holds Incus snapshots: Incus 7.6 does not rebuild such an
+/// instance, and says so only once the instance is stopped.
+fn holds_snapshots(name: &str, held: &[String]) -> CallError {
+    let (noun, them) = if held.len() == 1 {
+        ("snapshot", "it")
+    } else {
+        ("snapshots", "them")
+    };
+    refused(format!(
+        "update service {name}: its instance holds the Incus {noun} {}, and Incus does not rebuild an instance that holds a snapshot, so the update would fail halfway. Arca has no step that removes an instance's own Incus snapshots yet. Removing {them} is to be a plan of its own, on a card the owner approves with their passkey; ask for the update again after that. Nothing was changed",
+        held.join(", "),
+    ))
+}
+
+/// The volumes of a snapshot, as the journal and the answer name them.
+fn volume_names(parts: &[SnapshotPart]) -> Value {
+    Value::Array(
+        parts
+            .iter()
+            .filter_map(|part| match part {
+                SnapshotPart::Volume { pool, volume } => {
+                    Some(json!({ "pool": pool, "volume": volume }))
+                }
+                SnapshotPart::Instance => None,
+            })
+            .collect(),
+    )
+}
+
+/// Whether Incus refused a snapshot because the project does not allow one: its own words, `Project "<p>" doesn't
+/// allow for snapshot creation`, whatever the status. Any other refusal, a 403 among them, is not that restriction.
+fn project_refuses_snapshots(error: &IncusError) -> bool {
+    matches!(error, IncusError::Status { message, .. }
+        if message.contains("doesn't allow for snapshot creation"))
 }
 
 impl ServiceHandler {
@@ -836,6 +1131,10 @@ impl ServiceHandler {
             ));
         };
         let reach = reach_of(&config, port);
+        // One claim per service, taken before anything reads what an earlier update left and held to the end of the
+        // call: the update, the restore it finishes and its rollback, or the no-new-privileges change.
+        let claim = Claim::take(&format!("{}\n{}", self.cfg.state_dir.display(), entry.id.0))
+            .ok_or_else(|| said("another update of this service is running"))?;
         // What the template says now about no-new-privileges, against what the service has. A difference is applied
         // as a config write and a restart, never a rebuild, so the data stays where it is. It is its own step: an
         // update that also moves the digest is refused, so no answer mixes the two and a failure of one never
@@ -862,26 +1161,57 @@ impl ServiceHandler {
                 reach,
                 seconds,
             };
-            return self.change_no_new_privileges(&entry, &config, wanted, &digest, key);
+            let answer = self.change_no_new_privileges(&entry, &config, wanted, &digest, key);
+            drop(claim);
+            return answer;
         }
         if args.get("noNewPrivileges").is_some() {
             return Err(said(
                 "noNewPrivileges: the service's template says what the service already has. Nothing was changed",
             ));
         }
-        if with && same_image(&new_source, &config.source) {
-            return Err(same_digest_with_template(&name));
+        // What an earlier rollback left on file, read under the claim and used for the whole call: volumes part
+        // restored, which the update finishes first, from the same snapshot, once the instance is stopped; or a root
+        // that runs another image than the service's record names (one saved just before that rollback), which a
+        // same-digest answer must not hide.
+        let mut pending = Pending::read(&self.cfg, &entry.id.0).map_err(|why| {
+            said(&format!(
+                "the record an earlier update's rollback left could not be read ({why})"
+            ))
+        })?;
+        let same = same_image(&new_source, &config.source);
+        if with && same {
+            return Err(same_digest_with_template(
+                &name,
+                pending
+                    .as_ref()
+                    .filter(|pending| !pending.settled(&config.source)),
+            ));
         }
-        if same_image(&new_source, &config.source) {
-            return Ok(json!({
+        let already = || -> Result<Value, CallError> {
+            Ok(json!({
                 "updated": false,
                 "service": name,
                 "digest": digest,
                 "message": "the service already runs this digest; nothing was changed",
-            }));
+            }))
+        };
+        if same && pending.is_none() {
+            return already();
         }
-        let claim = Claim::take(&format!("{}\n{}", self.cfg.state_dir.display(), entry.id.0))
-            .ok_or_else(|| said("another update of this service is running"))?;
+        // A whole record whose root is the one the service's record names says nothing more: it comes off file.
+        if same
+            && pending
+                .as_ref()
+                .is_some_and(|pending| pending.settled(&config.source))
+        {
+            if let Err(error) = Pending::remove(&self.cfg, &entry.id.0) {
+                eprintln!(
+                    "arca: a finished rollback record of {name} could not be removed: {error}"
+                );
+            }
+            return already();
+        }
         let changer = self.state_changer(&config)?;
         // A local image is copied or built into the service project by hand: require its fingerprint in the store
         // before anything is stopped or rebuilt, since Incus's own answer to a rebuild names no reason.
@@ -930,6 +1260,48 @@ impl ServiceHandler {
             return Err(said(
                 "the service has never been started, and a rebuild would leave it unable to start: start it with instance_start first",
             ));
+        }
+        // Incus 7.6 refuses to rebuild an instance that holds a snapshot, once it is stopped: said now, with nothing changed.
+        let held = changer.instance_snapshots(&seen).map_err(|error| {
+            said(&format!(
+                "its instance's snapshots could not be read ({})",
+                incus_words(&error)
+            ))
+        })?;
+        if !held.is_empty() {
+            return Err(holds_snapshots(&name, &held));
+        }
+        // A record kept for another instance (one this service had before it was made again) is not this one's to
+        // finish: it is taken off file, and the update goes on as it would have.
+        if pending
+            .as_ref()
+            .is_some_and(|pending| !pending.is_for(&seen))
+        {
+            Pending::remove(&self.cfg, &entry.id.0).map_err(|error| {
+                said(&format!(
+                    "a record of an unfinished restore kept for an earlier instance of the service could not be removed ({error})"
+                ))
+            })?;
+            eprintln!(
+                "arca: the record of an unfinished restore of {name} was kept for an earlier instance and was removed"
+            );
+            pending = None;
+            if same {
+                return already();
+            }
+        }
+        // A running one runs on part-restored volumes as they are, so it is not stopped for it without being asked.
+        if let Some(pending) = &pending
+            && !pending.whole()
+            && seen.is_running()
+        {
+            return Err(said(&format!(
+                "an earlier update's rollback did not finish putting its volumes back to the snapshot {} (put back, as last recorded: {}; to put back: {}), and the service runs on them as they are. Stop it with instance_stop and ask again: the update then first puts every one of them back to {}, which undoes what was written to them since",
+                pending.snapshot,
+                volume_words(&pending.restored),
+                volume_words(&pending.parts),
+                pending.snapshot,
+            )));
         }
         // The template's difference, worked out again: the run changes nothing unless it is the one on the card.
         let first = if with {
@@ -981,6 +1353,13 @@ impl ServiceHandler {
         if let Some(first) = &first {
             begin["template"] = service_reconfigure::names_of(&first.changes);
         }
+        // The root runs another image than the record names: a rollback rebuilds that one.
+        let live = pending
+            .as_ref()
+            .map_or(&config.source, |pending| &pending.source);
+        if !same_image(live, &config.source) {
+            begin["runs"] = live.clone();
+        }
         journal
             .line("begin", true, begin)
             .map_err(|_| said("the update journal could not be written"))?;
@@ -1016,6 +1395,7 @@ impl ServiceHandler {
             config: &config,
             entry: &entry,
             new_source: &new_source,
+            live,
             digest: &digest,
             port,
             reach,
@@ -1024,6 +1404,8 @@ impl ServiceHandler {
             journal: &journal,
             was_running: seen.is_running(),
             template: template.as_ref(),
+            pending: pending.as_ref(),
+            notes: RefCell::new(Vec::new()),
         };
         let outcome = run.go(seen);
         drop(claim);
@@ -1046,10 +1428,7 @@ impl ServiceHandler {
     ) -> Result<Value, CallError> {
         let name = &config.name;
         let said = |why: &str| refused(format!("update service {name}: {why}"));
-        let _claim = Claim::take(&format!("{}\n{}", self.cfg.state_dir.display(), entry.id.0))
-            .ok_or_else(|| {
-                said("another update of this service is running. Nothing was changed")
-            })?;
+        // The caller holds the service's claim.
         let changer = self.state_changer(config)?;
         let seen = changer
             .read(&config.project, &config.instance)
@@ -1158,6 +1537,7 @@ impl ServiceHandler {
                 config,
                 entry,
                 new_source: &config.source,
+                live: &config.source,
                 digest,
                 port: key.port,
                 reach: key.reach,
@@ -1166,6 +1546,8 @@ impl ServiceHandler {
                 journal: &journal,
                 was_running,
                 template: None,
+                pending: None,
+                notes: RefCell::new(Vec::new()),
             };
             if let Err(failure) = run.healthy() {
                 journal.step("health", false, json!({ "why": failure.why }));
@@ -1284,6 +1666,9 @@ struct Run<'a> {
     config: &'a ServiceConfig,
     entry: &'a Entry,
     new_source: &'a Value,
+    /// The source of the root the instance runs when the update begins, which a rollback rebuilds: the service's record's,
+    /// or the one an earlier rollback's record names when the record was saved with another just before that rollback.
+    live: &'a Value,
     digest: &'a str,
     port: u16,
     reach: Reach,
@@ -1292,11 +1677,16 @@ struct Run<'a> {
     journal: &'a Journal,
     was_running: bool,
     template: Option<&'a TemplateStep>,
+    /// The restore an earlier rollback did not finish, which this update finishes first.
+    pending: Option<&'a Pending>,
+    /// What the update changed before anything was to be rolled back, in words, for an answer that says it.
+    notes: RefCell<Vec<String>>,
 }
 
 impl Run<'_> {
     fn go(&self, seen: InstanceState) -> Result<Value, CallError> {
         let name = &self.config.name;
+        let origin = seen.clone();
         let mut instance = seen;
         let mut back: Option<Back> = None;
         let failure = match self.forward(&mut instance, &mut back) {
@@ -1368,17 +1758,26 @@ impl Run<'_> {
             });
         }
         let Some(back) = back else {
-            // Nothing was changed but the power state: the old version is started again when it ran.
-            let restarted = self.start_again(&mut instance);
+            // Nothing was changed but the power state and what `notes` says: the old version is started again when it
+            // ran, if it is still the instance the update began with.
+            let restarted = self
+                .reread(&origin)
+                .and_then(|mut instance| self.start_again(&mut instance));
+            let notes = self.notes.borrow();
             self.journal.step(
                 "end",
                 false,
-                json!({ "rolledBack": false, "changedAnything": false }),
+                json!({ "rolledBack": false, "changedAnything": !notes.is_empty(), "changed": *notes }),
             );
             return Err(refused(format!(
-                "update service {name}: {} failed: {}. Nothing was changed{}",
+                "update service {name}: {} failed: {}. {}{}",
                 failure.step,
                 failure.why,
+                if notes.is_empty() {
+                    "Nothing was changed".to_string()
+                } else {
+                    format!("Nothing else was changed: {}", notes.join("; "))
+                },
                 if restarted.is_ok() {
                     ""
                 } else {
@@ -1386,17 +1785,20 @@ impl Run<'_> {
                 },
             )));
         };
-        match self.roll_back(&mut instance, &back, failure.step) {
+        match self.roll_back(&mut instance, &origin, &back, &failure) {
             Ok(back) => {
                 let mut end = json!({ "rolledBack": true, "rootKept": back.root_kept, "oldAnswers": back.answers });
                 if let Some(restored) = back.record {
                     end["recordRestored"] = json!(restored);
                 }
+                if let Some(kept) = back.desired {
+                    end["recordNamesNew"] = json!({ "keptOnFile": kept });
+                }
                 self.journal.step("end", false, end);
                 Err(CallError::Refused {
                     code: "rolled_back".into(),
                     message: format!(
-                        "update service {name} to {}: {} failed: {}. The update was rolled back: {}{}the old version is {}{}",
+                        "update service {name} to {}: {} failed: {}. The update was rolled back: {}{}the old version is {}{}{}",
                         self.digest,
                         failure.step,
                         failure.why,
@@ -1418,11 +1820,23 @@ impl Run<'_> {
                         } else {
                             ""
                         },
+                        match back.desired {
+                            None => String::new(),
+                            Some(true) => format!(
+                                ". The service's record names {}, which it does not run: service_update to it rebuilds it",
+                                self.digest
+                            ),
+                            Some(false) => format!(
+                                ". The service's record names {}, which it does not run, and the node could not put that on file: service_update to it may answer that it runs it already",
+                                self.digest
+                            ),
+                        },
                     ),
                 })
             }
             Err((second, record)) => {
-                let mut end = json!({ "rolledBack": false, "why": second.why });
+                let mut end =
+                    json!({ "rolledBack": false, "step": second.step, "why": second.why });
                 if let Some(restored) = record {
                     end["recordRestored"] = json!(restored);
                 }
@@ -1430,7 +1844,7 @@ impl Run<'_> {
                 Err(CallError::Refused {
                     code: "rollback_failed".into(),
                     message: format!(
-                        "update service {name} to {}: {} failed: {}. It was NOT rolled back: {} failed: {}. {}The service is stopped; service_status shows what is there",
+                        "update service {name} to {}: {} failed: {}. It was NOT rolled back: {} failed: {}. {}{}; service_status shows what is there",
                         self.digest,
                         failure.step,
                         failure.why,
@@ -1439,6 +1853,7 @@ impl Run<'_> {
                         self.record_words(record)
                             .map(|words| format!("{}. ", sentence(words)))
                             .unwrap_or_default(),
+                        self.power_words(&origin),
                     ),
                 })
             }
@@ -1506,6 +1921,9 @@ impl Run<'_> {
         Ok(())
     }
 
+    /// Stops the instance, when it runs. `change` refuses before the write an instance that is not `instance` (its uuid,
+    /// kind and mark), and answers a read-back that shows another as applied but unconfirmed: any answer but a refusal
+    /// may follow a stop that landed, which is a change the answer says.
     fn stopped(&self, instance: &mut InstanceState) -> Result<(), Failure> {
         if instance.is_stopped() {
             return Ok(());
@@ -1513,7 +1931,16 @@ impl Run<'_> {
         self.changer
             .change(instance, StateAction::Stop)
             .map(|state| *instance = state)
-            .map_err(|error| Failure::of("stop", &error))
+            .map_err(|error| {
+                if !matches!(error, IncusError::Refused(_)) {
+                    self.notes.borrow_mut().push(format!(
+                        "a stop was sent to its instance {} ({})",
+                        instance.name,
+                        incus_words(&error)
+                    ));
+                }
+                Failure::of("stop", &error)
+            })
     }
 
     /// Steps 1 to 5. `back` is set as soon as something that must be undone is about to be done.
@@ -1524,35 +1951,16 @@ impl Run<'_> {
     ) -> Result<Option<String>, Failure> {
         self.stopped(instance)?;
         self.journal.step("stop", true, json!({}));
-        let snapshot = format!("pre-update-{}", (self.journal.clock)());
-        let held = match self.changer.snapshot_instance(instance, &snapshot) {
-            Ok(()) => {
-                self.journal
-                    .step("snapshot", true, json!({ "snapshot": snapshot }));
-                Some(snapshot)
-            }
-            // A project that forbids snapshots (every project Arca makes does, and Incus answers 500 or 403): the old version is put back by a rebuild from its
-            // own digest instead.
-            Err(IncusError::Status { code, message })
-                if code == 403 || message.contains("snapshot creation") =>
-            {
-                self.journal.step(
-                    "snapshot",
-                    false,
-                    json!({ "skipped": "the project does not allow snapshots", "incus": message }),
-                );
-                None
-            }
-            Err(error) => {
-                return Err(Failure::of("snapshot", &error));
-            }
-        };
-        *back = Some(match &held {
-            Some(name) => Back::Snapshot(name.clone()),
-            None => Back::OldImage,
+        self.finish_pending(instance)?;
+        let held = self.volume_snapshot(instance)?;
+        *back = Some(Back {
+            volumes: held.clone(),
         });
         self.rebuild_from(instance, self.new_source)
-            .map_err(|error| Failure::of("rebuild", &error))?;
+            .map_err(|error| Failure {
+                root_untouched: image_not_fetched(&error),
+                ..Failure::of("rebuild", &error)
+            })?;
         self.journal
             .step("rebuild", true, json!({ "digest": self.digest }));
         self.edge_root();
@@ -1566,7 +1974,322 @@ impl Run<'_> {
             .step("health", true, json!({ "port": self.port }));
         self.record()?;
         self.journal.step("record", true, json!({}));
-        Ok(held)
+        // The record names the root that runs now: what an earlier rollback left says nothing more. Whole by now, so
+        // one that cannot be removed puts nothing back again.
+        if self.pending.is_some()
+            && let Err(error) = Pending::remove(&self.handler.cfg, &self.entry.id.0)
+        {
+            self.journal.step(
+                "rollback record",
+                false,
+                json!({ "removed": false, "why": error.to_string() }),
+            );
+        }
+        Ok(held.map(|(snapshot, _)| snapshot))
+    }
+
+    /// Finishes what an earlier rollback left: every volume it named goes back to its snapshot, the stopped instance's
+    /// own volumes as the restore checks them, unless every one is back already. The record then says every volume is
+    /// back ([`Run::settle`]), before the update goes on: one that still said otherwise would put the volumes back again
+    /// at a later update, over what was written to them since. It stays on file, whole, while the service's record names
+    /// another image than the root runs. A failure keeps the record, with how far this attempt got when that could be
+    /// written.
+    fn finish_pending(&self, instance: &InstanceState) -> Result<(), Failure> {
+        let Some(pending) = self.pending else {
+            return Ok(());
+        };
+        let cfg = &self.handler.cfg;
+        let id = &self.entry.id.0;
+        if !pending.whole() {
+            match self
+                .changer
+                .restore_with_volumes(instance, &pending.snapshot, &pending.parts)
+            {
+                Ok(_) => {
+                    self.journal.step(
+                        "restore pending",
+                        true,
+                        json!({ "snapshot": pending.snapshot, "volumes": volume_names(&pending.parts) }),
+                    );
+                    self.notes.borrow_mut().push(format!(
+                        "its volumes {} were put back to the snapshot {}, as an earlier rollback had left them part restored",
+                        volume_words(&pending.parts),
+                        pending.snapshot,
+                    ));
+                }
+                Err(failure) => {
+                    let progress = Pending {
+                        restored: failure.done.clone(),
+                        ..pending.clone()
+                    };
+                    let kept = progress.write(cfg, id, &self.journal.id);
+                    if !failure.done.is_empty() {
+                        self.notes.borrow_mut().push(format!(
+                            "its volumes {} were put back to the snapshot {}",
+                            volume_words(&failure.done),
+                            pending.snapshot,
+                        ));
+                    }
+                    self.journal.step(
+                        "restore pending",
+                        false,
+                        json!({
+                            "snapshot": pending.snapshot,
+                            "restored": volume_names(&failure.done),
+                            "failed": volume_names(std::slice::from_ref(&failure.part)),
+                            "progressKept": kept.is_ok(),
+                        }),
+                    );
+                    return Err(Failure::said(
+                        "restore pending",
+                        format!(
+                            "{}; an earlier rollback had left them part restored, and they stay so until a restore of all of them goes through{}",
+                            restore_words(&pending.snapshot, &pending.parts, &failure),
+                            match kept {
+                                Ok(()) => String::new(),
+                                Err(error) => format!(
+                                    ". The node could not put how far this attempt got on file ({error}), so its record still says put back: {}",
+                                    volume_words(&pending.restored)
+                                ),
+                            },
+                        ),
+                    ));
+                }
+            }
+        }
+        self.settle(pending, self.live).map_err(|error| {
+            Failure::said(
+                "restore pending",
+                format!(
+                    "every volume is back to the snapshot {}, but that could not be put on file ({error}), so the update stops here: with the record as it is, a later update would put the volumes back again",
+                    pending.snapshot
+                ),
+            )
+        })
+    }
+
+    /// Every volume of `record` is back: the record says so, on file and synced, so it never puts a volume back again.
+    /// It then comes off file when the service's record names the image of the root that runs (`live`); otherwise it
+    /// stays, whole, so that no answer says the service runs what its record names. Only the first write is required:
+    /// a removal that fails leaves a record that puts nothing back.
+    fn settle(&self, record: &Pending, live: &Value) -> std::io::Result<()> {
+        let cfg = &self.handler.cfg;
+        let id = &self.entry.id.0;
+        let whole = Pending {
+            restored: record.parts.clone(),
+            source: live.clone(),
+            ..record.clone()
+        };
+        whole.write(cfg, id, &self.journal.id)?;
+        if self.record_runs(live) {
+            let removed = Pending::remove(cfg, id);
+            self.journal.step(
+                "rollback record",
+                removed.is_ok(),
+                match removed {
+                    Ok(()) => json!({ "removed": true }),
+                    Err(error) => json!({ "removed": false, "why": error.to_string() }),
+                },
+            );
+        } else {
+            self.journal.step(
+                "rollback record",
+                true,
+                json!({ "kept": true, "runs": live }),
+            );
+        }
+        Ok(())
+    }
+
+    /// Whether the service's record, as the kernel holds it now, names the image of `source`.
+    fn record_runs(&self, source: &Value) -> bool {
+        self.handler.kernel.lock().ok().is_some_and(|kernel| {
+            service_entries(kernel.entries())
+                .into_iter()
+                .find(|(entry, _)| entry.id == self.entry.id)
+                .is_some_and(|(_, config)| same_image(&config.source, source))
+        })
+    }
+
+    /// Snapshots the service's own volumes, `pre-update-<time>`, and not the instance. A project that refuses the
+    /// snapshot (Incus's own words for its `restricted.snapshots`) is given its owner's `snapshots` step, and the
+    /// snapshot is taken again. A service that has volumes of its own is never rebuilt without their snapshot: when the
+    /// project still refuses it, or the step cannot be written, the update stops there and the old version is started
+    /// again. A service with no volume of its own goes on with none. Every update keeps its snapshot, so a name an
+    /// earlier one took (two updates in one millisecond) gets `-2`, `-3`, ...: only once every volume snapshotted under
+    /// the taken name was removed again.
+    fn volume_snapshot(
+        &self,
+        instance: &InstanceState,
+    ) -> Result<Option<(String, Vec<SnapshotPart>)>, Failure> {
+        let base = format!("pre-update-{}", (self.journal.clock)());
+        let mut snapshot = base.clone();
+        let mut taken_name = 1;
+        let mut allowed = false;
+        let project = &self.config.project;
+        loop {
+            match self.changer.snapshot_own_volumes(instance, &snapshot) {
+                Ok(taken) if taken.taken.is_empty() => {
+                    self.journal.step(
+                        "snapshot",
+                        false,
+                        json!({ "skipped": "the service has no volume of its own" }),
+                    );
+                    return Ok(None);
+                }
+                Ok(taken) => {
+                    let parts: Vec<SnapshotPart> =
+                        taken.taken.into_iter().map(|taken| taken.part).collect();
+                    self.journal.step(
+                        "snapshot",
+                        true,
+                        json!({ "snapshot": snapshot, "volumes": volume_names(&parts) }),
+                    );
+                    return Ok(Some((snapshot, parts)));
+                }
+                Err(failure)
+                    if project_refuses_snapshots(&failure.error)
+                        && !allowed
+                        && failure.done.is_empty()
+                        && failure.left.is_empty() =>
+                {
+                    allowed = true;
+                    match self.allow_snapshots() {
+                        Ok(true) => {
+                            self.journal.step(
+                                "snapshots allowed",
+                                true,
+                                json!({ "project": project, "written": true }),
+                            );
+                            self.notes.borrow_mut().push(format!(
+                                "the owner's entry of the project {project} now lets it hold snapshots, and stays so"
+                            ));
+                        }
+                        Ok(false) => {
+                            return Err(Failure::said(
+                                "snapshot",
+                                format!(
+                                    "Incus refuses a snapshot of the service's volumes in the project {project} ({}), although the project's owner already lets it hold snapshots: the node has not applied that to Incus yet. The update does not rebuild without a snapshot to roll the volumes back to",
+                                    incus_words(&failure.error)
+                                ),
+                            ));
+                        }
+                        Err(error) => {
+                            let saved = self.snapshots_saved();
+                            if saved {
+                                self.notes.borrow_mut().push(format!(
+                                    "the owner's entry of the project {project} was saved with its snapshots step, which the node did not apply"
+                                ));
+                            }
+                            return Err(Failure::said(
+                                "snapshots allowed",
+                                format!(
+                                    "{}{}. The update does not rebuild without a snapshot to roll the volumes back to",
+                                    call_words(&error),
+                                    if saved {
+                                        "; the owner's entry was saved with the step, and the node tries it again on its later passes"
+                                    } else {
+                                        "; the owner's entry was not changed"
+                                    },
+                                ),
+                            ));
+                        }
+                    }
+                }
+                Err(failure)
+                    if project_refuses_snapshots(&failure.error)
+                        && failure.done.is_empty()
+                        && failure.left.is_empty() =>
+                {
+                    return Err(Failure::said(
+                        "snapshot",
+                        format!(
+                            "Incus still refuses a snapshot of the service's volumes in the project {project} ({}) after its owner's entry was given the step. The update does not rebuild without a snapshot to roll the volumes back to",
+                            incus_words(&failure.error)
+                        ),
+                    ));
+                }
+                Err(failure)
+                    if matches!(failure.error, IncusError::Status { code: 409, .. })
+                        && failure.left.is_empty()
+                        && taken_name < MAX_SNAPSHOT_NAMES =>
+                {
+                    taken_name += 1;
+                    snapshot = format!("{base}-{taken_name}");
+                }
+                Err(failure) => {
+                    if !failure.left.is_empty() {
+                        let left: Vec<SnapshotPart> =
+                            failure.left.iter().map(|(part, _)| part.clone()).collect();
+                        self.notes.borrow_mut().push(format!(
+                            "the snapshot {snapshot} of its volumes {} was taken and could not be removed again",
+                            volume_words(&left)
+                        ));
+                    }
+                    return Err(Failure::said(
+                        "snapshot",
+                        format!("the snapshot {snapshot}: {failure}"),
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Whether the owner's entry of the service's project has the `snapshots` step saved in the desired document.
+    fn snapshots_saved(&self) -> bool {
+        match &self.config.tenant {
+            Some(tenant) => {
+                super::tenants::tenant_snapshots_saved(&self.handler.kernel, &tenant.id)
+            }
+            None => service_snapshots_saved(&self.handler.kernel, &self.handler.cfg),
+        }
+    }
+
+    /// The instance read again, refused before anything is written unless it is still the one the update began with:
+    /// the same uuid, kind and mark. Only its power state is taken from the read.
+    fn reread(&self, origin: &InstanceState) -> Result<InstanceState, Failure> {
+        let fresh = self
+            .changer
+            .read(&origin.project, &origin.name)
+            .map_err(|error| Failure::of("read", &error))?;
+        if fresh.uuid != origin.uuid
+            || fresh.kind != origin.kind
+            || fresh.own_config.get(KERNEL_ENTRY_KEY) != origin.own_config.get(KERNEL_ENTRY_KEY)
+        {
+            return Err(Failure::said(
+                "read",
+                "another instance has taken the service's place under its name since the update began, and nothing was written to it".to_string(),
+            ));
+        }
+        Ok(fresh)
+    }
+
+    /// The service's power state as a read of it shows it now, in words, to end a sentence that is not rolled back.
+    fn power_words(&self, origin: &InstanceState) -> String {
+        match self.reread(origin) {
+            Ok(fresh) if fresh.is_stopped() => "The service is stopped".to_string(),
+            Ok(fresh) if fresh.is_running() => "The service is running".to_string(),
+            Ok(fresh) => format!("The service reads {}", fresh.status),
+            Err(failure)
+                if failure.step == "read" && failure.why.starts_with("another instance") =>
+            {
+                "Another instance is there under the service's name now".to_string()
+            }
+            Err(_) => "Whether the service runs could not be read".to_string(),
+        }
+    }
+
+    /// Gives the service's project its owner's `snapshots` step: the tenant's entry for a tenant's service, else the
+    /// service project's owner. Under the node's write gate. Answers whether the entry was written.
+    fn allow_snapshots(&self) -> Result<bool, CallError> {
+        let _write = self.handler.writes.lock().map_err(|_| internal())?;
+        let now = (self.handler.clock)();
+        match &self.config.tenant {
+            Some(tenant) => {
+                super::tenants::allow_tenant_snapshots(&self.handler.kernel, &tenant.id, now)
+            }
+            None => allow_service_snapshots(&self.handler.kernel, &self.handler.cfg, now),
+        }
     }
 
     /// The service answers within the timeout, as its reach lets the node tell.
@@ -1681,60 +2404,124 @@ impl Run<'_> {
     }
 
     /// Puts the old version back, and starts it when it ran before the update. The record was never changed before
-    /// the health check passed, so it still names the old image. A failed rebuild from the old image after a failed
-    /// rebuild from the new one leaves the old root as it was (Incus resolves the image before it takes the root
-    /// away), so the old version is simply started.
+    /// the health check passed, so it still names the old image. Every step is sent only to the instance the update
+    /// began with (`origin`'s uuid, kind and mark). A failed rebuild from the old image after a rebuild from the new one
+    /// that failed on its image leaves the old root as it was (Incus fetches the image before it takes the root away),
+    /// so the old version is simply started; after any other failure of the new rebuild the root may be the new one,
+    /// and nothing is started on it.
     fn roll_back(
         &self,
         instance: &mut InstanceState,
+        origin: &InstanceState,
         back: &Back,
-        after: &str,
+        failure: &Failure,
     ) -> Result<Rolled, (Failure, Option<bool>)> {
+        // The instance is read first, and nothing is put back to one that is not the instance the update began with,
+        // not even the template's record, which the node would write to whatever instance is there.
+        *instance = self.reread(origin).map_err(|failure| (failure, None))?;
         // The template's settings go back first, whatever happens to the root after: the node writes the old config
         // while the instance is still stopped (or running, which takes it at its next start).
-        let record = self.put_template_back();
-        self.root_back(instance, back, after, record)
+        let record = self
+            .put_template_back(origin)
+            .map_err(|failure| (failure, None))?;
+        self.root_back(instance, origin, back, failure, record)
             .map_err(|failure| (failure, record))
     }
 
     fn root_back(
         &self,
         instance: &mut InstanceState,
+        origin: &InstanceState,
         back: &Back,
-        after: &str,
+        failure: &Failure,
         record: Option<bool>,
     ) -> Result<Rolled, Failure> {
+        // Read again: a new version that did not stay running has stopped by itself, and a stop of it is refused. The
+        // stop's own read-back is refused when another instance has taken the name meanwhile.
+        *instance = self.reread(origin)?;
         self.stopped(instance)?;
         let mut root_kept = false;
-        match back {
-            Back::Snapshot(snapshot) => {
-                self.handler
-                    .with_labels_preserved(self.entry, self.config, snapshot, || {
-                        self.changer.restore_snapshot(instance, snapshot)
-                    })
-                    .map_err(|error| Failure::of("restore", &error))?;
-                self.journal
-                    .step("restore", true, json!({ "snapshot": snapshot }));
+        // The root the instance ran when the update began, which is not always what the service's record names.
+        match self.rebuild_from(instance, self.live) {
+            Ok(()) => {
+                self.journal.step("rebuild back", true, json!({}));
+                self.edge_root();
                 self.run_emptied(instance, self.config.run_tmpfs);
             }
-            Back::OldImage => match self.rebuild_from(instance, &self.config.source) {
-                Ok(()) => {
-                    self.journal.step("rebuild back", true, json!({}));
-                    self.edge_root();
-                    self.run_emptied(instance, self.config.run_tmpfs);
-                }
-                Err(error) if after == "rebuild" && !matches!(error, IncusError::Timeout) => {
-                    root_kept = true;
-                    self.journal
-                        .step("rebuild back", false, json!({ "why": incus_words(&error) }));
-                }
-                Err(error) => return Err(Failure::of("rebuild back", &error)),
-            },
+            Err(error)
+                if failure.step == "rebuild"
+                    && failure.root_untouched
+                    && image_not_fetched(&error) =>
+            {
+                root_kept = true;
+                self.journal
+                    .step("rebuild back", false, json!({ "why": incus_words(&error) }));
+            }
+            Err(error) if failure.step == "rebuild" && failure.root_untouched => {
+                return Err(Failure::said(
+                    "rebuild back",
+                    format!(
+                        "{}. The rebuild from the old image failed after Incus may have taken the old root away, so no root there is known to be whole, and nothing was started",
+                        incus_words(&error)
+                    ),
+                ));
+            }
+            Err(error) if failure.step == "rebuild" => {
+                return Err(Failure::said(
+                    "rebuild back",
+                    format!(
+                        "{}. The rebuild from the new image failed after Incus may have taken the old root away, so the root there may be the new version's, and it was not started",
+                        incus_words(&error)
+                    ),
+                ));
+            }
+            Err(error) => return Err(Failure::of("rebuild back", &error)),
         }
-        *instance = self
-            .changer
-            .read(&instance.project, &instance.name)
-            .map_err(|error| Failure::of("read", &error))?;
+        // What the new version wrote to its volumes is undone: each goes back to the snapshot taken before the rebuild.
+        // The restore is on file before its first volume is put back, and says it is finished only once every one is.
+        let mut desired = None;
+        if let Some((snapshot, parts)) = &back.volumes {
+            let cfg = &self.handler.cfg;
+            let id = &self.entry.id.0;
+            let record = Pending::new(origin, snapshot, parts, &[], self.live);
+            record
+                .write(cfg, id, &self.journal.id)
+                .map_err(|error| {
+                    Failure::said(
+                        "restore",
+                        format!(
+                            "the restore of the volumes to the snapshot {snapshot} could not be put on file first ({error}), so no volume was put back: they hold what the new version wrote, under the old root"
+                        ),
+                    )
+                })?;
+            self.changer
+                .restore_with_volumes(instance, snapshot, parts)
+                .map_err(|failure| self.restore_failed(origin, snapshot, parts, &failure))?;
+            self.journal.step(
+                "restore",
+                true,
+                json!({ "snapshot": snapshot, "volumes": volume_names(parts) }),
+            );
+            self.settle(&record, self.live).map_err(|error| {
+                Failure::said(
+                    "restore",
+                    format!(
+                        "every volume went back to the snapshot {snapshot}, but that could not be put on file ({error}), so the old version was not started: with the record as it is, the next update would put the volumes back again"
+                    ),
+                )
+            })?;
+        }
+        // The service's record may name the new image (saved just before the rollback): it is said, and a record on
+        // file keeps the root's own source so no answer says the service runs the new one.
+        if !self.record_runs(self.live) {
+            desired = Some(match &back.volumes {
+                Some(_) => true,
+                None => self
+                    .settle(&Pending::new(origin, "", &[], &[], self.live), self.live)
+                    .is_ok(),
+            });
+        }
+        *instance = self.reread(origin)?;
         self.start_again(instance)?;
         let mut answers = true;
         if self.was_running {
@@ -1746,7 +2533,51 @@ impl Run<'_> {
             root_kept,
             answers,
             record,
+            desired,
         })
+    }
+
+    /// A rollback's restore of the volumes that failed: it is kept on file, so the next update finishes it before it
+    /// does anything else, and said with what went back and what did not.
+    fn restore_failed(
+        &self,
+        origin: &InstanceState,
+        snapshot: &str,
+        parts: &[SnapshotPart],
+        failure: &arca_incus::PartFailure,
+    ) -> Failure {
+        // The record is on file already; this puts how far the restore got in it.
+        let kept = Pending::new(origin, snapshot, parts, &failure.done, self.live).write(
+            &self.handler.cfg,
+            &self.entry.id.0,
+            &self.journal.id,
+        );
+        self.journal.step(
+            "restore",
+            false,
+            json!({
+                "snapshot": snapshot,
+                "volumes": volume_names(parts),
+                "restored": volume_names(&failure.done),
+                "failed": volume_names(std::slice::from_ref(&failure.part)),
+                "pendingKept": kept.is_ok(),
+            }),
+        );
+        Failure::said(
+            "restore",
+            format!(
+                "{}. {}",
+                restore_words(snapshot, parts, failure),
+                match kept {
+                    Ok(()) => format!(
+                        "The next update of the service puts every one of them back to {snapshot} first, once the service is stopped"
+                    ),
+                    Err(error) => format!(
+                        "The node could not put how far it got on file ({error}); the record from before the restore stays, so the next update of the service still puts every one of them back to {snapshot} first"
+                    ),
+                },
+            ),
+        )
     }
 
     /// With the template: its record is written, under the node's write gate and only while the record is the one the
@@ -1789,14 +2620,43 @@ impl Run<'_> {
     }
 
     /// Puts the old record back when the template's was written: `None` when there was nothing to put back, else whether
-    /// it worked.
-    fn put_template_back(&self) -> Option<bool> {
-        let step = self.template.filter(|step| step.written.get())?;
-        let restored = self
+    /// it worked. The instance is read again under the node's write gate just before the record is written, and nothing
+    /// is put back unless it is still the one the update began with (`origin`); the node then writes the old settings
+    /// to the instance under the name. It is read once more after: when another one is there, the settings may have
+    /// gone to it, and the failure says so with what was put back.
+    fn put_template_back(&self, origin: &InstanceState) -> Result<Option<bool>, Failure> {
+        let Some(step) = self.template.filter(|step| step.written.get()) else {
+            return Ok(None);
+        };
+        let held = self
             .handler
-            .put_plan_back(&self.entry.id.0, &step.old, true);
+            .put_plan_back_while(&self.entry.id.0, &step.old, true, || {
+                self.reread(origin).is_ok()
+            });
+        let Some(restored) = held else {
+            self.journal
+                .step("put back", false, json!({ "skipped": "another instance" }));
+            return Err(Failure::said(
+                "put back",
+                "another instance has taken the service's place under its name since the update began, so the template's old settings were not put back in the service's record, which still holds the new ones".to_string(),
+            ));
+        };
         self.journal.step("put back", restored, json!({}));
-        Some(restored)
+        if let Err(after) = self.reread(origin) {
+            return Err(Failure::said(
+                "put back",
+                format!(
+                    "{}; the template's old settings {} the service's record, and the node may have written them to the instance now under its name, which is not the one the update began with",
+                    after.why,
+                    if restored {
+                        "were put back in"
+                    } else {
+                        "may be part put back in"
+                    },
+                ),
+            ));
+        }
+        Ok(Some(restored))
     }
 
     /// What a refusal says of the record a rollback put back, or `None` when there was nothing to put back.
@@ -1854,4 +2714,6 @@ struct Rolled {
     answers: bool,
     /// With the template: whether its old record was put back, or `None` when there was nothing to put back.
     record: Option<bool>,
+    /// `None` when the service's record names the root that runs; else whether a record on file says which one runs.
+    desired: Option<bool>,
 }

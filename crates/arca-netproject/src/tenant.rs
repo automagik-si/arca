@@ -66,6 +66,11 @@ pub struct TenantConfig {
     pub pool: String,
     pub caps: TenantCaps,
     pub created: u64,
+    /// The project holds Incus snapshots: `restricted.snapshots` is `allow`, the same `snapshots` step the service
+    /// project's owner has. Set the first time an update snapshots a volume of a service in the tenant. An entry an
+    /// earlier kernel wrote has no such key.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub snapshots: bool,
 }
 
 /// The restrictions a tenant's project is created with, beside `restricted` itself. Each is the tighter value: no proxy
@@ -485,6 +490,9 @@ impl Plugin for Tenant {
                 for (key, value) in cfg.caps.limits() {
                     config.insert(key.into(), json!(value));
                 }
+                if cfg.snapshots {
+                    config.insert(crate::SNAPSHOTS_KEY.into(), json!("allow"));
+                }
                 create(
                     ctx,
                     IncusKind::Project,
@@ -505,6 +513,11 @@ impl Plugin for Tenant {
                     if current["config"][key].as_str() != Some(value.as_str()) {
                         changes.insert(key.to_string(), Some(value));
                     }
+                }
+                if cfg.snapshots
+                    && current["config"][crate::SNAPSHOTS_KEY].as_str() != Some("allow")
+                {
+                    changes.insert(crate::SNAPSHOTS_KEY.to_string(), Some("allow".to_string()));
                 }
                 if !changes.is_empty() {
                     ctx.effect(EffectOp::IncusPatchConfig {
@@ -1250,6 +1263,7 @@ mod tests {
                 disk: "64GiB".into(),
             },
             created: 0,
+            snapshots: false,
         };
         let manifest = Tenant::manifest();
         let mut provider = Unreached;

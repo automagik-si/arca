@@ -447,6 +447,52 @@ pub(super) fn sync_front_held(
     Ok(changed)
 }
 
+/// Lets the project of the tenant `id` hold Incus snapshots: its entry gains the `snapshots` step the service project's
+/// owner has, applied at once, with no card. An entry that has the step already is not written again, and the answer is
+/// then `false`. An update's snapshot of a tenant's service volume needs it. The caller holds the node's write gate.
+pub(super) fn allow_tenant_snapshots(
+    kernel: &Mutex<Kernel>,
+    id: &str,
+    now: u64,
+) -> Result<bool, CallError> {
+    let mut kernel = lock(kernel)?;
+    let entry_id = tenant_entry(id);
+    let (_, mut config) = tenants(kernel.entries())
+        .into_iter()
+        .find(|(entry, config)| entry.id.0 == entry_id && config.id == id)
+        .ok_or_else(|| tenant_not_found(id))?;
+    if config.snapshots {
+        return Ok(false);
+    }
+    config.snapshots = true;
+    let change = crate::desired_store::EntryChange::Put(service_entry(
+        &entry_id,
+        "arca.tenant",
+        serde_json::to_value(&config).map_err(|_| internal())?,
+    ));
+    let outcomes = kernel.propose(vec![change], now).map_err(|_| internal())?;
+    if service_wiring::failed_for(&outcomes, &[entry_id.as_str()]) {
+        let why = service_wiring::failure_reason(&outcomes, &[entry_id.as_str()])
+            .unwrap_or_else(|| "the kernel recorded no reason".to_string());
+        return Err(service_refused(format!(
+            "the project of tenant {id} could not be set to hold snapshots ({why})"
+        )));
+    }
+    Ok(true)
+}
+
+/// Whether the desired document already lets the project of tenant `id` hold snapshots: the tenant's entry has the
+/// `snapshots` step, saved, whether or not the node has applied it to Incus yet.
+pub(super) fn tenant_snapshots_saved(kernel: &Mutex<Kernel>, id: &str) -> bool {
+    let Ok(kernel) = lock(kernel) else {
+        return false;
+    };
+    let entry_id = tenant_entry(id);
+    tenants(kernel.entries())
+        .into_iter()
+        .any(|(entry, config)| entry.id.0 == entry_id && config.id == id && config.snapshots)
+}
+
 /// Follows the front on a thread of its own, every 30 seconds, for as long as the process runs.
 pub fn spawn_front_sync(
     kernel: Arc<Mutex<Kernel>>,
@@ -1631,6 +1677,7 @@ impl TenantHandler {
             pool,
             caps,
             created: now,
+            snapshots: false,
         };
         changes.push(crate::desired_store::EntryChange::Put(service_entry(
             &entry_id,

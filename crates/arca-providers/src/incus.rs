@@ -101,16 +101,17 @@ fn service_proxy_allowance(entry: &EntryId, project: &str, key: &str, value: Opt
         && value == Some("allow")
 }
 
-// Only an entry that may own the service project may let it hold Incus snapshots, and only in that project, on a create or
-// a patch: the snapshot of a service's instance with its volumes, taken before an app update (Rule 55).
+// Only an entry that may own the service project may let it hold Incus snapshots, and only in that project, and a tenant's
+// entry in its own project alone, on a create or a patch: the snapshot of a service's volumes taken before an update
+// (Rule 55).
 fn service_snapshot_allowance(
     entry: &EntryId,
     project: &str,
     key: &str,
     value: Option<&str>,
 ) -> bool {
-    (entry.0 == NET_ENTRY || entry.0 == BRIDGED_ENTRY)
-        && project == SERVICE_PROJECT
+    ((entry.0 == NET_ENTRY || entry.0 == BRIDGED_ENTRY) && project == SERVICE_PROJECT
+        || tenant_owns(entry, project))
         && key == "restricted.snapshots"
         && value == Some("allow")
 }

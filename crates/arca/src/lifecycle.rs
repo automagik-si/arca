@@ -424,6 +424,15 @@ impl InstanceLifecycle {
                         " Arca gives it {GRACE_SECONDS} seconds to shut down and forces nothing."
                     )
                 };
+                // A change Incus applied whose read-back is not the instance asked for, or not the state asked for,
+                // was sent: said so, never "was not".
+                let said = match &error {
+                    IncusError::AppliedUnconfirmed(unconfirmed) => format!(
+                        "the change to have {named} {verb} was sent and Incus applied it, but its read-back does not confirm it: {}. It is {now} now.{grace}",
+                        unconfirmed.reason
+                    ),
+                    _ => format!("{named} was not {verb}: {error}. It is {now} now.{grace}"),
+                };
                 Err(Stopped {
                     refusal: refused(
                         match action {
@@ -431,7 +440,7 @@ impl InstanceLifecycle {
                             StateAction::Stop => "InstanceStopFailed",
                             StateAction::Restart => "InstanceRestartFailed",
                         },
-                        format!("{named} was not {verb}: {error}. It is {now} now.{grace}"),
+                        said,
                     ),
                     uuid: seen.uuid.clone(),
                     was: Some(seen.status.clone()),

@@ -705,6 +705,33 @@ impl ServiceHandler {
         .is_ok()
     }
 
+    /// [`ServiceHandler::put_plan_back`], only while `still` holds when it is asked under the node's write gate, just
+    /// before the record is written: `None` when it did not, and nothing was written; else whether the record went back.
+    pub(super) fn put_plan_back_while(
+        &self,
+        entry_id: &str,
+        old: &ServiceConfig,
+        exactly: bool,
+        still: impl FnOnce() -> bool,
+    ) -> Option<bool> {
+        let mut old = old.clone();
+        old.environment_patch = None;
+        let mut held = true;
+        let written = self
+            .amend(entry_id, &old.name.clone(), |record| {
+                if !still() {
+                    held = false;
+                    return;
+                }
+                fields(record, &old);
+                if exactly {
+                    record.entrypoint = old.entrypoint.clone();
+                }
+            })
+            .is_ok();
+        held.then_some(written)
+    }
+
     /// `service_reconfigure`: makes the service `name` what its template says now, exactly as the approved card
     /// showed. `entries` are the ones the call may see, a tenant's when it names one. Only an approved proposal runs it.
     pub(super) fn call_reconfigure(
