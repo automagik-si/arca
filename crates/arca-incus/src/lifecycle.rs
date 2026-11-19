@@ -8,6 +8,7 @@
 //! read. The one exception is a service's snapshots ([`StateChanger::snapshot_with_volumes`] and the writes beside it):
 //! they take, restore and remove Incus snapshots of a service instance of the node's own service project and of the
 //! custom volumes it mounts, check the instance's mark and each volume's themselves, and send no stop and no start.
+//! A tenant service's own custom volume can also be snapshotted in its tenant's project.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -372,8 +373,9 @@ impl StateChanger {
     }
 
     /// Takes a snapshot named `snapshot` of one custom volume the service instance `seen` mounts, and waits for its
-    /// operation. It sends no stop and no start: the caller decides when the volume is snapshotted. The instance is
-    /// checked as [`StateChanger::snapshot_with_volumes`] checks it, and the volume must carry the instance's own mark.
+    /// operation. It sends no stop and no start: the caller decides when the volume is snapshotted. The instance
+    /// must belong to the node's service project or to its own tenant's project in this changer's family. The volume
+    /// must carry the instance's own mark.
     pub fn snapshot_volume(
         &self,
         seen: &InstanceState,
@@ -381,7 +383,7 @@ impl StateChanger {
         volume: &str,
         snapshot: &str,
     ) -> Result<(), IncusError> {
-        let (fresh, metadata) = self.owned_service(seen)?;
+        let (fresh, metadata) = self.owned_service(seen, true)?;
         self.mounted_volume(&fresh, &metadata, pool, volume)?;
         named(snapshot)?;
         self.send_volume_snapshot(&fresh.project, pool, volume, snapshot)
@@ -395,7 +397,7 @@ impl StateChanger {
         volume: &str,
         snapshot: &str,
     ) -> Result<(), IncusError> {
-        let (fresh, metadata) = self.owned_service(seen)?;
+        let (fresh, metadata) = self.owned_service(seen, false)?;
         if !fresh.is_stopped() {
             return Err(refused("the instance is not stopped"));
         }
@@ -410,7 +412,7 @@ impl StateChanger {
         seen: &InstanceState,
         snapshot: &str,
     ) -> Result<(), IncusError> {
-        let (fresh, _) = self.owned_service(seen)?;
+        let (fresh, _) = self.owned_service(seen, false)?;
         named(snapshot)?;
         self.send_removal(&fresh, &SnapshotPart::Instance, snapshot)
     }
@@ -423,7 +425,7 @@ impl StateChanger {
         volume: &str,
         snapshot: &str,
     ) -> Result<(), IncusError> {
-        let (fresh, metadata) = self.owned_service(seen)?;
+        let (fresh, metadata) = self.owned_service(seen, false)?;
         self.mounted_volume(&fresh, &metadata, pool, volume)?;
         named(snapshot)?;
         let part = SnapshotPart::Volume {
@@ -447,7 +449,7 @@ impl StateChanger {
         let early = |part: SnapshotPart| move |error| PartFailure::before(part, error);
         named(snapshot).map_err(early(SnapshotPart::Instance))?;
         let (fresh, metadata) = self
-            .owned_service(seen)
+            .owned_service(seen, false)
             .map_err(early(SnapshotPart::Instance))?;
         let (volumes, not_taken) = disks(&metadata);
         let mark = fresh.own_config[KERNEL_ENTRY_KEY].clone();
@@ -500,7 +502,9 @@ impl StateChanger {
         let first = parts.first().cloned().unwrap_or(SnapshotPart::Instance);
         let early = |part: SnapshotPart| move |error| PartFailure::before(part, error);
         named(snapshot).map_err(early(first.clone()))?;
-        let (fresh, metadata) = self.owned_service(seen).map_err(early(first.clone()))?;
+        let (fresh, metadata) = self
+            .owned_service(seen, false)
+            .map_err(early(first.clone()))?;
         if !fresh.is_stopped() {
             return Err(PartFailure::before(
                 first,
@@ -559,17 +563,19 @@ impl StateChanger {
         (done, left)
     }
 
-    /// Reads the instance `seen` names again and checks, before any write, that it is a service instance of the node's
-    /// own service project that Arca made and is not removing, and that it is the instance `seen` was read from. The
-    /// checks on `seen` come first, so a target that is not a service's is refused before any request.
-    fn owned_service(&self, seen: &InstanceState) -> Result<(InstanceState, Value), IncusError> {
+    /// Checks the target before making any request, then reads it again and verifies its identity and ownership.
+    fn owned_service(
+        &self,
+        seen: &InstanceState,
+        allow_tenant: bool,
+    ) -> Result<(InstanceState, Value), IncusError> {
         self.allow(&seen.project)?;
-        service_target(seen)?;
+        service_target(seen, allow_tenant)?;
         let (fresh, metadata) = self.read_with(&seen.project, &seen.name)?;
         if fresh.uuid != seen.uuid || fresh.kind != seen.kind {
             return Err(refused("the instance was recreated since it was read"));
         }
-        service_target(&fresh)?;
+        service_target(&fresh, allow_tenant)?;
         if fresh.own_config.get(KERNEL_ENTRY_KEY) != seen.own_config.get(KERNEL_ENTRY_KEY) {
             return Err(refused("the instance's owner changed since it was read"));
         }
@@ -1045,30 +1051,38 @@ impl fmt::Display for PartFailure {
     }
 }
 
-/// Refuses, before any request, an instance that is not a service's of the node's own service project as Arca made it:
-/// another project, a tenant's, an adopted one, one without a uuid, one without a service's mark, one being removed.
-fn service_target(state: &InstanceState) -> Result<(), IncusError> {
-    if arca_kernel::ownership::tenant_of_project(&state.project).is_some() {
-        return Err(refused("a tenant's instance is not snapshotted here"));
-    }
+/// Checks that the instance belongs to a service Arca made in the node's own project, or in its own tenant's
+/// project when taking a volume snapshot. The instance must have a uuid and no tombstone.
+fn service_target(state: &InstanceState, allow_tenant: bool) -> Result<(), IncusError> {
     let mark = state
         .own_config
         .get(KERNEL_ENTRY_KEY)
         .map_or("", String::as_str);
-    if state
-        .project
-        .starts_with(crate::adopt::ADOPT_PROJECT_PREFIX)
-        || mark.starts_with(crate::adopt::ADOPT_ENTRY_PREFIX)
-    {
-        return Err(refused("an adopted instance is not snapshotted here"));
-    }
-    if state.project != crate::exec::SERVICE_PROJECT {
-        return Err(refused(
-            "only an instance of the node's own service project is snapshotted here",
-        ));
-    }
-    if mark.len() <= SERVICE_ENTRY_PREFIX.len() || !mark.starts_with(SERVICE_ENTRY_PREFIX) {
-        return Err(refused("the instance is not a service's that Arca made"));
+    if let Some(id) = arca_kernel::ownership::tenant_of_project(&state.project) {
+        let service = state.name.strip_suffix(&format!("-{id}"));
+        if !allow_tenant
+            || service.is_none_or(|name| {
+                name.is_empty() || mark != format!("t-{id}-{SERVICE_ENTRY_PREFIX}{name}")
+            })
+        {
+            return Err(refused("a tenant's instance is not snapshotted here"));
+        }
+    } else {
+        if state
+            .project
+            .starts_with(crate::adopt::ADOPT_PROJECT_PREFIX)
+            || mark.starts_with(crate::adopt::ADOPT_ENTRY_PREFIX)
+        {
+            return Err(refused("an adopted instance is not snapshotted here"));
+        }
+        if state.project != crate::exec::SERVICE_PROJECT {
+            return Err(refused(
+                "only an instance of the node's own service project is snapshotted here",
+            ));
+        }
+        if mark.len() <= SERVICE_ENTRY_PREFIX.len() || !mark.starts_with(SERVICE_ENTRY_PREFIX) {
+            return Err(refused("the instance is not a service's that Arca made"));
+        }
     }
     if state.uuid.is_none() {
         return Err(refused("the instance has no uuid"));

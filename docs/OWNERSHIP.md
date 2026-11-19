@@ -337,11 +337,10 @@ mark. `features.networks` is not set: a kernel project has no networks of its ow
 own image store, so an image an instance pulls lands inside the project and never in the default project's store, and the
 project's retirement deletes it (Rule 42). Incus 7.3 sets it to `"true"` by default; the kernel sets it so that nothing depends on
 that default. A plugin may set a `restricted`, `restricted.*` or `features.*` key
-on a project create only to the value the kernel pins it at, with one exception: `restricted.networks.access`, which names the
-bridges the project may use and is checked as Rule 41 states. Any other value is refused, and so is a key the kernel does not pin,
-whatever its value, so `restricted.containers.privilege` set to `allow`, `features.images` set to `false` and `features.networks`
-set to anything are all refused. A project patch may not change any such key, whatever its value, and the refusal is made before
-any request; the one exception is the widening of the service project by the entry that owns it (Rule 55). A project is named by its own name. Whatever the provider allows, no request can PATCH a project: `exchange`, the one
+on a project create only to the value the kernel pins it at or as allowed by Rules 41, 55 and 62.
+`restricted.containers.privilege` set to `allow`, `features.images` set to `false` and `features.networks` set to anything
+are all refused. A patch to a guarded key is refused before any request except for the owner steps in Rules 55 and 62.
+A project is named by its own name. Whatever the provider allows, no request can PATCH a project: `exchange`, the one
 function every request of the read client and the writer passes through, refuses a PATCH whose path is `/1.0/projects` or under
 it, percent-decoded, with `IncusError::Refused("a project is never sent a PATCH")`, before it connects, so no byte reaches the
 socket (Rule 43).
@@ -1274,12 +1273,14 @@ carry the mark `net-arcak-svc`. The project is restricted like every kernel proj
 keys, each at its tighter value, which the provider admits for a tenant's entry in its own project and for nothing else:
 `restricted.devices.proxy=block`, `restricted.devices.gpu=block`, `restricted.devices.disk=managed`,
 `restricted.devices.nic=managed`, `restricted.containers.nesting=block`, `restricted.containers.privilege=unprivileged`,
-`restricted.containers.lowlevel=block` and `restricted.virtual-machines.lowlevel=block`. A scratch run never makes the
-bridge: it joins the one the node has, or the create is refused.
+`restricted.containers.lowlevel=block` and `restricted.virtual-machines.lowlevel=block`. The tenant's owner entry can also
+set `snapshots: true`, applying `restricted.snapshots=allow` on create or by a journaled project config write (Rule 43),
+with no card. An absent or false flag leaves the snapshot setting alone. The provider admits this change only from the
+owner entry of that tenant's own project. A scratch run joins the bridge the node has, or the create is refused.
 Source: `Tenant::apply` and `RESTRICTIONS` in `crates/arca-netproject/src/tenant.rs`; `tenant_restriction`, `tenant_owns`
-and `prepared_create` in `crates/arca-providers/src/incus.rs`. Test
+and `project_snapshot_allowance` in `crates/arca-providers/src/incus.rs`. Tests
 `a_tenant_is_one_restricted_project_on_the_managed_bridge_with_its_caps_and_profile` in
-`crates/arca/tests/tenants/admission.rs`.
+`crates/arca/tests/tenants/admission.rs` and the tests in `crates/arca/tests/tenants/snapshots.rs`.
 
 **Rule 63.** A tenant's caps are its project's own `limits.instances`, `limits.containers`, `limits.virtual-machines`,
 `limits.cpu`, `limits.memory` and `limits.disk`. They are set at the project's create and, when the entry's caps change,
@@ -1788,9 +1789,11 @@ tests in `crates/arca/tests/tenants/image_import.rs`.
 
 **Rule 81.** A service's instance and the custom volumes it mounts are snapshotted, restored and their snapshots removed only
 through the state changer's snapshot writes, outside the desired-state journal, and only for a container or virtual machine
-of the node's own service project `arcak-svc` whose own config carries a service's mark (`service-<name>`) and no tombstone.
-A target outside the family, a tenant's project, an adoption project, an instance whose mark is an adoption's, an instance
-with no service mark and one being removed are refused from the instance the caller read, before any request; the instance
+of the node's own service project `arcak-svc` whose own config carries a service's mark (`service-<name>`) and no tombstone,
+with one exception. A custom volume alone can also be snapshotted in a tenant's project when its owner entry has allowed
+snapshots (Rule 62). The instance must carry the matching `t-<id>-service-<name>` mark for `<name>-<id>` in that project.
+A target outside the family, an adoption project, an instance whose mark is an adoption's, an instance without the
+required service mark and one being removed are refused from the instance the caller read, before any request. The instance
 is then read again and refused when its uuid, its type or its mark changed. A volume is written only when the instance
 mounts it (its own devices laid over its profiles') and the volume's own config carries the instance's mark and no
 tombstone. The requests are a `POST .../instances/<i>/snapshots` of `{name, stateful: false}`, a

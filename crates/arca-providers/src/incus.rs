@@ -101,16 +101,15 @@ fn service_proxy_allowance(entry: &EntryId, project: &str, key: &str, value: Opt
         && value == Some("allow")
 }
 
-// Only an entry that may own the service project may let it hold Incus snapshots, and only in that project, on a create or
-// a patch: the snapshot of a service's instance with its volumes, taken before an app update (Rule 55).
-fn service_snapshot_allowance(
+// Only a service-project owner or a tenant's own entry may let its project hold Incus snapshots (Rules 55 and 62).
+fn project_snapshot_allowance(
     entry: &EntryId,
     project: &str,
     key: &str,
     value: Option<&str>,
 ) -> bool {
-    (entry.0 == NET_ENTRY || entry.0 == BRIDGED_ENTRY)
-        && project == SERVICE_PROJECT
+    (((entry.0 == NET_ENTRY || entry.0 == BRIDGED_ENTRY) && project == SERVICE_PROJECT)
+        || tenant_owns(entry, project))
         && key == "restricted.snapshots"
         && value == Some("allow")
 }
@@ -657,7 +656,7 @@ impl IncusProvider {
                 if service_proxy_allowance(entry, project, key, set.as_str()) {
                     continue;
                 }
-                if service_snapshot_allowance(entry, project, key, set.as_str()) {
+                if project_snapshot_allowance(entry, project, key, set.as_str()) {
                     continue;
                 }
                 if host_nic_allowance(entry, project, key, set.as_str(), true) {
@@ -1938,9 +1937,9 @@ fn apply_changes(
 }
 
 /// The keys a change may name: plain, and never the kernel's tombstone or Incus's own `volatile` namespace. On a project, no
-/// guarded key except the widening of the service project by an entry that may own it: its proxy and snapshot allowances, and for the
-/// network entry the host-bridge NIC allowance with the removal of the bridge grant. The plan refuses them before any
-/// read, so a refused change sends no request.
+/// guarded key except the owner steps in Rules 55 and 62: proxy and snapshot allowances in the service project,
+/// the host-bridge NIC allowance with removal of the bridge grant, and snapshots in a tenant's own project.
+/// The plan checks these keys before any read.
 fn check_patch_keys(
     entry: &EntryId,
     object: &ObjectRef,
@@ -1950,7 +1949,7 @@ fn check_patch_keys(
         if object.kind == IncusKind::Project
             && guarded_project_key(key)
             && !service_proxy_allowance(entry, &object.project, key, value.as_deref())
-            && !service_snapshot_allowance(entry, &object.project, key, value.as_deref())
+            && !project_snapshot_allowance(entry, &object.project, key, value.as_deref())
             && !host_nic_allowance(entry, &object.project, key, value.as_deref(), false)
             && !bridge_grant_removal(entry, &object.project, key, value.as_deref())
         {
