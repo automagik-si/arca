@@ -4,6 +4,9 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 
 ## Unreleased
 
+A tenant's owner entry can set `snapshots: true` to allow Incus snapshots on project creation or reconciliation.
+This setting defaults to off. It lets Arca snapshot a tenant service's data volume.
+
 ## 0.38.0 (2026-11-19)
 
 Arca can now take an Incus snapshot of a service's instance together with each custom volume it mounts, under one

@@ -7723,6 +7723,11 @@ the top of the subnet down. The node's own services keep `.10` to `.239` without
 tenants fit a node. In a scratch run (`kernel.scratch`) a tenant's project is `arcak-scratch-t-<id>`, and the kernel
 joins the managed bridge the node already has instead of making one.
 
+The tenant's desired-state owner entry (`tenant-<id>`) can set `snapshots: true`. Arca sets
+`restricted.snapshots=allow` when it creates the project or applies the step to an existing project, with no approval
+card. The setting defaults to off. With it on, Arca can take an Incus snapshot of a data volume mounted and owned by one
+of that tenant's services.
+
 The verbs:
 
 | Verb | What it does |

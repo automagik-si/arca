@@ -18,7 +18,7 @@ use std::net::Ipv4Addr;
 pub const PROJECT: &str = "arcak-svc";
 pub const BRIDGE: &str = "arcak-svcbr";
 pub const PROFILE: &str = "arca-service";
-/// The project key that lets the service project hold Incus snapshots, set to `allow` by its owner's `snapshots` step.
+/// The Incus project key an owner's `snapshots` step sets to `allow`.
 pub const SNAPSHOTS_KEY: &str = "restricted.snapshots";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

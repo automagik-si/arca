@@ -1631,6 +1631,7 @@ impl TenantHandler {
             pool,
             caps,
             created: now,
+            snapshots: false,
         };
         changes.push(crate::desired_store::EntryChange::Put(service_entry(
             &entry_id,
