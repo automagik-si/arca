@@ -487,6 +487,29 @@ impl StateChanger {
         })
     }
 
+    /// Reads the names directly. A recursive list can omit snapshots that Incus fails to render.
+    pub fn instance_snapshots(&self, seen: &InstanceState) -> Result<Vec<String>, IncusError> {
+        self.allow(&seen.project)?;
+        object_url(&seen.project, &seen.name)?;
+        let path = format!("/1.0/instances/{}/snapshots", seen.name);
+        let url = format!("{path}?project={}", seen.project);
+        let listed = checked_metadata(self.send("GET", &url, None)?)?;
+        let rows = listed
+            .as_array()
+            .ok_or_else(|| decode("the snapshot list is not a list"))?;
+        let prefix = format!("{path}/");
+        rows.iter()
+            .map(|row| {
+                row.as_str()
+                    .and_then(|url| url.strip_prefix(&prefix))
+                    .map(|name| name.split_once('?').map_or(name, |(name, _)| name))
+                    .filter(|name| !name.is_empty() && !name.contains('/'))
+                    .map(str::to_owned)
+                    .ok_or_else(|| decode("a snapshot is not named by its address"))
+            })
+            .collect()
+    }
+
     /// Puts the parts `parts` of the stopped service instance `seen` back to their snapshot `snapshot`: the instance first
     /// when it is named, then each volume in the order given. Every check is made before the first write, that each part
     /// holds the snapshot among them. A restore cannot be undone, so a failure names the part and the parts already
