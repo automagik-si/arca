@@ -878,3 +878,23 @@ fn a_rollback_of_an_older_service_leaves_the_old_roots_run_on_its_disk() {
         assert!(emptied[0] < back, "{steps:?}");
     }
 }
+
+#[test]
+fn a_rollback_puts_no_template_settings_back_onto_an_instance_that_took_the_services_place() {
+    let key = common::SkKey::from_seed(83);
+    let up = Arc::new(AtomicBool::new(false));
+    let rig = node(&up, &key, true);
+    rig.template("app", second());
+    let proposed = propose_update(&rig, with_template()).expect("proposed");
+    // At the update's start another instance takes the name, with the new template's settings in its config.
+    rig.fake
+        .recreate_at_next_start(PROJECT, "app", "00000000-0000-4000-8000-0000000000dd");
+
+    let (code, message) = refusal_words(approve(&rig, &key, &proposed));
+    assert_eq!(code, "rollback_failed", "{message}");
+    assert!(message.contains("another instance has taken"), "{message}");
+    // The template's old settings were not written to the newcomer: its config is as the update left it.
+    let after = config(&rig);
+    assert!(after.get("oci.entrypoint").is_some(), "{after}");
+    assert!(!journal(&rig).iter().any(|(step, _)| step == "put back"));
+}

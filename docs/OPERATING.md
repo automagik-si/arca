@@ -2004,20 +2004,26 @@ restored to its snapshot, so what the new version wrote there (a migration, for 
 started if it was running before, given 30 seconds to answer, and the call is
 refused with code `rolled_back` and the failing step's words (and a note when the old version does not answer yet).
 When Incus could not fetch the new image, the old root was never taken away: if it cannot fetch the old one either,
-the old version is started as it is, and the refusal says so. When the new rebuild failed any other way, the root may
-already be the new one: if the old one cannot be rebuilt then, nothing is started and the refusal is `rollback_failed`.
-Every rollback step goes only to the instance the update began with; if another instance has taken its name meanwhile,
-nothing is written to it and the refusal is `rollback_failed`. If a volume's restore fails part way, the refusal names
-the snapshot, the volumes put back and the one that failed, and the node keeps that on file: the next update of the
-service, once it is stopped, first puts every one of them back to that snapshot (undoing what was written to them since),
-then goes on. While the service runs, that update is refused and asks for `instance_stop` first. If Incus does not finish a rebuild in time, nothing is
+the old version is started as it is, and the refusal says so, but only when the old rebuild also failed on fetching
+its image. When either rebuild failed any other way, the root may no longer be the old one: nothing is started and the
+refusal is `rollback_failed`. Every rollback step, the template's settings put back among them, goes only to the
+instance the update began with, checked again by each step's own read; if another instance has taken its name
+meanwhile, nothing is written to it and the refusal is `rollback_failed`. The node puts the volumes' restore on file
+(`service-update-restore-<entry>.json` in its state folder) before it puts back the first one, and takes it off only
+once every one is back; if it cannot put it on file, no volume is put back. If a restore fails part way, the refusal
+names the snapshot, the volumes put back and the one that failed, and the record stays: the next update of the service,
+once it is stopped, first puts every one of them back to that snapshot (undoing what was written to them since), takes
+the record off file, then goes on; if the record cannot come off, it stops there. This holds for an update to the
+digest the record already names too. While the service runs, that update is refused and asks for `instance_stop`
+first. A record kept for an earlier instance of the service (one made again since) is removed and not used. If Incus does not finish a rebuild in time, nothing is
 rolled back, so as not to rebuild twice at once: the refusal is `update_unsettled`, and the same update may be asked
 for again once Incus is idle. If the old version cannot be put back, the refusal is `rollback_failed`, says so, and
 says whether the service is stopped, as a read of it shows. A failure before anything is changed (the digest is malformed, the service is not made
 from an image by digest or a local image pinned by fingerprint, the image a local update names is not in the service
 project's image store, its instance is not the one Arca created, it has never been started, its instance holds an
 Incus snapshot, the volume snapshot failed, or the project still refuses it) says "Nothing was changed", or, when
-the owner's `snapshots` step was written or saved on the way, "Nothing else was changed" and names it. A service that
+the owner's `snapshots` step was written or saved, a snapshot could not be removed again, or volumes were put back on
+the way, "Nothing else was changed" and names it. A service that
 has volumes of its own is never rebuilt without their snapshot. An instance that holds Incus snapshots is refused
 before anything is stopped, in words that name each of them: the rebuild would fail halfway. Arca has no step that
 removes an instance's own Incus snapshots yet (`snapshot_delete` removes Arca's copies, not these): removing them is to

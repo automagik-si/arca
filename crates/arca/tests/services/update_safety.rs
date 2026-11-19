@@ -3,6 +3,8 @@
 //! replaced, a restore that stops halfway, a snapshot list Incus renders short, and a snapshot name that is taken on one
 //! volume of two. Every value is synthetic.
 use super::*;
+use arca_incus::fake::RebuildStep;
+use std::sync::Mutex;
 
 /// The snapshot name the first update of the fixed test clock takes.
 fn first_name() -> String {
@@ -175,6 +177,14 @@ fn a_restore_that_stops_at_the_second_volume_is_finished_by_the_next_update_befo
     let (code, message) = refusal_words(update(&rig, json!({ "name": "app", "digest": NEW })));
     assert_eq!(code, "refused", "{message}");
     assert!(message.contains("restore pending failed"), "{message}");
+    // It put app-data back again before `more` refused: that is said, not "Nothing was changed".
+    assert!(
+        message.contains(&format!(
+            "Nothing else was changed: its volumes app-data (pool1) were put back to the snapshot {}",
+            first_name()
+        )),
+        "{message}"
+    );
     assert_eq!(rig.fake.rebuilds(PROJECT, "app").len(), rebuilds);
 
     // Once they take it, every volume goes back to the first snapshot, then the update runs as asked.
@@ -286,7 +296,163 @@ fn a_name_taken_on_the_second_volume_whose_first_snapshot_stays_stops_the_update
         message.contains("the volume app-data of the pool pool1 was not removed"),
         "{message}"
     );
+    // The snapshot left on app-data is a change, and the answer says so.
+    assert!(
+        message.contains(&format!(
+            "Nothing else was changed: the snapshot {taken} of its volumes app-data (pool1) was taken and could not be removed again"
+        )),
+        "{message}"
+    );
     assert!(rig.fake.rebuilds(PROJECT, "app").is_empty());
     assert!(volume_snapshot(&rig, "app-data", &format!("{taken}-2")).is_none());
     assert_eq!(instance(&rig)["status"], "Running");
+}
+
+#[test]
+fn an_instance_that_takes_the_services_place_at_the_rollbacks_stop_gets_no_rebuild_restore_or_start()
+ {
+    let up = Arc::new(AtomicBool::new(false));
+    let rig = rig(&up);
+    // The update's own stop goes by; at the rollback's stop another, stopped instance takes the name.
+    rig.fake
+        .recreate_at_stop(PROJECT, "app", "00000000-0000-4000-8000-0000000000cc", 1);
+    let actions = rig.fake.state_actions(PROJECT, "app").len();
+
+    let (code, message) = refusal_words(update(
+        &rig,
+        json!({ "name": "app", "digest": NEW, "timeoutSeconds": 1 }),
+    ));
+    assert_eq!(code, "rollback_failed", "{message}");
+    assert!(message.contains("stop failed"), "{message}");
+    assert!(message.contains("Another instance is there"), "{message}");
+    assert_eq!(
+        rig.fake.state_actions(PROJECT, "app")[actions..],
+        ["stop".to_string(), "start".to_string(), "stop".to_string()]
+    );
+    assert_eq!(rig.fake.rebuilds(PROJECT, "app"), vec!["registry"]);
+    assert!(volume_restores(&rig).is_empty());
+}
+
+#[test]
+fn an_old_rebuild_that_fails_after_its_root_landed_is_not_reported_as_the_old_root_kept() {
+    let up = Arc::new(AtomicBool::new(true));
+    let rig = rig(&up);
+    // The new image is never fetched; the old one is, and its rebuild fails after the old root was taken away.
+    rig.fake.script_rebuilds(
+        PROJECT,
+        "app",
+        vec![
+            RebuildStep::RefuseFetch,
+            RebuildStep::LandThenFail("Failed applying the image's OCI config".to_string()),
+        ],
+    );
+    let actions = rig.fake.state_actions(PROJECT, "app").len();
+
+    let (code, message) = refusal_words(update(&rig, json!({ "name": "app", "digest": NEW })));
+    assert_eq!(code, "rollback_failed", "{message}");
+    assert!(
+        message.contains("no root there is known to be whole"),
+        "{message}"
+    );
+    assert_eq!(
+        rig.fake.state_actions(PROJECT, "app")[actions..],
+        ["stop".to_string()]
+    );
+    assert!(volume_restores(&rig).is_empty());
+    assert_eq!(instance(&rig)["status"], "Stopped");
+}
+
+#[test]
+fn the_restore_is_on_file_before_its_first_volume_is_put_back() {
+    let up = Arc::new(AtomicBool::new(false));
+    let rig = rig(&up);
+    second_volume(&rig);
+    let record = rig.dir.join("service-update-restore-service-app.json");
+    let seen: Arc<Mutex<Vec<(String, bool)>>> = Arc::new(Mutex::new(Vec::new()));
+    let (looked, at) = (Arc::clone(&seen), record.clone());
+    rig.fake.observe_volume_restores(Arc::new(move |volume| {
+        looked
+            .lock()
+            .expect("the list")
+            .push((volume.to_string(), at.exists()));
+    }));
+
+    let (code, message) = refusal_words(update(
+        &rig,
+        json!({ "name": "app", "digest": NEW, "timeoutSeconds": 1 }),
+    ));
+    assert_eq!(code, "rolled_back", "{message}");
+    assert_eq!(
+        *seen.lock().expect("the list"),
+        vec![
+            ("pool1/app-data".to_string(), true),
+            ("pool1/more".to_string(), true)
+        ]
+    );
+    // Off file once every volume is back.
+    assert!(!record.exists());
+}
+
+#[test]
+fn a_finished_restore_whose_record_cannot_be_removed_stops_the_update_before_the_rebuild() {
+    use std::os::unix::fs::PermissionsExt;
+    let up = Arc::new(AtomicBool::new(false));
+    let rig = rig(&up);
+    second_volume(&rig);
+    rig.fake
+        .set_reject_put("/1.0/storage-pools/pool1/volumes/custom/more");
+    let _ = update(
+        &rig,
+        json!({ "name": "app", "digest": NEW, "timeoutSeconds": 1 }),
+    );
+    rig.fake.clear_reject_put();
+    let rebuilds = rig.fake.rebuilds(PROJECT, "app").len();
+    up.store(true, Ordering::SeqCst);
+
+    // The node's state folder takes no removal: the restore goes through, its record cannot come off file.
+    let mode = fs::metadata(&rig.dir)
+        .expect("the state folder")
+        .permissions()
+        .mode();
+    fs::set_permissions(&rig.dir, fs::Permissions::from_mode(0o500)).expect("read-only");
+    let result = update(&rig, json!({ "name": "app", "digest": NEW }));
+    fs::set_permissions(&rig.dir, fs::Permissions::from_mode(mode)).expect("writable again");
+
+    let (code, message) = refusal_words(result);
+    assert_eq!(code, "refused", "{message}");
+    assert!(message.contains("could not be taken off file"), "{message}");
+    assert_eq!(more_restores(&rig), vec![first_name()]);
+    assert_eq!(rig.fake.rebuilds(PROJECT, "app").len(), rebuilds);
+    assert!(
+        rig.dir
+            .join("service-update-restore-service-app.json")
+            .exists()
+    );
+    assert_eq!(alias_of_record(&rig), "app@".to_string() + DIGEST);
+}
+
+#[test]
+fn a_restore_left_on_file_is_finished_even_by_an_update_to_the_digest_the_record_names() {
+    let up = Arc::new(AtomicBool::new(false));
+    let rig = rig(&up);
+    second_volume(&rig);
+    rig.fake
+        .set_reject_put("/1.0/storage-pools/pool1/volumes/custom/more");
+    let _ = update(
+        &rig,
+        json!({ "name": "app", "digest": NEW, "timeoutSeconds": 1 }),
+    );
+    rig.fake.clear_reject_put();
+    up.store(true, Ordering::SeqCst);
+
+    // The record names the digest asked for, but the volumes are part restored: no "already runs this digest".
+    let done = update(&rig, json!({ "name": "app", "digest": DIGEST })).expect("the update");
+    assert_eq!(done["updated"], true, "{done}");
+    assert_eq!(more_restores(&rig), vec![first_name()]);
+    assert!(journal(&rig).contains(&("restore pending".to_string(), true)));
+    assert!(
+        !rig.dir
+            .join("service-update-restore-service-app.json")
+            .exists()
+    );
 }

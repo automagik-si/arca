@@ -1812,17 +1812,20 @@ creation`). `service_update` snapshots only the service's own volumes, `pre-upda
 Incus 7.6 refuses to rebuild an instance that holds a snapshot; a service that has volumes of its own is never rebuilt
 without their snapshot, so a project that still refuses it, or a step that cannot be written, ends the update before the
 rebuild. A name a volume already holds is taken again with a suffix only once every volume snapshotted under it was
-removed again; otherwise the update stops and names the snapshot and what was not removed. A rollback sends every step
-only to the instance the update began with (uuid, kind and mark), rebuilds the old root and then restores each volume.
-It starts the old version on a root it could not rebuild only when the new rebuild failed on fetching its image, before
-Incus took the old root away. A restore that fails part way is kept on file, with the snapshot and the volumes; the next
-update finishes it, once the service is stopped, before it takes a snapshot of its own. An update of an instance that
+removed again; otherwise the update stops and names the snapshot and what was not removed. A rollback sends every step,
+the template's record put back among them, only to the instance the update began with (uuid, kind and mark); a state
+change's read-back and a rebuild's last read refuse another instance. It rebuilds the old root and then restores each
+volume. It starts the old version on a root it could not rebuild only when both rebuilds failed on fetching their
+image, before Incus took a root away. A volume restore is on file, with the snapshot, the volumes and the instance's
+project, name, uuid and mark, from before its first volume is put back until its last one is; the next update finishes
+an unfinished one, once the service is stopped, before it takes a snapshot of its own, also for the digest the record
+already names, and goes on only once the record is off file. A record kept for another instance is removed unused. An update of an instance that
 holds an instance snapshot is refused, naming them, before any write, from the list of snapshot names (Incus's
 recursive list leaves out a snapshot it cannot render). Arca has no step that removes those snapshots yet.
 Source: `StateChanger::{snapshot_volume, restore_volume, remove_instance_snapshot, remove_volume_snapshot,
 snapshot_with_volumes, snapshot_own_volumes, instance_snapshots, restore_with_volumes}` and `service_target` in
 `crates/arca-incus/src/lifecycle.rs`; `Run::volume_snapshot`, `Run::finish_pending`, `Run::reread` and `Run::root_back`
-in `crates/arca/src/service_update.rs`;
+and `Pending` in `crates/arca/src/service_update.rs`;
 the fake's `volume_snapshot`, `restore_volume` and its rebuild refusal in `crates/arca-incus/src/fake.rs`;
 tests in `crates/arca-incus/tests/service_snapshots.rs`,
 `an_instance_that_holds_a_snapshot_is_refused_before_any_change_naming_each_snapshot` in

@@ -18,8 +18,9 @@ the volume to that snapshot, so what the new version wrote there is undone. Befo
 rolled back with no snapshot at all and left the new version's writes in the data volume. The first update whose
 snapshot the project refuses gives the project its `snapshots` step, in the node's service project and in a tenant's
 alike. A service with volumes of its own is never rebuilt without their snapshot. A rollback writes only to the
-instance the update began with, starts the old version on a root it could not rebuild only when the new image was never
-fetched, and a restore that fails part way is finished by the next update before it does anything else. Each update
+instance the update began with, starts the old version on a root it could not rebuild only when neither image was
+fetched, and a volume restore is on file from before its first volume until its last, so one that fails part way is
+finished by the next update before it does anything else. Each update
 keeps its volume snapshot until a later release removes old ones. An instance that already holds an Incus snapshot is
 refused before anything is changed, in words that name each snapshot; Arca has no step that removes them yet.
 

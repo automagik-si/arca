@@ -213,6 +213,13 @@ impl StateChanger {
         let envelope = checked_envelope(self.send("PUT", &url, Some(&body))?)?;
         self.wait_for(&envelope)?;
         let after = self.read(&seen.project, &seen.name)?;
+        // Another instance that took the name while the change ran is not the one that was changed: its state is not
+        // handed back as if it were.
+        if after.uuid != seen.uuid || after.kind != seen.kind {
+            return Err(refused(
+                "another instance took the instance's place while its state changed",
+            ));
+        }
         let wanted = match action {
             StateAction::Start | StateAction::Restart => after.is_running(),
             StateAction::Stop => after.is_stopped(),
@@ -356,7 +363,10 @@ impl StateChanger {
     pub fn restore_snapshot(&self, seen: &InstanceState, snapshot: &str) -> Result<(), IncusError> {
         self.allow(&seen.project)?;
         let fresh = self.read(&seen.project, &seen.name)?;
-        if fresh.uuid != seen.uuid || fresh.kind != seen.kind {
+        if fresh.uuid != seen.uuid
+            || fresh.kind != seen.kind
+            || fresh.own_config.get(KERNEL_ENTRY_KEY) != seen.own_config.get(KERNEL_ENTRY_KEY)
+        {
             return Err(refused("the instance was recreated since it was read"));
         }
         if !fresh.is_stopped() {
@@ -749,7 +759,10 @@ impl StateChanger {
         registry: Option<&crate::write::RegistryCredential>,
     ) -> Result<(), IncusError> {
         let fresh = self.read(&seen.project, &seen.name)?;
-        if fresh.uuid != seen.uuid || fresh.kind != seen.kind {
+        if fresh.uuid != seen.uuid
+            || fresh.kind != seen.kind
+            || fresh.own_config.get(KERNEL_ENTRY_KEY) != seen.own_config.get(KERNEL_ENTRY_KEY)
+        {
             return Err(refused("the instance was recreated since it was read"));
         }
         if !fresh.is_stopped() {
@@ -799,7 +812,10 @@ impl StateChanger {
         source: &Value,
     ) -> Result<(), IncusError> {
         let fresh = self.read(&seen.project, &seen.name)?;
-        if fresh.uuid != seen.uuid || fresh.kind != seen.kind {
+        if fresh.uuid != seen.uuid
+            || fresh.kind != seen.kind
+            || fresh.own_config.get(KERNEL_ENTRY_KEY) != seen.own_config.get(KERNEL_ENTRY_KEY)
+        {
             return Err(refused("the instance was recreated since it was read"));
         }
         if !fresh.is_stopped() {
