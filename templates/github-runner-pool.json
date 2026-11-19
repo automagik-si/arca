@@ -8,7 +8,7 @@
   "autostart": true,
   "firstBoot": { "file": "github-runner-pool.sh" },
   "secrets": ["GITHUB_APP_CLIENT_ID", "GITHUB_APP_PRIVATE_KEY", "GITHUB_TOKEN", "GITHUB_REGISTRATION_TOKEN"],
-  "createSettings": ["url", "runnerGroupId", "classes", "maxSlots", "aptPackages", "registration", "runnerGroup"],
+  "createSettings": ["url", "runnerGroupId", "classes", "maxSlots", "aptPackages", "registration", "runnerGroup", "keepBetweenJobs"],
   "settingRules": [
     { "need": "maxSlots", "atLeast": { "count": "classes" }, "why": "every class is kept one place under the cap: set maxSlots to the number of classes or more, or name fewer classes" }
   ],
@@ -23,6 +23,7 @@
       { "name": "standard", "labels": ["self-hosted", "linux", "x64", "arca"], "cpu": 2, "memory": "4GiB", "slots": 2 },
       { "name": "large", "labels": ["self-hosted", "linux", "x64", "arca-large"], "cpu": 6, "memory": "9GiB", "slots": 2 }
     ],
+    "keepBetweenJobs": false,
     "dockerCache": "90GiB",
     "dependencyCache": "30GiB",
     "runnerImage": "ghcr.io/actions/actions-runner@sha256:759a1d94a15b05941aba5196974ff43fe15b4cbba29b694b35cbc32a1166b232",

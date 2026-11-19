@@ -31,7 +31,7 @@ command=${1-}
 # The name, the slice and the image of a `docker run` or `docker create`: the image is the first argument that is
 # neither an option nor an option's value.
 name='' cgroup_parent='' image='' jit_file='' tools_mounted='' home_mount='' command_line='' token_file='' reg_dir=''
-reg_dir_ro='' command_args=()
+reg_dir_ro='' docker_store='' tool_cache='' dependency_cache='' network='' command_args=()
 parse_run() {
   while [ $# -gt 0 ]; do
     case $1 in
@@ -46,10 +46,14 @@ parse_run() {
           *:/home/runner/externals | *:/home/runner/externals:*) tools_mounted=1 ;;
           *:/home/runner:ro) home_mount=${2%:/home/runner:ro} ;;
           *:/home/runner) home_mount=${2%:/home/runner} ;;
+          *:/var/lib/docker) docker_store=${2%:/var/lib/docker} ;;
+          *:/opt/hostedtoolcache) tool_cache=${2%:/opt/hostedtoolcache} ;;
+          *:/var/cache/pool) dependency_cache=${2%:/var/cache/pool} ;;
         esac
         shift 2
         ;;
-      -e | --label | --network) shift 2 ;;
+      --network) network=$2; shift 2 ;;
+      -e | --label) shift 2 ;;
       -d | --privileged) shift ;;
       -*) shift ;;
       *)
@@ -61,6 +65,27 @@ parse_run() {
         ;;
     esac
   done
+}
+
+# Play a job writing to the three stores, or report what the next job can read from the mounts it received.
+play_cache_job() {
+  local job=$1 store marker found=0
+  local markers=()
+  store=$(cat "$root/containers/${network#container:}/store") || return 1
+  for marker in "$store" "$tool_cache" "$dependency_cache"; do
+    [ -n "$marker" ] && [ -d "$marker" ] || return 1
+  done
+  markers=("$store/images" "$store/buildkit" "$store/volumes" "$tool_cache" "$dependency_cache")
+  for marker in "${markers[@]}"; do
+    if [ "$job" = 'write caches' ]; then
+      mkdir -p "$marker" && printf 'residue\n' >"$marker/.job-marker" || return 1
+    elif [ -f "$marker/.job-marker" ]; then
+      found=$((found + 1))
+    fi
+  done
+  if [ "$job" = 'read caches' ]; then
+    echo "$found" >"$root/${name%-run}.residue"
+  fi
 }
 
 play_runner() {
@@ -123,6 +148,9 @@ play_runner() {
       # The runner prints the time, then the job: the pool times the job from this line.
       echo "$(date -u '+%Y-%m-%d %H:%M:%S')Z: Running job: $job" >>"$dir/log"
       touch "$dir/worker"
+      case $job in
+        'write caches' | 'read caches') play_cache_job "$job" || { end_play 1; return; } ;;
+      esac
       sleep "$seconds"
       [ -d "$dir" ] || return
       rm -f "$dir/worker"
@@ -191,6 +219,9 @@ case $command in
     echo "$image" >"$dir/image"
     # The host directory mounted as the runner's home, when one is: a real runner and its daemon share its files.
     echo "$home_mount" >"$dir/home"
+    if [ -n "$docker_store" ]; then
+      printf '%s\n' "$docker_store" >"$dir/store"
+    fi
     : >"$dir/log"
     if [ -n "$cgroup_parent" ]; then
       # What the slot's slice would report after a job: a memory peak and the CPU time used.
@@ -285,6 +316,7 @@ case $command in
       [ -d "$dir" ] || continue
       case " $* " in
         *' {{.ID}} {{.Names}} '*) echo "id-$(basename "$dir") $(basename "$dir")" ;;
+        *' {{.Names}} '*) basename "$dir" ;;
         *) echo "id-$(basename "$dir")" ;;
       esac
     done
@@ -322,7 +354,15 @@ case $command in
     cat "$root/containers/$1/log" 2>/dev/null
     ;;
   exec)
-    [ -d "$root/containers/$1" ] || exit 1
+    dir="$root/containers/$1"
+    [ -d "$dir" ] || exit 1
+    if [ -f "$dir/store" ]; then
+      store=$(cat "$dir/store")
+      case ${4-} in
+        *'docker volume prune -af'*) rm -f "$store/volumes/.job-marker" ;;
+        *'docker system prune -af'*) rm -f "$store/images/.job-marker" "$store/buildkit/.job-marker" ;;
+      esac
+    fi
     ;;
   image)
     # `image inspect`: an image named by digest is there unless the test says none is; a local name only once built.

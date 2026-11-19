@@ -2267,6 +2267,14 @@ fn the_shipped_template_is_a_virtual_machine_with_its_script_its_secrets_and_pin
     }
     let settings = template.settings.as_ref().expect("settings");
     assert_eq!(settings["url"], "https://github.com/example-org");
+    assert_eq!(settings["keepBetweenJobs"], false);
+    let keeping =
+        arca::service::create_settings(&template, Some(&json!({"keepBetweenJobs": true})))
+            .expect("the pool can keep its caches when asked at create");
+    assert_eq!(
+        keeping.merged.expect("the settings")["keepBetweenJobs"],
+        true
+    );
     // What GitHub's ubuntu-latest has and the pinned runner image lacks (DEFAULT_PACKAGES). Node.js is not added: a
     // job sets up its own.
     assert_eq!(
@@ -2461,6 +2469,102 @@ fn one_slot_pool(github: &Github, change: impl FnOnce(&mut Value)) -> Pool {
     let pool = Pool::new(&settings, 64 * GIB, 60 * GIB);
     pool.secret("GITHUB_TOKEN", PAT);
     pool
+}
+
+#[test]
+fn job_cache_residue_is_cleared_on_every_slot_unless_keeping_is_enabled() {
+    for (keep, over_budget, expected) in [
+        (None, false, "0"),
+        (Some(false), false, "0"),
+        (Some(true), false, "4"),
+        (Some(true), true, "0"),
+    ] {
+        let scratch = scratch_dir();
+        let github = Github::start(&scratch, &format!("/orgs/{ORG}"));
+        github.state().tokens.push(PAT.to_string());
+        let labels = ["one", "two", "three", "four"];
+        let classes: Vec<_> = labels
+            .iter()
+            .map(|label| class_of(label, "4GiB", 1))
+            .collect();
+        let mut settings = settings(json!(classes), 4, &format!("https://github.com/{ORG}"));
+        if let Some(keep) = keep {
+            settings["keepBetweenJobs"] = json!(keep);
+        }
+        if over_budget {
+            settings["dockerCache"] = json!("4B");
+            settings["dependencyCache"] = json!("4B");
+        }
+        let mut pool = Pool::new(&settings, 64 * GIB, 60 * GIB);
+        pool.secret("GITHUB_TOKEN", PAT);
+        for label in labels {
+            github.queue(&[&format!("arca-{label}")], "write caches", 0.1);
+        }
+        pool.start(&github);
+        wait_for(
+            &pool,
+            "a completed write and a replacement on every slot",
+            || pool.jobs().len() == 4 && github.registrations().len() == 8,
+        );
+        let mut written_slots: Vec<_> = pool.jobs().into_iter().map(|job| job[1].clone()).collect();
+        written_slots.sort();
+        assert_eq!(written_slots, ["0", "1", "2", "3"]);
+        for label in labels {
+            github.queue(&[&format!("arca-{label}")], "read caches", 0.1);
+        }
+        wait_for(&pool, "the jobs on the replacement runners", || {
+            pool.jobs().len() == 8
+        });
+        for slot in 0..4 {
+            assert_eq!(
+                pool.read(&format!("docker/pool1-s{slot}.residue")).trim(),
+                expected,
+                "slot {slot}, keepBetweenJobs={keep:?}, over_budget={over_budget}"
+            );
+        }
+        assert_eq!(pool.stop(), Some(0));
+        let _ = fs::remove_dir_all(scratch);
+    }
+}
+
+#[test]
+fn a_failed_job_cache_reset_blocks_registration_until_the_slot_is_clean() {
+    let scratch = scratch_dir();
+    let github = Github::start(&scratch, &format!("/orgs/{ORG}"));
+    let mut pool = one_slot_pool(&github, |_| {});
+    executable(
+        &pool.dir.join("bin/rm"),
+        &format!(
+            "#!/bin/sh\nfor path do\n\
+             case $path in */slots/0/docker)\n\
+              if [ -e \"$FAKE_DOCKER_DIR/refuse-reset\" ] && [ -e \"$path/images/.job-marker\" ]; then exit 1; fi;;\n\
+             esac\ndone\nexec '{}' \"$@\"\n",
+            which("rm").display()
+        ),
+    );
+    let refused = pool.dir.join("docker/refuse-reset");
+    fs::write(&refused, "").expect("block removal of the Docker store after the first job");
+    github.queue(&["arca"], "write caches", 0.1);
+    pool.start(&github);
+    let failure = "slot 0 (small) failed: the Docker store, tool cache or dependency cache could not be reset";
+    wait_for(&pool, "the failed reap and a failed retry", || {
+        pool.output().matches(failure).count() >= 2
+    });
+    assert_eq!(github.registrations().len(), 1);
+    assert!(
+        pool.dir
+            .join("state/slots/0/docker/images/.job-marker")
+            .is_file()
+    );
+
+    fs::remove_file(refused).expect("allow removal again");
+    github.queue(&["arca"], "read caches", 0.1);
+    wait_for(&pool, "the next job after recovery", || {
+        pool.jobs().len() == 2
+    });
+    assert_eq!(pool.read("docker/pool1-s0.residue").trim(), "0");
+    assert_eq!(pool.stop(), Some(0));
+    let _ = fs::remove_dir_all(scratch);
 }
 
 #[test]

@@ -330,6 +330,7 @@ load_settings() {
     }
   fi
   [ -z "$repo" ] || GROUP_NAME=''
+  KEEP_BETWEEN_JOBS=$(jq -r '.keepBetweenJobs == true' "$POOL_SETTINGS")
   MAX_SLOTS=$(setting .maxSlots)
   RUNNER_IMAGE=$(setting .runnerImage)
   DOCKER_IMAGE=$(setting .dockerImage)
@@ -683,23 +684,53 @@ slot_failed() {
   say "slot $slot (${SLOT_CLASS[$slot]}) failed: $*. Slots start again in $pause seconds"
 }
 
-# Removes a slot's containers and what the job left: the per-job cleanup. The Docker layer cache and the dependency
-# caches stay, unless the slot's share of their budget is passed, and then they are emptied.
+slot_keeps_caches() { [ -n "$REG" ] || [ "$KEEP_BETWEEN_JOBS" = true ]; }
+
+# Docker's remove can fail because a container is already gone. Check that no old container can write to the stores.
+slot_remove_containers() {
+  local slot=$1 runner=$2 daemon=$3 names
+  docker rm -fv "$runner" "$daemon" >/dev/null 2>&1 && return 0
+  if names=$(docker ps -a --format '{{.Names}}' 2>/dev/null) &&
+    ! grep -Fxq -e "$runner" -e "$daemon" <<<"$names"; then
+    return 0
+  fi
+  slot_failed "$slot" "the previous runner or Docker daemon could not be removed"
+  return 1
+}
+
+slot_clear_caches() {
+  local slot=$1 dir=$2
+  if ! { rm -rf "${dir:?}/docker" "$dir/toolcache" "$dir/cache" &&
+    mkdir -p "$dir/docker" "$dir/toolcache" "$dir/cache"; } >/dev/null 2>&1; then
+    slot_failed "$slot" "the Docker store, tool cache or dependency cache could not be reset"
+    return 1
+  fi
+}
+
+# Takes away the job's containers and files. A JIT slot starts its next job with empty stores by default.
 slot_reap() {
-  local slot=$1 dir runner daemon used
+  local slot=$1 dir runner daemon
   dir=$(slot_dir "$slot")
   runner="$POOL_NAME-s$slot-run"
   daemon="$POOL_NAME-s$slot-dind"
   set_state "$slot" cleaning
-  # Inside the slot's own Docker daemon: the job's containers, volumes and networks go; images and build cache stay.
-  docker exec "$daemon" sh -c 'c=$(docker ps -aq); [ -z "$c" ] || docker rm -fv $c; docker volume prune -af; docker network prune -f' >/dev/null 2>&1
-  slot_trim_docker "$slot" "$daemon"
-  docker rm -fv "$runner" "$daemon" >/dev/null 2>&1
+  if slot_keeps_caches; then
+    # Inside the slot's own Docker daemon: containers, volumes and networks go; images and build cache may stay.
+    docker exec "$daemon" sh -c 'c=$(docker ps -aq); [ -z "$c" ] || docker rm -fv $c; docker volume prune -af; docker network prune -f' >/dev/null 2>&1
+    slot_trim_docker "$slot" "$daemon"
+    docker rm -fv "$runner" "$daemon" >/dev/null 2>&1
+  else
+    slot_remove_containers "$slot" "$runner" "$daemon" || return 1
+  fi
   # Whatever is left in the slot's slice ends with it, and its memory peak starts from nothing for the next job.
   systemctl stop "$(slot_slice "$slot")" >/dev/null 2>&1
   rm -rf "${dir:?}/work" "${dir:?}/sock" "${POOL_RUN:?}/jit/$slot" "${dir:?}/kept"
   unlayer_home "$slot"
-  slot_trim_dependencies "$slot"
+  if slot_keeps_caches; then
+    slot_trim_dependencies "$slot"
+  else
+    slot_clear_caches "$slot" "$dir"
+  fi
 }
 
 # The slot's Docker layer cache, emptied once it passes the slot's share of dockerCache.
@@ -801,7 +832,7 @@ persistent_look() {
     read -r peak cpu_mark <<<"$(slot_usage "$slot")"
     set_state "$slot" busy "$name ${job:+job \"$job\"}"
   elif [ "$begun" -le "$recorded" ] && [ "$ended" -gt 0 ] && [ "$updating" != 1 ]; then
-    # Back to waiting for its next job; the caches are trimmed between jobs, as a fresh runner's are.
+    # While it waits for its next job, the persistent runner keeps its caches under their budgets.
     if [ "$(cut -f1 "$POOL_RUN/slots/$slot" 2>/dev/null)" = busy ]; then
       set_state "$slot" idle "$name"
       slot_trim_docker "$slot" "$daemon"
@@ -884,6 +915,11 @@ slot_begin() {
 
   # A slot begun just as the controller was told to stop registers no runner.
   ! stopping || return 1
+  if ! slot_keeps_caches; then
+    # A failed reap or an interrupted controller can leave old data on disk.
+    slot_remove_containers "$slot" "$runner" "$daemon" && slot_clear_caches "$slot" "$dir" || return 1
+    ! stopping || return 1
+  fi
   if [ -n "$REG" ]; then
     # Registration-token mode: the slot's one runner, registered once and kept. Its name carries the pool's own id, as
     # a just-in-time runner's does: config.sh --replace takes over a runner of the same name, and it must never take
@@ -925,13 +961,13 @@ slot_begin() {
   # runner has reached GitHub only once it listens for jobs (persistent_look).
   [ -n "$REG" ] || rm -f "$POOL_RUN/backoff" "$POOL_RUN/backoff-until"
 
-  # A fresh work directory and socket directory for this runner. The caches are the slot's own and are kept.
+  # Give the runner its work directory and access to the slot's stores.
   rm -rf "${dir:?}/work" "${dir:?}/sock"
   mkdir -p "$dir/work" "$dir/sock" "$dir/docker" "$dir/toolcache" "$dir/cache"
   chmod 755 "$dir" "$dir/work" "$dir/sock" "$dir/toolcache" "$dir/cache"
   if [ "$(id -u)" = 0 ]; then chown "$RUNNER_UID:$DOCKER_GID" "$dir/work" "$dir/toolcache" "$dir/cache"; fi
   set_state "$slot" starting "$name"
-  docker rm -fv "$runner" "$daemon" >/dev/null 2>&1
+  if slot_keeps_caches; then docker rm -fv "$runner" "$daemon" >/dev/null 2>&1; fi
   # The runner's files for this job. Layered: one fresh copy that the runner writes and the daemon reads, both at the
   # runner's own path. Plain: the runner keeps its image's own files, and the daemon has the pinned bundled tools,
   # read-only. Either way the runner's tools are no mount of their own, so the runner can replace them when GitHub
@@ -942,7 +978,7 @@ slot_begin() {
   else
     home=(-v "$EXTERNALS:/home/runner/externals:ro")
   fi
-  # The slot's own Docker daemon. Its data directory is the slot's layer cache. It sees the runner's bundled tools at
+  # The slot's own Docker daemon. It sees the runner's bundled tools at
   # the runner's own path, because a job that runs in a container has them mounted from there by this daemon.
   if ! docker run -d --name "$daemon" --label "arca.pool=$POOL_NAME" --privileged --cgroup-parent "$slice" \
     -v "$dir/sock:/var/run" "${home[@]}" -v "$dir/work:/home/runner/_work" \
@@ -1192,7 +1228,10 @@ slot_cycle() {
     record_job "$slot" "$finished" "$job" "$result" "$seconds" "$peak" "$cpu" "$name"
     slot_reap "$slot"
   else
-    slot_reap "$slot"
+    if ! slot_reap "$slot"; then
+      slot_abandon "$slot" "$runner_id"
+      return 0
+    fi
     slot_abandon "$slot" "$runner_id"
     if [ -n "$asked" ]; then
       # GitHub was asked to take this runner off and can have done so though no yes came: it answered with a server
