@@ -191,8 +191,10 @@ impl StateChanger {
 
     /// Sends one state change for the instance `seen` was read from, waits for its operation and reads the instance back.
     /// A stop and a restart are graceful: Incus gives the instance [`GRACE_SECONDS`] to shut down and fails the operation
-    /// after that, leaving it running. The instance is read again first, and one that was recreated since `seen` is refused
-    /// before any write. Returns the instance as the read-back shows it.
+    /// after that, leaving it running. The instance is read again first, and one that was recreated since `seen`, or whose
+    /// owner's mark changed, is refused before any write. A read-back that shows another instance or another mark is
+    /// [`IncusError::AppliedUnconfirmed`]: the change was sent, and what it landed on is not the instance that was asked
+    /// for. Returns the instance as the read-back shows it.
     pub fn change(
         &self,
         seen: &InstanceState,
@@ -202,6 +204,9 @@ impl StateChanger {
         let fresh = self.read(&seen.project, &seen.name)?;
         if fresh.uuid != seen.uuid || fresh.kind != seen.kind {
             return Err(refused("the instance was recreated since it was read"));
+        }
+        if fresh.own_config.get(KERNEL_ENTRY_KEY) != seen.own_config.get(KERNEL_ENTRY_KEY) {
+            return Err(refused("the instance's owner changed since it was read"));
         }
         let url = state_url(&seen.project, &seen.name)?;
         let body = match action {
@@ -213,11 +218,31 @@ impl StateChanger {
         let envelope = checked_envelope(self.send("PUT", &url, Some(&body))?)?;
         self.wait_for(&envelope)?;
         let after = self.read(&seen.project, &seen.name)?;
-        // Another instance that took the name while the change ran is not the one that was changed: its state is not
-        // handed back as if it were.
+        // The change was sent and its operation ended: whatever the read-back shows, it is not a refusal. Another
+        // instance, or another owner's mark, is not the one that was asked for, and its state is not handed back as if
+        // it were. The target names the instance asked for; the uuid is the one the read-back showed.
+        let unconfirmed = |reason: &str| {
+            IncusError::AppliedUnconfirmed(Box::new(crate::read::Unconfirmed {
+                target: crate::read::Target {
+                    kind: arca_kernel::ownership::IncusKind::Instance,
+                    project: seen.project.clone(),
+                    parent: None,
+                    name: seen.name.clone(),
+                    uuid: seen.uuid.clone(),
+                },
+                uuid: after.uuid.clone(),
+                owner: None,
+                reason: reason.to_string(),
+            }))
+        };
         if after.uuid != seen.uuid || after.kind != seen.kind {
-            return Err(refused(
+            return Err(unconfirmed(
                 "another instance took the instance's place while its state changed",
+            ));
+        }
+        if after.own_config.get(KERNEL_ENTRY_KEY) != seen.own_config.get(KERNEL_ENTRY_KEY) {
+            return Err(unconfirmed(
+                "the instance's owner changed while its state changed",
             ));
         }
         let wanted = match action {
@@ -225,21 +250,9 @@ impl StateChanger {
             StateAction::Stop => after.is_stopped(),
         };
         if !wanted {
-            return Err(IncusError::AppliedUnconfirmed(Box::new(
-                crate::read::Unconfirmed {
-                    target: crate::read::Target {
-                        kind: arca_kernel::ownership::IncusKind::Instance,
-                        project: seen.project.clone(),
-                        parent: None,
-                        name: seen.name.clone(),
-                        uuid: after.uuid.clone(),
-                    },
-                    uuid: after.uuid.clone(),
-                    owner: None,
-                    reason: "the read-back does not show the state the change asked for"
-                        .to_string(),
-                },
-            )));
+            return Err(unconfirmed(
+                "the read-back does not show the state the change asked for",
+            ));
         }
         Ok(after)
     }

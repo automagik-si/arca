@@ -394,7 +394,7 @@ fn the_restore_is_on_file_before_its_first_volume_is_put_back() {
 }
 
 #[test]
-fn a_finished_restore_whose_record_cannot_be_removed_stops_the_update_before_the_rebuild() {
+fn a_finished_restore_that_cannot_be_put_on_file_stops_the_update_before_the_rebuild() {
     use std::os::unix::fs::PermissionsExt;
     let up = Arc::new(AtomicBool::new(false));
     let rig = rig(&up);
@@ -409,7 +409,7 @@ fn a_finished_restore_whose_record_cannot_be_removed_stops_the_update_before_the
     let rebuilds = rig.fake.rebuilds(PROJECT, "app").len();
     up.store(true, Ordering::SeqCst);
 
-    // The node's state folder takes no removal: the restore goes through, its record cannot come off file.
+    // The node's state folder takes no new file: the restore goes through, and its record cannot say so.
     let mode = fs::metadata(&rig.dir)
         .expect("the state folder")
         .permissions()
@@ -420,7 +420,7 @@ fn a_finished_restore_whose_record_cannot_be_removed_stops_the_update_before_the
 
     let (code, message) = refusal_words(result);
     assert_eq!(code, "refused", "{message}");
-    assert!(message.contains("could not be taken off file"), "{message}");
+    assert!(message.contains("could not be put on file"), "{message}");
     assert_eq!(more_restores(&rig), vec![first_name()]);
     assert_eq!(rig.fake.rebuilds(PROJECT, "app").len(), rebuilds);
     assert!(
@@ -455,4 +455,239 @@ fn a_restore_left_on_file_is_finished_even_by_an_update_to_the_digest_the_record
             .join("service-update-restore-service-app.json")
             .exists()
     );
+}
+
+#[test]
+fn an_owners_mark_that_changes_at_the_rollbacks_stop_gets_no_rebuild_restore_or_start() {
+    let up = Arc::new(AtomicBool::new(false));
+    let rig = rig(&up);
+    // The update's own stop goes by; at the rollback's stop the instance keeps its uuid and takes another owner's mark.
+    rig.fake
+        .remark_at_stop(PROJECT, "app", "service-someone-else", 1);
+    let actions = rig.fake.state_actions(PROJECT, "app").len();
+
+    let (code, message) = refusal_words(update(
+        &rig,
+        json!({ "name": "app", "digest": NEW, "timeoutSeconds": 1 }),
+    ));
+    assert_eq!(code, "rollback_failed", "{message}");
+    assert!(message.contains("stop failed"), "{message}");
+    assert!(message.contains("owner changed"), "{message}");
+    assert_eq!(
+        rig.fake.state_actions(PROJECT, "app")[actions..],
+        ["stop".to_string(), "start".to_string(), "stop".to_string()]
+    );
+    assert_eq!(rig.fake.rebuilds(PROJECT, "app"), vec!["registry"]);
+    assert!(volume_restores(&rig).is_empty());
+}
+
+#[test]
+fn a_call_while_an_update_runs_is_refused_even_for_the_digest_the_service_runs() {
+    use std::sync::OnceLock;
+    let up = Arc::new(AtomicBool::new(true));
+    let mut rig = rig(&up);
+    let handler: Arc<OnceLock<Arc<dyn ToolHandler>>> = Arc::new(OnceLock::new());
+    let second: Arc<Mutex<Option<Result<Value, CallError>>>> = Arc::default();
+    let (inner, answer) = (Arc::clone(&handler), Arc::clone(&second));
+    rig.handlers = service_handlers_updating(
+        rig.kernel.clone(),
+        Arc::new(|| NOW),
+        rig.cfg.clone(),
+        None,
+        UpdateOptions {
+            probe: Arc::new(move |_, _, _| {
+                let mut slot = answer.lock().expect("the slot");
+                if slot.is_none() {
+                    // The first update holds the service: a second call comes now, for the digest its record names.
+                    *slot = Some(inner.get().expect("the handler").call(
+                        json!({ "name": "app", "digest": DIGEST }),
+                        &Caller {
+                            token_id: "doctor".into(),
+                            scope: Scope::Doctor,
+                            tools: None,
+                            limits: Default::default(),
+                        },
+                    ));
+                }
+                true
+            }),
+            pace: Duration::from_millis(10),
+        },
+    )
+    .into_iter()
+    .collect();
+    assert!(handler.set(rig.handlers["service_update"].clone()).is_ok());
+
+    let done = update(&rig, json!({ "name": "app", "digest": NEW })).expect("the update");
+    assert_eq!(done["updated"], true, "{done}");
+    let taken = second
+        .lock()
+        .expect("the slot")
+        .take()
+        .expect("the second call");
+    let (code, message) = refusal_words(taken);
+    assert_eq!(code, "refused", "{message}");
+    assert!(
+        message.contains("another update of this service is running"),
+        "{message}"
+    );
+}
+
+#[test]
+fn a_record_whose_folder_could_not_be_synced_is_trusted_by_no_later_call() {
+    use std::os::unix::fs::PermissionsExt;
+    let up = Arc::new(AtomicBool::new(false));
+    let rig = rig(&up);
+    second_volume(&rig);
+    let mode = fs::metadata(&rig.dir)
+        .expect("the state folder")
+        .permissions()
+        .mode();
+    // As the last volume goes back, the state folder stops taking a sync: its entries still change, unsynced.
+    let dir = rig.dir.clone();
+    rig.fake.observe_volume_restores(Arc::new(move |volume| {
+        if volume == "pool1/more" {
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o300)).expect("no reads");
+        }
+    }));
+
+    let (code, message) = refusal_words(update(
+        &rig,
+        json!({ "name": "app", "digest": NEW, "timeoutSeconds": 1 }),
+    ));
+    assert_eq!(code, "rollback_failed", "{message}");
+    assert!(message.contains("could not be put on file"), "{message}");
+    let rebuilds = rig.fake.rebuilds(PROJECT, "app").len();
+
+    // The next call cannot sync the folder either: it trusts neither the record nor its absence.
+    up.store(true, Ordering::SeqCst);
+    let result = update(&rig, json!({ "name": "app", "digest": NEW }));
+    fs::set_permissions(&rig.dir, fs::Permissions::from_mode(mode)).expect("readable again");
+    let (code, message) = refusal_words(result);
+    assert_eq!(code, "refused", "{message}");
+    assert!(message.contains("could not be synced"), "{message}");
+    assert!(message.ends_with("Nothing was changed"), "{message}");
+    assert_eq!(rig.fake.rebuilds(PROJECT, "app").len(), rebuilds);
+}
+
+#[test]
+fn a_digest_saved_just_before_its_update_failed_is_neither_said_to_run_nor_rolled_back_to() {
+    let up = Arc::new(AtomicBool::new(true));
+    let rig = rig(&up);
+    second_volume(&rig);
+    rig.fake
+        .set_reject_put("/1.0/storage-pools/pool1/volumes/custom/more");
+    // The node saves the new digest in the service's record, then cannot apply the record: the instance no longer
+    // looks like the service's.
+    rig.fake
+        .set_instance_config(PROJECT, "app", service::TEMPLATE_KEY, "another");
+
+    let (code, message) = refusal_words(update(&rig, json!({ "name": "app", "digest": NEW })));
+    assert_eq!(code, "rollback_failed", "{message}");
+    assert!(message.contains("record failed"), "{message}");
+    assert_eq!(
+        alias_of_record(&rig),
+        format!("app@{NEW}"),
+        "saved before it was applied"
+    );
+    assert_eq!(
+        rig.fake
+            .rebuild_sources(PROJECT, "app")
+            .last()
+            .expect("a rebuild")["alias"],
+        "app@".to_string() + DIGEST
+    );
+    rig.fake
+        .set_instance_config(PROJECT, "app", service::TEMPLATE_KEY, "app");
+    rig.fake.clear_reject_put();
+
+    // The retry names the digest the record holds: it finishes the restore, rebuilds and fails its health check. The
+    // rollback rebuilds the root the service ran, and says the record names a digest the service does not run.
+    up.store(false, Ordering::SeqCst);
+    let (code, message) = refusal_words(update(
+        &rig,
+        json!({ "name": "app", "digest": NEW, "timeoutSeconds": 1 }),
+    ));
+    assert_eq!(code, "rolled_back", "{message}");
+    assert!(message.contains("which it does not run"), "{message}");
+    let sources = rig.fake.rebuild_sources(PROJECT, "app");
+    assert_eq!(sources[sources.len() - 2]["alias"], format!("app@{NEW}"));
+    assert_eq!(
+        sources.last().expect("a rebuild")["alias"],
+        "app@".to_string() + DIGEST
+    );
+
+    // No answer says it runs that digest: the next call for it rebuilds again.
+    let rebuilds = sources.len();
+    let again = update(
+        &rig,
+        json!({ "name": "app", "digest": NEW, "timeoutSeconds": 1 }),
+    );
+    assert!(again.is_err(), "{again:?}");
+    assert!(rig.fake.rebuilds(PROJECT, "app").len() > rebuilds);
+}
+
+#[test]
+fn a_retry_that_cannot_write_its_progress_says_so_and_later_words_say_as_last_recorded() {
+    use std::os::unix::fs::PermissionsExt;
+    let up = Arc::new(AtomicBool::new(false));
+    let rig = rig(&up);
+    second_volume(&rig);
+    rig.fake
+        .set_reject_put("/1.0/storage-pools/pool1/volumes/custom/more");
+    let _ = update(
+        &rig,
+        json!({ "name": "app", "digest": NEW, "timeoutSeconds": 1 }),
+    );
+
+    // The retry puts app-data back again, `more` still refuses, and the folder takes no new file for its progress.
+    let mode = fs::metadata(&rig.dir)
+        .expect("the state folder")
+        .permissions()
+        .mode();
+    fs::set_permissions(&rig.dir, fs::Permissions::from_mode(0o500)).expect("read-only");
+    let result = update(&rig, json!({ "name": "app", "digest": NEW }));
+    fs::set_permissions(&rig.dir, fs::Permissions::from_mode(mode)).expect("writable again");
+    let (code, message) = refusal_words(result);
+    assert_eq!(code, "refused", "{message}");
+    assert!(
+        message.contains("could not put how far this attempt got on file"),
+        "{message}"
+    );
+    assert!(
+        message.contains("its record still says put back: app-data (pool1)"),
+        "{message}"
+    );
+
+    // Started by hand: the refusal names the volumes put back as last recorded.
+    rig.edit(
+        "PUT",
+        &format!("/1.0/instances/app/state?project={PROJECT}"),
+        json!({ "action": "start" }),
+    );
+    let (code, message) = refusal_words(update(&rig, json!({ "name": "app", "digest": NEW })));
+    assert_eq!(code, "refused", "{message}");
+    assert!(
+        message.contains("put back, as last recorded: app-data (pool1)"),
+        "{message}"
+    );
+}
+
+#[test]
+fn a_stop_that_lands_on_another_instance_is_said_as_a_change() {
+    let up = Arc::new(AtomicBool::new(true));
+    let rig = rig(&up);
+    // At the update's own stop another, stopped instance takes the name.
+    rig.fake
+        .recreate_at_stop(PROJECT, "app", "00000000-0000-4000-8000-0000000000cd", 0);
+
+    let (code, message) = refusal_words(update(&rig, json!({ "name": "app", "digest": NEW })));
+    assert_eq!(code, "refused", "{message}");
+    assert!(message.contains("stop failed"), "{message}");
+    assert!(
+        message.contains("Nothing else was changed: a stop was sent to its instance app"),
+        "{message}"
+    );
+    assert!(!message.contains("Nothing was changed"), "{message}");
+    assert!(rig.fake.rebuilds(PROJECT, "app").is_empty());
 }

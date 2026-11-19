@@ -898,3 +898,33 @@ fn a_rollback_puts_no_template_settings_back_onto_an_instance_that_took_the_serv
     assert!(after.get("oci.entrypoint").is_some(), "{after}");
     assert!(!journal(&rig).iter().any(|(step, _)| step == "put back"));
 }
+
+#[test]
+fn a_rollback_that_finds_another_instance_after_the_template_went_back_says_where_its_settings_may_be()
+ {
+    let key = common::SkKey::from_seed(84);
+    let up = Arc::new(AtomicBool::new(false));
+    let rig = node(&up, &key, true);
+    rig.template("app", second());
+    let proposed = propose_update(&rig, with_template()).expect("proposed");
+    // The forward write of the template's settings goes by (its race changes nothing); just before the rollback's
+    // write of the old settings is checked, another instance takes the name.
+    let path = "/1.0/instances/app";
+    rig.fake
+        .race_patch_config(path, KERNEL_ENTRY_KEY, "service-app");
+    rig.fake.race_patch_config(
+        path,
+        "volatile.uuid",
+        "00000000-0000-4000-8000-0000000000ef",
+    );
+
+    let (code, message) = refusal_words(approve(&rig, &key, &proposed));
+    assert_eq!(code, "rollback_failed", "{message}");
+    assert!(message.contains("put back failed"), "{message}");
+    assert!(
+        message.contains("may have written them to the instance now under its name"),
+        "{message}"
+    );
+    assert!(!message.contains("its instance's config"), "{message}");
+    assert_eq!(rig.fake.rebuilds(PROJECT, "app"), vec!["registry"]);
+}

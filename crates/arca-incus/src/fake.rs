@@ -272,9 +272,11 @@ struct Shared {
     landed_failures: Mutex<BTreeMap<(String, String), String>>,
     /// Path prefixes whose PUT is refused with 400 before any change.
     reject_put: Mutex<Vec<String>>,
-    /// The instances another one takes the place of at a stop, by project and name: the newcomer's uuid, and how many
-    /// stops go by first.
-    stop_recreations: Mutex<BTreeMap<(String, String), (String, u32)>>,
+    /// The instances whose config changes at a stop, by project and name: the key that changes (its uuid, for another
+    /// instance taking its place, or its owner's mark), its new value, and how many stops go by first.
+    stop_recreations: Mutex<BTreeMap<(String, String), (String, String, u32)>>,
+    /// The source each rebuild of an instance named, in order.
+    rebuild_sources: Mutex<BTreeMap<(String, String), Vec<Value>>>,
     /// What each instance's next rebuilds do, in order, before any other switch is looked at.
     rebuild_scripts: Mutex<BTreeMap<(String, String), VecDeque<RebuildStep>>>,
     /// Called with the volume's `<pool>/<name>` as each volume restore arrives, before it is answered.
@@ -554,6 +556,7 @@ impl Shared {
             landed_failures: Mutex::new(BTreeMap::new()),
             reject_put: Mutex::new(Vec::new()),
             stop_recreations: Mutex::new(BTreeMap::new()),
+            rebuild_sources: Mutex::new(BTreeMap::new()),
             rebuild_scripts: Mutex::new(BTreeMap::new()),
             restore_observer: Mutex::new(None),
             volume_snapshot_refusals: Mutex::new(BTreeSet::new()),
@@ -694,8 +697,29 @@ impl FakeIncus {
     pub fn recreate_at_stop(&self, project: &str, name: &str, uuid: &str, skip: u32) {
         lock(&self.shared.stop_recreations).insert(
             (project.to_string(), name.to_string()),
-            (uuid.to_string(), skip),
+            ("volatile.uuid".to_string(), uuid.to_string(), skip),
         );
+    }
+
+    /// At a stop of the instance `name` in `project`, after `skip` stops have gone by, its owner's mark
+    /// (`user.arcakernel.entry`) becomes `mark`, with its uuid kept. It records no write.
+    pub fn remark_at_stop(&self, project: &str, name: &str, mark: &str, skip: u32) {
+        lock(&self.shared.stop_recreations).insert(
+            (project.to_string(), name.to_string()),
+            (
+                arca_kernel::ownership::KERNEL_ENTRY_KEY.to_string(),
+                mark.to_string(),
+                skip,
+            ),
+        );
+    }
+
+    /// The source each rebuild of the instance `name` in `project` named, in order, as it was sent.
+    pub fn rebuild_sources(&self, project: &str, name: &str) -> Vec<Value> {
+        lock(&self.shared.rebuild_sources)
+            .get(&(project.to_string(), name.to_string()))
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Runs `observer` with the volume's `<pool>/<name>` as each volume restore arrives, before it is answered: what
@@ -4234,6 +4258,10 @@ fn rebuild(shared: &Shared, store: &mut Store, request: &Request, address: &Addr
         return bad("Instance must be stopped to be rebuilt");
     }
     let key = (address.project.clone(), address.name.clone());
+    lock(&shared.rebuild_sources)
+        .entry(key.clone())
+        .or_default()
+        .push(sent.get("source").cloned().unwrap_or(Value::Null));
     let local = sent
         .get("source")
         .and_then(|source| source.get("fingerprint"))
@@ -4483,21 +4511,23 @@ fn change_state(
             let key = (address.project.clone(), address.name.clone());
             let mut recreations = lock(&shared.stop_recreations);
             let newcomer = match recreations.get_mut(&key) {
-                Some((_, skip)) if *skip > 0 => {
+                Some((_, _, skip)) if *skip > 0 => {
                     *skip -= 1;
                     None
                 }
-                Some(_) => recreations.remove(&key).map(|(uuid, _)| uuid),
+                Some(_) => recreations
+                    .remove(&key)
+                    .map(|(changed, value, _)| (changed, value)),
                 None => None,
             };
             drop(recreations);
-            if let Some(uuid) = newcomer
+            if let Some((changed, value)) = newcomer
                 && let Some(config) = store.objects[index]
                     .body
                     .get_mut("config")
                     .and_then(Value::as_object_mut)
             {
-                config.insert("volatile.uuid".to_string(), json!(uuid));
+                config.insert(changed, json!(value));
             }
             answered(shared, store, "instance", "PUT", Ok(()))
         }

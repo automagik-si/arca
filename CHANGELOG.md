@@ -20,7 +20,10 @@ snapshot the project refuses gives the project its `snapshots` step, in the node
 alike. A service with volumes of its own is never rebuilt without their snapshot. A rollback writes only to the
 instance the update began with, starts the old version on a root it could not rebuild only when neither image was
 fetched, and a volume restore is on file from before its first volume until its last, so one that fails part way is
-finished by the next update before it does anything else. Each update
+finished by the next update before it does anything else. One update of a service runs at a time, and holds the
+service before it reads what an earlier one left; a rollback rebuilds the root the service ran, not a digest saved just
+before it failed, and an answer never says the service runs a digest its record names while its root runs another.
+Each update
 keeps its volume snapshot until a later release removes old ones. An instance that already holds an Incus snapshot is
 refused before anything is changed, in words that name each snapshot; Arca has no step that removes them yet.
 

@@ -2005,17 +2005,33 @@ started if it was running before, given 30 seconds to answer, and the call is
 refused with code `rolled_back` and the failing step's words (and a note when the old version does not answer yet).
 When Incus could not fetch the new image, the old root was never taken away: if it cannot fetch the old one either,
 the old version is started as it is, and the refusal says so, but only when the old rebuild also failed on fetching
-its image. When either rebuild failed any other way, the root may no longer be the old one: nothing is started and the
-refusal is `rollback_failed`. Every rollback step, the template's settings put back among them, goes only to the
-instance the update began with, checked again by each step's own read; if another instance has taken its name
-meanwhile, nothing is written to it and the refusal is `rollback_failed`. The node puts the volumes' restore on file
-(`service-update-restore-<entry>.json` in its state folder) before it puts back the first one, and takes it off only
-once every one is back; if it cannot put it on file, no volume is put back. If a restore fails part way, the refusal
-names the snapshot, the volumes put back and the one that failed, and the record stays: the next update of the service,
-once it is stopped, first puts every one of them back to that snapshot (undoing what was written to them since), takes
-the record off file, then goes on; if the record cannot come off, it stops there. This holds for an update to the
-digest the record already names too. While the service runs, that update is refused and asks for `instance_stop`
-first. A record kept for an earlier instance of the service (one made again since) is removed and not used. If Incus does not finish a rebuild in time, nothing is
+its image. When the new rebuild failed any other way, the root may no longer be the old one, but a rebuild from the old
+image that goes through puts it back: the volumes are restored and the old version is started if it ran. Nothing is
+started, and the refusal is `rollback_failed`, only when the rebuild from the old image fails too and the two failures
+do not show that the old root was never touched. The old image a rollback rebuilds is the one the root ran when the
+update began, which is not always what the service's record names: a record saved with the new digest just before the
+update failed is not taken for the root that runs. One update of a service runs at a time: a second call, even for the
+digest the service runs, is refused while one is under way, and nothing an earlier update left on file is read
+before the call holds the service. Every rollback step goes only to the instance the update began with (its uuid, kind
+and owner's mark), checked again by each step's own read before it writes and by the read-back of each stop and start;
+a stop or start whose read-back shows another instance or another mark was sent, and is said so, never as nothing
+sent. The template's settings are put back in the service's record only while a read under the node's write gate still
+finds that instance; the node then writes them to the instance under the name, and when a read after it finds another
+one there, the refusal is `rollback_failed` and says the settings may have gone to it. If another instance has taken
+the name, nothing more is written and the refusal is `rollback_failed`. The node puts the volumes' restore on file
+(`service-update-restore-<entry>.json` in its state folder) before it puts back the first one, syncing the file and the
+folder; if it cannot, no volume is put back. Once every volume is back the record is rewritten as finished, which never
+puts a volume back again, and taken off file when the service's record names the root that runs; while the record names
+another image (the new digest saved just before the rollback), it stays, so that no answer says the service runs what
+it does not, and the refusal says so. Each call syncs the state folder before it reads that record, so neither a record
+nor its absence is trusted before it is on disk. If a restore fails part way, the refusal names the snapshot, the
+volumes put back and the one that failed, and the record stays (when this attempt cannot write how far it got, the
+refusal says that the record still names the volumes put back before it, and later words name them "as last
+recorded"): the next update of the service, once it is stopped, first puts every one of them back to that snapshot
+(undoing what was written to them since), marks the record finished, then goes on; if it cannot, it stops there. This
+holds for an update to the digest the record already names too, and such an update with `withTemplate` is refused,
+saying how to finish the record first. While the service runs on volumes part restored, that update is refused and asks
+for `instance_stop` first. A record kept for an earlier instance of the service (one made again since) is removed and not used. If Incus does not finish a rebuild in time, nothing is
 rolled back, so as not to rebuild twice at once: the refusal is `update_unsettled`, and the same update may be asked
 for again once Incus is idle. If the old version cannot be put back, the refusal is `rollback_failed`, says so, and
 says whether the service is stopped, as a read of it shows. A failure before anything is changed (the digest is malformed, the service is not made

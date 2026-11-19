@@ -675,6 +675,70 @@ fn an_instance_recreated_after_it_was_read_is_refused_before_any_write() {
 }
 
 #[test]
+fn an_instance_whose_owner_changed_after_it_was_read_is_refused_before_any_write() {
+    let rig = Rig::new("life-remarked");
+    let changer = arca_incus::StateChanger::new(
+        rig.fake.socket().to_path_buf(),
+        ProjectFamily::new([PROJECT], ["droid"]).expect("the family is valid"),
+    );
+    let mut seen = changer.read(PROJECT, "api").expect("the instance reads");
+    // The same uuid, but the caller checked it under another owner's mark.
+    seen.own_config.insert(
+        "user.arcakernel.entry".to_string(),
+        "service-someone-else".to_string(),
+    );
+    let refused = changer.change(&seen, arca_incus::StateAction::Stop);
+    assert!(
+        matches!(refused, Err(arca_incus::IncusError::Refused(_))),
+        "{refused:?}"
+    );
+    assert_eq!(rig.state_writes(), 0, "nothing was sent");
+    assert_eq!(rig.status(PROJECT, "api"), "Running");
+}
+
+#[test]
+fn a_stop_that_landed_on_another_instance_or_owner_is_said_as_sent_not_as_nothing_sent() {
+    let changer = |rig: &Rig| {
+        arca_incus::StateChanger::new(
+            rig.fake.socket().to_path_buf(),
+            ProjectFamily::new([PROJECT], ["droid"]).expect("the family is valid"),
+        )
+    };
+    for (label, recreated) in [("life-taken", true), ("life-owner", false)] {
+        let rig = Rig::new(label);
+        if recreated {
+            rig.fake
+                .recreate_at_stop(PROJECT, "api", "00000000-0000-4000-8000-0000000000ee", 0);
+        } else {
+            rig.fake
+                .remark_at_stop(PROJECT, "api", "service-someone-else", 0);
+        }
+        let seen = changer(&rig)
+            .read(PROJECT, "api")
+            .expect("the instance reads");
+        let landed = changer(&rig).change(&seen, arca_incus::StateAction::Stop);
+        // The stop was sent and its operation ended: never the refusal that means nothing was sent.
+        let Err(arca_incus::IncusError::AppliedUnconfirmed(unconfirmed)) = landed else {
+            panic!("{label}: {landed:?}");
+        };
+        assert_eq!(unconfirmed.target.uuid, seen.uuid, "{label}");
+        assert_eq!(rig.state_writes(), 1, "{label}");
+    }
+
+    // Through the verb: the answer says the stop was sent, not that nothing was.
+    let rig = Rig::new("life-taken-verb");
+    rig.fake
+        .recreate_at_stop(PROJECT, "api", "00000000-0000-4000-8000-0000000000ee", 0);
+    let (code, message) = refusal(rig.approved("instance_stop", at(PROJECT, "api")));
+    assert_eq!(code, "InstanceStopFailed", "{message}");
+    assert!(!message.contains("nothing was sent"), "{message}");
+    assert!(
+        message.contains("was sent and Incus applied it"),
+        "{message}"
+    );
+}
+
+#[test]
 fn a_proposal_binds_the_call_without_confirm() {
     let rig = Rig::new("life-confirm");
     let mut args = at(PROJECT, "api");
