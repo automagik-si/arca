@@ -614,6 +614,18 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
             );
             assert_eq!(shown[4], ("Tenant", "abcdefgh"));
             assert_eq!(shown.len(), 5);
+            let vm = action.details(&json!({
+                "name": "workspace", "settings": {"members":true},
+                "changes":{"settings":{"members":{"old":false,"new":true}}}
+            }));
+            assert!(
+                vm.iter()
+                    .any(|r| r.label == "Previous members" && r.value == "false")
+            );
+            assert!(
+                vm.iter()
+                    .any(|r| r.label == "New members" && r.value == "true")
+            );
             let schema = action.params_schema();
             assert!(
                 schema["properties"]
@@ -628,6 +640,7 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
                         "eraseData",
                         "noNewPrivileges",
                         "withTemplate",
+                        "settings",
                         "changes",
                         "tenant"
                     ]

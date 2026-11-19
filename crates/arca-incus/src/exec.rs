@@ -246,6 +246,9 @@ impl ExecCommand {
 /// disk, with one file of root's, mode 0600, per secret. Incus writes both through the guest agent.
 pub const GUEST_SECRETS_DIR: &str = "/etc/arca-secrets";
 
+/// Non-secret VM settings written by cloud-init or by an approved settings update.
+pub const GUEST_SETTINGS_PATH: &str = "/etc/arca/settings.json";
+
 /// A destination is constructed only by a fixed variant or the secrets-path validator.
 #[derive(Clone, Debug)]
 pub enum ServiceFile {
@@ -253,6 +256,8 @@ pub enum ServiceFile {
     Secret(SecretName),
     /// [`GUEST_SECRETS_DIR`] itself, made as a directory.
     GuestSecretsDir,
+    GuestSettingsDir,
+    GuestSettings,
     /// One secret's file in [`GUEST_SECRETS_DIR`].
     GuestSecret(SecretName),
     /// The Caddyfile of an edge service ([`EDGE_CONFIG`]), which Arca renders whole from the node's routes.
@@ -284,6 +289,8 @@ impl SecretName {
 impl ServiceFile {
     pub fn path(&self) -> String {
         match self {
+            Self::GuestSettings => GUEST_SETTINGS_PATH.into(),
+            Self::GuestSettingsDir => "/etc/arca".into(),
             Self::TailnetKey => "/run/arca-ts/authkey".into(),
             Self::Secret(key) => format!("/run/secrets/{}", key.0),
             Self::GuestSecretsDir => GUEST_SECRETS_DIR.into(),
@@ -292,10 +299,12 @@ impl ServiceFile {
             Self::EdgeConfigKept => EDGE_CONFIG_KEPT.into(),
         }
     }
-    /// The Incus file type and mode the destination is written with: a private directory, or a private file.
+    /// The Incus type and permissions for this destination. Guest settings match the first-boot file mode.
     fn kind(&self) -> (&'static str, &'static str) {
         match self {
             Self::GuestSecretsDir => ("directory", "0700"),
+            Self::GuestSettingsDir => ("directory", "0755"),
+            Self::GuestSettings => ("file", "0644"),
             _ => ("file", "0600"),
         }
     }
@@ -328,8 +337,8 @@ fn target(owned: &Owned) -> Result<String, IncusError> {
 }
 
 /// The instance path and the project of a guest-file request: the project is the owned instance's own, as the writer
-/// read it under its family, and is the node's service project or a tenant's project and nothing else. Only the two
-/// guest-secret destinations are sent to it. A command and every other file stay with [`target`], and a recording is
+/// read it under its family, and is the node's service project or a tenant's project and nothing else. Only the fixed
+/// guest settings and secret destinations are sent to it. A command and every other file stay with [`target`], and a recording is
 /// read and deleted by its own fixed path ([`UnixIncusWriter::service_output`]): all three name the
 /// node's own project.
 fn guest_target(owned: &Owned) -> Result<(String, &str), IncusError> {
@@ -480,18 +489,21 @@ impl UnixIncusWriter {
         }
     }
 
-    /// The payload is sent only as the files request body, with root ownership and mode 0600. A directory destination
-    /// takes no payload and is made with mode 0700; Incus leaves one that exists as it is.
+    /// The payload is sent only as the files request body, with root ownership and the destination's mode. A directory destination
+    /// takes no payload; Incus leaves one that exists as it is.
     pub fn write_service_file(
         &self,
         owned: &Owned,
         file: &ServiceFile,
         bytes: &[u8],
     ) -> Result<(), IncusError> {
-        // A guest secret goes to the owned instance's own project, which may be a tenant's. Every other file goes to
+        // A VM settings or secret file goes to the owned instance's own project, which may be a tenant's. Every other file goes to
         // an instance of the node's own project only.
         let (path, project) = match file {
-            ServiceFile::GuestSecretsDir | ServiceFile::GuestSecret(_) => guest_target(owned)?,
+            ServiceFile::GuestSecretsDir
+            | ServiceFile::GuestSecret(_)
+            | ServiceFile::GuestSettingsDir
+            | ServiceFile::GuestSettings => guest_target(owned)?,
             ServiceFile::TailnetKey
             | ServiceFile::Secret(_)
             | ServiceFile::EdgeConfig

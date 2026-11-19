@@ -4,6 +4,11 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 
 ## Unreleased
 
+Owners can change a VM's named `createSettings` in place by approving a `service_update` card. The card and
+service update journal show each changed value. Arca writes the guest settings file and restarts a running VM.
+
+## 0.38.0 (2026-11-19)
+
 Arca can now take an Incus snapshot of a service's instance together with each custom volume it mounts, under one
 name, without stopping or starting it; restore the parts it names on a stopped instance; and remove them. A disk that
 is a path of the host is listed as not snapshotted. If one part fails, the parts already taken are removed and the
@@ -33,6 +38,11 @@ carries that check.
 Older releases refuse templates that carry `health`. Once a service record carries `health`, downgrading past
 this release is unsupported. Older releases silently skip those records, so the services disappear from list
 and status.
+
+- Merge PR 271: a linked kernel's owner approval requests reach the owner's page
+- Merge PR 268: an appUpdate formula of several ordered components
+- Merge PR 267: app update design addendum for #266 and #265
+- Merge PR 264: service snapshots of an instance with its data volumes, restore and removal
 
 ## 0.37.0 (2026-11-18)
 

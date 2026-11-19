@@ -1923,6 +1923,11 @@ impl ToolHandler for ActionPropose {
                     let entries = lock(&self.kernel)?.entries().to_vec();
                     service_update::check_proposal(node, &entries, &payload)?
                 }
+                None if payload.get("settings").is_some() => {
+                    return Err(service_refused(
+                        "the node must read the VM settings for the owner's card",
+                    ));
+                }
                 None => {
                     let mut payload = payload;
                     if let Some(object) = payload.as_object_mut() {
@@ -6337,6 +6342,8 @@ pub(crate) mod service_labels;
 mod service_reconfigure;
 #[path = "service_update.rs"]
 mod service_update;
+#[path = "service_vm_settings.rs"]
+mod service_vm_settings;
 #[path = "service_wiring.rs"]
 mod service_wiring;
 pub use service_update::{
@@ -8179,6 +8186,7 @@ impl ServiceHandler {
             "service_logs" => &["name", "lines"],
             "service_update" => &[
                 "name",
+                "settings",
                 "digest",
                 "timeoutSeconds",
                 "follow",
@@ -8482,6 +8490,15 @@ impl ServiceHandler {
             }
             _ => service_project(&self.cfg)?,
         };
+        if self.verb == "service_update" && args.get("settings").is_some() {
+            if !preapproved {
+                return Err(service_refused(
+                    "VM settings require an owner-approved action_propose card",
+                ));
+            }
+            let _write = self.writes.lock().map_err(|_| internal())?;
+            return self.update_vm_settings(&args);
+        }
         let read = UnixIncus::new(self.cfg.incus.socket.clone());
         let subject = read_subject(self.verb, &args);
         // Only a create needs an instance's live state: the addresses and the interfaces that are in no record.

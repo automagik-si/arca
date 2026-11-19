@@ -1080,8 +1080,7 @@ same share as a drive. A restricted project always admits that disk (`checkRestr
 `internal/server/project/permissions.go`). The guest's interface name follows the PCI slot QEMU gives the NIC, which depends on
 the devices of the host's QEMU, and the public images configure `enp5s0` only; with `agent.nic_config` the agent renames the
 interface whose MAC is the device's to the device's `name` when it starts (`osReconfigureNetworkInterfaces` in Incus's
-`cmd/incus-agent/os_linux.go`), whatever its slot. Nothing is changed on a virtual machine after its create, so one made before
-this rule keeps the devices it has.
+`cmd/incus-agent/os_linux.go`), whatever its slot. Arca installs these devices at creation. A VM made before this rule keeps its original devices.
 Source: `vm_config`, `vm_devices`, `vm_body` and `managed_vm_body` in `crates/arca/src/service.rs`; tests
 `every_virtual_machine_carries_the_agent_disk_and_a_nic_name_the_image_configures` and
 `a_vm_is_created_with_its_type_devices_and_limits_and_no_network_is_created_or_read`. The fake admits the drive in a
@@ -1127,8 +1126,7 @@ enter Incus's instance config.
   with one `write_files` entry that writes the object to `/etc/arca/settings.json`, its content base64, so no setting can
   change the YAML around it. Both are recorded in the service's record (`vm.userData`, `vm.vendorData`), because the create
   body is built from the record; a record without them is exactly the one an earlier kernel wrote, and its create is
-  unchanged. Neither may hold a secret, and nothing is changed on a virtual machine after its create (Rule 59), so a changed
-  script or setting applies to a machine created after the change.
+  unchanged. Neither may hold a secret. Editing the template changes the settings and script supplied to future VMs.
 - `createSettings` lists the top-level keys of `settings` that one `service_create` may replace with its own `settings`
   argument. The value in the template is the default and gives the shape. `create_settings` refuses, before any write and
   again when a create is proposed, and names the place down to a list's element (`setting_refusal`): a key that is not
@@ -1143,12 +1141,16 @@ enter Incus's instance config.
   zero of at most six digits, and under a key named `memory` more than the template's `limits.memory`; and a merged
   object over the settings size. The machine's `cloud-init.vendor-data` is built from the merged object; the record
   keeps the replaced values as `vm.settings`, and a record of a create that gave none has no such key and is the record
-  of before. `service_status` answers `settings`, read back from the record's vendor data (`Vm::guest_settings`), so it
-  is what the machine got whatever the template says later; the owner's card has one row for each replaced key with its
+  of before. `service_status` answers `settings`, from the recorded first-boot values and subsequent approved overrides
+  (`Vm::guest_settings`); the owner's card has one row for each replaced key with its
   value in words, and for a list one row for each element (`setting_rows`). The card cuts nothing a proposal carries:
   `ActionKind::prepare` refuses a setting whose row would pass 160 characters (`SETTING_ROW_MAX`), so the owner
   approves exactly what is shown. Settings never hold a
   secret. Tests in `crates/arca/tests/services/create_settings.rs`.
+- An owner-approved `service_update` can change listed `createSettings` in place. The node derives each old and new
+  value from the VM record and the requested changes, binds them to the card, and compares them again under the write
+  gate. It sends JSON to the fixed guest settings path using the same owned-instance file writer as VM secrets, then
+  restarts the running VM before recording the overrides. The service update journal records the named differences.
 - `update` is `{ "pin": "<key>" }`, on a virtual-machine template only: the key of `settings` that holds the version
   its service runs. `validate_vm_template` refuses a key that `settings` does not have, one that `createSettings`
   lists (a create never chooses the version), and a value that is not an image by digest (`image_by_digest`).
