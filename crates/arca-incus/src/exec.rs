@@ -246,6 +246,7 @@ impl ExecCommand {
 /// disk, with one file of root's, mode 0600, per secret. Incus writes both through the guest agent.
 pub const GUEST_SECRETS_DIR: &str = "/etc/arca-secrets";
 
+/// Non-secret VM settings written by cloud-init or by an approved settings update.
 pub const GUEST_SETTINGS_PATH: &str = "/etc/arca/settings.json";
 
 /// A destination is constructed only by a fixed variant or the secrets-path validator.
@@ -298,7 +299,7 @@ impl ServiceFile {
             Self::EdgeConfigKept => EDGE_CONFIG_KEPT.into(),
         }
     }
-    /// The Incus file type and mode the destination is written with: a private directory, or a private file.
+    /// The Incus type and permissions for this destination. Guest settings match the first-boot file mode.
     fn kind(&self) -> (&'static str, &'static str) {
         match self {
             Self::GuestSecretsDir => ("directory", "0700"),
