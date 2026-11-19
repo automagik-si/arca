@@ -18,7 +18,7 @@
 //!
 //! The test needs `bash`, `curl`, `jq`, `openssl` and `flock` on the machine that runs it. Every credential is made here.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -1022,6 +1022,20 @@ impl Pool {
             env: Vec::new(),
         };
         pool.memory(memory_total, memory_available);
+        fs::write(pool.dir.join("cpu-status"), "Cpus_allowed_list:\t0-63\n").expect("CPUs");
+        let lxcfs = pool.dir.join("lxcfs");
+        fs::create_dir_all(lxcfs.join("proc")).expect("fake LXCFS");
+        for file in ["meminfo", "cpuinfo", "stat", "loadavg", "swaps", "uptime"] {
+            fs::write(lxcfs.join("proc").join(file), "").expect("an LXCFS file");
+        }
+        fs::write(
+            pool.dir.join("mountinfo"),
+            format!(
+                "41 29 0:42 / {} rw - fuse.lxcfs lxcfs rw\n",
+                lxcfs.display()
+            ),
+        )
+        .expect("a mounted LXCFS");
         fs::copy(
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/runner_pool/fake-docker.sh"),
             pool.dir.join("bin/docker"),
@@ -1108,6 +1122,9 @@ impl Pool {
             .env("POOL_RUN", self.dir.join("run"))
             .env("POOL_CGROUP", self.dir.join("cgroup"))
             .env("POOL_MEMINFO", self.dir.join("meminfo"))
+            .env("POOL_CPU_STATUS", self.dir.join("cpu-status"))
+            .env("POOL_LXCFS", self.dir.join("lxcfs"))
+            .env("POOL_MOUNTINFO", self.dir.join("mountinfo"))
             .env("POOL_UNITS", self.dir.join("units"))
             .env("POOL_API_URL", &github.url)
             .env("POOL_TICK", "0.1")
@@ -1317,6 +1334,223 @@ fn key_lines(pem: &str) -> Vec<String> {
         .filter(|line| !line.starts_with("-----") && line.len() >= 20)
         .map(str::to_string)
         .collect()
+}
+
+#[test]
+fn each_slot_starts_with_its_own_cpus_and_the_lxcfs_proc_files() {
+    let scratch = scratch_dir();
+    let github = Github::start(&scratch, &format!("/orgs/{ORG}"));
+    github.state().tokens.push(PAT.to_string());
+    let mut large = class_of("large", "9GiB", 1);
+    large["cpu"] = json!(6);
+    let mut pool = Pool::new(
+        &settings(
+            json!([small(2), large]),
+            3,
+            &format!("https://github.com/{ORG}"),
+        ),
+        64 * GIB,
+        60 * GIB,
+    );
+    fs::write(
+        pool.dir.join("cpu-status"),
+        "Cpus_allowed_list:\t2-4,6-12\n",
+    )
+    .expect("CPUs");
+    pool.secret("GITHUB_TOKEN", PAT);
+    pool.start(&github);
+    wait_for(&pool, "all three runner and daemon pairs", || {
+        pool.read("logs/status.txt").contains("idle=3")
+    });
+
+    let calls = pool.read("docker/calls.log");
+    let mut used = BTreeSet::new();
+    for (slot, count, memory) in [(0, 2, 4), (1, 2, 4), (2, 6, 9)] {
+        let cpus_for = |container| {
+            let prefix = format!("run -d --name pool1-s{slot}-{container} ");
+            let run = calls
+                .lines()
+                .find(|line| line.starts_with(&prefix))
+                .expect(&prefix);
+            for file in ["meminfo", "cpuinfo", "stat", "loadavg", "swaps", "uptime"] {
+                let mount = format!(
+                    "--mount type=bind,source={}/lxcfs/proc/{file},target=/proc/{file},readonly",
+                    pool.dir.display()
+                );
+                assert!(run.contains(&mount), "{run}");
+            }
+            run.split_whitespace()
+                .skip_while(|arg| *arg != "--cpuset-cpus")
+                .nth(1)
+                .expect(run)
+        };
+        let cpus = cpus_for("run");
+        assert_eq!(cpus_for("dind"), cpus);
+        let cpu_ids = cpus.split(',').map(|cpu| cpu.parse::<u32>().expect(cpus));
+        assert_eq!(cpu_ids.clone().count(), count);
+        for cpu in cpu_ids {
+            assert!(
+                (2..=4).contains(&cpu) || (6..=12).contains(&cpu),
+                "CPU {cpu}"
+            );
+            assert!(used.insert(cpu), "CPU {cpu} is assigned to two slots");
+        }
+        let slice = pool.read(&format!("units/arcapool-s{slot}.slice"));
+        assert!(slice.contains(&format!("AllowedCPUs={cpus}\n")), "{slice}");
+        assert!(
+            slice.contains(&format!("MemoryMax={}\n", memory * GIB)),
+            "{slice}"
+        );
+    }
+    assert_eq!(pool.stop(), Some(0));
+    let _ = fs::remove_dir_all(scratch);
+}
+
+#[test]
+fn the_slot_budget_names_cpus_and_keeps_slots_without_cpus_queued() {
+    let scratch = scratch_dir();
+    let github = Github::start(&scratch, &format!("/orgs/{ORG}"));
+    github.state().tokens.push(PAT.to_string());
+    let mut pool = Pool::new(
+        &settings(
+            json!([small(2), class_of("other", "4GiB", 1)]),
+            2,
+            &format!("https://github.com/{ORG}"),
+        ),
+        64 * GIB,
+        60 * GIB,
+    );
+    fs::write(pool.dir.join("cpu-status"), "Cpus_allowed_list:\t0-3\n").expect("CPUs");
+    pool.secret("GITHUB_TOKEN", PAT);
+    pool.start(&github);
+    wait_for(
+        &pool,
+        "two slots with CPUs and one waiting for CPUs",
+        || {
+            let status = pool.read("logs/status.txt");
+            status.contains("idle=2") && status.contains("queued (needs 2 dedicated CPUs)")
+        },
+    );
+    let warning = "WARNING: the 3 slots ask for 6 CPUs together and the machine has 4 CPUs";
+    assert!(pool.output().contains(warning));
+    assert!(pool.read("logs/status.txt").contains(warning));
+    assert_eq!(live_slots(&github), ["0", "2"]);
+    assert_eq!(pool.stop(), Some(0));
+    let _ = fs::remove_dir_all(scratch);
+}
+
+#[test]
+fn ceiling_memory_admits_more_slots_and_preserves_their_limits_and_the_machine_reserve() {
+    let scratch = scratch_dir();
+    let mut config = settings(
+        json!([class_of("large", "8GiB", 4)]),
+        4,
+        &format!("https://github.com/{ORG}"),
+    );
+    config["reserveMemory"] = json!("4GiB");
+    for (policy, expected) in [("reserved", 3), ("ceiling", 4)] {
+        let github = Github::start(&scratch, &format!("/orgs/{ORG}"));
+        github.state().tokens.push(PAT.to_string());
+        config["memory"] = json!(policy);
+        let mut pool = Pool::new(&config, 32 * GIB, 28 * GIB);
+        pool.secret("GITHUB_TOKEN", PAT);
+        pool.start(&github);
+        wait_for(
+            &pool,
+            "the expected number of slots under the memory policy",
+            || {
+                pool.read("logs/status.txt").contains(&format!(
+                    "idle={expected} starting=0 queued={}",
+                    4 - expected
+                ))
+            },
+        );
+        assert_eq!(github.registrations().len(), expected);
+        let parent = pool.read("units/arcapool.slice");
+        let status = pool.read("logs/status.txt");
+        if policy == "ceiling" {
+            assert!(
+                parent.contains(&format!("MemoryMax={}\n", 28 * GIB)),
+                "{parent}"
+            );
+            assert!(
+                status.contains("memory_ceilings=32768MiB memory_budget=28672MiB"),
+                "{status}"
+            );
+        } else {
+            assert!(parent.is_empty(), "{parent}");
+            assert!(
+                status.contains("memory_reserved=24576MiB of 28672MiB"),
+                "{status}"
+            );
+        }
+        let calls = pool.read("docker/calls.log");
+        for slot in live_slots(&github) {
+            let slice = pool.read(&format!("units/arcapool-s{slot}.slice"));
+            assert!(
+                slice.contains(&format!("MemoryMax={}\n", 8 * GIB)),
+                "{slice}"
+            );
+            assert!(calls.lines().any(|run| {
+                run.starts_with(&format!("run -d --name pool1-s{slot}-run "))
+                    && run.contains("target=/proc/meminfo,readonly")
+            }));
+        }
+        assert_eq!(pool.stop(), Some(0));
+    }
+    let _ = fs::remove_dir_all(scratch);
+}
+
+#[test]
+fn slots_wait_for_lxcfs_before_registering_in_either_mode() {
+    for persistent in [false, true] {
+        let scratch = scratch_dir();
+        let github = Github::start(&scratch, &format!("/orgs/{ORG}"));
+        github.state().tokens.push(PAT.to_string());
+        github.state().registration_token = Some(REGISTRATION_TOKEN.to_string());
+        let mut config = settings(json!([small(1)]), 1, &format!("https://github.com/{ORG}"));
+        if persistent {
+            config["registration"] = json!("registration-token");
+            config["runnerGroup"] = json!("arca-pool");
+        }
+        let mut pool = Pool::new(&config, 64 * GIB, 60 * GIB);
+        pool.secret("GITHUB_TOKEN", PAT);
+        pool.secret("GITHUB_REGISTRATION_TOKEN", REGISTRATION_TOKEN);
+        let mountinfo = pool.read("mountinfo");
+        fs::write(pool.dir.join("mountinfo"), "").expect("unmounted LXCFS");
+        fs::remove_file(pool.dir.join("lxcfs/proc/meminfo")).expect("required LXCFS file");
+        fs::remove_file(pool.dir.join("lxcfs/proc/uptime")).expect("optional LXCFS file");
+        pool.start(&github);
+        wait_for(&pool, "LXCFS failure before registration", || {
+            pool.output().contains("LXCFS is not mounted at")
+        });
+        assert!(github.registrations().is_empty());
+        assert!(github.state().registered.is_empty());
+
+        fs::write(pool.dir.join("mountinfo"), mountinfo).expect("mounted LXCFS");
+        wait_for(&pool, "the missing LXCFS file is named", || {
+            let output = pool.output();
+            output.contains("LXCFS is missing") && output.contains("/lxcfs/proc/meminfo")
+        });
+        assert!(github.registrations().is_empty());
+        assert!(github.state().registered.is_empty());
+
+        fs::write(pool.dir.join("lxcfs/proc/meminfo"), "").expect("LXCFS meminfo restored");
+        wait_for(&pool, "the runner started once LXCFS is mounted", || {
+            pool.read("logs/status.txt").contains("idle=1")
+        });
+        let calls = pool.read("docker/calls.log");
+        assert!(!calls.contains("target=/proc/uptime"));
+        if persistent {
+            assert!(calls.lines().any(|line| {
+                line.starts_with("run --rm --name pool1-s0-reg ")
+                    && line.contains("--cpuset-cpus 0,1")
+                    && line.contains("target=/proc/meminfo,readonly")
+            }));
+        }
+        assert_eq!(pool.stop(), Some(0));
+        let _ = fs::remove_dir_all(scratch);
+    }
 }
 
 #[test]
@@ -2360,6 +2594,7 @@ fn a_first_boot_names_the_commands_that_are_missing_on_the_console_and_installs_
         ),
         ("util-linux", "flock"),
         ("hostname", "hostname"),
+        ("lxcfs", "the slots' cgroup-aware proc files"),
     ] {
         assert!(
             packages.iter().any(|name| name == package),
