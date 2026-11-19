@@ -514,6 +514,11 @@ pub(super) fn check_proposal(
     entries: &[Entry],
     payload: &Value,
 ) -> Result<Value, CallError> {
+    if payload.get("settings").is_some() {
+        let mut bound = payload.clone();
+        bound["changes"] = service_vm_settings::plan(cfg, entries, payload)?.changes;
+        return Ok(bound);
+    }
     // The template's difference is the node's to work out: what a caller sent there is never kept.
     let mut payload = payload.clone();
     if let Some(object) = payload.as_object_mut() {

@@ -1851,7 +1851,7 @@ fn settings_that_cannot_be_used_are_said_in_words_and_nothing_is_started() {
             &workspace,
             "workspace team1 does not start: its settings cannot be used: ",
         );
-        says(&workspace, "They are fixed when the machine is created");
+        says(&workspace, "Propose corrected settings with service_update");
         assert_eq!(workspace.stop(), Some(0));
         assert_eq!(workspace.read("docker/calls.log"), "", "{words}");
 

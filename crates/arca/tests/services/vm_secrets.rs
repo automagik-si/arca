@@ -35,7 +35,7 @@ fn pool_rig() -> Rig {
 
 /// The instance verbs as `arca serve` builds them: a start or a restart writes a virtual machine's secrets into its
 /// guest. `wait` is how long the guest agent is waited for.
-fn life(rig: &Rig, wait: Duration) -> HashMap<&'static str, Arc<dyn ToolHandler>> {
+pub(super) fn life(rig: &Rig, wait: Duration) -> HashMap<&'static str, Arc<dyn ToolHandler>> {
     let secrets = arca::guest_secrets::GuestSecrets::new(rig.cfg.clone(), Arc::clone(&rig.kernel))
         .with_wait(wait, Duration::from_millis(10));
     life_with_writer(rig, Arc::new(secrets))
@@ -70,7 +70,7 @@ fn life_with_writer(
     .collect()
 }
 
-fn start(
+pub(super) fn start(
     life: &HashMap<&'static str, Arc<dyn ToolHandler>>,
     name: &str,
 ) -> Result<Value, CallError> {
