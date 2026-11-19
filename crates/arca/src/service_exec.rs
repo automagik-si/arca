@@ -172,33 +172,13 @@ pub struct FormulaRun {
     pub exit: i64,
     /// Whether the in-instance limit ended it (`/usr/bin/timeout`'s 124 or 137).
     pub past_limit: bool,
-    /// Whether an output was longer than the 64 KiB kept of it, and what was dropped of what was kept.
-    pub output_cut: OutputCut,
+    /// Whether an output was longer than the 64 KiB kept of it.
+    pub output_cut: bool,
     /// The kept lines, masked: the app's words, untrusted. Empty for the version reader and for a health check that
     /// passed.
     pub lines: Vec<String>,
     /// The version reader's first line, when it is a plain version. `None` for every other part.
     pub version: Option<String>,
-}
-
-/// Whether an output was longer than the 64 KiB kept of it. The kept tail of a longer output begins inside a line,
-/// where a secret may be cut and no longer match as a whole value, so that first partial line is dropped whole before
-/// the rest is masked.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum OutputCut {
-    /// Neither output was longer than what is kept of it.
-    Whole,
-    /// An output was longer: the first line of its kept tail, which began before the cut, was dropped.
-    FirstLineDropped,
-    /// An output was longer and its kept tail held no line break: nothing of that output is kept.
-    NothingKept,
-}
-
-impl OutputCut {
-    /// Whether an output was longer than what is kept of it.
-    pub fn is_cut(self) -> bool {
-        self != Self::Whole
-    }
 }
 
 #[derive(Clone)]
@@ -841,23 +821,9 @@ fn kept(
     stderr: &Tail,
     secrets: &[String],
 ) -> FormulaRun {
-    let (out, out_cut) = whole_lines(stdout);
-    let (err, err_cut) = whole_lines(stderr);
-    let output_cut = [out_cut, err_cut]
-        .into_iter()
-        .max_by_key(|cut| match cut {
-            OutputCut::Whole => 0,
-            OutputCut::FirstLineDropped => 1,
-            OutputCut::NothingKept => 2,
-        })
-        .unwrap_or(OutputCut::Whole);
-    let mut lines = hide_cut_key(masked_lines(out, secrets), stdout, out, secrets);
-    lines.extend(hide_cut_key(
-        masked_lines(err, secrets),
-        stderr,
-        err,
-        secrets,
-    ));
+    let output_cut = stdout.cut || stderr.cut;
+    let mut lines = masked_lines(&stdout.bytes, secrets);
+    lines.extend(masked_lines(&stderr.bytes, secrets));
     let (lines, version) = match part {
         FormulaPart::Update => (last(lines, UPDATE_LINES), None),
         FormulaPart::Health if exit != 0 => (last(lines, HEALTH_LINES), None),
@@ -881,96 +847,6 @@ fn kept(
         lines,
         version,
     }
-}
-
-/// The part of a kept tail that is whole lines: all of it when the output was not cut, and otherwise what follows its
-/// first line break, since its first line began before the cut. A cut tail with no line break keeps nothing.
-fn whole_lines(tail: &Tail) -> (&[u8], OutputCut) {
-    if !tail.cut {
-        return (&tail.bytes, OutputCut::Whole);
-    }
-    match tail.bytes.iter().position(|b| matches!(b, b'\n' | b'\r')) {
-        Some(at) => (&tail.bytes[at + 1..], OutputCut::FirstLineDropped),
-        None => (&[], OutputCut::NothingKept),
-    }
-}
-
-/// The longest line of a key's body that [`hide_cut_key`] takes when the dropped first line holds no BEGIN line.
-const KEY_LINE_MAX: usize = 80;
-
-/// The last pass over a cut output's answer lines, which only hides more. When the kept lines begin with a key's body
-/// (its BEGIN line cut away, or on the dropped first line), each answer line they make becomes `[secret]`, so a part's
-/// last lines are the same lines as without this pass. A key's body is a run of key lines ([`key_line`]), PEM headers
-/// (`Proc-Type: ...`) and blank lines, at least one a key line. The run is judged on the text as it came and replaced
-/// only when its lines, masked alone, are the first answer lines; otherwise the masking hid it already (an END line
-/// after it hides all before). It never edits inside a line and gives nothing back to the masking, so it shows no byte
-/// the masking alone hides.
-fn hide_cut_key(
-    mut lines: Vec<String>,
-    tail: &Tail,
-    kept: &[u8],
-    secrets: &[String],
-) -> Vec<String> {
-    if !tail.cut || kept.is_empty() {
-        return lines;
-    }
-    let [_, _, header, begin, end] = cut_patterns();
-    // A BEGIN line with no END line after it on the dropped first line: the key goes on, in lines of any length.
-    let first = String::from_utf8_lossy(&tail.bytes[..tail.bytes.len() - kept.len()]);
-    let opened = (begin.find_iter(&first).last()).is_some_and(|b| !end.is_match(&first[b.end()..]));
-    let text = String::from_utf8_lossy(kept);
-    let (mut at, mut keyed) = (0, false);
-    for line in text.split_inclusive(['\n', '\r']) {
-        let bare = line
-            .trim_end_matches(['\n', '\r'])
-            .trim_matches([' ', '\t']);
-        let key = key_line(bare, opened);
-        if !(key || bare.is_empty() || header.is_match(bare)) {
-            break;
-        }
-        keyed |= key;
-        at += line.len();
-    }
-    let run = if keyed {
-        masked_lines(text[..at].as_bytes(), secrets)
-    } else {
-        Vec::new()
-    };
-    if !run.is_empty() && lines.starts_with(&run) {
-        lines[..run.len()].fill("[secret]".to_owned());
-    }
-    lines
-}
-
-/// A line of a key's body: key characters only (base64, a `/` also written `\/`), in pieces between line breaks
-/// written out (`\n`, `\r`), one at least 16 long and none longer than [`KEY_LINE_MAX`] unless the key `opened` on
-/// the dropped first line.
-fn key_line(line: &str, opened: bool) -> bool {
-    let [key, written_break, ..] = cut_patterns();
-    let pieces: Vec<&str> = (written_break.split(line))
-        .map(|piece| piece.trim_matches([' ', '\t']))
-        .filter(|piece| !piece.is_empty())
-        .collect();
-    !pieces.is_empty()
-        && (pieces.iter()).all(|p| (opened || p.len() <= KEY_LINE_MAX) && key.is_match(p))
-        && pieces.iter().any(|piece| piece.len() >= 16)
-}
-
-/// The patterns [`hide_cut_key`] reads a text with: a piece of a key line, a line break written out, a PEM header, a
-/// BEGIN line and an END line.
-fn cut_patterns() -> &'static [regex::Regex; 5] {
-    static PATTERNS: std::sync::OnceLock<[regex::Regex; 5]> = std::sync::OnceLock::new();
-    PATTERNS.get_or_init(|| {
-        let label = crate::service::PEM_LABEL;
-        [
-            r"\A(?:[A-Za-z0-9+=]|\\?/)+\z".to_owned(),
-            r"\\r\\n|\\r|\\n".to_owned(),
-            r"\A(?:Proc-Type|DEK-Info|Comment|Version|Hash|Charset)[ \t]*:".to_owned(),
-            format!("-----BEGIN {label}-----"),
-            format!("-----END {label}-----"),
-        ]
-        .map(|pattern| regex::Regex::new(&pattern).expect("the pattern is valid"))
-    })
 }
 
 fn last(mut lines: Vec<String>, count: usize) -> Vec<String> {

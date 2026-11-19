@@ -4273,7 +4273,7 @@ pub const SECRET_LINE_MIN: usize = 16;
 
 /// A PEM label as RFC 7468 allows it: printable characters other than `-`, joined by single spaces or hyphens, so
 /// `RSA PRIVATE KEY`, `OpenVPN Static key V1` and `OpenVPN tls-crypt-v2 server key` are all labels.
-pub(crate) const PEM_LABEL: &str = r"[\x21-\x2C\x2E-\x7E](?:[- ]?[\x21-\x2C\x2E-\x7E]){0,63}";
+const PEM_LABEL: &str = r"[\x21-\x2C\x2E-\x7E](?:[- ]?[\x21-\x2C\x2E-\x7E]){0,63}";
 
 /// What may follow the BEGIN line of a PEM block whose END line was not printed: line breaks (also written as `\n`
 /// inside a string), and lines that are only base64 of at least 16 characters (a `/` may be written `\/`) or a PEM
