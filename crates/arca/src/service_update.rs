@@ -2478,7 +2478,7 @@ impl Run<'_> {
             Err(error) => return Err(Failure::of("rebuild back", &error)),
         }
         // What the new version wrote to its volumes is undone: each goes back to the snapshot taken before the rebuild.
-        // The restore is on file before its first volume is put back, and comes off only once every one is.
+        // The restore is on file before its first volume is put back, and says it is finished only once every one is.
         let mut desired = None;
         if let Some((snapshot, parts)) = &back.volumes {
             let cfg = &self.handler.cfg;
