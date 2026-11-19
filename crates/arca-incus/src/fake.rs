@@ -252,6 +252,15 @@ struct Shared {
     restores: Mutex<BTreeMap<(String, String), Vec<String>>>,
     /// The snapshots each custom volume was restored to, in order, by project and `<pool>/<volume>`.
     volume_restores: Mutex<BTreeMap<(String, String), Vec<String>>>,
+    /// The instances another one takes the place of at their next start, by project and name: the newcomer's uuid.
+    recreations: Mutex<BTreeMap<(String, String), String>>,
+    /// The instances whose next rebuild replaces the root and then fails in its operation with this message, after
+    /// which every rebuild of theirs is refused.
+    landed_failures: Mutex<BTreeMap<(String, String), String>>,
+    /// Path prefixes whose PUT is refused with 400 before any change.
+    reject_put: Mutex<Vec<String>>,
+    /// The projects where every volume snapshot is refused as a project that does not allow one refuses it.
+    volume_snapshot_refusals: Mutex<BTreeSet<String>>,
     /// The power changes each instance was asked for, in order: `start`, `stop` or `restart`, whatever Incus answered.
     state_actions: Mutex<BTreeMap<(String, String), Vec<String>>>,
     counter: AtomicU64,
@@ -521,6 +530,10 @@ impl Shared {
             rebuild_refusals: Mutex::new(BTreeMap::new()),
             restores: Mutex::new(BTreeMap::new()),
             volume_restores: Mutex::new(BTreeMap::new()),
+            recreations: Mutex::new(BTreeMap::new()),
+            landed_failures: Mutex::new(BTreeMap::new()),
+            reject_put: Mutex::new(Vec::new()),
+            volume_snapshot_refusals: Mutex::new(BTreeSet::new()),
             state_actions: Mutex::new(BTreeMap::new()),
             counter: AtomicU64::new(1),
             resources: Mutex::new(None),
@@ -636,6 +649,38 @@ impl FakeIncus {
     /// not answer.
     pub fn refuse_rebuild(&self, project: &str, name: &str) {
         lock(&self.shared.rebuild_refusals).insert((project.to_string(), name.to_string()), true);
+    }
+
+    /// The next rebuild of the instance `name` in `project` replaces its root, as Incus does once it has deleted the
+    /// old root volume, and then fails in its operation with `message`, as one that fails after that point does. Every
+    /// rebuild of it after that one is refused, as [`FakeIncus::refuse_rebuild`] refuses it.
+    pub fn land_then_fail_rebuild(&self, project: &str, name: &str, message: &str) {
+        lock(&self.shared.landed_failures)
+            .insert((project.to_string(), name.to_string()), message.to_string());
+    }
+
+    /// At the next start of the instance `name` in `project`, another instance of the same name takes its place: it
+    /// runs, with the uuid `uuid`, and keeps its config and devices. It records no write.
+    pub fn recreate_at_next_start(&self, project: &str, name: &str, uuid: &str) {
+        lock(&self.shared.recreations)
+            .insert((project.to_string(), name.to_string()), uuid.to_string());
+    }
+
+    /// Makes a PUT whose path starts with `path_prefix` answer 400 before changing any object: a project's write, or a
+    /// volume's restore.
+    pub fn set_reject_put(&self, path_prefix: &str) {
+        lock(&self.shared.reject_put).push(path_prefix.to_string());
+    }
+
+    /// Lifts every refusal [`FakeIncus::set_reject_put`] armed.
+    pub fn clear_reject_put(&self) {
+        lock(&self.shared.reject_put).clear();
+    }
+
+    /// Every volume snapshot in `project` is refused from now on, as a project that does not allow snapshots refuses
+    /// it, whatever its `restricted.snapshots` says: an Incus that has not taken the owner's step yet.
+    pub fn refuse_volume_snapshots(&self, project: &str) {
+        lock(&self.shared.volume_snapshot_refusals).insert(project.to_string());
     }
 
     /// Takes back [`FakeIncus::lose_image`] and [`FakeIncus::refuse_rebuild`].
@@ -2097,6 +2142,32 @@ fn dispatch(shared: &Shared, request: &Request, route: Route) -> (u16, String, V
         ("GET", Route::InstanceState(address)) => instance_state(store, &address),
         ("PUT", Route::InstanceState(address)) => change_state(shared, store, request, &address),
         ("POST", Route::InstanceRebuild(address)) => rebuild(shared, store, request, &address),
+        // Without `recursion=1`, Incus lists an instance's snapshots by their addresses.
+        ("GET", Route::InstanceSnapshots(address))
+            if request
+                .target
+                .split_once('?')
+                .and_then(|(_, query)| query_param(query, "recursion"))
+                != Some("1") =>
+        {
+            sync(Value::Array(
+                store
+                    .objects
+                    .iter()
+                    .filter(|object| {
+                        object.kind == address.kind
+                            && object.project == address.project
+                            && object.parent == address.parent
+                    })
+                    .map(|object| {
+                        json!(format!(
+                            "/1.0/instances/{}/snapshots/{}",
+                            object.parent, object.name
+                        ))
+                    })
+                    .collect(),
+            ))
+        }
         ("GET", Route::InstanceSnapshots(address) | Route::InstanceBackups(address)) => {
             sync(Value::Array(
                 store
@@ -2884,6 +2955,16 @@ fn put(
     request: &Request,
     address: &Address,
 ) -> (u16, String, Value) {
+    if lock(&shared.reject_put)
+        .iter()
+        .any(|prefix| request.path().starts_with(prefix))
+    {
+        return (
+            400,
+            String::new(),
+            error_envelope(400, "put rejected by test"),
+        );
+    }
     let (index, body) = match written(store, request, address) {
         Ok(found) => found,
         Err(answer) => return answer,
@@ -4210,6 +4291,11 @@ fn rebuild(shared: &Shared, store: &mut Store, request: &Request, address: &Addr
             config.insert("volatile.base_image".to_string(), json!(fingerprint));
         }
     }
+    let key = (address.project.clone(), address.name.clone());
+    if let Some(message) = lock(&shared.landed_failures).remove(&key) {
+        lock(&shared.rebuild_refusals).insert(key, true);
+        return answered(shared, store, "instance", "PUT", Err((500, message)));
+    }
     answered(shared, store, "instance", "PUT", Ok(()))
 }
 
@@ -4296,7 +4382,15 @@ fn change_state(
             store.start(index, shared.counter.fetch_add(1, Ordering::SeqCst));
             let key = (address.project.clone(), address.name.clone());
             if let Some(plan) = lock(&shared.exit_plans).get(&key).cloned() {
-                lock(&shared.exits).insert(key, plan);
+                lock(&shared.exits).insert(key.clone(), plan);
+            }
+            if let Some(uuid) = lock(&shared.recreations).remove(&key)
+                && let Some(config) = store.objects[index]
+                    .body
+                    .get_mut("config")
+                    .and_then(Value::as_object_mut)
+            {
+                config.insert("volatile.uuid".to_string(), json!(uuid));
             }
             answered(shared, store, "instance", "PUT", Ok(()))
         }
@@ -4371,7 +4465,9 @@ fn volume_snapshot(
     if store.find(&held).is_none() {
         return (404, String::new(), error_envelope(404, "not found"));
     }
-    if store.restricted(&address.project) && !store.allows(&address.project, "restricted.snapshots")
+    if (store.restricted(&address.project)
+        && !store.allows(&address.project, "restricted.snapshots"))
+        || lock(&shared.volume_snapshot_refusals).contains(&address.project)
     {
         let message = format!(
             "Project \"{}\" doesn't allow for snapshot creation",
@@ -4423,6 +4519,16 @@ fn restore_volume(
     request: &Request,
     address: &Address,
 ) -> Answer {
+    if lock(&shared.reject_put)
+        .iter()
+        .any(|prefix| request.path().starts_with(prefix))
+    {
+        return (
+            400,
+            String::new(),
+            error_envelope(400, "put rejected by test"),
+        );
+    }
     let sent = serde_json::from_slice::<Value>(&request.body).unwrap_or(Value::Null);
     if sent.get("restore").is_none() {
         return (

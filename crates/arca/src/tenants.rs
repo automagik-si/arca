@@ -481,6 +481,18 @@ pub(super) fn allow_tenant_snapshots(
     Ok(true)
 }
 
+/// Whether the desired document already lets the project of tenant `id` hold snapshots: the tenant's entry has the
+/// `snapshots` step, saved, whether or not the node has applied it to Incus yet.
+pub(super) fn tenant_snapshots_saved(kernel: &Mutex<Kernel>, id: &str) -> bool {
+    let Ok(kernel) = lock(kernel) else {
+        return false;
+    };
+    let entry_id = tenant_entry(id);
+    tenants(kernel.entries())
+        .into_iter()
+        .any(|(entry, config)| entry.id.0 == entry_id && config.id == id && config.snapshots)
+}
+
 /// Follows the front on a thread of its own, every 30 seconds, for as long as the process runs.
 pub fn spawn_front_sync(
     kernel: Arc<Mutex<Kernel>>,

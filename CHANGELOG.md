@@ -17,9 +17,11 @@ holds a snapshot, while a volume's snapshot does not stop a rebuild. A rollback 
 the volume to that snapshot, so what the new version wrote there is undone. Before, an update in a project Arca made
 rolled back with no snapshot at all and left the new version's writes in the data volume. The first update whose
 snapshot the project refuses gives the project its `snapshots` step, in the node's service project and in a tenant's
-alike. Each update keeps its volume snapshot until a later release removes old ones. An instance that already holds
-an Incus snapshot is refused before anything is changed, in words that name each snapshot; removing them is a plan of
-its own, on the owner's passkey card.
+alike. A service with volumes of its own is never rebuilt without their snapshot. A rollback writes only to the
+instance the update began with, starts the old version on a root it could not rebuild only when the new image was never
+fetched, and a restore that fails part way is finished by the next update before it does anything else. Each update
+keeps its volume snapshot until a later release removes old ones. An instance that already holds an Incus snapshot is
+refused before anything is changed, in words that name each snapshot; Arca has no step that removes them yet.
 
 A container template may carry `appUpdate`, a formula for updating the app inside its service: a `health` command and
 a `version` reader, and on a `system` container an `update` command that takes the version as one argument
@@ -35,8 +37,8 @@ an optional SSH listener and rollback. It has not yet been run on a live node.
 
 `service_labels_set` merges a service's plain labels, with null removing a key. `service_status` and `service_list`
 rows now include the label map. Writes use ownership checks, If-Match and read-back outside the effect journal;
-uncertain answers carry an explicit code. Label keeping during snapshot rollback is best effort and never prevents
-the rollback or changes its result.
+uncertain answers carry an explicit code. A failed update's rollback restores only the data volume, so labels stay
+as they were written.
 Both reads are marked as carrying untrusted text because labels are caller data.
 
 `tenant_image_import` uses an approved card to copy an exact image from the node's store into a tenant and add its

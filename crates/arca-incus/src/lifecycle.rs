@@ -507,24 +507,28 @@ impl StateChanger {
         })
     }
 
-    /// The names of the Incus snapshots the instance `seen` holds, in the order Incus lists them.
+    /// The names of the Incus snapshots the instance `seen` holds, in the order Incus lists them. It reads the list of
+    /// names, not the recursive one: Incus 7.6 leaves a snapshot it cannot render out of the recursive list and still
+    /// answers it with success, while the names come from its database alone and a failure to read them is an error.
     pub fn instance_snapshots(&self, seen: &InstanceState) -> Result<Vec<String>, IncusError> {
         self.allow(&seen.project)?;
         object_url(&seen.project, &seen.name)?;
         let url = format!(
-            "/1.0/instances/{}/snapshots?project={}&recursion=1",
+            "/1.0/instances/{}/snapshots?project={}",
             seen.name, seen.project
         );
         let listed = checked_metadata(self.send("GET", &url, None)?)?;
         let rows = listed
             .as_array()
             .ok_or_else(|| decode("the snapshot list is not a list"))?;
+        let prefix = format!("/1.0/instances/{}/snapshots/", seen.name);
         rows.iter()
             .map(|row| {
-                row.get("name")
-                    .and_then(Value::as_str)
-                    .map(|name| name.rsplit('/').next().unwrap_or(name).to_string())
-                    .ok_or_else(|| decode("a snapshot has no name"))
+                row.as_str()
+                    .and_then(|url| url.strip_prefix(&prefix))
+                    .map(|name| name.split('?').next().unwrap_or(name).to_string())
+                    .filter(|name| !name.is_empty())
+                    .ok_or_else(|| decode("a snapshot is not named by its address"))
             })
             .collect()
     }

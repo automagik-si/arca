@@ -4087,6 +4087,19 @@ pub fn allow_service_snapshots(
     Ok(true)
 }
 
+/// Whether the desired document already lets the service project hold snapshots: its owner's entry has the `snapshots`
+/// step, saved, whether or not the node has applied it to Incus yet.
+pub(crate) fn service_snapshots_saved(kernel: &Mutex<Kernel>, cfg: &NodeConfig) -> bool {
+    let Ok(kernel) = lock(kernel) else {
+        return false;
+    };
+    let needs = ProjectNeeds {
+        snapshots: true,
+        ..ProjectNeeds::default()
+    };
+    project_changes(kernel.entries(), cfg, needs).is_ok_and(|changes| changes.is_empty())
+}
+
 /// Refuses, in words and before any write, a write of the project owner's entry whose configured virtual-machine count is
 /// below the number of virtual machines the node holds: Incus would refuse that count for the project, and the entry would
 /// then fail on every pass. It is a `capacity` refusal: the node holds more virtual machines than its cap allows.

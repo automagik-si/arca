@@ -888,11 +888,9 @@ Label text is caller data, so both reads are marked as carrying untrusted text.
 Label writes check ownership and If-Match, read the instance back, and are not journalled. Result `code: unconfirmed`
 means the PATCH answer was uncertain: the returned map is what was read, and the write may still land later; read
 status again before deciding what to do. If read-back is unavailable, `labels_unconfirmed` reports that uncertainty.
-Adopted and imported services show existing labels but take no label write. Snapshot rollback keeps labels best effort;
-a label read or repair failure is logged without values and never prevents an otherwise successful rollback.
-Rollback takes no node write gate: a label write that lands while the restore itself is running can be lost.
-Put-back only replaces a stored value still exactly equal to the snapshot's; a different value is left alone,
-including after an If-Match conflict is re-read.
+Adopted and imported services show existing labels but take no label write. A failed `service_update` rebuilds the
+old root and restores only the data volume, never the instance's config, so labels written before or during the update
+stay as they are.
 
 **Templates an earlier release installed.** A release may change a shipped template: up to 0.12.0, for one, the
 shipped `postgres-autopg` template declared `POSTGRES_PASSWORD` and did not make it, so a create came up stopped
@@ -2006,16 +2004,24 @@ restored to its snapshot, so what the new version wrote there (a migration, for 
 started if it was running before, given 30 seconds to answer, and the call is
 refused with code `rolled_back` and the failing step's words (and a note when the old version does not answer yet).
 When Incus could not fetch the new image, the old root was never taken away: if it cannot fetch the old one either,
-the old version is started as it is, and the refusal says so. If Incus does not finish a rebuild in time, nothing is
+the old version is started as it is, and the refusal says so. When the new rebuild failed any other way, the root may
+already be the new one: if the old one cannot be rebuilt then, nothing is started and the refusal is `rollback_failed`.
+Every rollback step goes only to the instance the update began with; if another instance has taken its name meanwhile,
+nothing is written to it and the refusal is `rollback_failed`. If a volume's restore fails part way, the refusal names
+the snapshot, the volumes put back and the one that failed, and the node keeps that on file: the next update of the
+service, once it is stopped, first puts every one of them back to that snapshot (undoing what was written to them since),
+then goes on. While the service runs, that update is refused and asks for `instance_stop` first. If Incus does not finish a rebuild in time, nothing is
 rolled back, so as not to rebuild twice at once: the refusal is `update_unsettled`, and the same update may be asked
 for again once Incus is idle. If the old version cannot be put back, the refusal is `rollback_failed`, says so, and
-leaves the service stopped. A failure before anything is changed (the digest is malformed, the service is not made
+says whether the service is stopped, as a read of it shows. A failure before anything is changed (the digest is malformed, the service is not made
 from an image by digest or a local image pinned by fingerprint, the image a local update names is not in the service
 project's image store, its instance is not the one Arca created, it has never been started, its instance holds an
-Incus snapshot, the volume snapshot failed for a reason other than the project not allowing one) says "Nothing was
-changed". An instance that holds Incus snapshots is refused before anything is stopped, in words that name each of
-them: the rebuild would fail halfway. Removing them is a plan of its own, on a card the owner approves with their
-passkey; ask for the update again after that. A call for the digest the service
+Incus snapshot, the volume snapshot failed, or the project still refuses it) says "Nothing was changed", or, when
+the owner's `snapshots` step was written or saved on the way, "Nothing else was changed" and names it. A service that
+has volumes of its own is never rebuilt without their snapshot. An instance that holds Incus snapshots is refused
+before anything is stopped, in words that name each of them: the rebuild would fail halfway. Arca has no step that
+removes an instance's own Incus snapshots yet (`snapshot_delete` removes Arca's copies, not these): removing them is to
+be a plan of its own, on a card the owner approves with their passkey. A call for the digest the service
 already runs changes nothing and answers `updated: false`. A service being updated refuses a second update until
 the first ends. The call is synchronous and can take several minutes: the journal keeps what it did.
 
