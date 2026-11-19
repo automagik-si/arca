@@ -10,9 +10,8 @@
 //!    fingerprint. Incus keeps the config, the devices (the data volume among them), the uuid, the secrets and the
 //!    firewall rules; only the root is the new image's;
 //! 3. it is started;
-//! 4. the health check, within a timeout: a service with a host port (`lan`) is tried through that port's proxy, a
-//!    service whose first port is its droidd port is tried at its address, and any other must stay running for a few
-//!    seconds, since the node may reach nothing else of it;
+//! 4. the health check, within a timeout: try the template's TCP port or HTTP path when set. Otherwise use the
+//!    service's existing proxy or droidd check where applicable, or check that the instance stays running;
 //! 5. the new digest is recorded in the service's desired state, so a restart keeps it.
 //!
 //! A service whose template declares a data volume that its instance has not keeps its data on the root, which the
@@ -34,7 +33,7 @@
 //! volume is the service's own and is not snapshotted, so what the new version wrote there stays.
 use super::service_reconfigure::{self, Doing, Ready, Written};
 use super::*;
-use crate::service::ServiceConfig;
+use crate::service::{PortHealth, ServiceConfig};
 use arca_incus::{IncusError, InstanceState, StateAction, StateChanger};
 use arca_kernel::desired::Entry;
 use std::cell::Cell;
@@ -47,7 +46,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 pub const SERVICE_UPDATES_FILE: &str = "service-updates.jsonl";
 /// A journal past this size is set aside as `<name>.1`, replacing the one set aside before, and a new one is begun.
 const MAX_JOURNAL_BYTES: u64 = 8 * 1024 * 1024;
-/// How long the first port has to answer, when the call states no timeout.
+/// How long health has to come, when the call states no timeout.
 pub const DEFAULT_HEALTH_SECONDS: u64 = 120;
 /// The longest timeout a call may state.
 pub const MAX_HEALTH_SECONDS: u64 = 900;
@@ -60,10 +59,10 @@ const STAY_RUNNING_SECONDS: u64 = 10;
 /// The old version, started again after a rollback, is given this long to answer.
 pub const OLD_ANSWERS_SECONDS: u64 = 30;
 
-/// One attempt of the health check: whether `address` answers on `port` now.
+/// One attempt of the health check: whether `address` answers on `port` now, within the time left.
 /// `forwarded` is true when the address is the node's own side of a proxy: the proxy takes the connection before it dials
 /// the service, so an answer is a connection that is not closed at once.
-pub type Probe = Arc<dyn Fn(&str, u16, bool) -> bool + Send + Sync>;
+pub type Probe = Arc<dyn Fn(&str, u16, bool, Option<&str>, Duration) -> bool + Send + Sync>;
 
 /// What a node's `service_update` does at its edges: how a port is tried and how long is waited between two tries.
 #[derive(Clone)]
@@ -75,32 +74,91 @@ pub struct UpdateOptions {
 impl Default for UpdateOptions {
     fn default() -> Self {
         Self {
-            probe: Arc::new(|address, port, forwarded| {
-                let Ok(ip) = address.parse::<std::net::IpAddr>() else {
-                    return false;
-                };
-                let Ok(mut stream) =
-                    TcpStream::connect_timeout(&SocketAddr::new(ip, port), CONNECT_WAIT)
-                else {
-                    return false;
-                };
-                if !forwarded {
-                    return true;
-                }
-                // The proxy closes a connection whose target does not answer; a service that waits for the client
-                // to speak first leaves it open.
-                let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
-                match stream.read(&mut [0u8; 1]) {
-                    Ok(read) => read > 0,
-                    Err(error) => matches!(
-                        error.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                    ),
-                }
-            }),
+            probe: Arc::new(probe_port),
             pace: Duration::from_secs(1),
         }
     }
+}
+
+fn probe_port(
+    address: &str,
+    port: u16,
+    forwarded: bool,
+    http_path: Option<&str>,
+    remaining: Duration,
+) -> bool {
+    let Ok(ip) = address.parse() else {
+        return false;
+    };
+    let deadline = Instant::now() + remaining.min(CONNECT_WAIT);
+    let socket = SocketAddr::new(ip, port);
+    let Ok(mut stream) = TcpStream::connect_timeout(&socket, remaining.min(CONNECT_WAIT)) else {
+        return false;
+    };
+    if let Some(path) = http_path {
+        return http_answers(&mut stream, socket, path, deadline).unwrap_or(false);
+    }
+    if !forwarded {
+        return true;
+    }
+    // The proxy closes the connection if its target does not answer. A service waiting for the client leaves it open.
+    let wait = deadline.saturating_duration_since(Instant::now());
+    let settle = Duration::from_millis(500);
+    if stream.set_read_timeout(Some(wait.min(settle))).is_err() {
+        return false;
+    }
+    match stream.read(&mut [0; 1]) {
+        Ok(read) => read > 0,
+        Err(error) => {
+            wait >= settle
+                && matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                )
+        }
+    }
+}
+
+/// Read only the HTTP status. A successful response is 2xx, and redirects are never followed.
+fn http_answers(
+    stream: &mut TcpStream,
+    socket: SocketAddr,
+    path: &str,
+    deadline: Instant,
+) -> std::io::Result<bool> {
+    let request = format!("GET {path} HTTP/1.1\r\nHost: {socket}\r\nConnection: close\r\n\r\n");
+    let mut request = request.as_bytes();
+    while !request.is_empty() {
+        stream.set_write_timeout(Some(deadline.saturating_duration_since(Instant::now())))?;
+        let written = stream.write(request)?;
+        if written == 0 {
+            return Ok(false);
+        }
+        request = &request[written..];
+    }
+    let mut status = [0; 1024];
+    let mut used = 0;
+    while used < status.len() {
+        stream.set_read_timeout(Some(deadline.saturating_duration_since(Instant::now())))?;
+        let read = stream.read(&mut status[used..])?;
+        if read == 0 {
+            break;
+        }
+        if let Some(newline) = status[used..used + read]
+            .iter()
+            .position(|byte| *byte == b'\n')
+        {
+            let end = used + newline;
+            return Ok(end >= 13
+                && status[end - 1] == b'\r'
+                && matches!(&status[..9], b"HTTP/1.0 " | b"HTTP/1.1 ")
+                && status[9] == b'2'
+                && status[10..12].iter().all(u8::is_ascii_digit)
+                && matches!(status[12], b' ' | b'\r'));
+        }
+        used += read;
+    }
+    Ok(false)
 }
 
 /// The services being updated now, so one service is never moved by two calls at once.
@@ -830,12 +888,16 @@ impl ServiceHandler {
                 "the service is not made from an OCI image by digest on a registry, nor from a local image pinned by fingerprint",
             ));
         };
-        let Some(port) = config.ports.first().copied() else {
+        let installed =
+            crate::service::load_template(&self.cfg.state_dir.join("templates"), &config.template);
+        let health = installed
+            .as_ref()
+            .map_or(config.health.as_ref(), |template| template.health.as_ref());
+        if health.is_none() && config.ports.is_empty() {
             return Err(said(
                 "its template declares no port, so there is nothing to check after the start",
             ));
-        };
-        let reach = reach_of(&config, port);
+        }
         // What the template says now about no-new-privileges, against what the service has. A difference is applied
         // as a config write and a restart, never a rebuild, so the data stays where it is. It is its own step: an
         // update that also moves the digest is refused, so no answer mixes the two and a failure of one never
@@ -857,11 +919,7 @@ impl ServiceHandler {
                     "noNewPrivileges is not what the template says now. Nothing was changed",
                 ));
             }
-            let key = KeyUpdate {
-                port,
-                reach,
-                seconds,
-            };
+            let key = KeyUpdate { health, seconds };
             return self.change_no_new_privileges(&entry, &config, wanted, &digest, key);
         }
         if args.get("noNewPrivileges").is_some() {
@@ -950,17 +1008,13 @@ impl ServiceHandler {
             None
         };
         // The new version listens where its template says now, so the health check looks there, never at the old port.
-        let (port, reach) = match &first {
-            Some(first) => {
-                let Some(port) = first.next.ports.first().copied() else {
-                    return Err(said(
-                        "its template now declares no port, so there is nothing to check after the start",
-                    ));
-                };
-                (port, reach_of(&first.next, port))
-            }
-            None => (port, reach),
-        };
+        let target = first.as_ref().map_or(&config, |first| &first.next);
+        if health.is_none() && target.ports.is_empty() {
+            return Err(said(
+                "its template now declares no port, so there is nothing to check after the start",
+            ));
+        }
+        let reach = Reach::of(target, health);
         let journal = Journal {
             path: self.cfg.state_dir.join(SERVICE_UPDATES_FILE),
             id: format!("{}-{}", entry.id.0, (self.clock)()),
@@ -986,15 +1040,15 @@ impl ServiceHandler {
             .map_err(|_| said("the update journal could not be written"))?;
         // The secrets the template makes are made now, and each hidden value put behind a reference, before anything
         // is stopped: a plan that moved meanwhile is refused with nothing changed.
-        let template = match first {
+        let template = match &first {
             Some(first) => {
                 let ready = if first.writes {
-                    Some(self.ready_plan(Doing::Update, entries, &config, &first, &journal)?)
+                    Some(self.ready_plan(Doing::Update, entries, &config, first, &journal)?)
                 } else {
                     None
                 };
                 Some(TemplateStep {
-                    changes: first.changes,
+                    changes: first.changes.clone(),
                     ready,
                     old: config.clone(),
                     written: Cell::new(false),
@@ -1017,8 +1071,9 @@ impl ServiceHandler {
             entry: &entry,
             new_source: &new_source,
             digest: &digest,
-            port,
             reach,
+            health,
+            health_written: Cell::new(false),
             seconds,
             registry: registry.as_ref(),
             journal: &journal,
@@ -1042,7 +1097,7 @@ impl ServiceHandler {
         config: &ServiceConfig,
         wanted: bool,
         digest: &str,
-        key: KeyUpdate,
+        key: KeyUpdate<'_>,
     ) -> Result<Value, CallError> {
         let name = &config.name;
         let said = |why: &str| refused(format!("update service {name}: {why}"));
@@ -1091,14 +1146,19 @@ impl ServiceHandler {
             .map_err(|_| said("the update journal could not be written. Nothing was changed"))?;
         // The node saves the record before it writes the instance, so a refused write leaves the new value saved:
         // it is put back here, and the answer says whether that worked.
+        let was_running = seen.is_running();
         let put_back = || {
             self.amend(&entry.id.0, name, |record| {
-                record.no_new_privileges = !wanted
+                record.no_new_privileges = !wanted;
+                record.health.clone_from(&config.health);
             })
             .is_ok()
         };
         if let Err(error) = self.amend(&entry.id.0, name, |record| {
-            record.no_new_privileges = wanted
+            record.no_new_privileges = wanted;
+            if was_running {
+                record.health = key.health.cloned();
+            }
         }) {
             let said_so = match &error {
                 CallError::Refused { message, .. } | CallError::Invalid(message) => message.clone(),
@@ -1116,7 +1176,6 @@ impl ServiceHandler {
             )));
         }
         journal.step("apply", true, json!({}));
-        let was_running = seen.is_running();
         if was_running && let Err(error) = changer.change(&seen, StateAction::Restart) {
             let restored = put_back();
             let running = changer
@@ -1151,6 +1210,7 @@ impl ServiceHandler {
         journal.step("restart", true, json!({ "restarted": was_running }));
         // The same health check a digest update runs, within the call's timeout: a service that does not come back
         // (an image whose setuid helper breaks under the key, say) gets the old setting back and a restart.
+        let reach = Reach::of(config, key.health);
         if was_running {
             let run = Run {
                 handler: self,
@@ -1159,8 +1219,9 @@ impl ServiceHandler {
                 entry,
                 new_source: &config.source,
                 digest,
-                port: key.port,
-                reach: key.reach,
+                reach,
+                health: key.health,
+                health_written: Cell::new(false),
                 seconds: key.seconds,
                 registry: None,
                 journal: &journal,
@@ -1182,7 +1243,9 @@ impl ServiceHandler {
                         changer.change(&state, action)
                     })
                     .is_ok();
-                let answers = restarted && run.answers_within(key.seconds.min(OLD_ANSWERS_SECONDS));
+                let old_reach = run.old_reach();
+                let old_seconds = key.seconds.min(OLD_ANSWERS_SECONDS);
+                let answers = restarted && run.answers_within(old_reach, old_seconds);
                 journal.step(
                     "end",
                     false,
@@ -1200,16 +1263,22 @@ impl ServiceHandler {
                             "The old setting could not be put back in its record: service_status shows what it says."
                         },
                         if !restarted {
-                            "It could not be restarted again: instance_start starts it."
+                            "It could not be restarted again: instance_start starts it.".to_string()
                         } else if answers {
-                            "It was restarted again and its port answers."
+                            format!(
+                                "It was restarted again and {}.",
+                                old_reach.success(old_seconds)
+                            )
                         } else {
-                            "It was restarted again, but its port did not answer yet: service_status and service_logs show how it is."
+                            format!(
+                                "It was restarted again, but {}: service_status and service_logs show how it is.",
+                                old_reach.failure(old_seconds)
+                            )
                         },
                     ),
                 });
             }
-            journal.step("health", true, json!({ "port": key.port }));
+            journal.step("health", true, reach.detail(key.seconds));
         }
         journal.step("end", true, json!({ "noNewPrivileges": wanted }));
         Ok(json!({
@@ -1221,48 +1290,102 @@ impl ServiceHandler {
             "message": format!(
                 "the service now runs {} no-new-privileges, as its template says{}; its image and data were not touched",
                 if wanted { "with" } else { "without" },
-                if was_running { ", and was restarted for it (the restart interrupts it) and answered its health check" } else { ", from its next start" },
+                if was_running {
+                    format!(", and was restarted for it (the restart interrupts it) and {}", reach.success(key.seconds))
+                } else {
+                    ", from its next start".to_string()
+                },
             ),
         }))
     }
 }
 
-/// What the health check after a key update needs: the port it tries, how it reaches it, and how long it waits.
-struct KeyUpdate {
-    port: u16,
-    reach: Reach,
+struct KeyUpdate<'a> {
+    health: Option<&'a PortHealth>,
     seconds: u64,
-}
-
-/// How the node can tell that the service `config` answers on its first port `port`: the host port's proxy, the
-/// droidd port its firewall opens to the node, or only that it runs.
-fn reach_of(config: &ServiceConfig, port: u16) -> Reach {
-    if let Some(lan) = &config.lan {
-        Reach::Lan(lan.port)
-    } else if let Some((address, port)) = config
-        .private_port
-        .as_ref()
-        .and_then(|private| Some((private.address.parse().ok()?, private.port)))
-    {
-        Reach::Private(address, port)
-    } else if config.droidd_port == Some(port) {
-        Reach::Direct(port)
-    } else {
-        Reach::Running
-    }
 }
 
 /// How the node tells that a service answers.
 #[derive(Clone, Copy)]
-enum Reach {
-    /// Through the proxy of the service's host port: the node's own loopback, this port.
-    Lan(u16),
-    /// Through the proxy of the service's private port: its one host address, which is the only one it listens on.
-    Private(std::net::Ipv4Addr, u16),
-    /// At the service's address, on a port its firewall opens to the node.
-    Direct(u16),
-    /// The node can reach nothing of it: the instance must stay running.
+enum Reach<'a> {
+    Port {
+        address: &'a str,
+        port: u16,
+        forwarded: bool,
+        http_path: Option<&'a str>,
+    },
     Running,
+}
+
+impl<'a> Reach<'a> {
+    fn of(config: &'a ServiceConfig, health: Option<&'a PortHealth>) -> Self {
+        // A named port uses a proxy for that port if there is one. The legacy check uses any existing proxy.
+        let matches = |port| health.is_none_or(|health| health.port == port);
+        let (address, port, forwarded) =
+            if let Some(lan) = config.lan.as_ref().filter(|lan| matches(lan.port)) {
+                ("127.0.0.1", lan.port, true)
+            } else if let Some(private) = config
+                .private_port
+                .as_ref()
+                .filter(|private| matches(private.port))
+            {
+                (private.address.as_str(), private.port, true)
+            } else if let Some(port) = health.map(|health| health.port).or(config
+                .droidd_port
+                .filter(|port| config.ports.first() == Some(port)))
+            {
+                (config.ipv4.as_str(), port, false)
+            } else {
+                return Self::Running;
+            };
+        Self::Port {
+            address,
+            port,
+            forwarded,
+            http_path: health.and_then(|health| health.http_path.as_deref()),
+        }
+    }
+
+    fn success(self, seconds: u64) -> String {
+        match self {
+            Self::Port {
+                port,
+                http_path: Some(path),
+                ..
+            } => format!("HTTP {path} on port {port} answered"),
+            Self::Port { port, .. } => format!("port {port} answered"),
+            Self::Running => format!("kept running for {} s", seconds.min(STAY_RUNNING_SECONDS)),
+        }
+    }
+
+    fn failure(self, seconds: u64) -> String {
+        match self {
+            Self::Port {
+                port,
+                http_path: Some(path),
+                ..
+            } => {
+                format!("HTTP {path} on port {port} did not answer successfully within {seconds} s")
+            }
+            Self::Port { port, .. } => format!("port {port} did not answer within {seconds} s"),
+            Self::Running => format!(
+                "the instance did not stay running for {} s",
+                seconds.min(STAY_RUNNING_SECONDS)
+            ),
+        }
+    }
+
+    fn detail(self, seconds: u64) -> Value {
+        match self {
+            Self::Port {
+                port,
+                http_path: Some(path),
+                ..
+            } => json!({ "port": port, "httpPath": path }),
+            Self::Port { port, .. } => json!({ "port": port }),
+            Self::Running => json!({ "runningSeconds": seconds.min(STAY_RUNNING_SECONDS) }),
+        }
+    }
 }
 
 /// The template's part of an update with `withTemplate`.
@@ -1285,8 +1408,9 @@ struct Run<'a> {
     entry: &'a Entry,
     new_source: &'a Value,
     digest: &'a str,
-    port: u16,
-    reach: Reach,
+    reach: Reach<'a>,
+    health: Option<&'a PortHealth>,
+    health_written: Cell<bool>,
     seconds: u64,
     registry: Option<&'a arca_incus::RegistryCredential>,
     journal: &'a Journal,
@@ -1310,8 +1434,8 @@ impl Run<'_> {
                         "digest": self.digest,
                         "snapshot": snapshot,
                         "message": format!(
-                            "service {name} runs {} and its port {} answered",
-                            self.digest, self.port,
+                            "service {name} runs {} and {}",
+                            self.digest, self.reach.success(self.seconds),
                         ),
                     });
                     if self.config.run_tmpfs {
@@ -1330,9 +1454,9 @@ impl Run<'_> {
                     "changes": template.changes,
                     "readBack": { "matches": differs.is_empty(), "differs": differs },
                     "message": format!(
-                        "service {name} runs {} and what its template says now, started once for both, and its port {} answered; {}",
+                        "service {name} runs {} and what its template says now, started once for both, and {}; {}",
                         self.digest,
-                        self.port,
+                        self.reach.success(self.seconds),
                         if differs.is_empty() {
                             "its config read back as applied".to_string()
                         } else {
@@ -1408,15 +1532,21 @@ impl Run<'_> {
                         self.record_words(back.record)
                             .map(|words| format!("{words}; "))
                             .unwrap_or_default(),
-                        if self.was_running {
+                        if self.was_running && back.answers {
                             "running again"
+                        } else if self.was_running {
+                            "back and was started again"
                         } else {
                             "in place, and the service is stopped as it was"
                         },
                         if self.was_running && !back.answers {
-                            ", but its port did not answer yet: service_status and service_logs show how it is"
+                            format!(
+                                ", but {}: service_status and service_logs show how it is",
+                                self.old_reach()
+                                    .failure(self.seconds.min(OLD_ANSWERS_SECONDS))
+                            )
                         } else {
-                            ""
+                            String::new()
                         },
                     ),
                 })
@@ -1558,12 +1688,13 @@ impl Run<'_> {
         self.edge_root();
         // The template's record goes in first: whether `/run` is memory from this start is what it says.
         self.apply_template()?;
+        self.apply_health()?;
         self.run_emptied(instance, self.memory_run());
         self.started(instance)?;
         self.journal.step("start", true, json!({}));
         self.healthy()?;
         self.journal
-            .step("health", true, json!({ "port": self.port }));
+            .step("health", true, self.reach.detail(self.seconds));
         self.record()?;
         self.journal.step("record", true, json!({}));
         Ok(held)
@@ -1571,63 +1702,59 @@ impl Run<'_> {
 
     /// The service answers within the timeout, as its reach lets the node tell.
     fn healthy(&self) -> Result<(), Failure> {
-        if self.answers_within(self.seconds) {
+        if self.answers_within(self.reach, self.seconds) {
             Ok(())
         } else {
             Err(Failure::said(
                 "health check",
-                match self.reach {
-                    Reach::Running => "the instance did not stay running".to_string(),
-                    _ => format!(
-                        "port {} did not answer within {} second{}",
-                        match self.reach {
-                            Reach::Lan(port) | Reach::Private(_, port) | Reach::Direct(port) =>
-                                port,
-                            Reach::Running => self.port,
-                        },
-                        self.seconds,
-                        if self.seconds == 1 { "" } else { "s" }
-                    ),
-                },
+                self.reach.failure(self.seconds),
             ))
         }
     }
 
-    fn answers_within(&self, seconds: u64) -> bool {
+    fn old_reach(&self) -> Reach<'_> {
+        Reach::of(self.config, self.config.health.as_ref())
+    }
+
+    fn answers_within(&self, reach: Reach<'_>, seconds: u64) -> bool {
         let options = &self.handler.update;
-        let begun = Instant::now();
-        if let Reach::Running = self.reach {
-            // Looked at over a few seconds: one look at the first moment says little.
-            let limit = Duration::from_secs(seconds.min(STAY_RUNNING_SECONDS));
+        let Reach::Port {
+            address,
+            port,
+            forwarded,
+            http_path,
+        } = reach
+        else {
+            let deadline = Instant::now() + Duration::from_secs(seconds.min(STAY_RUNNING_SECONDS));
             loop {
-                let up = self
+                if !self
                     .changer
                     .read(&self.config.project, &self.config.instance)
-                    .is_ok_and(|state| state.is_running());
-                if !up {
+                    .is_ok_and(|state| state.is_running())
+                {
                     return false;
                 }
-                if begun.elapsed() >= limit {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
                     return true;
                 }
-                std::thread::sleep(options.pace);
+                std::thread::sleep(options.pace.min(remaining));
             }
-        }
-        let limit = Duration::from_secs(seconds);
+        };
+        let deadline = Instant::now() + Duration::from_secs(seconds);
         loop {
-            let up = match self.reach {
-                Reach::Lan(port) => (options.probe)("127.0.0.1", port, true),
-                Reach::Private(address, port) => (options.probe)(&address.to_string(), port, true),
-                Reach::Direct(port) => (options.probe)(&self.config.ipv4, port, false),
-                Reach::Running => true,
-            };
-            if up {
-                return true;
-            }
-            if begun.elapsed() >= limit {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
                 return false;
             }
-            std::thread::sleep(options.pace);
+            if (options.probe)(address, port, forwarded, http_path, remaining) {
+                return Instant::now() <= deadline;
+            }
+            std::thread::sleep(
+                options
+                    .pace
+                    .min(deadline.saturating_duration_since(Instant::now())),
+            );
         }
     }
 
@@ -1680,8 +1807,8 @@ impl Run<'_> {
         }
     }
 
-    /// Puts the old version back, and starts it when it ran before the update. The record was never changed before
-    /// the health check passed, so it still names the old image. A failed rebuild from the old image after a failed
+    /// Puts the old version back, and starts it when it ran before the update. The record still names the old
+    /// image. A failed rebuild from the old image after a failed
     /// rebuild from the new one leaves the old root as it was (Incus resolves the image before it takes the root
     /// away), so the old version is simply started.
     fn roll_back(
@@ -1692,7 +1819,11 @@ impl Run<'_> {
     ) -> Result<Rolled, (Failure, Option<bool>)> {
         // The template's settings go back first, whatever happens to the root after: the node writes the old config
         // while the instance is still stopped (or running, which takes it at its next start).
-        let record = self.put_template_back();
+        let template = self.put_template_back();
+        let health = self.put_health_back();
+        let record = template
+            .or(health)
+            .map(|_| template != Some(false) && health != Some(false));
         self.root_back(instance, back, after, record)
             .map_err(|failure| (failure, record))
     }
@@ -1739,7 +1870,7 @@ impl Run<'_> {
         let mut answers = true;
         if self.was_running {
             self.journal.step("start", true, json!({ "old": true }));
-            answers = self.answers_within(self.seconds.min(OLD_ANSWERS_SECONDS));
+            answers = self.answers_within(self.old_reach(), self.seconds.min(OLD_ANSWERS_SECONDS));
             self.journal.step("old answers", answers, json!({}));
         }
         Ok(Rolled {
@@ -1780,6 +1911,41 @@ impl Run<'_> {
         }
     }
 
+    /// Apply the installed template's health check, including its host-only ACL rule, before starting the new image.
+    fn apply_health(&self) -> Result<(), Failure> {
+        if self.health == self.config.health.as_ref() {
+            return Ok(());
+        }
+        // The record is saved before its effects are applied. Restore it even if an effect is refused.
+        self.health_written.set(true);
+        self.handler
+            .amend(&self.entry.id.0, &self.config.name, |record| {
+                record.health = self.health.cloned();
+            })
+            .map_err(|_| {
+                Failure::said(
+                    "apply health",
+                    "the node did not apply its template's health check".into(),
+                )
+            })?;
+        self.journal.step("apply health", true, json!({}));
+        Ok(())
+    }
+
+    fn put_health_back(&self) -> Option<bool> {
+        if !self.health_written.get() {
+            return None;
+        }
+        let restored = self
+            .handler
+            .amend(&self.entry.id.0, &self.config.name, |record| {
+                record.health.clone_from(&self.config.health);
+            })
+            .is_ok();
+        self.journal.step("put health back", restored, json!({}));
+        Some(restored)
+    }
+
     /// Whether the instance keeps `/run` in memory from the start this update gives it: as the template's record says
     /// when this update writes one, else as the service's record does.
     fn memory_run(&self) -> bool {
@@ -1803,7 +1969,11 @@ impl Run<'_> {
     fn record_words(&self, record: Option<bool>) -> Option<&'static str> {
         record.map(|restored| {
             if restored {
-                "its old settings are back in its record and its instance's config, its entrypoint among them"
+                if self.template.is_some_and(|step| step.written.get()) {
+                    "its old settings are back in its record and its instance's config, its entrypoint among them"
+                } else {
+                    "its old health check is back"
+                }
             } else {
                 "its old settings could not be put back in its record (service_status shows what it says)"
             }
@@ -1852,6 +2022,50 @@ struct Rolled {
     root_kept: bool,
     /// The old version answered after it was started.
     answers: bool,
-    /// With the template: whether its old record was put back, or `None` when there was nothing to put back.
+    /// Whether the old template settings or health check were put back, if either was written.
     record: Option<bool>,
+}
+
+#[cfg(test)]
+mod health_tests {
+    use super::{CONNECT_WAIT, probe_port};
+    use std::io::{BufRead, BufReader, Write as _};
+    use std::net::{Ipv4Addr, TcpListener};
+
+    #[test]
+    fn http_health_requests_the_path_and_requires_a_successful_status() {
+        for (status, healthy) in [
+            ("204 No Content", true),
+            ("302 Found", false),
+            ("503 Unavailable", false),
+        ] {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream.set_read_timeout(Some(CONNECT_WAIT)).unwrap();
+                let mut reader = BufReader::new(&mut stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert_eq!(line, "GET /ready?mode=full HTTP/1.1\r\n");
+                loop {
+                    line.clear();
+                    assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                write!(stream, "HTTP/1.1 {status}\r\nContent-Length: 0\r\n\r\n").unwrap();
+            });
+            let answered = probe_port(
+                &addr.ip().to_string(),
+                addr.port(),
+                false,
+                Some("/ready?mode=full"),
+                CONNECT_WAIT,
+            );
+            server.join().unwrap();
+            assert_eq!(answered, healthy, "{status}");
+        }
+    }
 }

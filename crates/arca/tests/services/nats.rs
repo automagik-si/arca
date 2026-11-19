@@ -444,7 +444,7 @@ fn a_created_nats_has_its_own_password_domain_and_script_and_a_link_gives_the_ur
         instance(&rig, "api")["config"]["environment.NATS_URL"],
         json!(format!("nats://{address}:4222"))
     );
-    // The link opened 4222 and not the leaf node port or monitoring.
+    // The node's health check and the linked consumer can reach 4222.
     let rules = acl(&rig, "bus")["ingress"].clone();
     let ports: Vec<_> = rules
         .as_array()
@@ -452,7 +452,11 @@ fn a_created_nats_has_its_own_password_domain_and_script_and_a_link_gives_the_ur
         .iter()
         .map(|r| r["destination_port"].clone())
         .collect();
-    assert_eq!(ports, vec![json!("4222")], "{rules}");
+    assert_eq!(ports, vec![json!("4222"), json!("4222")], "{rules}");
+    let bus = rig.service_config("bus");
+    let consumer = rig.service_config("api");
+    assert_eq!(rules[0]["source"], format!("{}/32", bus.gateway));
+    assert_eq!(rules[1]["source"], format!("{}/32", consumer.ipv4));
     // A second service has its own password and its own domain.
     rig.call("service_create", json!({"name":"bus2","template":"nats"}))
         .expect("create");

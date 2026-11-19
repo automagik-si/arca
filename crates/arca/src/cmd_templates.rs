@@ -63,6 +63,39 @@ pub const SHIPPED: &[(&str, &str)] = shipped![
 /// v<previous>:templates/<name> | sha256sum`). A test checks the list against the release tags where the checkout has
 /// them. A hash is of a file exactly as a release shipped it, so an owner's edit never matches one.
 pub const EARLIER: &[(&str, &str)] = &[
+    // 0.37.0: before these templates named an image update health port.
+    (
+        "arca-edge.json",
+        "94c564d8aa5ba2b46282008c569b14d2f64096bf0f93bdd01129238db5f5fad0",
+    ),
+    (
+        "automagik-server.json",
+        "9bd4243feb2288ce6c86e1879b90fbf3deb8ba38dcf8fbfa2d90e92ed65473a8",
+    ),
+    (
+        "gitlab.json",
+        "b46c0a033f5e6be3dccf87a028ea49d1d3a7e522cc1f352f13cc636a37e48000",
+    ),
+    (
+        "nats-primary.json",
+        "730ced8304e539526427086a0c99ab599a101332dd9d5f9f310c23836c94af00",
+    ),
+    (
+        "nats-replica.json",
+        "936dedb2e6d5cc9ee68abaff90c676044492771d911f93371ff0171a99675f41",
+    ),
+    (
+        "nats.json",
+        "2d43456d23a03db5fe95a51fc85fcb14ed5cb294d892f0076be8d86ca132abd6",
+    ),
+    (
+        "omni-api.json",
+        "824e04ab5b3b71c4c75469ee842db093b4a5a0f470975401e0348a14d869d69e",
+    ),
+    (
+        "postgres-autopg.json",
+        "5371254f9b91dde56b9abce9594361036cb11b3201e1a644d6216e205a2916f0",
+    ),
     // 0.34.0 to 0.35.0: before keyless Tailscale starts waited ten minutes for sign-in.
     (
         "tailscale.sh",

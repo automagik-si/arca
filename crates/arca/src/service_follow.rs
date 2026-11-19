@@ -345,7 +345,7 @@ pub struct Follower {
     /// The last thing said on the log about a look that could not be made, so it is said once.
     said: Mutex<Option<String>>,
     paused: AtomicBool,
-    /// How long a moved service's first port has to answer; the update's own default when absent.
+    /// How long the updated service has to pass its health check. Absent uses the update's default.
     health_seconds: Option<u64>,
     /// The digests whose version is known without asking anyone: the images the shipped template pinned.
     pins: Vec<(String, String)>,
@@ -391,7 +391,7 @@ impl Follower {
         self
     }
 
-    /// How many seconds a moved service's first port has to answer (`service_update`'s `timeoutSeconds`).
+    /// How many seconds the updated service has to pass its health check (`service_update`'s `timeoutSeconds`).
     pub fn with_health_seconds(mut self, seconds: u64) -> Follower {
         self.health_seconds = Some(seconds);
         self
