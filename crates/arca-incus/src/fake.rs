@@ -199,6 +199,9 @@ pub enum Appears {
 /// What a test runs as each volume restore arrives ([`FakeIncus::observe_volume_restores`]).
 pub type RestoreObserver = Arc<dyn Fn(&str) + Send + Sync>;
 
+/// A config change armed for a stop: the key that changes, its new value, and how many stops go by first.
+type StopChange = (String, String, u32);
+
 /// What one scripted rebuild does ([`FakeIncus::script_rebuilds`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RebuildStep {
@@ -274,7 +277,7 @@ struct Shared {
     reject_put: Mutex<Vec<String>>,
     /// The instances whose config changes at a stop, by project and name: the key that changes (its uuid, for another
     /// instance taking its place, or its owner's mark), its new value, and how many stops go by first.
-    stop_recreations: Mutex<BTreeMap<(String, String), (String, String, u32)>>,
+    stop_recreations: Mutex<BTreeMap<(String, String), StopChange>>,
     /// The source each rebuild of an instance named, in order.
     rebuild_sources: Mutex<BTreeMap<(String, String), Vec<Value>>>,
     /// What each instance's next rebuilds do, in order, before any other switch is looked at.
