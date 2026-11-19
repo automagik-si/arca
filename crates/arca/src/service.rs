@@ -4273,7 +4273,7 @@ pub const SECRET_LINE_MIN: usize = 16;
 
 /// A PEM label as RFC 7468 allows it: printable characters other than `-`, joined by single spaces or hyphens, so
 /// `RSA PRIVATE KEY`, `OpenVPN Static key V1` and `OpenVPN tls-crypt-v2 server key` are all labels.
-const PEM_LABEL: &str = r"[\x21-\x2C\x2E-\x7E](?:[- ]?[\x21-\x2C\x2E-\x7E]){0,63}";
+pub(crate) const PEM_LABEL: &str = r"[\x21-\x2C\x2E-\x7E](?:[- ]?[\x21-\x2C\x2E-\x7E]){0,63}";
 
 /// What may follow the BEGIN line of a PEM block whose END line was not printed: line breaks (also written as `\n`
 /// inside a string), and lines that are only base64 of at least 16 characters (a `/` may be written `\/`) or a PEM
@@ -4327,45 +4327,6 @@ pub fn redact_blocks(text: &str) -> String {
     let mut hidden = ended.replace_all(with_end, "[secret]").into_owned();
     hidden.push_str(&unended.replace_all(without_end, "[secret]"));
     hidden
-}
-
-/// Hides the lines a cut text begins with when they are a key's body: lines of 16 to 80 key characters, or PEM headers
-/// (`Proc-Type: ...`) among them, with at least one key line. The text was cut inside a key whose BEGIN line is gone.
-/// An END line right after them is hidden too, and a short last line of the key just before it. Lines may be broken
-/// as [`PEM_BODY`] takes them, `\n` written out included. A text that begins otherwise is left as it is.
-pub fn redact_cut_start(text: &str) -> String {
-    use std::sync::OnceLock;
-    static LEAD: OnceLock<(regex::Regex, regex::Regex)> = OnceLock::new();
-    let (line, end) = LEAD.get_or_init(|| {
-        let sep = r"(?:\r\n|\r|\n|\\r\\n|\\r|\\n)";
-        let key = r"(?:[A-Za-z0-9+=]|\\?/)";
-        (
-            regex::Regex::new(&format!(
-                r"\A{sep}*(?:[ \t]*(?P<key>{key}{{16,80}})[ \t]*|(?:Proc-Type|DEK-Info|Comment|Version|Hash|Charset)[ \t]*:[^\r\n\\]*)(?:{sep}|\z)"
-            ))
-            .expect("the key line pattern is valid"),
-            regex::Regex::new(&format!(
-                r"\A{sep}*(?:[ \t]*{key}{{1,80}}[ \t]*{sep})?[ \t]*-----END {PEM_LABEL}-----"
-            ))
-            .expect("the END line pattern is valid"),
-        )
-    });
-    let (mut at, mut keyed) = (0, false);
-    while let Some(found) = line.captures(&text[at..]) {
-        let whole = found.get(0).expect("a match");
-        if whole.is_empty() {
-            break;
-        }
-        keyed |= found.name("key").is_some();
-        at += whole.end();
-    }
-    if !keyed {
-        return text.to_owned();
-    }
-    if let Some(found) = end.find(&text[at..]) {
-        at += found.end();
-    }
-    format!("[secret]{}", &text[at..])
 }
 
 /// What hides the stored secrets in a text: the values to replace, longest first, and the base64 body of each secret

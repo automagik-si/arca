@@ -1826,29 +1826,33 @@ and the same post-exec uuid check, which discards the output of a changed instan
 websocket, no terminal), as root, with no environment added, under the in-instance `/usr/bin/timeout -k 2` with the
 formula's seconds, and waited on through its operation in the node's own project in bounded waits until a client
 deadline 5 seconds past that limit. Its two recordings are read as a stream and the last 64 KiB of each is kept in place
-of Rule 50's cap; a longer output is never an error and is reported as cut. In the kept tail of a longer output every
-PEM block is hidden whole first, over all of it, so a key whose BEGIN line is on the first line stays hidden; then the
+of Rule 50's cap; a longer output is never an error and is reported as cut. In the kept tail of a longer output the
 first partial line, where a secret may be cut, is dropped, and nothing of that output is kept when no line break is
-left; and a tail that then begins inside a key's body (lines of 16 to 80 key characters, with PEM headers) has that body
-hidden to its END line, or to the end of those lines. The answer says which. The kept text is then masked as a service's
-log is (every PEM block whole, then per line control bytes, stored secret values, the instance's own environment values
-and credential shapes), and only a bounded tail is returned: the update command's last 60 lines of at most 300
-characters, a failed health check's last 5, the version reader's first line only when it is a plain version. Both
-recordings are deleted on every outcome, and the audit is Rule 50's, with no argument and no output. Once Arca has
-passed its checks and tries to send the start request, any outcome that does not show the command ended sets the same
-hung mark Rule 50 sets, since the command may still run: no answer by the client deadline, a wait whose connection is
-refused, reset or cut, a wait answered with an error status (a 404 for the operation among them), a malformed or foreign
-operation, a start request whose connection fails or whose answer is cut or is not an operation, or an audit row that
-cannot be written once the command started. Only an operation Incus reports ended is an answer: one that succeeded, or
-one that failed (a status of 400 to 599 in its metadata), which sets no mark; nor does a start request Arca refused
-before trying to send it, or that Incus answered with an error status. Rule 50's own commands are still marked only at
-the deadline. The mark is kept in memory; no command of this type runs in a marked instance, nor any closed command but
-a cleanup. The mark is cleared when Arca reads the instance, with the same uuid, stopped, and otherwise only as Rule 50
-drops it, when the uuid changes; clearing it makes no stop. No rule here limits which program a formula names.
+left; the answer says which. The kept text is then masked as a service's log is (every PEM block whole, then per line
+control bytes, stored secret values, the instance's own environment values and credential shapes). Only after that may a
+last pass hide more, and only whole lines: when the kept lines of a cut output begin with a key's body (lines of 16 to
+80 key characters, or longer ones when the dropped line holds a BEGIN line with no END line after it, with PEM headers,
+blank lines and line breaks written out among them), each answer line they make is replaced by a `[secret]` line, so the
+answer keeps its number of lines and the bounded tail below takes the same lines. It never edits inside a line and gives
+nothing back to the masking, so it shows nothing the masking alone hides. Only a bounded tail is returned: the update
+command's last 60 lines of at most 300 characters, a failed health check's last 5, the version reader's first line only
+when it is a plain version. Both recordings are deleted on every outcome, and the audit is Rule 50's, with no argument
+and no output. Once Arca has passed its checks and tries to send the start request, any outcome that does not show the
+command ended sets the same hung mark Rule 50 sets, since the command may still run: no answer by the client deadline, a
+wait whose connection is refused, reset or cut, a wait answered with an error status (a 404 for the operation among
+them), a malformed or foreign operation, a start request whose connection fails or whose answer is cut or is not an
+operation, or an audit row that cannot be written once the command started. Only an operation Incus reports ended is an
+answer: one that succeeded, or one that failed (a status of 400 to 599 in its metadata), which sets no mark; nor does a
+start request Arca refused before trying to send it, or that Incus answered with an error status. A timeout on the owner
+re-read the start request makes before it is sent marks the instance as the deadline does; that errs toward the mark.
+Rule 50's own commands are still marked only at the deadline. The mark is kept in memory; no command of this type runs
+in a marked instance, nor any closed command but a cleanup. The mark is cleared when Arca reads the instance, with the
+same uuid, stopped, and otherwise only as Rule 50 drops it, when the uuid changes; clearing it makes no stop. No rule
+here limits which program a formula names.
 Source: `FormulaCommand`, `FormulaState`, `FormulaStart`, `UnixIncusWriter::{start_formula_exec, formula_exec_state,
 formula_output}` in `crates/arca-incus/src/exec.rs` and `exchange_tail` in `crates/arca-incus/src/read.rs`;
-`DeclaredCommand` and `ServiceExec::{run_formula, hung, clear_hung_after_stop}` in `crates/arca/src/service_exec.rs`;
-`redact_cut_start` in `crates/arca/src/service.rs`; tests in `crates/arca/tests/services/formula_exec.rs`.
+`DeclaredCommand`, `ServiceExec::{run_formula, hung, clear_hung_after_stop}` and `hide_cut_key` in
+`crates/arca/src/service_exec.rs`; tests in `crates/arca/tests/services/formula_exec.rs`.
 
 ## Out of scope
 

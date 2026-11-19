@@ -16,10 +16,10 @@ keeps one snapshot until a later release removes old ones.
 Arca can now run a formula's command inside its service's container: a `system` container or an OCI container of the
 node's own service project. It is started as the formula names it, as root and with no environment added, under the
 image's `/usr/bin/timeout`, and waited on until its `seconds` and 5 more. The last 64 KiB of each output is kept, a
-longer output is no error and drops its first partial line once a key in it was hidden, and what is kept is masked as
-`service_logs` masks a log. A command whose end Incus does not show, by the deadline or because its answer was lost,
-marks the instance hung until Arca sees it stopped. No verb runs a formula yet, so nothing changes on a node by this
-release alone. See OPERATING.md.
+longer output is no error and drops its first partial line, and what is kept is masked as `service_logs` masks a log,
+with a key's body the cut left at its start hidden in whole lines. A command whose end Incus does not show, by the
+deadline or because its answer was lost, marks the instance hung until Arca sees it stopped. No verb runs a formula yet,
+so nothing changes on a node by this release alone. See OPERATING.md.
 
 A container template may carry `appUpdate`, a formula for updating the app inside its service: a `health` command and
 a `version` reader, and on a `system` container an `update` command that takes the version as one argument

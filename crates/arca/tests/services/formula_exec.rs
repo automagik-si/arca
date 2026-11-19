@@ -6,7 +6,7 @@ use super::*;
 use arca::app_formula::{AppUpdate, AppVersion};
 use arca::service_exec::{
     AUDIT_FILE, DeclaredCommand, ExecError, ExecTarget, FormulaPart, FormulaRun, OutputCut,
-    ServiceExec,
+    ServiceExec, masked_lines,
 };
 use arca_incus::{
     exec::{ExecCommand, FormulaCommand},
@@ -16,6 +16,11 @@ use std::time::{Duration, Instant};
 
 const STORED: &str = "synthetic-stored-value-4b1c9e";
 const ENV_VALUE: &str = "synthetic-environment-value-7d2a";
+/// A stored value with a line break written out in it (a backslash and an `n`), its first 16 characters a key's line.
+const ESCAPED: &str = r"ABCDEFGHIJKLMNOP\ndemo-secret-suffix";
+/// A stored value, and one that holds the marker that hides a value followed by the first letters of the other.
+const SHORT: &str = "abcdefghij";
+const MARKED: &str = "[secret]abc";
 
 fn formula(kind: &str) -> AppUpdate {
     let mut value = json!({
@@ -60,10 +65,16 @@ fn operator(rig: &Rig, verb: &str, args: Value) -> Result<Value, CallError> {
 
 /// A running service `app` of `kind`, with one stored secret and one environment value of its own.
 fn service(kind: &str) -> Rig {
+    service_storing(kind, &[STORED])
+}
+
+/// A running service `app` of `kind` with one environment value of its own, and each of `values` stored as a secret.
+fn service_storing(kind: &str, values: &[&str]) -> Rig {
     let rig = Rig::new();
+    let keys: Vec<String> = (0..values.len()).map(|n| format!("SECRET_{n}")).collect();
     let mut template = json!({
         "name": "app", "kind": kind, "ports": [], "env": { "APP_URL": ENV_VALUE },
-        "secrets": ["API_TOKEN"]
+        "secrets": keys
     });
     if kind == "oci" {
         template["image"] = json!("registry.example/app");
@@ -74,12 +85,10 @@ fn service(kind: &str) -> Rig {
     rig.template("app", template);
     rig.call("service_create", json!({"name":"app","template":"app"}))
         .expect("the service");
-    operator(
-        &rig,
-        "service_secret_set",
-        json!({"name":"app","key":"API_TOKEN","value":STORED}),
-    )
-    .expect("the secret");
+    for (key, value) in keys.iter().zip(values) {
+        let secret = json!({"name":"app","key":key,"value":value});
+        operator(&rig, "service_secret_set", secret).expect("the secret");
+    }
     rig
 }
 
@@ -632,74 +641,6 @@ fn cut_before(head: &str, tail: &str) -> Vec<u8> {
     format!("{}\n{head}{kept}", "z".repeat(5000)).into_bytes()
 }
 
-/// A key whose BEGIN line is on, or before, the line the 64 KiB cut falls in: its body is hidden whatever the first
-/// kept line holds and whether or not an END line follows. Masking runs over the whole kept tail before its partial
-/// first line is dropped, and a tail that begins inside a key's body has that body hidden.
-#[test]
-fn a_key_cut_by_the_kept_tail_shows_no_byte_of_its_body() {
-    let rig = service("system");
-    let (seam, target) = seam(&rig);
-    let word = ["PRI", "VATE"].concat();
-    let begin = format!("-----BEGIN RSA {word} KEY-----");
-    let end = format!("-----END RSA {word} KEY-----");
-    let body: Vec<String> = (0..4)
-        .map(|n| format!("{n}QkVHSU5ib2R5bGluZXRoYXRsb29rc2xpa2VhcmVhbGtleWJ1dGlzbm90MDEy{n}x"))
-        .collect();
-    let lines = body.join("\n");
-    let cuts = [
-        // The cut falls on the first byte of a standalone BEGIN line, and no END line follows.
-        (
-            "standalone BEGIN",
-            String::new(),
-            format!("{begin}\n{lines}\n"),
-        ),
-        // The cut falls before an inline BEGIN marker, on the line it shares with other words.
-        (
-            "inline BEGIN",
-            "Gene".to_string(),
-            format!("rated: {begin}\n{lines}\n"),
-        ),
-        // The cut falls inside the BEGIN marker itself.
-        (
-            "inside BEGIN",
-            "-----BEG".to_string(),
-            format!("IN RSA {word} KEY-----\n{lines}\n"),
-        ),
-        // The cut falls inside the body, and its END line follows.
-        (
-            "body, END later",
-            format!("{begin}\n0QkVHSU5i"),
-            format!("{}\n{end}\n", &lines[9..]),
-        ),
-        // The cut falls inside the body, and no END line follows.
-        (
-            "body, no END",
-            format!("{begin}\n0QkVHSU5i"),
-            format!("{}\n", &lines[9..]),
-        ),
-    ];
-    for (shape, head, tail) in cuts {
-        script(&rig, &update("2.0"), 1, &cut_before(&head, &tail), b"");
-        let answer = run(&seam, &target, &update("2.0")).expect("an answer");
-        assert_eq!(answer.output_cut, OutputCut::FirstLineDropped, "{shape}");
-        let shown = answer.lines.join("\n");
-        for line in &body {
-            for part in [&line[..20], &line[20..40], &line[line.len() - 20..]] {
-                assert!(
-                    !shown.contains(part),
-                    "{shape}: {part:?} is shown in {:?}",
-                    &shown[..shown.len().min(400)]
-                );
-            }
-        }
-        assert!(
-            answer.lines.last().unwrap().starts_with("w."),
-            "{shape}: the lines after the key are kept"
-        );
-    }
-    assert_eq!(rig.fake.recordings(), 0);
-}
-
 /// How a test arms one fault on the fake Incus.
 type Arm<'a> = &'a dyn Fn(&Rig);
 
@@ -804,4 +745,136 @@ fn a_restore_or_a_rebuild_alone_does_not_clear_the_mark() {
         Err(ExecError::Refused("hung"))
     ));
     assert_eq!(execs(&rig).len(), 1);
+}
+
+/// Whatever a cut tail holds, its answer is the one the log masking alone gives once the first partial line is dropped
+/// (as at c739db95), with whole lines of it hidden more: line for line, each answer line is that answer's line or
+/// `[secret]` where that line is a key's, so an update's last 60 and a failed health check's last 5 are the same lines
+/// whatever the other output holds, and no seven bytes of a hidden value or of a key's body are shown. The rows: a key
+/// cut in five places, a key on one long line, CRLF, a value with a line break written out, a value after a key-like
+/// line, overlapping values on one line, and a cut error output that begins with key-like lines.
+#[test]
+fn a_cut_tail_shows_no_line_the_log_masking_hides_and_no_part_of_a_hidden_value() {
+    let rig = service_storing("system", &[STORED, ESCAPED, SHORT, MARKED]);
+    let (seam, target) = seam(&rig);
+    let secrets = [STORED, ESCAPED, SHORT, MARKED, ENV_VALUE].map(String::from);
+    let word = ["PRI", "VATE"].concat();
+    let begin = format!("-----BEGIN RSA {word} KEY-----");
+    let end = format!("-----END RSA {word} KEY-----");
+    let body: Vec<String> = (0..4)
+        .map(|n| format!("{n}QkVHSU5ib2R5bGluZXRoYXRsb29rc2xpa2VhcmVhbGtleWJ1dGlzbm90MDEy{n}x"))
+        .collect();
+    let (lines, crlf) = (body.join("\n"), body.join("\r\n"));
+    let long = "S2V5T25PbmVMaW5l".repeat(12);
+    let hex = format!("{}\n", "0123456789abcdef".repeat(4));
+    let cut_err = |count: usize, last: &str| {
+        format!("{}\n{}{last}\n", "x".repeat(70_000), hex.repeat(count)).into_bytes()
+    };
+    let numbered = |count: usize| -> Vec<u8> {
+        (1..=count)
+            .flat_map(|n| format!("line {n}\n").into_bytes())
+            .collect()
+    };
+    let cut = |shape, head: &str, tail: String| {
+        (
+            shape,
+            update("2.0"),
+            60,
+            cut_before(head, &tail),
+            Vec::new(),
+        )
+    };
+    let open = format!("{begin}\n0QkVHSU5i");
+    let open_crlf = format!("{begin}\r\n0QkVHSU5i");
+    let rows = [
+        cut("standalone BEGIN", "", format!("{begin}\n{lines}\n")),
+        cut("inline BEGIN", "Gene", format!("rated: {begin}\n{lines}\n")),
+        cut(
+            "inside BEGIN",
+            "-----BEG",
+            format!("IN RSA {word} KEY-----\n{lines}\n"),
+        ),
+        cut("body, no END", &open, format!("{}\n", &lines[9..])),
+        cut(
+            "body, END later",
+            &open,
+            format!("{}\n{end}\n", &lines[9..]),
+        ),
+        cut("one long line", "", format!("{begin}\n{long}\n")),
+        cut(
+            "CRLF",
+            &open_crlf,
+            format!("{}\r\nusing {STORED} now\r\n", &crlf[9..]),
+        ),
+        cut("written-out break", "par", format!("tial\n{ESCAPED}\n")),
+        cut(
+            "overlapping values",
+            "par",
+            format!("tial\nKLMNOPQRSTUVWXYZ\n{SHORT}\n"),
+        ),
+        cut(
+            "one line",
+            "par",
+            format!("tial\nlead {MARKED}{SHORT} and {SHORT}xyz\n"),
+        ),
+        (
+            "health",
+            health("system"),
+            5,
+            numbered(6),
+            cut_err(4, "health: refused"),
+        ),
+        (
+            "update",
+            update("2.0"),
+            60,
+            numbered(100),
+            cut_err(30, "one more line"),
+        ),
+    ];
+    // The answer at c739db95: each output's last 64 KiB, a cut one with its first partial line dropped, masked as a
+    // log on its own, the error output's lines after the others, then the part's last lines.
+    let before = |stdout: &[u8], stderr: &[u8], keep: usize| {
+        let mut lines = Vec::new();
+        for output in [stdout, stderr] {
+            let kept = &output[output.len().saturating_sub(64 * 1024)..];
+            let whole = match kept.iter().position(|b| matches!(b, b'\n' | b'\r')) {
+                _ if kept.len() == output.len() => kept,
+                Some(at) => &kept[at + 1..],
+                None => &[],
+            };
+            lines.extend(masked_lines(whole, &secrets));
+        }
+        lines.drain(..lines.len().saturating_sub(keep));
+        lines
+    };
+    let mut faults = Vec::new();
+    for (shape, command, keep, stdout, stderr) in rows {
+        script(&rig, &command, 1, &stdout, &stderr);
+        let answer = run(&seam, &target, &command).expect("an answer");
+        assert_eq!(answer.output_cut, OutputCut::FirstLineDropped, "{shape}");
+        let before = before(&stdout, &stderr, keep);
+        let key = |old: &str| {
+            old.len() >= 16
+                && old
+                    .bytes()
+                    .all(|b| b"+/=".contains(&b) || b.is_ascii_alphanumeric())
+        };
+        let same = answer.lines.len() == before.len()
+            && (answer.lines.iter().zip(&before))
+                .all(|(line, old)| line == old || line == "[secret]" && key(old));
+        if !same {
+            faults.push(format!("{shape}: not c739db95's answer line for line"));
+        }
+        let shown = answer.lines.join("\n");
+        let piece = (secrets.iter().chain(&body).chain([&long]))
+            .flat_map(|value| value.as_bytes().windows(7))
+            .map(|piece| std::str::from_utf8(piece).unwrap())
+            .find(|piece| !"[secret]".contains(piece) && shown.contains(piece));
+        if let Some(piece) = piece {
+            faults.push(format!("{shape}: {piece:?} of a hidden value is shown"));
+        }
+    }
+    assert!(faults.is_empty(), "{faults:#?}");
+    assert_eq!(rig.fake.recordings(), 0);
 }

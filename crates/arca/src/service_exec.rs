@@ -411,8 +411,10 @@ impl ServiceExec {
     }
     /// Runs a command a template's formula declares (Rule 82), in a `system` or an OCI container of the node's own
     /// service project, with Rule 50's identity checks and audit. It is started detached and waited on in bounded waits
-    /// until its in-instance limit and [`FORMULA_MARGIN`] have passed, or `until` when that comes first. A command Incus
-    /// does not answer for by then marks the instance hung, and no declared command runs in a marked instance. The last
+    /// until its in-instance limit and [`FORMULA_MARGIN`] have passed, or `until` when that comes first. Once the start
+    /// request is being sent, any outcome that does not show the command ended marks the instance hung, Incus not
+    /// answering by then among them; so does a timeout on the owner re-read the start request makes before it is
+    /// sent, which errs toward the mark. No declared command runs in a marked instance. The last
     /// 64 KiB of each output is kept, masked as `service_logs` masks a log, and both recordings are deleted on every
     /// outcome; an instance whose uuid changed meanwhile has its output discarded.
     pub fn run_formula(
@@ -499,8 +501,9 @@ impl ServiceExec {
         secrets.extend(environment_values(&instance));
         Ok(kept(command.part, exit, &stdout, &stderr, &secrets))
     }
-    /// Whether `target`'s instance is marked hung: a command of either kind that Incus did not answer for by Arca's
-    /// deadline, in the instance with this uuid.
+    /// Whether `target`'s instance is marked hung, in the instance with this uuid: a command of either kind that Incus
+    /// did not answer for by Arca's deadline, a declared command whose end Incus did not show once its start request
+    /// was being sent, or a timeout on the owner re-read that request makes before it is sent (Rule 82).
     pub fn hung(&self, target: &ExecTarget) -> bool {
         self.hung.lock().is_ok_and(|hung| {
             hung.get(&target.service.name)
@@ -621,7 +624,8 @@ impl ServiceExec {
         Ok((owned, state))
     }
     /// A declared command whose request went out and that Incus has not shown ended: whatever the error, it may still
-    /// run, so its instance is marked hung (Rule 82). The closed list marks on its deadline only ([`Self::error`]).
+    /// run, so its instance is marked hung (Rule 82). The closed list marks on its deadline only ([`Self::error`]),
+    /// which a declared command's timeout before its start request is sent also goes through, so that marks too.
     fn lost(&self, target: &ExecTarget, error: IncusError) -> ExecError {
         if error == IncusError::Timeout {
             return self.error(target, error);
@@ -839,7 +843,6 @@ fn kept(
 ) -> FormulaRun {
     let (out, out_cut) = whole_lines(stdout);
     let (err, err_cut) = whole_lines(stderr);
-    let (out, err) = (out.as_bytes(), err.as_bytes());
     let output_cut = [out_cut, err_cut]
         .into_iter()
         .max_by_key(|cut| match cut {
@@ -848,8 +851,13 @@ fn kept(
             OutputCut::NothingKept => 2,
         })
         .unwrap_or(OutputCut::Whole);
-    let mut lines = masked_lines(out, secrets);
-    lines.extend(masked_lines(err, secrets));
+    let mut lines = hide_cut_key(masked_lines(out, secrets), stdout, out, secrets);
+    lines.extend(hide_cut_key(
+        masked_lines(err, secrets),
+        stderr,
+        err,
+        secrets,
+    ));
     let (lines, version) = match part {
         FormulaPart::Update => (last(lines, UPDATE_LINES), None),
         FormulaPart::Health if exit != 0 => (last(lines, HEALTH_LINES), None),
@@ -875,23 +883,94 @@ fn kept(
     }
 }
 
-/// The part of a kept tail that is whole lines: all of it when the output was not cut. A cut tail's PEM blocks are
-/// hidden first over all of it, so a BEGIN line on its first line still hides the key after it; then what follows the
-/// first line break is kept, since the first line began before the cut, with a key's body it begins with hidden too
-/// (its BEGIN line was cut away). A cut tail with no line break left keeps nothing.
-fn whole_lines(tail: &Tail) -> (String, OutputCut) {
-    let text = String::from_utf8_lossy(&tail.bytes);
+/// The part of a kept tail that is whole lines: all of it when the output was not cut, and otherwise what follows its
+/// first line break, since its first line began before the cut. A cut tail with no line break keeps nothing.
+fn whole_lines(tail: &Tail) -> (&[u8], OutputCut) {
     if !tail.cut {
-        return (text.into_owned(), OutputCut::Whole);
+        return (&tail.bytes, OutputCut::Whole);
     }
-    let masked = crate::service::redact_blocks(&text);
-    match masked.find(['\n', '\r']) {
-        Some(at) => (
-            crate::service::redact_cut_start(&masked[at + 1..]),
-            OutputCut::FirstLineDropped,
-        ),
-        None => (String::new(), OutputCut::NothingKept),
+    match tail.bytes.iter().position(|b| matches!(b, b'\n' | b'\r')) {
+        Some(at) => (&tail.bytes[at + 1..], OutputCut::FirstLineDropped),
+        None => (&[], OutputCut::NothingKept),
     }
+}
+
+/// The longest line of a key's body that [`hide_cut_key`] takes when the dropped first line holds no BEGIN line.
+const KEY_LINE_MAX: usize = 80;
+
+/// The last pass over a cut output's answer lines, which only hides more. When the kept lines begin with a key's body
+/// (its BEGIN line cut away, or on the dropped first line), each answer line they make becomes `[secret]`, so a part's
+/// last lines are the same lines as without this pass. A key's body is a run of key lines ([`key_line`]), PEM headers
+/// (`Proc-Type: ...`) and blank lines, at least one a key line. The run is judged on the text as it came and replaced
+/// only when its lines, masked alone, are the first answer lines; otherwise the masking hid it already (an END line
+/// after it hides all before). It never edits inside a line and gives nothing back to the masking, so it shows no byte
+/// the masking alone hides.
+fn hide_cut_key(
+    mut lines: Vec<String>,
+    tail: &Tail,
+    kept: &[u8],
+    secrets: &[String],
+) -> Vec<String> {
+    if !tail.cut || kept.is_empty() {
+        return lines;
+    }
+    let [_, _, header, begin, end] = cut_patterns();
+    // A BEGIN line with no END line after it on the dropped first line: the key goes on, in lines of any length.
+    let first = String::from_utf8_lossy(&tail.bytes[..tail.bytes.len() - kept.len()]);
+    let opened = (begin.find_iter(&first).last()).is_some_and(|b| !end.is_match(&first[b.end()..]));
+    let text = String::from_utf8_lossy(kept);
+    let (mut at, mut keyed) = (0, false);
+    for line in text.split_inclusive(['\n', '\r']) {
+        let bare = line
+            .trim_end_matches(['\n', '\r'])
+            .trim_matches([' ', '\t']);
+        let key = key_line(bare, opened);
+        if !(key || bare.is_empty() || header.is_match(bare)) {
+            break;
+        }
+        keyed |= key;
+        at += line.len();
+    }
+    let run = if keyed {
+        masked_lines(text[..at].as_bytes(), secrets)
+    } else {
+        Vec::new()
+    };
+    if !run.is_empty() && lines.starts_with(&run) {
+        lines[..run.len()].fill("[secret]".to_owned());
+    }
+    lines
+}
+
+/// A line of a key's body: key characters only (base64, a `/` also written `\/`), in pieces between line breaks
+/// written out (`\n`, `\r`), one at least 16 long and none longer than [`KEY_LINE_MAX`] unless the key `opened` on
+/// the dropped first line.
+fn key_line(line: &str, opened: bool) -> bool {
+    let [key, written_break, ..] = cut_patterns();
+    let pieces: Vec<&str> = (written_break.split(line))
+        .map(|piece| piece.trim_matches([' ', '\t']))
+        .filter(|piece| !piece.is_empty())
+        .collect();
+    !pieces.is_empty()
+        && (pieces.iter()).all(|p| (opened || p.len() <= KEY_LINE_MAX) && key.is_match(p))
+        && pieces.iter().any(|piece| piece.len() >= 16)
+}
+
+/// The patterns [`hide_cut_key`] reads a text with: a piece of a key line, a line break written out, a PEM header, a
+/// BEGIN line and an END line.
+fn cut_patterns() -> &'static [regex::Regex; 5] {
+    static PATTERNS: std::sync::OnceLock<[regex::Regex; 5]> = std::sync::OnceLock::new();
+    PATTERNS.get_or_init(|| {
+        let label = crate::service::PEM_LABEL;
+        [
+            r"\A(?:[A-Za-z0-9+=]|\\?/)+\z".to_owned(),
+            r"\\r\\n|\\r|\\n".to_owned(),
+            r"\A(?:Proc-Type|DEK-Info|Comment|Version|Hash|Charset)[ \t]*:".to_owned(),
+            format!("-----BEGIN {label}-----"),
+            format!("-----END {label}-----"),
+        ]
+        .map(|pattern| regex::Regex::new(&pattern).expect("the pattern is valid"))
+    })
 }
 
 fn last(mut lines: Vec<String>, count: usize) -> Vec<String> {
