@@ -141,7 +141,11 @@ impl StateChanger {
     }
 
     /// The same read, with the instance's whole document.
-    fn read_with(&self, project: &str, name: &str) -> Result<(InstanceState, Value), IncusError> {
+    pub fn read_with(
+        &self,
+        project: &str,
+        name: &str,
+    ) -> Result<(InstanceState, Value), IncusError> {
         self.allow(project)?;
         let url = object_url(project, name)?;
         let metadata = checked_metadata(self.send("GET", &url, None)?)?;
