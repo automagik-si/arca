@@ -15,7 +15,7 @@
 #   --ephemeral. The runner's own registration (.runner, .credentials, .credentials_rsaparams) is kept per slot in
 #   /var/lib/arca-runner-pool/registered, which only root enters, and the slot's runner takes job after job: its
 #   container and registration stay between jobs. By default a completed hook waits for the controller to replace
-#   the slot's Docker daemon and empty its caches. A started hook verifies the new daemon before the steps run.
+#   the slot's Docker daemon, clear its work and caches, and reset its network. The started hook checks the reset.
 #   The token is deleted once every slot is registered, or after an hour, when GitHub's own has ended.
 #   A slot that has its registration starts without one.
 #
@@ -66,6 +66,7 @@ set -u
 : "${POOL_GROUP_EVERY:=600}"   # seconds between two reads of the runner group (or the repository) on GitHub
 : "${POOL_BUILD_RETRY:=60}"    # seconds before the first retry at building the runner image with its packages
 : "${POOL_TOKEN_LIFE:=3600}"   # seconds a registration token is kept; GitHub's lasts one hour
+POOL_RESET_WAIT=300            # seconds for a persistent slot's whole between-job reset
 
 INSTALLED=/usr/local/sbin/arca-runner-pool
 
@@ -73,14 +74,15 @@ INSTALLED=/usr/local/sbin/arca-runner-pool
 # them is missing, and names it. crates/arca/tests/runner_pool.rs runs the controller with nothing else on its PATH,
 # so a program used below and not listed here fails that test.
 POOL_PROGRAMS='docker jq curl openssl flock systemctl apt-get lxcfs hostname awk sed grep find cat chmod chown cut date du
-fold head id install mkdir mount mountpoint mv od rm sha256sum sleep stat tail tee touch tr umount'
+fold head id install mkdir mount mountpoint mv od rm sha256sum sleep stat tail tee timeout touch tr umount
+nsenter ip nft iptables-legacy-save iptables-legacy-restore ip6tables-legacy-save ip6tables-legacy-restore'
 
 # The Debian packages the first boot installs. Recommended packages are not installed, so every package that is needed
 # is named here. docker.io is the daemon alone: on Debian 13 the `docker` command is a package of its own, docker-cli,
 # which docker.io only recommends. mount and umount, which layer the runner's files, are the package mount, not
 # util-linux. The ones the image already carries are named too, so the list says what the script
 # stands on.
-POOL_PACKAGES='docker.io docker-cli curl jq openssl ca-certificates util-linux mount coreutils hostname lxcfs'
+POOL_PACKAGES='docker.io docker-cli curl jq openssl ca-certificates util-linux mount coreutils hostname lxcfs iproute2 nftables iptables'
 # The Ubuntu packages added to the runner image when the settings name none (aptPackages): what GitHub's own
 # ubuntu-latest has and the pinned runner image lacks. libatomic1 is what Node.js-based tools such as pnpm load;
 # build-essential is make, gcc and g++; zstd is what actions/cache compresses with when it is there (without it the
@@ -699,8 +701,9 @@ slot_keeps_caches() { [ "$KEEP_BETWEEN_JOBS" = true ]; }
 # The controller runs as root. Replace the file atomically so a runner with the old file mounted can finish safely.
 write_job_hooks() {
   local hook="$POOL_RUN/tmp/job-started.sh"
-  cat >"$hook" <<'HOOK' && chmod 555 "$hook" && mv -f "$hook" "$POOL_RUN/job-started.sh"
-#!/bin/bash
+  {
+    # Allow a controller poll and a margin for scheduling and timeout's final kill.
+    printf '#!/bin/bash\nboundary_wait=%s\n' "$((POOL_RESET_WAIT + ${POOL_POLL%.*} + 15))" && cat <<'HOOK'
 set -u
 PATH=/usr/bin:/bin
 unset DOCKER_CONTEXT DOCKER_TLS DOCKER_TLS_VERIFY DOCKER_CERT_PATH DOCKER_API_VERSION
@@ -718,14 +721,14 @@ stop_job() {
 }
 
 wait_for_boundary() {
-  local wanted=$1 phase id deadline=$((SECONDS + 120))
+  local wanted=$1 phase id deadline=$((SECONDS + boundary_wait))
   while [ "$SECONDS" -lt "$deadline" ]; do
-    read -r phase id <"$boundary/state" || return 1
+    read -r phase id work <"$boundary/state" || return 1
     [ "$phase" != failed ] || return 1
     if [ "$phase" = "$wanted" ]; then
       case $wanted in
         running) [ "$id" = "$generation" ] && return 0 ;;
-        ready) [ "$id" != "$generation" ] && return 0 ;;
+        ready) [ "$id" != "$generation" ] && [ "$work" = work-clean ] && return 0 ;;
       esac
     fi
     sleep 0.1
@@ -743,9 +746,10 @@ docker_is_empty() {
     networks=$(slot_docker network ls -q --filter type=custom) && [ -z "$networks" ]
 }
 
-read -r phase generation <"$boundary/state" || stop_job 'the slot has no job boundary'
+read -r phase generation work <"$boundary/state" || stop_job 'the slot has no job boundary'
 if [ "${0##*/}" = job-started.sh ]; then
   [ "$phase" = ready ] || stop_job 'the previous job did not finish its slot reset'
+  [ "$work" = work-clean ] || stop_job 'the slot could not verify a clean work directory before the job'
   if ! { printf 'start %s\n' "$generation" >"$boundary/request" && wait_for_boundary running; }; then
     stop_job 'the slot could not verify a fresh Docker daemon before the job'
   fi
@@ -761,13 +765,21 @@ else
   fi
 fi
 HOOK
+  } >"$hook" && chmod 555 "$hook" && mv -f "$hook" "$POOL_RUN/job-started.sh"
+}
+
+# Only the between-job reset sets this deadline. Each blocking operation gets the time still available.
+reset_exec() {
+  if [ -z "${reset_deadline:-}" ]; then "$@"; return; fi
+  local remaining=$((reset_deadline - SECONDS))
+  [ "$remaining" -gt 0 ] && timeout -k 1 "$remaining" "$@"
 }
 
 # Docker's remove can fail because a container is already gone. Confirm absence before clearing its files.
 remove_containers() {
   local names container
-  docker rm -fv "$@" >/dev/null 2>&1 && return 0
-  names=$(docker ps -a --format '{{.Names}}' 2>/dev/null) || return 1
+  reset_exec docker rm -fv "$@" >/dev/null 2>&1 && return 0
+  names=$(reset_exec docker ps -a --format '{{.Names}}' 2>/dev/null) || return 1
   for container; do
     if grep -Fxq -- "$container" <<<"$names"; then return 1; fi
   done
@@ -1013,7 +1025,9 @@ slot_register() {
 # directory can still have files in it. Docker's --mount fails if a source disappears before the container starts.
 slot_limits() {
   local slot=$1 slice=$2 file
-  if ! awk -v path="$POOL_LXCFS" '$5 == path {
+  # The field references belong to awk.
+  # shellcheck disable=SC2016
+  if ! reset_exec awk -v path="$POOL_LXCFS" '$5 == path {
       for (i = 7; i < NF; i++) if ($i == "-" && $(i + 1) == "fuse.lxcfs") mounted = 1
     } END { exit !mounted }' "$POOL_MOUNTINFO"; then
     slot_failed "$slot" "LXCFS is not mounted at $POOL_LXCFS. Check lxcfs.service inside the pool machine"
@@ -1032,6 +1046,45 @@ slot_limits() {
 
 # A persistent runner and all generations of its daemon share a separate network namespace so that localhost
 # still works for service containers. The holder has no slot mounts or Docker socket.
+slot_network_state() {
+  local sandbox
+  sandbox=$(reset_exec docker inspect -f '{{.NetworkSettings.SandboxKey}}' "$network") || return 1
+  # Docker uses a short hex key for a private sandbox. Refuse its host namespace and any unexpected path.
+  [[ $sandbox =~ ^/(var/)?run/docker/netns/[0-9a-f]{12}$ ]] || return 1
+  reset_exec nsenter --net="$sandbox" -- bash -e -o pipefail -s -- "$1" "$dir/boundary/network" <<'NETWORK'
+cd "$2" || exit 1
+if [ "$1" = save ]; then
+  nft list ruleset > nftables
+  iptables-legacy-save > iptables
+  ip6tables-legacy-save > ip6tables
+  for family in -4 -6; do
+    ip "$family" route save table all > "routes$family"
+    ip "$family" rule save > "rules$family"
+  done
+  exit 0
+fi
+
+# Leave the outer Docker link and loopback in place. The old daemon's bridges belong to this namespace.
+links=$(ip -j link show type bridge | jq -r '.[].ifname')
+while IFS= read -r link; do
+  [ -z "$link" ] || ip link delete dev "$link"
+done <<< "$links"
+for family in -4 -6; do
+  ip "$family" route flush table all
+  ip "$family" route restore < "routes$family"
+  ip "$family" rule flush
+  ip "$family" rule restore < "rules$family"
+done
+{ printf 'flush ruleset\n'; cat nftables; } | nft -f -
+# Legacy xtables are separate from nftables. Clear every loaded table and restore its original policies and rules.
+for tables in iptables ip6tables; do
+  "$tables-legacy-save" | awk '/^\*/ || /^COMMIT$/ { print } /^:/ && $2 != "-" { print $1, "ACCEPT [0:0]" }' |
+    "$tables-legacy-restore" -w
+  "$tables-legacy-restore" -w < "$tables"
+done
+NETWORK
+}
+
 slot_start_daemon() {
   local tries=0 daemon_home=() daemon_network=()
   if [ -n "$layered" ]; then
@@ -1040,37 +1093,48 @@ slot_start_daemon() {
     daemon_home=(-v "$EXTERNALS:/home/runner/externals:ro")
   fi
   [ "$network" = "$daemon" ] || daemon_network=(--network "container:$network")
-  daemon_id=$(docker run -d --name "$daemon" --label "arca.pool=$POOL_NAME" --privileged "${limits[@]}" \
+  daemon_id=$(reset_exec docker run -d --name "$daemon" --label "arca.pool=$POOL_NAME" --privileged "${limits[@]}" \
     "${daemon_network[@]}" -v "$dir/sock:/var/run" "${daemon_home[@]}" -v "$dir/work:/home/runner/_work" \
     -v "$dir/toolcache:/opt/hostedtoolcache" -v "$dir/docker:/var/lib/docker" \
     "$DOCKER_IMAGE" dockerd --host=unix:///var/run/docker.sock --group="$DOCKER_GID" 2>/dev/null) || return 1
   [ -n "$daemon_id" ] || return 1
-  until docker exec "$daemon" docker info >/dev/null 2>&1; do
+  until reset_exec docker exec "$daemon" docker info >/dev/null 2>&1; do
     tries=$((tries + 1))
-    if stopping || [ "$tries" -gt "$POOL_READY_WAIT" ]; then return 1; fi
+    if stopping || [ "$tries" -gt "$POOL_READY_WAIT" ] ||
+      [ "${reset_deadline:-$((SECONDS + 1))}" -le "$SECONDS" ]; then return 1; fi
     nap 1
   done
 }
 
 boundary_state() {
-  (umask 022 && printf '%s %s\n' "$1" "$2" >"$dir/boundary/state.new") &&
-    mv -f "$dir/boundary/state.new" "$dir/boundary/state"
+  (umask 022 && printf '%s\n' "$*" >"$dir/boundary/state.new") &&
+    reset_exec mv -f "$dir/boundary/state.new" "$dir/boundary/state"
+}
+
+boundary_ready() {
+  local residue
+  # Runner.Worker creates the next job's directories and downloads actions before its started hook runs.
+  residue=$(reset_exec find "$dir/work" -xdev -mindepth 1 -print -quit) && [ -z "$residue" ] &&
+    boundary_state ready "$daemon_id" work-clean
 }
 
 slot_prepare_boundary() {
   mkdir -m 755 "$dir/boundary" &&
     (umask 077 && : >"$dir/boundary/request") &&
     { [ "$(id -u)" != 0 ] || chown "$RUNNER_UID:$DOCKER_GID" "$dir/boundary/request"; } &&
-    boundary_state ready "$daemon_id"
+    mkdir -m 700 "$dir/boundary/network" && slot_network_state save
 }
 
 # The runner keeps these bind mount inodes. Delete their contents after the old daemon and its jobs have stopped.
 slot_replace_daemon() {
-  docker exec "$daemon" sh -ec 'ids=$(docker ps -aq); [ -z "$ids" ] || docker rm -fv $ids' >/dev/null 2>&1 &&
+  # The daemon's shell expands its own container IDs.
+  # shellcheck disable=SC2016
+  reset_exec docker exec "$daemon" sh -ec 'ids=$(docker ps -aq); [ -z "$ids" ] || docker rm -fv $ids' >/dev/null 2>&1 &&
     remove_containers "$daemon" &&
-    rm -rf "${dir:?}/docker" && [ ! -e "$dir/docker" ] && [ ! -L "$dir/docker" ] &&
-    mkdir "$dir/docker" &&
-    find "$dir/sock" "$dir/toolcache" "$dir/cache" -xdev -mindepth 1 -delete &&
+    reset_exec rm -rf "${dir:?}/docker" && [ ! -e "$dir/docker" ] && [ ! -L "$dir/docker" ] &&
+    reset_exec mkdir "$dir/docker" &&
+    reset_exec find "$dir/work" "$dir/sock" "$dir/toolcache" "$dir/cache" -xdev -mindepth 1 -delete &&
+    slot_network_state restore &&
     slot_limits "$slot" "$slice" &&
     slot_start_daemon
 }
@@ -1078,20 +1142,22 @@ slot_replace_daemon() {
 # Grant a daemon generation to exactly one job. Once granted, only that job's completed hook can request its
 # replacement. A missing completion, interrupted reset or failed identity check forces a fresh slot start.
 slot_job_boundary() {
-  local phase generation action requested actual
-  if read -r phase generation <"$dir/boundary/state" && [ -n "$generation" ]; then
+  local phase generation work action requested actual reset_deadline
+  if read -r phase generation work <"$dir/boundary/state" && [ -n "$generation" ]; then
     case $phase in
       ready | running)
         read -r action requested <"$dir/boundary/request" || return 0
         [ "$requested" = "$generation" ] || return 0
         case "$phase:$action" in
           ready:start)
-            if actual=$(docker inspect -f '{{.Id}} {{.State.Running}}' "$daemon" 2>/dev/null) &&
+            if [ "$work" = work-clean ] && actual=$(docker inspect -f '{{.Id}} {{.State.Running}}' "$daemon" 2>/dev/null) &&
               [ "$actual" = "$generation true" ] && boundary_state running "$generation"; then return 0; fi
             ;;
           running:complete)
+            reset_deadline=$((SECONDS + POOL_RESET_WAIT))
             if boundary_state resetting "$generation" && slot_replace_daemon && [ "$daemon_id" != "$generation" ] &&
-              boundary_state ready "$daemon_id"; then return 0; fi
+              boundary_ready; then return 0; fi
+            unset reset_deadline
             ;;
           *:abort) ;;
           *) return 0 ;;
@@ -1192,10 +1258,10 @@ slot_begin() {
     slot_prepare_home
   fi
   if [ "$network" != "$daemon" ] &&
-    ! docker run -d --name "$network" --label "arca.pool=$POOL_NAME" "${limits[@]}" --entrypoint /bin/sleep \
-      "$DOCKER_IMAGE" infinity >/dev/null 2>&1; then
+    ! { docker run -d --name "$network" --label "arca.pool=$POOL_NAME" "${limits[@]}" --entrypoint /bin/sleep \
+      "$DOCKER_IMAGE" infinity >/dev/null 2>&1 && slot_prepare_boundary; }; then
     slot_abandon "$slot" "$runner_id"
-    slot_failed "$slot" "the slot's shared network container could not be started"
+    slot_failed "$slot" "the slot's shared network could not be started or saved"
     return 1
   fi
   if ! slot_start_daemon; then
@@ -1213,7 +1279,7 @@ slot_begin() {
   if [ -n "$REG" ]; then
     local hook_args=()
     if ! slot_keeps_caches; then
-      if ! slot_prepare_boundary; then
+      if ! boundary_ready; then
         slot_abandon "$slot" ''
         slot_failed "$slot" "the slot's job boundary could not be created"
         return 1

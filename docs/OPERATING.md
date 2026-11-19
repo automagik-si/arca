@@ -7122,13 +7122,15 @@ What the pool does with it:
   `instance_start` again within the token's hour: Arca writes the stored token again and the slot registers with it.
 
 **The runner keeps its container and registration between jobs.** A root-owned, read-only completed hook waits for
-the controller to replace the daemon container and clear the Docker store, tool cache and dependency cache. The
-replacement daemon uses the same slot limits and network namespace, so service containers still answer on
-localhost. Before workflow steps run, a started hook requires a fresh daemon generation and empty caches. A
-failed or interrupted reset stops the runner. The pool can start it cleanly again using the saved registration.
+the controller to clear `_work` as root, empty the Docker store and caches, and replace the daemon. It removes the
+old Docker bridges and restores the shared namespace's routes and firewall rules before starting the replacement.
+Service containers still answer on localhost. The controller allows five minutes for the whole reset, including
+daemon readiness. The hook allows one controller poll and 15 seconds more. Before workflow steps run, the started
+hook requires a fresh daemon, empty caches and confirmation that the controller emptied `_work` before GitHub set
+up the new job. A failed or interrupted reset stops the runner, which can restart with its saved registration.
 Set `keepBetweenJobs: true` to use the existing persistent daemon and cache budgets without these hooks.
 
-The completed hook also clears what the runner user can remove from `_work` and `/tmp`. A job can still change
+The completed hook also clears what the runner user can remove from `/tmp`. A job can still change
 the persistent runner's own files and executables, which can affect its later jobs. Use this mode only for
 repositories that trust each other. In `jit` mode the pool replaces the runner and removes its work, socket and
 home layer before requesting the next runner. Each job is recorded in `jobs.tsv` with its name, result and

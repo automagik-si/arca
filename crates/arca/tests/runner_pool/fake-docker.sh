@@ -15,6 +15,47 @@ set -u
 PATH=${FAKE_PATH:-$PATH}
 unset -f command_not_found_handle 2>/dev/null
 root=$FAKE_DOCKER_DIR
+
+# Run the controller's network reset script against files instead of a real namespace.
+if [ "${0##*/}" = nsenter ]; then
+  key=${1##*/}
+  for holder in "$root"/containers/*-net; do
+    [ "$(cat "$holder/sandbox" 2>/dev/null)" != "$key" ] || break
+  done
+  [ -f "$holder/sandbox" ] && [ "$(cat "$holder/sandbox")" = "$key" ] || exit 1
+  export FAKE_HOLDER="$holder"
+  ip() {
+    case $* in
+      '-j link show type bridge')
+        if [ -d "$FAKE_HOLDER/br-old" ]; then echo '[{"ifname":"br-old"}]'; else echo '[]'; fi ;;
+      'link delete dev br-old') rm -rf "$FAKE_HOLDER/br-old" ;;
+      '-4 route save table all' | '-6 route save table all' | *' rule save') echo baseline ;;
+      *' route flush table all') rm -rf "$FAKE_HOLDER/routes" ;;
+      *' route restore' | *' rule restore') grep -qx baseline ;;
+      *' rule flush') : ;;
+      *) return 1 ;;
+    esac
+  }
+  nft() {
+    case $* in
+      'list ruleset') : ;;
+      '-f -') grep -qx 'flush ruleset' && rm -rf "$FAKE_HOLDER/nftables" ;;
+      *) return 1 ;;
+    esac
+  }
+  iptables-legacy-save() {
+    if [ -d "$FAKE_HOLDER/iptables" ]; then printf '*filter\n:OUTPUT DROP [0:0]\nCOMMIT\n'; fi
+  }
+  iptables-legacy-restore() {
+    if grep -qx ':OUTPUT ACCEPT \[0:0\]'; then rm -rf "$FAKE_HOLDER/iptables"; fi
+  }
+  ip6tables-legacy-save() { :; }
+  ip6tables-legacy-restore() { :; }
+  export -f ip nft iptables-legacy-save iptables-legacy-restore ip6tables-legacy-save ip6tables-legacy-restore
+  shift 2
+  exec "$@"
+fi
+
 mkdir -p "$root/containers" "$root/images"
 # A played runner in a session of its own, when the test asks for one (FAKE_DETACH): a real container outlives the
 # controller that started it, and a played runner outlives the controller's process group then. It is no call.
@@ -91,6 +132,10 @@ play_cache_job() {
   markers=("$store/images" "$store/buildkit" "$store/volumes" "$store/containers" "$store/networks"
     "$tool_cache" "$dependency_cache")
   case $job in
+    *root\ work*) markers=("$work_mount/root-owned") ;;
+    *network\ residue*)
+      markers=("$root/containers/${network#container:}/"{iptables,nftables,routes,br-old})
+      ;;
     *daemon*)
       # One bind mount into the daemon's writable filesystem and one detached container.
       markers+=("$daemon_dir/private-tmp" "$store/containers/detached")
@@ -145,6 +190,12 @@ play_job_hook() (
   # shellcheck disable=SC2329
   find() {
     [ "$*" = '/tmp /home/runner/_work -xdev -mindepth 1 -delete' ] || return 1
+    if [ -d "$FAKE_WORK/root-owned" ]; then
+      # The runner user cannot unlink files in this root-owned directory. The controller can.
+      command find "$FAKE_RUNNER_DIR/private-tmp" "$FAKE_WORK" -xdev -mindepth 1 \
+        ! -path "$FAKE_WORK/root-owned" ! -path "$FAKE_WORK/root-owned/*" -delete
+      return 1
+    fi
     command find "$FAKE_RUNNER_DIR/private-tmp" "$FAKE_WORK" -xdev -mindepth 1 -delete
   }
   # Only the disposable worker may be killed here. PID 1 in this test is outside the fake container.
@@ -222,12 +273,16 @@ play_runner() {
       touch "$dir/worker"
       hook_status=0
       if [ -n "$job_hook" ]; then
+        # Runner.Worker prepares the next job's directories before invoking its hook.
+        mkdir -p "$work_mount/repo/repo" "$work_mount/_PipelineMapping"
         play_job_hook job-started.sh "$job_hook_mount" >>"$dir/log" 2>&1 || hook_status=$?
       fi
       # An ordinary hook error fails a step. Steps marked always() can still run unless the job worker died.
       if [ "$hook_status" != 137 ]; then
         case $job in
           'write caches' | 'read caches' | 'write daemon residue' | 'read daemon residue' | 'fail daemon reset' | 'interrupted job')
+            play_cache_job "$job" || { end_play 1; return; } ;;
+          'write root work' | 'read root work' | 'write network residue' | 'read network residue')
             play_cache_job "$job" || { end_play 1; return; } ;;
         esac
         sleep "$seconds"
@@ -306,6 +361,10 @@ case $command in
     # The host directory mounted as the runner's home, when one is: a real runner and its daemon share its files.
     echo "$home_mount" >"$dir/home"
     echo "$network" >"$dir/network"
+    if [[ $name == *-net ]]; then
+      slot=${name%-net}
+      printf '%012d\n' "${slot##*-s}" >"$dir/sandbox"
+    fi
     if [ -n "$docker_store" ]; then
       printf '%s\n' "$docker_store" >"$dir/store"
       printf 'daemon-%s\n' "$BASHPID" >"$dir/id"
@@ -435,6 +494,7 @@ case $command in
     dir="$root/containers/$last"
     [ -d "$dir" ] || exit 1
     case " $* " in
+      *'{{.NetworkSettings.SandboxKey}}'*) printf '/var/run/docker/netns/%s\n' "$(cat "$dir/sandbox")" ;;
       *'{{.Id}} {{.State.Running}}'*)
         [ ! -e "$dir/exit" ] && printf '%s true\n' "$(cat "$dir/id")"
         ;;
