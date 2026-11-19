@@ -49,7 +49,7 @@ parse_run() {
         esac
         shift 2
         ;;
-      -e | --label | --network) shift 2 ;;
+      -e | --label | --network | --cpuset-cpus | --mount) shift 2 ;;
       -d | --privileged) shift ;;
       -*) shift ;;
       *)

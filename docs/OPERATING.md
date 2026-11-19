@@ -6973,6 +6973,7 @@ since it is where the pool's credential will be used.
 | `runnerGroupId` | yes | The number of the runner group the runners join (step 1). Not used for a repository. |
 | `classes` | yes | The label sets, each with its slot size: `name` (a-z, 0-9), `labels` (what a job's `runs-on` asks for), `cpu`, `memory` and `slots` (how many runners of this class the pool keeps). Given at create, it replaces the whole list. Each class is checked like the template's first: whole numbers for `cpu` and `slots`, and a `memory` above zero and at most the machine's. The card shows one row a class. |
 | `maxSlots` | yes | The cap: never more than this many slots at once, whatever the classes add up to. Never below the number of classes: a create with less is refused ("A place for every class" below). |
+| `memory` | yes | `reserved` (default) reserves a slot's full class memory before starting it. `ceiling` lets slots share the pool's memory budget, with each slot capped at its class memory. |
 | `aptPackages` | yes | The Ubuntu packages added to the runner image, which the machine builds once ("The runner image's packages" below). The default is `["libatomic1", "build-essential", "zstd", "wget", "skopeo", "xz-utils", "zip", "rsync", "gh"]`. Given at create, it replaces the whole list, so name the defaults too when you add one; `[]` runs the runner image as it is. |
 | `registration` | yes | `jit` (the default): a just-in-time runner per job, registered with the pool's App or token. `registration-token`: no GitHub credential at all; each slot is registered once with a registration token and keeps its runner between jobs ("Without a GitHub credential" below). |
 | `runnerGroup` | yes | With `registration-token`, the runner group's name as GitHub shows it (config.sh names a group by name). Required for an organisation. |
@@ -6994,7 +6995,13 @@ is never started (two slots of 10GiB beside the two small ones would not fit). G
 job needs: a full `cargo test` of a large workspace has been seen to fill a 10GiB slot. Settings are read when the pool is created and are fixed from then on (see "What to
 know").
 
-**Sizing so that every slot fits.** A slot is started only while its whole memory fits, so the rule is:
+**Sizing so that every slot fits.** Add up `cpu × slots` for every class. The pool assigns each slot its own CPUs
+at startup, giving the first slot in each class priority. If the total exceeds the CPUs the machine has, the pool
+logs both numbers and slots without a full CPU assignment stay queued. `maxSlots` caps how many runners start and
+each slot keeps its CPU assignment when it is idle or queued.
+
+With `memory: reserved`, a slot starts only when its whole memory is available. To run every slot at once, their
+combined memory must fit this budget.
 
     the memory of all slots together  <=  the memory the machine reports  -  reserveMemory
 
@@ -7007,6 +7014,22 @@ controller now says this at its start and in every status block, as a `WARNING` 
 much. (It does not say this when `maxSlots` is below the number of slots: then they are not meant to run all at
 once.) A slot that is larger by itself than the memory for slots never starts, whatever `maxSlots` is, and the jobs
 that ask for its labels wait for ever: the controller says that too, as a `WARNING` that names the class.
+
+With `memory: ceiling`, the pool starts slots up to `maxSlots` and their dedicated CPU assignments without waiting
+for each slot's full class memory to be free. Each slot keeps its class's `MemoryMax`. The parent slice caps the pool
+at the machine's reported memory minus `reserveMemory`, so each slot's ceiling still has to fit that budget on its
+own. The sum of the ceilings can exceed the budget. A job can be OOM-killed when it reaches its slot limit or when
+concurrent slots fill the pool budget under memory pressure. Status reports `memory_ceilings` and `memory_budget`
+in this mode.
+
+**What a job sees.** For steps that run directly on the runner, `nproc` reports the class's CPU count and `MemTotal`
+in `/proc/meminfo` reports its memory limit. Docker pins the runner and its daemon with `--cpuset-cpus`, and both
+mount LXCFS views of `/proc/meminfo`, `/proc/cpuinfo`, `/proc/stat` and `/proc/loadavg`, plus `/proc/swaps` and
+`/proc/uptime` when LXCFS serves them. A slot waits to register if its LXCFS mount or a required file is missing and
+logs the cause. The systemd slice enforces `AllowedCPUs`, `CPUQuota`, `MemoryMax` and `MemorySwapMax=0`. Docker's
+`--cgroup-parent` places the runner and daemon in that slice, so containers the daemon starts also share those
+limits and CPU assignment. Those inner containers, including job and service containers, get their own `/proc`
+without the LXCFS mounts and can see the machine's memory in `MemTotal`.
 
 **A place for every class.** `maxSlots` caps registered runners, and a runner that is registered and waits for a job
 keeps its place until a job ends. So that no class is left without a runner behind the idle runners of the others,
@@ -7039,8 +7062,8 @@ What this is not:
   every registered runner may take a job at any moment. A runner that has a job is never retired, and neither is a
   class's only runner; one that is updating itself is not retired before its update is over. So when every runner
   that could give its place up is at work, the class waits until a job ends, or until an update is over.
-- A place is not memory. A slot still starts only when its whole memory fits (above), and the pool retires nothing
-  for a class whose slot would still lack its memory.
+- With `memory: reserved`, the pool retires an idle runner for another class only if the new slot would have
+  enough memory to start. Every admitted slot needs its own CPUs under either memory setting.
 - It is one place a class, not a share. Beyond that one place, the busiest classes can hold all the others.
 
 A pool with one class has nothing to hand out between classes and works as it did.
@@ -7053,8 +7076,8 @@ its line breaks, the one at its end too; a key pasted on one line works too. For
 or log shows a value again. When the App's two secrets and a token are all set, the pool uses the App and says so.
 
 **5. Arca: `instance_start`** with `{"project": "arcak-svc", "instance": "ci-pool"}`. The virtual machine starts and
-the answer names the secrets written into it. Its first boot installs Docker and downloads the two images, which
-takes a few minutes.
+the answer names the secrets written into it. Its first boot installs Docker and LXCFS and downloads the two
+images, which takes a few minutes.
 
 **6. Check.** `service_logs` with `{"name": "ci-pool"}` shows the pool's own lines (below), among them the runner
 group it registers in. On GitHub, the organisation's "Settings", "Actions", "Runners" lists runners named
@@ -7164,7 +7187,7 @@ arca-runner-pool: totals busy=2 idle=1 starting=0 queued=1 jobs_done=412 failure
 |---------------|---------|
 | `busy`, `idle` | Runners with a job, and runners registered and waiting for one. |
 | `starting` | Slots registering, starting or cleaning up. |
-| `queued` | Slots the pool wants and has not started. The slot's own line says why: the cap, memory no slot has reserved, memory that is free now, a pause after a failure, or no credential. |
+| `queued` | Slots waiting for dedicated CPUs, a place under the cap, memory, a retry after a failure, or a credential. The slot's own line gives the reason. |
 | `jobs_done` | Jobs finished since the controller started, whatever their result. |
 | `failures` | Failures of the pool itself since the controller started: GitHub refused the credential or a registration, the runner group was refused, a container did not start, a runner went away before it took a job. A job that fails its own steps is a job done, with `result=Failed`. |
 | `runner_updates` | Runners that GitHub told to update themselves before their job (see "Pins" below). Above zero means the pool's pinned runner is behind. |
@@ -7240,10 +7263,6 @@ neither has been measured on the pool itself.
   `/var/log/arca-runner-pool/runner-image-build.log` inside the machine. The packages come from Ubuntu's archive on
   the day of the build, so two machines built on different days can differ in their versions; the runner image
   underneath is the pinned one.
-- **Admission by memory.** A slot starts only while there is memory for its whole size: memory that no other slot has
-  reserved, and memory the machine has free at that moment. A slot's memory is a hard limit with no swap, so a job that
-  passes it is stopped by the kernel and no other slot pays for it. CPU is different: each slot has a ceiling of its
-  `cpu`, and slots share the machine's CPUs.
 - **Docker, and how far jobs are apart.** Each slot has a Docker daemon of its own, started fresh for each job. A
   job's containers, volumes and networks are removed after it; the daemon's images and build cache stay for the next
   job of that slot. Two jobs therefore never see each other's containers or share a daemon. They are not walled off
@@ -8159,12 +8178,13 @@ against a fake GitHub API (a small HTTP server in the test that checks every tok
 `docker` (`tests/runner_pool/fake-docker.sh`, which plays a runner that takes one job with the configuration it was
 started with). It needs `bash`, `curl`, `jq`, `openssl` and `flock` on the machine that runs it. It covers
 registration with an App and with a token, one job per runner, replacement, admission by reserved and by free memory,
-the cap, the job records and their bound, the pause after failures, the refusal of the default runner group at the
-start and after a later change on GitHub, a public repository's warning, a runner that GitHub tells to update itself,
-the shared layer of the runner's files and both ways back from it, a token renewed before an old runner is removed,
-cleanup of exactly this pool's leftovers, the URL and API host rules, and that no credential is in any output, file
-or command line. `crates/arca/tests/services/vm_secrets.rs` and `create_settings.rs` cover the kernel's half against
-the fake Incus.
+admission with memory ceilings, the cap, distinct CPU assignments and LXCFS mount arguments for each class,
+registration waiting for LXCFS, the job records and their bound, the pause after failures, the refusal of the default
+runner group at the start and after a later change on GitHub, a public repository's warning, a runner that GitHub
+tells to update itself, the shared layer of the runner's files and both ways back from it, a token renewed before an
+old runner is removed, cleanup of exactly this pool's leftovers, the URL and API host rules, and that no credential
+is in any output, file or command line. `crates/arca/tests/services/vm_secrets.rs` and `create_settings.rs` cover the
+kernel's half against the fake Incus.
 
 The controller runs in these tests with nothing on its `PATH` but the stand-ins and the programs the script declares
 (`POOL_PROGRAMS`), so a program it starts without declaring fails them; the first boot checks that same list on the
@@ -8209,6 +8229,7 @@ Not proven yet, by these tests or on that node:
   mounted, and the daemon seeing the updated tools. A machine where it does not work falls back by itself, which is
   tested; that the layered start works is not;
 - jobs that use `container:` and `services:`;
+- the values of `nproc` and `MemTotal` in a real job for each runner class;
 - that GitHub lists a runner as `offline` when it is, and answers a repository's `private` field as its
   documentation says;
 - that the memory limit and the CPU ceiling of a slot's slice hold for a job's own containers, those it starts

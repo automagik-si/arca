@@ -44,6 +44,10 @@ and status.
 - Merge PR 267: app update design addendum for #266 and #265
 - Merge PR 264: service snapshots of an instance with its data volumes, restore and removal
 
+GitHub Actions runner pool slots have dedicated CPUs and report their class's CPU count and memory limit to jobs
+that run directly on the runner. Set `memory` to `ceiling` to admit slots without reserving each one's full memory
+up front. Each slot keeps its own limit, and the pool's running slots share the memory left after `reserveMemory`.
+
 ## 0.37.0 (2026-11-18)
 
 A container template may carry `appUpdate`, a formula for updating the app inside its service: a `health` command and
