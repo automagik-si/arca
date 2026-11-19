@@ -7121,15 +7121,18 @@ What the pool does with it:
   can be deleted as unneeded while every slot still looks registered. If a slot then waits for a token, run
   `instance_start` again within the token's hour: Arca writes the stored token again and the slot registers with it.
 
-**The runner keeps its container, work directory and home between jobs.** A read-only job-started hook clears the
-slot's Docker objects, tool cache and dependency cache before workflow steps run. The hook uses the existing Docker
-daemon because GitHub can assign the next job as soon as the runner is ready. If cleanup fails, the hook stops that
-job's worker. Set `keepBetweenJobs: true` to skip the hook and trim caches under the existing budgets.
+**The runner keeps its container and registration between jobs.** A root-owned, read-only completed hook waits for
+the controller to replace the daemon container and clear the Docker store, tool cache and dependency cache. The
+replacement daemon uses the same slot limits and network namespace, so service containers still answer on
+localhost. Before workflow steps run, a started hook requires a fresh daemon generation and empty caches. A
+failed or interrupted reset stops the runner. The pool can start it cleanly again using the saved registration.
+Set `keepBetweenJobs: true` to use the existing persistent daemon and cache budgets without these hooks.
 
-A job can change its own persistent runner's files and affect later jobs on that runner, even with cache cleanup
-enabled. Use this mode only for repositories that trust each other. In `jit` mode the pool replaces the runner and
-its work directory after each job. Each job is recorded in `jobs.tsv` with its name, result and seconds. The memory
-peak is the slot's since its runner started, and CPU time is the slot's since the job began.
+The completed hook also clears what the runner user can remove from `_work` and `/tmp`. A job can still change
+the persistent runner's own files and executables, which can affect its later jobs. Use this mode only for
+repositories that trust each other. In `jit` mode the pool replaces the runner and removes its work, socket and
+home layer before requesting the next runner. Each job is recorded in `jobs.tsv` with its name, result and
+seconds. The memory peak is the slot's since its runner started, and CPU time is the slot's since the job began.
 
 ### Who can reach what
 
@@ -7249,7 +7252,8 @@ neither has been measured on the pool itself.
 - **Caches.** By default, a `jit` slot replaces its Docker store, tool cache (`RUNNER_TOOL_CACHE` at
   `/opt/hostedtoolcache`) and dependency cache (`POOL_CACHE_DIR` at `/var/cache/pool`) with empty directories
   before registering the next runner. If the reset fails, the slot logs the failure and retries before
-  registering. In `registration-token` mode the job-started hook clears those caches before each job. In both
+  registering. In `registration-token` mode the controller replaces the daemon and clears those caches while
+  the completed hook waits. In both
   modes each job pulls its images and sets up its tools and dependencies again until a read-only cache is
   available. With `keepBetweenJobs: true`, images, build cache and the two filesystem caches can survive jobs
   and restarts. Each slot has an equal share of `dockerCache` and `dependencyCache`. The pool trims and logs any

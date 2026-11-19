@@ -31,8 +31,8 @@ command=${1-}
 # The name, the slice and the image of a `docker run` or `docker create`: the image is the first argument that is
 # neither an option nor an option's value.
 name='' cgroup_parent='' image='' jit_file='' tools_mounted='' home_mount='' command_line='' token_file='' reg_dir=''
-reg_dir_ro='' docker_store='' tool_cache='' dependency_cache='' network='' command_args=()
-job_hook='' job_hook_mount=''
+reg_dir_ro='' docker_store='' tool_cache='' dependency_cache='' work_mount='' network='' command_args=()
+job_hook='' job_hook_mount='' completed_hook='' completed_hook_mount='' boundary_mount='' request_mount=''
 parse_run() {
   while [ $# -gt 0 ]; do
     case $1 in
@@ -45,9 +45,13 @@ parse_run() {
           *:/run/arca/registration) reg_dir=${2%:/run/arca/registration} ;;
           *:/run/arca/registration:ro) reg_dir_ro=${2%:/run/arca/registration:ro} ;;
           *:/run/arca/job-started.sh:ro) job_hook_mount=${2%:/run/arca/job-started.sh:ro} ;;
+          *:/run/arca/job-completed.sh:ro) completed_hook_mount=${2%:/run/arca/job-completed.sh:ro} ;;
+          *:/run/arca/boundary:ro) boundary_mount=${2%:/run/arca/boundary:ro} ;;
+          *:/run/arca/boundary/request:rw) request_mount=${2%:/run/arca/boundary/request:rw} ;;
           *:/home/runner/externals | *:/home/runner/externals:*) tools_mounted=1 ;;
           *:/home/runner:ro) home_mount=${2%:/home/runner:ro} ;;
           *:/home/runner) home_mount=${2%:/home/runner} ;;
+          *:/home/runner/_work) work_mount=${2%:/home/runner/_work} ;;
           *:/var/lib/docker) docker_store=${2%:/var/lib/docker} ;;
           *:/opt/hostedtoolcache) tool_cache=${2%:/opt/hostedtoolcache} ;;
           *:/var/cache/pool) dependency_cache=${2%:/var/cache/pool} ;;
@@ -56,10 +60,13 @@ parse_run() {
         ;;
       --network) network=$2; shift 2 ;;
       -e)
-        case $2 in ACTIONS_RUNNER_HOOK_JOB_STARTED=*) job_hook=${2#*=} ;; esac
+        case $2 in
+          ACTIONS_RUNNER_HOOK_JOB_STARTED=*) job_hook=${2#*=} ;;
+          ACTIONS_RUNNER_HOOK_JOB_COMPLETED=*) completed_hook=${2#*=} ;;
+        esac
         shift 2
         ;;
-      --label | --cpuset-cpus | --mount) shift 2 ;;
+      --label | --cpuset-cpus | --mount | --entrypoint) shift 2 ;;
       -d | --privileged) shift ;;
       -*) shift ;;
       *)
@@ -75,57 +82,82 @@ parse_run() {
 
 # Play a job writing to the three stores, or report what the next job can read from the mounts it received.
 play_cache_job() {
-  local job=$1 store marker found=0
+  local job=$1 store marker found=0 daemon_dir="$root/containers/${name%-run}-dind"
   local markers=()
-  store=$(cat "$root/containers/${network#container:}/store") || return 1
+  store=$(cat "$daemon_dir/store") || return 1
   for marker in "$store" "$tool_cache" "$dependency_cache"; do
     [ -n "$marker" ] && [ -d "$marker" ] || return 1
   done
   markers=("$store/images" "$store/buildkit" "$store/volumes" "$store/containers" "$store/networks"
     "$tool_cache" "$dependency_cache")
+  case $job in
+    *daemon*)
+      # One bind mount into the daemon's writable filesystem and one detached container.
+      markers+=("$daemon_dir/private-tmp" "$store/containers/detached")
+      cat "$daemon_dir/id" >"$root/${name%-run}.${job%% *}-daemon" || return 1
+      if [[ $job == write* ]]; then
+        mkdir -p "$dir/private-tmp"
+        touch "$dir/private-tmp/.job-marker" "$work_mount/.job-marker"
+      fi
+      ;;
+  esac
   for marker in "${markers[@]}"; do
-    if [ "$job" = 'write caches' ]; then
+    if [[ $job == write* || $job = 'fail daemon reset' || $job = 'interrupted job' ]]; then
       mkdir -p "$marker" && printf 'residue\n' >"$marker/.job-marker" || return 1
     elif [ -f "$marker/.job-marker" ]; then
       found=$((found + 1))
     fi
   done
-  if [ "$job" = 'read caches' ]; then
+  if [[ $job == read* ]]; then
     echo "$found" >"$root/${name%-run}.residue"
   fi
+  if [ "$job" = 'fail daemon reset' ]; then : >"$root/refuse-hook-cleanup"; fi
 }
 
 # Run the mounted hook for real with the runner's Docker socket and bind mounts modeled under the test directory.
-play_job_started_hook() (
-  local store
-  store=$(cat "$root/containers/${network#container:}/store") || return 1
-  export FAKE_SLOT_STORE="$store" FAKE_TOOL_CACHE="$tool_cache" FAKE_DEPENDENCY_CACHE="$dependency_cache"
-  # The hook invokes these exported functions in its own Bash process.
+play_job_hook() (
+  local phase=$1 source=$2 hook="$dir/$1"
+  export FAKE_BOUNDARY="$boundary_mount" FAKE_DAEMON="$root/containers/${name%-run}-dind"
+  export FAKE_TOOL_CACHE="$tool_cache" FAKE_DEPENDENCY_CACHE="$dependency_cache" FAKE_RUNNER_DIR="$dir" FAKE_WORK="$work_mount"
   # shellcheck disable=SC2329
   docker() {
+    local store kind
     [ "$1" = --host=unix:///var/run/docker.sock ] && [ "$2" = --config=/run/arca ] || return 1
-    [ ! -e "$FAKE_DOCKER_DIR/refuse-hook-cleanup" ] || return 1
+    store=$(cat "$FAKE_DAEMON/store") || return 1
     shift 2
     case $* in
-      'ps -aq')
-        if [ -f "$FAKE_SLOT_STORE/containers/.job-marker" ]; then echo cache-container; fi
+      'system df --format {{.TotalCount}}')
+        for kind in images containers volumes buildkit; do
+          if [ -f "$store/$kind/.job-marker" ]; then echo 1; else echo 0; fi
+        done
         ;;
-      'rm -fv cache-container') rm -f "$FAKE_SLOT_STORE/containers/.job-marker" ;;
-      'system prune -af --volumes') rm -f "$FAKE_SLOT_STORE/"{images,networks}/.job-marker ;;
-      'volume prune -af') rm -f "$FAKE_SLOT_STORE/volumes/.job-marker" ;;
-      'builder prune -af') rm -f "$FAKE_SLOT_STORE/buildkit/.job-marker" ;;
+      'network ls -q --filter type=custom')
+        if [ -f "$store/networks/.job-marker" ]; then echo custom-network; fi
+        ;;
       *) return 1 ;;
     esac
   }
   # shellcheck disable=SC2329
   sudo() {
-    [ "$*" = '-n /usr/bin/find /opt/hostedtoolcache /var/cache/pool -xdev -mindepth 1 -delete' ] || return 1
-    [ -d "$FAKE_TOOL_CACHE" ] && [ -d "$FAKE_DEPENDENCY_CACHE" ] || return 1
-    find "$FAKE_TOOL_CACHE" "$FAKE_DEPENDENCY_CACHE" -xdev -mindepth 1 -delete
+    [ "$*" = '-n /usr/bin/find /opt/hostedtoolcache /var/cache/pool -xdev -mindepth 1 -print -quit' ] || return 1
+    command find "$FAKE_TOOL_CACHE" "$FAKE_DEPENDENCY_CACHE" -xdev -mindepth 1 -print -quit
   }
-  export -f docker sudo
+  # shellcheck disable=SC2329
+  find() {
+    [ "$*" = '/tmp /home/runner/_work -xdev -mindepth 1 -delete' ] || return 1
+    command find "$FAKE_RUNNER_DIR/private-tmp" "$FAKE_WORK" -xdev -mindepth 1 -delete
+  }
+  # Only the disposable worker may be killed here. PID 1 in this test is outside the fake container.
+  # shellcheck disable=SC2329
+  kill() {
+    if [ "$*" = '-TERM 1' ]; then return 0; fi
+    [ "$*" = "-KILL $PPID" ] && builtin kill -KILL "$PPID"
+  }
+  export -f docker sudo find kill
+  sed 's|^boundary=/run/arca/boundary$|boundary=$FAKE_BOUNDARY|' "$source" >"$hook"
+  grep -Fxq 'boundary=$FAKE_BOUNDARY' "$hook" || return 1
   # The hook's parent is a disposable stand-in for Runner.Worker.
-  bash -c 'bash -e "$1" & wait "$!"' fake-worker "$job_hook_mount"
+  bash -c 'bash -e "$1" & wait "$!"' fake-worker "$hook"
 )
 
 play_runner() {
@@ -190,14 +222,20 @@ play_runner() {
       touch "$dir/worker"
       hook_status=0
       if [ -n "$job_hook" ]; then
-        play_job_started_hook >>"$dir/log" 2>&1 || hook_status=$?
+        play_job_hook job-started.sh "$job_hook_mount" >>"$dir/log" 2>&1 || hook_status=$?
       fi
       # An ordinary hook error fails a step. Steps marked always() can still run unless the job worker died.
       if [ "$hook_status" != 137 ]; then
         case $job in
-          'write caches' | 'read caches') play_cache_job "$job" || { end_play 1; return; } ;;
+          'write caches' | 'read caches' | 'write daemon residue' | 'read daemon residue' | 'fail daemon reset' | 'interrupted job')
+            play_cache_job "$job" || { end_play 1; return; } ;;
         esac
         sleep "$seconds"
+      fi
+      if [ "$job" = 'interrupted job' ]; then
+        result=Failed
+      elif [ "$hook_status" = 0 ] && [ -n "$completed_hook" ]; then
+        play_job_hook job-completed.sh "$completed_hook_mount" >>"$dir/log" 2>&1 || hook_status=$?
       fi
       [ "$hook_status" = 0 ] || result=Failed
       [ -d "$dir" ] || return
@@ -267,8 +305,10 @@ case $command in
     echo "$image" >"$dir/image"
     # The host directory mounted as the runner's home, when one is: a real runner and its daemon share its files.
     echo "$home_mount" >"$dir/home"
+    echo "$network" >"$dir/network"
     if [ -n "$docker_store" ]; then
       printf '%s\n' "$docker_store" >"$dir/store"
+      printf 'daemon-%s\n' "$BASHPID" >"$dir/id"
     fi
     : >"$dir/log"
     if [ -n "$cgroup_parent" ]; then
@@ -324,6 +364,9 @@ case $command in
       # A persistent runner reads the registration a registration container wrote.
       if [ -n "$job_hook" ]; then
         [ "$job_hook" = /run/arca/job-started.sh ] && [ -x "$job_hook_mount" ] || exit 125
+        [ "$completed_hook" = /run/arca/job-completed.sh ] && [ -x "$completed_hook_mount" ] || exit 125
+        [ -n "$boundary_mount" ] && [ "$request_mount" = "$boundary_mount/request" ] || exit 125
+        mkdir -p "$dir/private-tmp"
       fi
       case $command_line in
         '/bin/bash -c cp /run/arca/registration/.runner /run/arca/registration/.credentials /run/arca/registration/.credentials_rsaparams /home/runner/ && exec /home/runner/run.sh') ;;
@@ -352,15 +395,30 @@ case $command in
         play_runner "$dir" "$(cat "$jit_file")" "$tools_mounted" </dev/null >/dev/null 2>&1 &
       fi
     fi
-    echo "id-$name"
+    if [ -n "$docker_store" ]; then cat "$dir/id"; else echo "id-$name"; fi
     ;;
   rm)
     # Removing a container takes time on a real machine: a test can say how long.
     [ -z "${FAKE_RM_SECONDS:-}" ] || sleep "$FAKE_RM_SECONDS"
+    status=0
     for argument in "$@"; do
       case $argument in -*) continue ;; esac
-      rm -rf "$root/containers/$argument" "$root/containers/${argument#id-}"
+      name=${argument#id-}
+      case $name in
+        *-dind)
+          if [ "$(cat "$root/containers/${name%-dind}-run/network" 2>/dev/null)" = "container:$name" ]; then
+            status=1
+            continue
+          fi
+          ;;
+      esac
+      if [[ $name == *-dind && -d $root/containers/$name && -e $root/refuse-hook-cleanup ]]; then
+        status=1
+        continue
+      fi
+      rm -rf "$root/containers/$argument" "$root/containers/$name"
     done
+    exit "$status"
     ;;
   ps)
     for dir in "$root"/containers/*/; do
@@ -377,6 +435,9 @@ case $command in
     dir="$root/containers/$last"
     [ -d "$dir" ] || exit 1
     case " $* " in
+      *'{{.Id}} {{.State.Running}}'*)
+        [ ! -e "$dir/exit" ] && printf '%s true\n' "$(cat "$dir/id")"
+        ;;
       *FinishedAt*)
         # An ended container says when: a running one, or one whose end was never played, has no time to give.
         if [ -e "$dir/finished" ]; then cat "$dir/finished"; else echo "0001-01-01T00:00:00Z"; fi
@@ -410,6 +471,9 @@ case $command in
     if [ -f "$dir/store" ]; then
       store=$(cat "$dir/store")
       case ${4-} in
+        'ids=$(docker ps -aq); [ -z "$ids" ] || docker rm -fv $ids')
+          [ ! -e "$root/refuse-hook-cleanup" ] && rm -rf "$store/containers"
+          ;;
         *'docker volume prune -af'*) rm -f "$store/"{volumes,containers,networks}/.job-marker ;;
         *'docker system prune -af'*) rm -f "$store/images/.job-marker" "$store/buildkit/.job-marker" ;;
       esac
