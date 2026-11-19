@@ -1046,6 +1046,8 @@ impl Pool {
             fs::Permissions::from_mode(0o755),
         )
         .expect("0755");
+        std::os::unix::fs::symlink("docker", pool.dir.join("bin/nsenter"))
+            .expect("the fake nsenter");
         executable(
             &pool.dir.join("bin/systemctl"),
             &format!(
@@ -5134,6 +5136,34 @@ fn a_persistent_runner_clears_job_cache_residue_unless_keeping_is_enabled() {
         assert_eq!(pool.stop(), Some(0));
         let _ = fs::remove_dir_all(scratch);
     }
+}
+
+#[test]
+fn a_fresh_persistent_runner_clears_root_owned_work_and_shared_network_residue() {
+    let scratch = scratch_dir();
+    let github = Github::start(&scratch, &format!("/orgs/{ORG}"));
+    github.state().registration_token = Some(REGISTRATION_TOKEN.to_string());
+    let mut pool = registration_pool(1, |_| {});
+    pool.secret("GITHUB_REGISTRATION_TOKEN", REGISTRATION_TOKEN);
+    pool.start(&github);
+
+    let mut finished = 0;
+    let mut observed = Vec::new();
+    for residue in ["root work", "network residue"] {
+        for action in ["write", "read"] {
+            github.queue(&["arca"], &format!("{action} {residue}"), 0.1);
+            finished += 1;
+            wait_for(&pool, "the job completed its boundary", || {
+                pool.jobs().len() == finished
+            });
+        }
+        observed.push(pool.read("docker/pool1-s0.residue").trim().to_owned());
+    }
+    assert_eq!(observed, ["0", "0"], "root-owned work and network markers");
+    assert!(pool.jobs().iter().all(|job| job[5] == "Succeeded"));
+    assert_eq!(github.state().registered.len(), 1);
+    assert_eq!(pool.stop(), Some(0));
+    let _ = fs::remove_dir_all(scratch);
 }
 
 #[test]
