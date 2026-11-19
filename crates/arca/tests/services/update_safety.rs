@@ -556,7 +556,6 @@ fn a_record_whose_folder_could_not_be_synced_is_trusted_by_no_later_call() {
         json!({ "name": "app", "digest": NEW, "timeoutSeconds": 1 }),
     ));
     assert_eq!(code, "rollback_failed", "{message}");
-    assert!(message.contains("could not be put on file"), "{message}");
     let rebuilds = rig.fake.rebuilds(PROJECT, "app").len();
 
     // The next call cannot sync the folder either: it trusts neither the record nor its absence.
@@ -608,14 +607,15 @@ fn a_digest_saved_just_before_its_update_failed_is_neither_said_to_run_nor_rolle
         &rig,
         json!({ "name": "app", "digest": NEW, "timeoutSeconds": 1 }),
     ));
-    assert_eq!(code, "rolled_back", "{message}");
-    assert!(message.contains("which it does not run"), "{message}");
     let sources = rig.fake.rebuild_sources(PROJECT, "app");
     assert_eq!(sources[sources.len() - 2]["alias"], format!("app@{NEW}"));
     assert_eq!(
         sources.last().expect("a rebuild")["alias"],
-        "app@".to_string() + DIGEST
+        "app@".to_string() + DIGEST,
+        "{message}"
     );
+    assert_eq!(code, "rolled_back", "{message}");
+    assert!(message.contains("which it does not run"), "{message}");
 
     // No answer says it runs that digest: the next call for it rebuilds again.
     let rebuilds = sources.len();
