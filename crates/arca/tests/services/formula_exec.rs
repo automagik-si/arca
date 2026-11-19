@@ -614,3 +614,194 @@ fn the_longest_argument_a_formula_takes_still_runs_with_the_longest_version() {
     let command = DeclaredCommand::update(&formula, "system", &version).expect("a command");
     assert_eq!(command.argv().last().unwrap().len(), 567);
 }
+
+/// An output whose kept 64 KiB tail begins exactly at `tail`: `head` comes before the cut, and lines of words that are
+/// not a key's follow `tail`, few enough that every line of `tail` is among an update's last 60.
+fn cut_before(head: &str, tail: &str) -> Vec<u8> {
+    let mut kept = String::from(tail);
+    while kept.len() + 2001 < 64 * 1024 - 10 {
+        kept.push_str(&"done. ".repeat(333));
+        kept.push('\n');
+    }
+    kept.push_str(&"w.".repeat((64 * 1024 - kept.len() - 1) / 2));
+    while kept.len() < 64 * 1024 - 1 {
+        kept.push('.');
+    }
+    kept.push('\n');
+    assert_eq!(kept.len(), 64 * 1024);
+    format!("{}\n{head}{kept}", "z".repeat(5000)).into_bytes()
+}
+
+/// A key whose BEGIN line is on, or before, the line the 64 KiB cut falls in: its body is hidden whatever the first
+/// kept line holds and whether or not an END line follows. Masking runs over the whole kept tail before its partial
+/// first line is dropped, and a tail that begins inside a key's body has that body hidden.
+#[test]
+fn a_key_cut_by_the_kept_tail_shows_no_byte_of_its_body() {
+    let rig = service("system");
+    let (seam, target) = seam(&rig);
+    let word = ["PRI", "VATE"].concat();
+    let begin = format!("-----BEGIN RSA {word} KEY-----");
+    let end = format!("-----END RSA {word} KEY-----");
+    let body: Vec<String> = (0..4)
+        .map(|n| format!("{n}QkVHSU5ib2R5bGluZXRoYXRsb29rc2xpa2VhcmVhbGtleWJ1dGlzbm90MDEy{n}x"))
+        .collect();
+    let lines = body.join("\n");
+    let cuts = [
+        // The cut falls on the first byte of a standalone BEGIN line, and no END line follows.
+        (
+            "standalone BEGIN",
+            String::new(),
+            format!("{begin}\n{lines}\n"),
+        ),
+        // The cut falls before an inline BEGIN marker, on the line it shares with other words.
+        (
+            "inline BEGIN",
+            "Gene".to_string(),
+            format!("rated: {begin}\n{lines}\n"),
+        ),
+        // The cut falls inside the BEGIN marker itself.
+        (
+            "inside BEGIN",
+            "-----BEG".to_string(),
+            format!("IN RSA {word} KEY-----\n{lines}\n"),
+        ),
+        // The cut falls inside the body, and its END line follows.
+        (
+            "body, END later",
+            format!("{begin}\n0QkVHSU5i"),
+            format!("{}\n{end}\n", &lines[9..]),
+        ),
+        // The cut falls inside the body, and no END line follows.
+        (
+            "body, no END",
+            format!("{begin}\n0QkVHSU5i"),
+            format!("{}\n", &lines[9..]),
+        ),
+    ];
+    for (shape, head, tail) in cuts {
+        script(&rig, &update("2.0"), 1, &cut_before(&head, &tail), b"");
+        let answer = run(&seam, &target, &update("2.0")).expect("an answer");
+        assert_eq!(answer.output_cut, OutputCut::FirstLineDropped, "{shape}");
+        let shown = answer.lines.join("\n");
+        for line in &body {
+            for part in [&line[..20], &line[20..40], &line[line.len() - 20..]] {
+                assert!(
+                    !shown.contains(part),
+                    "{shape}: {part:?} is shown in {:?}",
+                    &shown[..shown.len().min(400)]
+                );
+            }
+        }
+        assert!(
+            answer.lines.last().unwrap().starts_with("w."),
+            "{shape}: the lines after the key are kept"
+        );
+    }
+    assert_eq!(rig.fake.recordings(), 0);
+}
+
+/// How a test arms one fault on the fake Incus.
+type Arm<'a> = &'a dyn Fn(&Rig);
+
+/// Once the request to start a declared command went out, any outcome that does not show the command ended marks the
+/// instance hung, as Incus not answering by the deadline does: the command may still run. One fault of each kind.
+#[test]
+fn a_declared_command_whose_end_is_not_shown_marks_the_instance_hung() {
+    let foreign = json!({
+        "id": "00000000-0000-4000-8000-0000000fffff", "class": "task", "status": "Success",
+        "status_code": 200, "metadata": { "return": 0 }
+    });
+    let faults: [(&str, Arm); 6] = [
+        ("a dropped wait connection", &|rig| {
+            rig.fake.drop_reads("/1.0/operations/", 1)
+        }),
+        ("a cut wait answer", &|rig| {
+            rig.fake.cut_reads("/1.0/operations/", 1)
+        }),
+        ("a 404 for the operation", &|rig| {
+            rig.fake.fail_reads("/1.0/operations/", 1, 404)
+        }),
+        ("a malformed operation", &|rig| {
+            rig.fake
+                .answer_reads("/1.0/operations/", 1, json!("not an operation"))
+        }),
+        ("a foreign operation", &|rig| {
+            rig.fake
+                .answer_reads("/1.0/operations/", 1, foreign.clone())
+        }),
+        ("a cut start answer", &|_| {}),
+    ];
+    for (fault, arm) in faults {
+        let rig = service("system");
+        let (seam, target) = seam(&rig);
+        let mut started = ExecScript::new(health("system").argv(), 0, "");
+        started.cut_answer = fault == "a cut start answer";
+        rig.fake.script_exec(started);
+        arm(&rig);
+        let error = run(&seam, &target, &health("system")).expect_err(fault);
+        assert!(
+            matches!(&error, ExecError::Failed(text) if text.contains("marked hung")),
+            "{fault}: {error:?}"
+        );
+        assert!(seam.hung(&target), "{fault}");
+        assert!(
+            matches!(
+                run(&seam, &target, &version("system")),
+                Err(ExecError::Refused("hung"))
+            ),
+            "{fault}: the next declared command is refused"
+        );
+        assert_eq!(execs(&rig).len(), 1, "{fault}: nothing more was sent");
+    }
+}
+
+/// An operation Incus reports failed is an answer: the command did not run, or ended. It marks nothing.
+#[test]
+fn a_declared_command_whose_operation_failed_does_not_mark_the_instance() {
+    let rig = service("system");
+    let (seam, target) = seam(&rig);
+    let mut failed = ExecScript::new(health("system").argv(), 0, "");
+    failed.op_failed = true;
+    rig.fake.script_exec(failed);
+    let error = run(&seam, &target, &health("system")).expect_err("the operation failed");
+    assert!(
+        matches!(&error, ExecError::Failed(text) if text == "service exec failed"),
+        "{error:?}"
+    );
+    assert!(!seam.hung(&target));
+    script(&rig, &health("system"), 0, b"", b"");
+    assert_eq!(run(&seam, &target, &health("system")).unwrap().exit, 0);
+    assert_eq!(execs(&rig).len(), 2);
+    assert_eq!(rig.fake.recordings(), 0);
+}
+
+/// A restore or a rebuild keeps the instance's uuid, and the instance runs again after it. Arca did not see it
+/// stopped, so the mark stays: only a stop Arca has seen clears it.
+#[test]
+fn a_restore_or_a_rebuild_alone_does_not_clear_the_mark() {
+    let rig = service("system");
+    let (seam, target) = seam(&rig);
+    script(&rig, &health("system"), 0, b"", b"");
+    rig.fake.drop_reads("/1.0/operations/", 1);
+    run(&seam, &target, &health("system")).expect_err("no answer");
+    assert!(seam.hung(&target));
+    let uuid = rig
+        .get(&format!("/1.0/instances/app?project={PROJECT}"))
+        .unwrap()["config"]["volatile.uuid"]
+        .clone();
+    // What a restore or a rebuild shows from outside: stopped, then running again, with the same uuid.
+    rig.fake.set_instance_status(PROJECT, "app", "Stopped");
+    rig.fake.set_instance_status(PROJECT, "app", "Running");
+    assert_eq!(
+        rig.get(&format!("/1.0/instances/app?project={PROJECT}"))
+            .unwrap()["config"]["volatile.uuid"],
+        uuid
+    );
+    assert!(!seam.clear_hung_after_stop(&target).unwrap());
+    assert!(seam.hung(&target));
+    assert!(matches!(
+        run(&seam, &target, &health("system")),
+        Err(ExecError::Refused("hung"))
+    ));
+    assert_eq!(execs(&rig).len(), 1);
+}

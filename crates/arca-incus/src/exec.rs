@@ -25,6 +25,24 @@ fn bad() -> IncusError {
     IncusError::Decode("invalid service exec answer".into())
 }
 
+/// The id of the task operation an exec's answer names.
+fn exec_operation(answer: &Value) -> Result<String, IncusError> {
+    // Incus's exec endpoint returns the task operation directly, rather than an async envelope.
+    let op = if answer.get("id").is_some() {
+        answer
+    } else {
+        answer.get("metadata").ok_or_else(bad)?
+    };
+    if op["class"] != "task" {
+        return Err(bad());
+    }
+    op["id"]
+        .as_str()
+        .filter(|id| operation_id(id))
+        .map(str::to_owned)
+        .ok_or_else(bad)
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct JournalLines(u16);
 impl JournalLines {
@@ -319,6 +337,16 @@ pub enum FormulaState {
     Running,
     /// The command ended with this exit code.
     Exited(i64),
+    /// Incus reports the operation failed (a status of 400 to 599 in its metadata): the command did not run, or ended.
+    Failed,
+}
+
+/// Why a formula's command gave no operation to wait on. Before its request went out, or when Incus answered it with an
+/// error, no command was started. Any other failure leaves it unknown whether the command runs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FormulaStart {
+    NotStarted(IncusError),
+    Unknown(IncusError),
 }
 
 /// `/usr/bin/timeout`'s exit codes for a command it ended at its limit: 124 when the command ended on the signal, 137
@@ -461,13 +489,32 @@ impl UnixIncusWriter {
     }
     /// Starts a formula's command on this entry's freshly checked instance, by the same checks and the same request as
     /// [`Self::start_service_exec`]. The caller audits its returned id before it waits ([`Self::formula_exec_state`]).
+    /// An error tells whether the command was started ([`FormulaStart`]): only a request that was never sent, or that
+    /// Incus answered with an error, is known not to have started one.
     pub fn start_formula_exec(
         &self,
         owned: &Owned,
         command: &FormulaCommand,
         timeout: Duration,
-    ) -> Result<String, IncusError> {
-        self.start_exec(owned, &command.body(), timeout)
+    ) -> Result<String, FormulaStart> {
+        let path = self.exec_path(owned).map_err(FormulaStart::NotStarted)?;
+        let framed = self
+            .send_checked(
+                "POST",
+                &format!("{path}/exec?project={SERVICE_PROJECT}"),
+                None,
+                Some(&command.body()),
+                timeout,
+            )
+            .map_err(|error| match error {
+                IncusError::Refused(_) => FormulaStart::NotStarted(error),
+                _ => FormulaStart::Unknown(error),
+            })?;
+        let answer = checked_envelope(&framed.into_raw()).map_err(|error| match error {
+            IncusError::Status { .. } => FormulaStart::NotStarted(error),
+            _ => FormulaStart::Unknown(error),
+        })?;
+        exec_operation(&answer).map_err(FormulaStart::Unknown)
     }
     fn start_exec(
         &self,
@@ -475,14 +522,7 @@ impl UnixIncusWriter {
         body: &Value,
         timeout: Duration,
     ) -> Result<String, IncusError> {
-        let path = target(owned)?;
-        if owned.entry() != self.entry() {
-            return Err(refused());
-        }
-        let fresh = self.read_owned(owned.target())?;
-        if fresh.uuid() != owned.uuid() || fresh.tombstone().is_some() {
-            return Err(refused());
-        }
+        let path = self.exec_path(owned)?;
         let framed = self.send_checked(
             "POST",
             &format!("{path}/exec?project={SERVICE_PROJECT}"),
@@ -491,20 +531,19 @@ impl UnixIncusWriter {
             timeout,
         )?;
         let answer = checked_envelope(&framed.into_raw()).map_err(exec_error)?;
-        // Incus's exec endpoint returns the task operation directly, rather than an async envelope.
-        let op = if answer.get("id").is_some() {
-            &answer
-        } else {
-            answer.get("metadata").ok_or_else(bad)?
-        };
-        if op["class"] != "task" {
-            return Err(bad());
+        exec_operation(&answer)
+    }
+    /// The instance's path for an exec, once this entry's owner mark and the uuid were read again just now.
+    fn exec_path(&self, owned: &Owned) -> Result<String, IncusError> {
+        let path = target(owned)?;
+        if owned.entry() != self.entry() {
+            return Err(refused());
         }
-        op["id"]
-            .as_str()
-            .filter(|id| operation_id(id))
-            .map(str::to_owned)
-            .ok_or_else(bad)
+        let fresh = self.read_owned(owned.target())?;
+        if fresh.uuid() != owned.uuid() || fresh.tombstone().is_some() {
+            return Err(refused());
+        }
+        Ok(path)
     }
     pub fn wait_service_exec(&self, id: &str) -> Result<i64, IncusError> {
         self.wait_on_in(id, Some(SERVICE_PROJECT))
@@ -516,7 +555,7 @@ impl UnixIncusWriter {
     /// One bounded wait on a formula's command: Incus is asked to answer within `wait` (whole seconds, at least one), and
     /// the request itself is cut five seconds later. A command that still runs is [`FormulaState::Running`]; the caller
     /// waits again while its own deadline allows. An operation that failed, such as a program that could not be
-    /// started, is a status error.
+    /// started, is [`FormulaState::Failed`]. Every error leaves it unknown whether the command still runs.
     pub fn formula_exec_state(&self, id: &str, wait: Duration) -> Result<FormulaState, IncusError> {
         if !operation_id(id) {
             return Err(refused());
@@ -544,10 +583,7 @@ impl UnixIncusWriter {
                 .filter(|n| (0..=255).contains(n))
                 .map(FormulaState::Exited)
                 .ok_or_else(bad),
-            Some(code @ 400..=599) => Err(IncusError::Status {
-                code: code as u16,
-                message: "the command could not be run".into(),
-            }),
+            Some(400..=599) => Ok(FormulaState::Failed),
             _ => Err(bad()),
         }
     }

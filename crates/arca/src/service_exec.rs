@@ -14,8 +14,8 @@ use crate::{
 use arca_incus::{
     IncusError, Owned, ProjectFamily, UnixIncusWriter,
     exec::{
-        ExecCommand, FormulaCommand, FormulaState, SERVICE_PROJECT, node_ok, past_limit,
-        valid_operation_id,
+        ExecCommand, FormulaCommand, FormulaStart, FormulaState, SERVICE_PROJECT, node_ok,
+        past_limit, valid_operation_id,
     },
     read::Tail,
 };
@@ -449,9 +449,14 @@ impl ServiceExec {
                         .saturating_duration_since(Instant::now())
                         .min(Duration::from_secs(10)),
                 )
-                .map_err(|e| self.error(target, e))?;
+                .map_err(|start| match start {
+                    FormulaStart::NotStarted(error) => self.error(target, error),
+                    FormulaStart::Unknown(error) => self.lost(target, error),
+                })?;
             op = Some(operation.clone());
-            self.append(&json!({"kind":"op","id":id,"op":operation,"instance":target.service.name,"project":SERVICE_PROJECT}))?;
+            // The command was started: a lost audit row must not leave it running in an unmarked instance.
+            self.append(&json!({"kind":"op","id":id,"op":operation,"instance":target.service.name,"project":SERVICE_PROJECT}))
+                .inspect_err(|_| self.mark_hung(target))?;
             let status = loop {
                 let left = deadline.saturating_duration_since(Instant::now());
                 // Each wait asks Incus to answer a little before the deadline, so its own request ends by then.
@@ -464,7 +469,10 @@ impl ServiceExec {
                 match writer.formula_exec_state(&operation, wait) {
                     Ok(FormulaState::Running) => continue,
                     Ok(FormulaState::Exited(code)) => break code,
-                    Err(error) => return Err(self.error(target, error)),
+                    Ok(FormulaState::Failed) => {
+                        return Err(ExecError::Failed("service exec failed".into()));
+                    }
+                    Err(error) => return Err(self.lost(target, error)),
                 }
             };
             exit = Some(status);
@@ -612,13 +620,25 @@ impl ServiceExec {
         }
         Ok((owned, state))
     }
+    /// A declared command whose request went out and that Incus has not shown ended: whatever the error, it may still
+    /// run, so its instance is marked hung (Rule 82). The closed list marks on its deadline only ([`Self::error`]).
+    fn lost(&self, target: &ExecTarget, error: IncusError) -> ExecError {
+        if error == IncusError::Timeout {
+            return self.error(target, error);
+        }
+        self.mark_hung(target);
+        ExecError::Failed("service exec unanswered; instance marked hung".into())
+    }
+    fn mark_hung(&self, target: &ExecTarget) {
+        if let Some(uuid) = &target.uuid
+            && let Ok(mut hung) = self.hung.lock()
+        {
+            hung.insert(target.service.name.clone(), uuid.clone());
+        }
+    }
     fn error(&self, target: &ExecTarget, error: IncusError) -> ExecError {
         if error == IncusError::Timeout {
-            if let Some(uuid) = &target.uuid
-                && let Ok(mut hung) = self.hung.lock()
-            {
-                hung.insert(target.service.name.clone(), uuid.clone());
-            }
+            self.mark_hung(target);
             return ExecError::Failed("service exec deadline passed; instance marked hung".into());
         }
         ExecError::Failed(
@@ -819,6 +839,7 @@ fn kept(
 ) -> FormulaRun {
     let (out, out_cut) = whole_lines(stdout);
     let (err, err_cut) = whole_lines(stderr);
+    let (out, err) = (out.as_bytes(), err.as_bytes());
     let output_cut = [out_cut, err_cut]
         .into_iter()
         .max_by_key(|cut| match cut {
@@ -854,15 +875,22 @@ fn kept(
     }
 }
 
-/// The part of a kept tail that is whole lines: all of it when the output was not cut, and otherwise what follows its
-/// first line break, since its first line began before the cut. A cut tail with no line break keeps nothing.
-fn whole_lines(tail: &Tail) -> (&[u8], OutputCut) {
+/// The part of a kept tail that is whole lines: all of it when the output was not cut. A cut tail's PEM blocks are
+/// hidden first over all of it, so a BEGIN line on its first line still hides the key after it; then what follows the
+/// first line break is kept, since the first line began before the cut, with a key's body it begins with hidden too
+/// (its BEGIN line was cut away). A cut tail with no line break left keeps nothing.
+fn whole_lines(tail: &Tail) -> (String, OutputCut) {
+    let text = String::from_utf8_lossy(&tail.bytes);
     if !tail.cut {
-        return (&tail.bytes, OutputCut::Whole);
+        return (text.into_owned(), OutputCut::Whole);
     }
-    match tail.bytes.iter().position(|b| matches!(b, b'\n' | b'\r')) {
-        Some(at) => (&tail.bytes[at + 1..], OutputCut::FirstLineDropped),
-        None => (&[], OutputCut::NothingKept),
+    let masked = crate::service::redact_blocks(&text);
+    match masked.find(['\n', '\r']) {
+        Some(at) => (
+            crate::service::redact_cut_start(&masked[at + 1..]),
+            OutputCut::FirstLineDropped,
+        ),
+        None => (String::new(), OutputCut::NothingKept),
     }
 }
 
