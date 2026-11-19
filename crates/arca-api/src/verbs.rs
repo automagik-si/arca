@@ -6382,7 +6382,7 @@ fn service_update_result() -> Value {
             },
             "service": { "type": "string" },
             "snapshot": {
-                "description": "The snapshot of the old version taken before the rebuild, or null when the service's project does not allow snapshots (no project Arca makes does). Absent when nothing was changed.",
+                "description": "Null after a digest update. Absent when nothing was changed.",
                 "type": ["string", "null"]
             },
             "updated": {

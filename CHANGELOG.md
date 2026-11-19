@@ -4,6 +4,9 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 
 ## Unreleased
 
+`service_update` checks for instance snapshots before changing the service. If any exist, it names them and leaves the
+service alone. The update takes no snapshot. Rollback rebuilds the root from the old image.
+
 ## 0.38.0 (2026-11-19)
 
 Arca can now take an Incus snapshot of a service's instance together with each custom volume it mounts, under one
@@ -11,9 +14,7 @@ name, without stopping or starting it; restore the parts it names on a stopped i
 is a path of the host is listed as not snapshotted. If one part fails, the parts already taken are removed and the
 answer names the failing part. The node's service project may now hold snapshots: its owner's entry gains a
 `snapshots` step that sets `restricted.snapshots` to `allow`, written with no card the first time such a snapshot
-needs it. No verb uses this yet, so nothing changes on a node by this release alone. Once a node's project holds
-snapshots, `service_update` takes its own pre-update snapshot there and restores it on a rollback, and each update
-keeps one snapshot until a later release removes old ones.
+needs it. No verb uses this yet, so nothing changes on a node by this release alone.
 
 A `system` container template's `appUpdate` may name several `components` of one instance, in the order they are
 updated, each with its own `update`, `health` and `version` under the same rules as the single form, and either form

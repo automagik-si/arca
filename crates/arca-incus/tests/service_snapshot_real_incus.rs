@@ -182,28 +182,26 @@ fn a_stopped_instance_is_snapshotted_exactly_and_both_disks_come_back() {
 
 #[test]
 #[ignore = "touches a real Incus; run by hand with ARCA_REAL_INCUS_PROOF=1"]
-fn a_rebuild_from_another_image_is_undone_by_the_snapshot_taken_before_it() {
+fn an_instance_snapshot_blocks_a_rebuild_from_another_image() {
     let Some(proof) = proof() else { return };
     let image = env("ARCA_PROOF_IMAGE").expect("ARCA_PROOF_IMAGE");
     let (alias, fingerprint) = image.split_once('@').expect("<alias>@<fingerprint>");
     proof.mark("before");
     proof.power(StateAction::Stop);
     let parts = proof.parts("arca-proof-rebuild");
-    proof
-        .changer
-        .rebuild_from_local(
-            &proof.seen(),
-            &json!({ "type": "image", "alias": alias, "fingerprint": fingerprint }),
-        )
-        .expect("rebuilt");
-    let rebuilt = proof.read_marks();
-    eprintln!("after the rebuild: {rebuilt:?}");
-    assert_eq!(rebuilt.0, "none", "a new root");
-    assert_eq!(rebuilt.1, "before", "the volume is kept by the rebuild");
-    proof.mark("after");
-    proof.restore("arca-proof-rebuild", &parts);
-    assert_eq!(proof.read_marks(), ("before".into(), "before".into()));
+    let result = proof.changer.rebuild_from_local(
+        &proof.seen(),
+        &json!({ "type": "image", "alias": alias, "fingerprint": fingerprint }),
+    );
     proof.remove("arca-proof-rebuild", &parts);
+    let error = result.expect_err("the rebuild is refused");
+    assert!(
+        error
+            .to_string()
+            .contains("Cannot remove an instance volume that has snapshots"),
+        "{error}"
+    );
+    assert_eq!(proof.read_marks(), ("before".into(), "before".into()));
 }
 
 #[test]

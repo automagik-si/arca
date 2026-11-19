@@ -1,11 +1,11 @@
 //! `service_update`: a running service made from an image by digest, or from a local image pinned by fingerprint,
-//! moves to another image in one call.
+//! moves to another image in one call. Before any write, an unreadable list of instance snapshots or any existing
+//! instance snapshot blocks the update.
 //!
 //! The steps, each journalled in [`SERVICE_UPDATES_FILE`] (an append-only file of JSON lines in the state directory,
-//! one `begin` line before anything is sent to Incus, one line per step and one `end` line; no line holds a secret):
+//! one `begin` line before the first Incus write, one line per step and one `end` line; no line holds a secret):
 //!
-//! 1. the instance is stopped, when it runs, and a snapshot of it is taken where the project allows one (an Arca
-//!    project never does, so on a node as Arca makes it there is none);
+//! 1. the instance is stopped, when it runs;
 //! 2. its root is rebuilt from the new digest, or, for a local image, from the project's own copy of the new
 //!    fingerprint. Incus keeps the config, the devices (the data volume among them), the uuid, the secrets and the
 //!    firewall rules; only the root is the new image's;
@@ -27,11 +27,8 @@
 //! node writes its config before the one start: one interruption for the image and the settings. A failure after that
 //! write puts the old record back too, before the old version is started.
 //!
-//! A failure at any step puts the old version back: the snapshot is restored (or, in a project that does not allow
-//! snapshots, the root is rebuilt from the old digest), the old version is started when it was running, and the answer
-//! is the error and the words "rolled back". Nothing is asked of the owner: the verb is a doctor's, and works in a
-//! tenant as it does outside one. The snapshot holds the root, the config and the devices of the instance; the data
-//! volume is the service's own and is not snapshotted, so what the new version wrote there stays.
+//! Rollback rebuilds the root from the old image and starts the old version when it was running. The answer names the
+//! error and says "rolled back" when that succeeds. Writes the new version made to the data volume stay there.
 use super::service_reconfigure::{self, Doing, Ready, Written};
 use super::*;
 use crate::service::ServiceConfig;
@@ -653,14 +650,6 @@ fn conflicts(args: &Value) -> Result<(), CallError> {
     Ok(())
 }
 
-/// How an update puts the old version back.
-enum Back {
-    /// The snapshot taken before the rebuild.
-    Snapshot(String),
-    /// A project that does not allow snapshots: the root is rebuilt from the old image.
-    OldImage,
-}
-
 impl ServiceHandler {
     /// The writer of the power state and of the root of this service's instance.
     pub(super) fn state_changer(&self, config: &ServiceConfig) -> Result<StateChanger, CallError> {
@@ -961,6 +950,18 @@ impl ServiceHandler {
             }
             None => (port, reach),
         };
+        let snapshots = changer.instance_snapshots(&seen).map_err(|error| {
+            said(&format!(
+                "the update was not done because Arca could not read the instance's snapshots ({})",
+                incus_words(&error)
+            ))
+        })?;
+        if !snapshots.is_empty() {
+            return Err(said(&format!(
+                "the update was not done because the instance holds these snapshots: {}. Removing them is a separate plan for the owner's passkey card, which Arca does not offer yet",
+                snapshots.join(", ")
+            )));
+        }
         let journal = Journal {
             path: self.cfg.state_dir.join(SERVICE_UPDATES_FILE),
             id: format!("{}-{}", entry.id.0, (self.clock)()),
@@ -1298,9 +1299,9 @@ impl Run<'_> {
     fn go(&self, seen: InstanceState) -> Result<Value, CallError> {
         let name = &self.config.name;
         let mut instance = seen;
-        let mut back: Option<Back> = None;
-        let failure = match self.forward(&mut instance, &mut back) {
-            Ok(snapshot) => {
+        let mut rebuild_attempted = false;
+        let failure = match self.forward(&mut instance, &mut rebuild_attempted) {
+            Ok(()) => {
                 let Some(template) = self.template else {
                     self.journal
                         .step("end", true, json!({ "digest": self.digest }));
@@ -1308,7 +1309,7 @@ impl Run<'_> {
                         "updated": true,
                         "service": name,
                         "digest": self.digest,
-                        "snapshot": snapshot,
+                        "snapshot": null,
                         "message": format!(
                             "service {name} runs {} and its port {} answered",
                             self.digest, self.port,
@@ -1326,7 +1327,7 @@ impl Run<'_> {
                     "updated": true,
                     "service": name,
                     "digest": self.digest,
-                    "snapshot": snapshot,
+                    "snapshot": null,
                     "changes": template.changes,
                     "readBack": { "matches": differs.is_empty(), "differs": differs },
                     "message": format!(
@@ -1367,7 +1368,7 @@ impl Run<'_> {
                 ),
             });
         }
-        let Some(back) = back else {
+        if !rebuild_attempted {
             // Nothing was changed but the power state: the old version is started again when it ran.
             let restarted = self.start_again(&mut instance);
             self.journal.step(
@@ -1385,8 +1386,8 @@ impl Run<'_> {
                     ", but the service could not be started again: instance_start starts it"
                 },
             )));
-        };
-        match self.roll_back(&mut instance, &back, failure.step) {
+        }
+        match self.roll_back(&mut instance, failure.step) {
             Ok(back) => {
                 let mut end = json!({ "rolledBack": true, "rootKept": back.root_kept, "oldAnswers": back.answers });
                 if let Some(restored) = back.record {
@@ -1473,8 +1474,8 @@ impl Run<'_> {
         }
     }
 
-    /// A service that keeps `/run` in memory has just been given a root (an image's, or its snapshot's), which may keep
-    /// files under `/run`: they are removed while the instance is stopped, so its start mounts a memory `/run`. A
+    /// A rebuilt root may hold files under `/run`. For a service that keeps `/run` in memory, they are removed while
+    /// the instance is stopped, so its start mounts a memory `/run`. A
     /// removal Incus does not take is journalled and the update goes on, with `/run` on the disk as before.
     /// `memory` is whether the record the instance starts with says so: the template's, when this update writes it, so
     /// a service whose template now keeps `/run` in memory has it from the one start, as a reconfigure gives it.
@@ -1516,41 +1517,15 @@ impl Run<'_> {
             .map_err(|error| Failure::of("stop", &error))
     }
 
-    /// Steps 1 to 5. `back` is set as soon as something that must be undone is about to be done.
+    /// Steps 1 to 5. A failed rebuild can still require putting the old root back.
     fn forward(
         &self,
         instance: &mut InstanceState,
-        back: &mut Option<Back>,
-    ) -> Result<Option<String>, Failure> {
+        rebuild_attempted: &mut bool,
+    ) -> Result<(), Failure> {
         self.stopped(instance)?;
         self.journal.step("stop", true, json!({}));
-        let snapshot = format!("pre-update-{}", (self.journal.clock)());
-        let held = match self.changer.snapshot_instance(instance, &snapshot) {
-            Ok(()) => {
-                self.journal
-                    .step("snapshot", true, json!({ "snapshot": snapshot }));
-                Some(snapshot)
-            }
-            // A project that forbids snapshots (every project Arca makes does, and Incus answers 500 or 403): the old version is put back by a rebuild from its
-            // own digest instead.
-            Err(IncusError::Status { code, message })
-                if code == 403 || message.contains("snapshot creation") =>
-            {
-                self.journal.step(
-                    "snapshot",
-                    false,
-                    json!({ "skipped": "the project does not allow snapshots", "incus": message }),
-                );
-                None
-            }
-            Err(error) => {
-                return Err(Failure::of("snapshot", &error));
-            }
-        };
-        *back = Some(match &held {
-            Some(name) => Back::Snapshot(name.clone()),
-            None => Back::OldImage,
-        });
+        *rebuild_attempted = true;
         self.rebuild_from(instance, self.new_source)
             .map_err(|error| Failure::of("rebuild", &error))?;
         self.journal
@@ -1566,7 +1541,7 @@ impl Run<'_> {
             .step("health", true, json!({ "port": self.port }));
         self.record()?;
         self.journal.step("record", true, json!({}));
-        Ok(held)
+        Ok(())
     }
 
     /// The service answers within the timeout, as its reach lets the node tell.
@@ -1687,49 +1662,35 @@ impl Run<'_> {
     fn roll_back(
         &self,
         instance: &mut InstanceState,
-        back: &Back,
         after: &str,
     ) -> Result<Rolled, (Failure, Option<bool>)> {
         // The template's settings go back first, whatever happens to the root after: the node writes the old config
         // while the instance is still stopped (or running, which takes it at its next start).
         let record = self.put_template_back();
-        self.root_back(instance, back, after, record)
+        self.root_back(instance, after, record)
             .map_err(|failure| (failure, record))
     }
 
     fn root_back(
         &self,
         instance: &mut InstanceState,
-        back: &Back,
         after: &str,
         record: Option<bool>,
     ) -> Result<Rolled, Failure> {
         self.stopped(instance)?;
         let mut root_kept = false;
-        match back {
-            Back::Snapshot(snapshot) => {
-                self.handler
-                    .with_labels_preserved(self.entry, self.config, snapshot, || {
-                        self.changer.restore_snapshot(instance, snapshot)
-                    })
-                    .map_err(|error| Failure::of("restore", &error))?;
-                self.journal
-                    .step("restore", true, json!({ "snapshot": snapshot }));
+        match self.rebuild_from(instance, &self.config.source) {
+            Ok(()) => {
+                self.journal.step("rebuild back", true, json!({}));
+                self.edge_root();
                 self.run_emptied(instance, self.config.run_tmpfs);
             }
-            Back::OldImage => match self.rebuild_from(instance, &self.config.source) {
-                Ok(()) => {
-                    self.journal.step("rebuild back", true, json!({}));
-                    self.edge_root();
-                    self.run_emptied(instance, self.config.run_tmpfs);
-                }
-                Err(error) if after == "rebuild" && !matches!(error, IncusError::Timeout) => {
-                    root_kept = true;
-                    self.journal
-                        .step("rebuild back", false, json!({ "why": incus_words(&error) }));
-                }
-                Err(error) => return Err(Failure::of("rebuild back", &error)),
-            },
+            Err(error) if after == "rebuild" && !matches!(error, IncusError::Timeout) => {
+                root_kept = true;
+                self.journal
+                    .step("rebuild back", false, json!({ "why": incus_words(&error) }));
+            }
+            Err(error) => return Err(Failure::of("rebuild back", &error)),
         }
         *instance = self
             .changer

@@ -888,11 +888,8 @@ Label text is caller data, so both reads are marked as carrying untrusted text.
 Label writes check ownership and If-Match, read the instance back, and are not journalled. Result `code: unconfirmed`
 means the PATCH answer was uncertain: the returned map is what was read, and the write may still land later; read
 status again before deciding what to do. If read-back is unavailable, `labels_unconfirmed` reports that uncertainty.
-Adopted and imported services show existing labels but take no label write. Snapshot rollback keeps labels best effort;
-a label read or repair failure is logged without values and never prevents an otherwise successful rollback.
-Rollback takes no node write gate: a label write that lands while the restore itself is running can be lost.
-Put-back only replaces a stored value still exactly equal to the snapshot's; a different value is left alone,
-including after an If-Match conflict is re-read.
+Adopted and imported services show existing labels but take no label write. `service_update` rebuilds the root and
+keeps the instance's labels, including when it rebuilds from the old image on rollback.
 
 **Templates an earlier release installed.** A release may change a shipped template: up to 0.12.0, for one, the
 shipped `postgres-autopg` template declared `POSTGRES_PASSWORD` and did not make it, so a create came up stopped
@@ -1116,7 +1113,7 @@ template port for the health check, and the service's data on a declared volume 
 replaces the root, so whatever the service keeps there is gone, and a service whose template declares a volume it does
 not have is refused. A service that keeps data on its root, whose image is not pinned, or whose template declares no
 port, is not updatable in place: copy the data out, or create a new service. Keep the old image in the store until the
-update has succeeded, since a rollback in a project without snapshots rebuilds the old root from it. A virtual machine
+update has succeeded, since rollback rebuilds the old root from it. A virtual machine
 has no update path: the way is a `service_remove` and a `service_create`, and the remove deletes the service's data,
 which Arca cannot put back into the new service:
 
@@ -1974,16 +1971,13 @@ pinned by fingerprint (a template's `local:<alias>` beside a `digest`, see "A lo
 digest, or fingerprint, in one call. It is a destructive verb (it takes the optional `confirm`), needs a `doctor`
 token and asks the owner for nothing, except for `eraseData` (see below); it works inside a tenant as outside one.
 There is no update path for `automagik-workspace` yet: it is a virtual machine, whose Docker pulls its own server
-image, and the verb refuses it. In order, each step a line in `service-updates.jsonl` in the
+image, and the verb refuses it. Before changing anything, the update reads the instance's snapshots. If it finds any,
+it names each one and leaves the service alone. Removing them requires a separate plan on the owner's passkey card.
+That plan is not available yet. If Arca cannot read the list, the update does not proceed. The update takes no snapshot
+and returns `snapshot: null` on success. Each step below has a line in `service-updates.jsonl` in the
 state directory (an append-only file of JSON lines: a `begin`, one line per step, an `end`; never a secret):
 
-1. the instance is stopped, if it runs, and a snapshot of it, `pre-update-<time>`, is taken where the project allows
-   one. Every project Arca makes is restricted, and Incus answers that it does not allow snapshot creation, unless
-   the project sets `restricted.snapshots` to `allow`. The node's service project gets that from Arca, with no card,
-   only the first time a snapshot of a service's instance with its volumes needs it, which no verb asks for yet. So
-   on a node that has not been given it there is no snapshot, and the answer's `snapshot` is `null`; on one that
-   has, the update takes its snapshot there and a rollback restores it, and nothing yet removes such a snapshot: each
-   update keeps one, until you delete it;
+1. the instance is stopped if it runs;
 2. its root is rebuilt from `<repository>@<digest>`, or, for a local pinned image, from the project's own copy of the
    image whose fingerprint is `digest`; Incus may take up to 10 minutes to fetch an OCI image. Incus keeps
    what is not the root: the config, the secrets, the firewall rules and the data volume (a template's `data`
@@ -1999,17 +1993,17 @@ state directory (an append-only file of JSON lines: a `begin`, one line per step
    is tried at its address. Any other service must only stay running for 10 seconds;
 5. the new digest is written into the service's record, so a restart keeps it and `service_status` names it.
 
-A failure at any step puts the old version back: the snapshot is restored, or, with none, the root is rebuilt from
-the old digest; the old version is started if it was running before, given 30 seconds to answer, and the call is
-refused with code `rolled_back` and the failing step's words (and a note when the old version does not answer yet).
+Rollback rebuilds the root from the old image. If the old version was running before, Arca starts it and gives it
+30 seconds to answer. A successful rollback returns `rolled_back` with the failing step's words and a note if the
+old version does not answer yet.
 When Incus could not fetch the new image, the old root was never taken away: if it cannot fetch the old one either,
 the old version is started as it is, and the refusal says so. If Incus does not finish a rebuild in time, nothing is
 rolled back, so as not to rebuild twice at once: the refusal is `update_unsettled`, and the same update may be asked
 for again once Incus is idle. If the old version cannot be put back, the refusal is `rollback_failed`, says so, and
 leaves the service stopped. A failure before anything is changed (the digest is malformed, the service is not made
 from an image by digest or a local image pinned by fingerprint, the image a local update names is not in the service
-project's image store, its instance is not the one Arca created, it has never been started, the snapshot failed for
-a reason other than the project not allowing one) says "Nothing was changed". A call for the digest the service
+project's image store, its instance is not the one Arca created, it has never been started, it holds snapshots or Arca
+could not read the snapshot list) says "Nothing was changed". A call for the digest the service
 already runs changes nothing and answers `updated: false`. A service being updated refuses a second update until
 the first ends. The call is synchronous and can take several minutes: the journal keeps what it did.
 
@@ -2021,10 +2015,9 @@ no image there has that fingerprint, saying how to put it there (`incus image co
 the image is put there can be approved, and its run is then refused before anything is changed. The record's alias
 becomes the installed template's alias when that template pins the same fingerprint, and stays what it was otherwise;
 the fingerprint decides which image Incus uses. **Keep the old image in the store until the update has succeeded**: a
-rollback in a project that allows no snapshot rebuilds the old root from the old fingerprint. If that image is gone, a
-rollback after a failed start or health check answers `rollback_failed`; after a failed new rebuild the old root was
-never taken away, so the answer is `rolled_back` with the old root kept. A project that allows snapshots restores the
-snapshot instead, and the record still names the old image either way. The update rebuilds from the project's own copy,
+rollback rebuilds the old root from the old fingerprint. If that image is gone, a rollback after a failed start or
+health check answers `rollback_failed`. After a failed new fetch, the old root stays in place and the answer is
+`rolled_back`. The update rebuilds from the project's own copy,
 never from an alias alone; a rebuild from an image the store no longer holds fails before it takes the old root away.
 
 #### Moving Omni to a new build, or creating one at a chosen build

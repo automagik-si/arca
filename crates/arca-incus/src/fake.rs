@@ -2096,6 +2096,13 @@ fn dispatch(shared: &Shared, request: &Request, route: Route) -> (u16, String, V
         ("PUT", Route::InstanceState(address)) => change_state(shared, store, request, &address),
         ("POST", Route::InstanceRebuild(address)) => rebuild(shared, store, request, &address),
         ("GET", Route::InstanceSnapshots(address) | Route::InstanceBackups(address)) => {
+            let recursion = request
+                .target
+                .split_once('?')
+                .and_then(|(_, query)| query_param(query, "recursion"))
+                .and_then(|level| level.parse::<u8>().ok())
+                .unwrap_or_default();
+            let names_only = address.kind == "snapshot" && recursion == 0;
             sync(Value::Array(
                 store
                     .objects
@@ -2105,7 +2112,18 @@ fn dispatch(shared: &Shared, request: &Request, route: Route) -> (u16, String, V
                             && object.project == address.project
                             && object.parent == address.parent
                     })
-                    .map(|object| object.body.clone())
+                    .map(|object| {
+                        if !names_only {
+                            return object.body.clone();
+                        }
+                        let path =
+                            format!("/1.0/instances/{}/snapshots/{}", object.parent, object.name);
+                        if object.project == DEFAULT_PROJECT {
+                            json!(path)
+                        } else {
+                            json!(format!("{path}?project={}", object.project))
+                        }
+                    })
                     .collect(),
             ))
         }
@@ -4091,8 +4109,8 @@ fn instance_state(store: &Store, address: &Address) -> Answer {
 }
 
 /// Rebuilds a stopped instance's root from an image, as an operation, and records which image the request named: the
-/// store's copy by fingerprint (`store`) or a registry's by alias (`registry`). A running instance is refused, and
-/// so is what a test set with [`FakeIncus::lose_image`] or [`FakeIncus::refuse_rebuild`]. The fake keeps no root; a
+/// store's copy by fingerprint (`store`) or a registry's by alias (`registry`). A running instance or an instance
+/// with snapshots is refused, as is what a test set with [`FakeIncus::lose_image`] or [`FakeIncus::refuse_rebuild`]. A
 /// rebuild from a registry leaves the image's record in the store, as a fetch does.
 fn rebuild(shared: &Shared, store: &mut Store, request: &Request, address: &Address) -> Answer {
     let bad = |message: &str| (400, String::new(), error_envelope(400, message));
@@ -4104,6 +4122,22 @@ fn rebuild(shared: &Shared, store: &mut Store, request: &Request, address: &Addr
     };
     if text_of(&store.objects[index].body, "status") != "Stopped" {
         return bad("Instance must be stopped to be rebuilt");
+    }
+    if store.objects.iter().any(|object| {
+        object.kind == "snapshot"
+            && object.project == address.project
+            && object.parent == address.name
+    }) {
+        return answered(
+            shared,
+            store,
+            "instance",
+            "POST",
+            Err((
+                400,
+                "Cannot remove an instance volume that has snapshots".to_string(),
+            )),
+        );
     }
     let key = (address.project.clone(), address.name.clone());
     let local = sent
