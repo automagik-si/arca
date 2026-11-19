@@ -59,7 +59,7 @@ parse_run() {
         case $2 in ACTIONS_RUNNER_HOOK_JOB_STARTED=*) job_hook=${2#*=} ;; esac
         shift 2
         ;;
-      --label) shift 2 ;;
+      --label | --cpuset-cpus | --mount) shift 2 ;;
       -d | --privileged) shift ;;
       -*) shift ;;
       *)

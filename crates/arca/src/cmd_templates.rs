@@ -203,6 +203,15 @@ pub const EARLIER: &[(&str, &str)] = &[
         "github-runner-pool.sh",
         "640b97d0bb914daf9ef2c8ea58276de6bd6bd71035d1f63a7057ba8843e1d7b0",
     ),
+    // 0.30.0 to 0.37.0: before dedicated CPUs, LXCFS mounts and the memory ceiling setting.
+    (
+        "github-runner-pool.json",
+        "47cd6ead1a7fcdd907d188a932e07f4fbf44d79656798695d9365c0c17fd0684",
+    ),
+    (
+        "github-runner-pool.sh",
+        "7cc2cde111624ad8483546fc43a14b3b1f278a7d38e59a84d9bcd4a1b1cb902d",
+    ),
     // 0.13.0: its controller took the stop signal in the process that ran the pool, where bash 5.2 can lose it.
     (
         "gitlab-runner-pool.sh",

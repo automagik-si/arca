@@ -29,6 +29,10 @@ The approval page now shows pending owner approval requests from linked kernels,
 relays passkey approvals and declines. The linked kernel decides the request, and only the requesting token can read
 the approval string there. See OPERATING.md for the relay token's tool list.
 
+GitHub Actions runner pool slots have dedicated CPUs and report their class's CPU count and memory limit to jobs
+that run directly on the runner. Set `memory` to `ceiling` to admit slots without reserving each one's full memory
+up front. Each slot keeps its own limit, and the pool's running slots share the memory left after `reserveMemory`.
+
 ## 0.37.0 (2026-11-18)
 
 A container template may carry `appUpdate`, a formula for updating the app inside its service: a `health` command and

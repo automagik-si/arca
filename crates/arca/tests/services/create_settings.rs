@@ -367,8 +367,8 @@ fn a_template_lists_only_keys_of_its_own_settings_and_only_a_virtual_machine_lis
             "only a virtual-machine template has a firstBoot, settings or createSettings"
         )
     );
-    // The shipped runner pool lets a create set its scope, size, runner packages, registration mode and cache
-    // policy. Image pins, API address and the switch for the default runner group are template settings.
+    // The shipped runner pool lets a create set its scope, slot sizes, memory policy, runner packages,
+    // registration mode and cache policy.
     let shipped = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../templates");
     let pool =
         service::load_template(&shipped, "github-runner-pool").expect("the shipped template");
@@ -379,11 +379,22 @@ fn a_template_lists_only_keys_of_its_own_settings_and_only_a_virtual_machine_lis
             "runnerGroupId",
             "classes",
             "maxSlots",
+            "memory",
             "aptPackages",
             "registration",
             "runnerGroup",
             "keepBetweenJobs"
         ]
+    );
+    assert_eq!(
+        pool.settings.as_ref().expect("pool settings")["memory"],
+        "reserved"
+    );
+    let ceiling = service::create_settings(&pool, Some(&json!({"memory": "ceiling"})))
+        .expect("a create can choose the ceiling policy");
+    assert_eq!(
+        ceiling.merged.expect("merged settings")["memory"],
+        "ceiling"
     );
 }
 

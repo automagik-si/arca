@@ -47,6 +47,9 @@ set -u
 : "${POOL_RUN:=/run/arca-runner-pool}"
 : "${POOL_CGROUP:=/sys/fs/cgroup}"
 : "${POOL_MEMINFO:=/proc/meminfo}"
+: "${POOL_CPU_STATUS:=/proc/self/status}"
+: "${POOL_LXCFS:=/var/lib/lxcfs}"
+: "${POOL_MOUNTINFO:=/proc/self/mountinfo}"
 : "${POOL_UNITS:=/run/systemd/system}"
 : "${POOL_CONSOLE:=/dev/console}"
 : "${POOL_TICK:=5}"            # seconds between two passes of the controller
@@ -68,7 +71,7 @@ INSTALLED=/usr/local/sbin/arca-runner-pool
 # Every program this script starts that bash does not have built in. The first boot refuses to go on while one of
 # them is missing, and names it. crates/arca/tests/runner_pool.rs runs the controller with nothing else on its PATH,
 # so a program used below and not listed here fails that test.
-POOL_PROGRAMS='docker jq curl openssl flock systemctl apt-get hostname awk sed grep find cat chmod chown cut date du
+POOL_PROGRAMS='docker jq curl openssl flock systemctl apt-get lxcfs hostname awk sed grep find cat chmod chown cut date du
 fold head id install mkdir mount mv od rm sha256sum sleep stat tail tee touch tr umount'
 
 # The Debian packages the first boot installs. Recommended packages are not installed, so every package that is needed
@@ -76,7 +79,7 @@ fold head id install mkdir mount mv od rm sha256sum sleep stat tail tee touch tr
 # which docker.io only recommends. mount and umount, which layer the runner's files, are the package mount, not
 # util-linux. The ones the image already carries are named too, so the list says what the script
 # stands on.
-POOL_PACKAGES='docker.io docker-cli curl jq openssl ca-certificates util-linux mount coreutils hostname'
+POOL_PACKAGES='docker.io docker-cli curl jq openssl ca-certificates util-linux mount coreutils hostname lxcfs'
 # The Ubuntu packages added to the runner image when the settings name none (aptPackages): what GitHub's own
 # ubuntu-latest has and the pinned runner image lacks. libatomic1 is what Node.js-based tools such as pnpm load;
 # build-essential is make, gcc and g++; zstd is what actions/cache compresses with when it is there (without it the
@@ -158,8 +161,8 @@ install_pool() {
   cat >/etc/systemd/system/arca-runner-pool.service <<UNIT
 [Unit]
 Description=Arca GitHub Actions runner pool
-After=docker.service network-online.target
-Wants=network-online.target
+After=docker.service lxcfs.service network-online.target
+Wants=lxcfs.service network-online.target
 Requires=docker.service
 
 [Service]
@@ -218,6 +221,7 @@ SLOT_LABELS=()
 SLOT_LABELS_JSON=()
 SLOT_REG_LABELS=()
 SLOT_CPU=()
+SLOT_CPUSET=()
 SLOT_MEM=()
 CLASS_NAMES=()
 # The first slot of each class: every slot of a class has the same size.
@@ -352,6 +356,11 @@ load_settings() {
     say "settings: reserveMemory, dockerCache and dependencyCache are sizes such as 4GiB"
     return 1
   fi
+  MEMORY_MODE=$(jq -r 'if has("memory") then .memory else "reserved" end' "$POOL_SETTINGS")
+  case $MEMORY_MODE in
+    reserved | ceiling) ;;
+    *) say "settings: memory is reserved (the default) or ceiling"; return 1 ;;
+  esac
   if [ -z "$RUNNER_IMAGE" ] || [ -z "$DOCKER_IMAGE" ]; then
     say "settings: runnerImage and dockerImage are required"
     return 1
@@ -423,7 +432,7 @@ load_settings() {
   DOCKER_BUDGET=$((docker_cache / SLOTS))
   DEPENDENCY_BUDGET=$((dependency_cache / SLOTS))
   POOL_NAME=${POOL_NAME:-$(hostname 2>/dev/null)}
-  POOL_NAME=$(printf '%s' "$POOL_NAME" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9-' '-' | cut -c1-20)
+  POOL_NAME=$(printf '%s' "$POOL_NAME" | LC_ALL=C tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-' | cut -c1-20)
   : "${POOL_NAME:=pool}"
 }
 
@@ -890,6 +899,7 @@ persistent_look() {
 # the runner image prints too); config.sh shows the token as *** in them, and the words hold none.
 slot_register() {
   local slot=$1 reg new copy args code out words='' line
+  shift
   REGISTER_ERROR=''
   reg=$(slot_registration "$slot")
   new="$reg.new"
@@ -927,6 +937,7 @@ slot_register() {
   docker rm -fv "$POOL_NAME-s$slot-reg" >/dev/null 2>&1
   # shellcheck disable=SC2016
   docker run --rm --name "$POOL_NAME-s$slot-reg" --label "arca.pool=$POOL_NAME" \
+    "$@" \
     -v "$copy:/run/arca/token:ro" -v "$new:/run/arca/registration" \
     "$RUNNER_RUN_IMAGE" /bin/bash -c 'ACTIONS_RUNNER_INPUT_TOKEN=$(cat /run/arca/token) && export ACTIONS_RUNNER_INPUT_TOKEN && cd /home/runner && ./config.sh --unattended --replace "$@" && cp .runner .credentials .credentials_rsaparams /run/arca/registration/' \
     config.sh "${args[@]}" >"$out" 2>&1
@@ -946,9 +957,31 @@ slot_register() {
   return 1
 }
 
+# The slot must see its own limits before it registers. Check the mount as well as the files: an unmounted
+# directory can still have files in it. Docker's --mount fails if a source disappears before the container starts.
+slot_limits() {
+  local slot=$1 slice=$2 file
+  if ! awk -v path="$POOL_LXCFS" '$5 == path {
+      for (i = 7; i < NF; i++) if ($i == "-" && $(i + 1) == "fuse.lxcfs") mounted = 1
+    } END { exit !mounted }' "$POOL_MOUNTINFO"; then
+    slot_failed "$slot" "LXCFS is not mounted at $POOL_LXCFS. Check lxcfs.service inside the pool machine"
+    return 1
+  fi
+  limits=(--cgroup-parent "$slice" --cpuset-cpus "${SLOT_CPUSET[$slot]}")
+  for file in meminfo cpuinfo stat loadavg swaps uptime; do
+    if [ ! -f "$POOL_LXCFS/proc/$file" ]; then
+      case $file in swaps | uptime) continue ;; esac
+      slot_failed "$slot" "LXCFS is missing $POOL_LXCFS/proc/$file. Check lxcfs.service inside the pool machine"
+      return 1
+    fi
+    limits+=(--mount "type=bind,source=$POOL_LXCFS/proc/$file,target=/proc/$file,readonly")
+  done
+}
+
 # The first part of a slot's life: register a fresh runner and start it, with its own Docker daemon. It sets the
 # variables of the slot_cycle that calls it, and returns 1 when the slot ends here.
 slot_begin() {
+  local limits=()
   set_state "$slot" registering
 
   # A slot begun just as the controller was told to stop registers no runner.
@@ -958,6 +991,7 @@ slot_begin() {
     slot_remove_containers "$slot" "$runner" "$daemon" && slot_clear_caches "$slot" "$dir" || return 1
     ! stopping || return 1
   fi
+  slot_limits "$slot" "$slice" || return 1
   if [ -n "$REG" ]; then
     # Registration-token mode: the slot's one runner, registered once and kept. Its name carries the pool's own id, as
     # a just-in-time runner's does: config.sh --replace takes over a runner of the same name, and it must never take
@@ -965,7 +999,7 @@ slot_begin() {
     name="$POOL_NAME-$POOL_ID-$slot"
     runner_id=''
     if ! registered "$slot"; then
-      if ! slot_register "$slot"; then
+      if ! slot_register "$slot" "${limits[@]}"; then
         slot_failed "$slot" "$REGISTER_ERROR"
         return 1
       fi
@@ -1018,7 +1052,7 @@ slot_begin() {
   fi
   # The slot's own Docker daemon. It sees the runner's bundled tools at
   # the runner's own path, because a job that runs in a container has them mounted from there by this daemon.
-  if ! docker run -d --name "$daemon" --label "arca.pool=$POOL_NAME" --privileged --cgroup-parent "$slice" \
+  if ! docker run -d --name "$daemon" --label "arca.pool=$POOL_NAME" --privileged "${limits[@]}" \
     -v "$dir/sock:/var/run" "${home[@]}" -v "$dir/work:/home/runner/_work" \
     -v "$dir/toolcache:/opt/hostedtoolcache" -v "$dir/docker:/var/lib/docker" \
     "$DOCKER_IMAGE" dockerd --host=unix:///var/run/docker.sock --group="$DOCKER_GID" >/dev/null 2>&1; then
@@ -1053,7 +1087,7 @@ slot_begin() {
     # the runner's home, where run.sh reads it; run.sh then takes job after job until the container is stopped.
     # shellcheck disable=SC2016
     if ! docker run -d --name "$runner" --label "arca.pool=$POOL_NAME" \
-      --cgroup-parent "$slice" --network "container:$daemon" \
+      "${limits[@]}" --network "container:$daemon" \
       -e DOCKER_HOST=unix:///var/run/docker.sock \
       "${hook_args[@]}" \
       -e RUNNER_TOOL_CACHE=/opt/hostedtoolcache -e POOL_CACHE_DIR=/var/cache/pool \
@@ -1077,7 +1111,7 @@ slot_begin() {
   jit=''
   # shellcheck disable=SC2016
   if ! docker run -d --name "$runner" --label "arca.pool=$POOL_NAME" \
-    --cgroup-parent "$slice" --network "container:$daemon" \
+    "${limits[@]}" --network "container:$daemon" \
     -e DOCKER_HOST=unix:///var/run/docker.sock \
     -e RUNNER_TOOL_CACHE=/opt/hostedtoolcache -e POOL_CACHE_DIR=/var/cache/pool \
     -v "$POOL_RUN/jit/$slot:/run/arca/jitconfig:ro" \
@@ -1394,12 +1428,52 @@ slot_abandon() {
 
 meminfo_bytes() { awk -v key="$1:" '$1 == key { printf "%d", $2 * 1024 }' "$POOL_MEMINFO"; }
 
-# Each slot's slice: memory is capped at the slot's size and never swapped, so a slot cannot take another's, and CPU is
-# a ceiling that slots share.
+# Set aside distinct CPUs for each slot, fitting the first slot of each class before the rest. The kernel's list
+# can contain gaps. Keep a slot queued if its whole CPU count does not fit, just as with the memory budget.
+layout_slot_cpus() {
+  local cpus=() slot offset cpuset next=0 wanted=0
+  mapfile -t cpus < <(awk '$1 == "Cpus_allowed_list:" {
+    n = split($2, ranges, ",")
+    for (i = 1; i <= n; i++) {
+      len = split(ranges[i], ends, "-")
+      last = (len == 2 ? ends[2] : ends[1]) + 0
+      for (cpu = ends[1] + 0; cpu <= last; cpu++) print cpu
+    }
+  }' "$POOL_CPU_STATUS")
+  for slot in "${CLASS_FIRST[@]}" "${!SLOT_CPU[@]}"; do
+    [ -z "${SLOT_CPUSET[$slot]+set}" ] || continue
+    SLOT_CPUSET[slot]=''
+    wanted=$((wanted + SLOT_CPU[slot]))
+    [ $((next + SLOT_CPU[slot])) -le "${#cpus[@]}" ] || continue
+    cpuset=${cpus[next]}
+    for ((offset = 1; offset < SLOT_CPU[slot]; offset++)); do
+      cpuset+=,${cpus[next + offset]}
+    done
+    SLOT_CPUSET[slot]=$cpuset
+    next=$((next + SLOT_CPU[slot]))
+  done
+  CPU_FIT_NOTE=''
+  if [ "$wanted" -gt "${#cpus[@]}" ]; then
+    CPU_FIT_NOTE="WARNING: the $SLOTS slots ask for $wanted CPUs together and the machine has ${#cpus[@]} CPUs: slots without their own CPUs stay queued. Make the slots smaller or fewer, or the machine larger, in the template, and create the pool again"
+    say "$CPU_FIT_NOTE"
+  fi
+}
+
+# Each slice caps and accounts for the runner, its Docker daemon and the containers that daemon starts.
 write_slices() {
   local slot
   mkdir -p "$POOL_UNITS"
+  if [ "$MEMORY_MODE" = ceiling ] && [ "$BUDGET" -gt 0 ]; then
+    cat >"$POOL_UNITS/arcapool.slice" <<UNIT
+[Unit]
+Description=Arca runner pool memory budget
+
+[Slice]
+MemoryMax=$BUDGET
+UNIT
+  fi
   for ((slot = 0; slot < SLOTS; slot++)); do
+    [ -n "${SLOT_CPUSET[$slot]}" ] || continue
     cat >"$POOL_UNITS/$(slot_slice "$slot")" <<UNIT
 [Unit]
 Description=Arca runner pool slot $slot (${SLOT_CLASS[$slot]})
@@ -1408,6 +1482,7 @@ Description=Arca runner pool slot $slot (${SLOT_CLASS[$slot]})
 MemoryMax=${SLOT_MEM[$slot]}
 MemorySwapMax=0
 CPUQuota=$((SLOT_CPU[slot] * 100))%
+AllowedCPUs=${SLOT_CPUSET[$slot]}
 UNIT
   done
   systemctl daemon-reload >/dev/null 2>&1
@@ -1679,7 +1754,7 @@ count_of() { stat -c %s "$POOL_RUN/$1" 2>/dev/null || echo 0; }
 
 # The status block: one line per slot, one per class with what its jobs used, and the totals.
 print_status() {
-  local slot phase since words busy=0 idle=0 starting=0 queued=0 reserved=0 at line class
+  local slot phase since words busy=0 idle=0 starting=0 queued=0 slot_memory=0 at line class memory
   at=$(now)
   {
     for ((slot = 0; slot < SLOTS; slot++)); do
@@ -1689,7 +1764,7 @@ print_status() {
           since=$at
           words=''
         }
-        reserved=$((reserved + SLOT_MEM[slot]))
+        slot_memory=$((slot_memory + SLOT_MEM[slot]))
         case $phase in
           busy) busy=$((busy + 1)) ;;
           idle | updating) idle=$((idle + 1)) ;;
@@ -1714,9 +1789,15 @@ print_status() {
     say "pool $POOL_NAME id $POOL_ID for $URL, $GROUP_NOTE"
     [ -z "$NEVER_NOTE" ] || say "$NEVER_NOTE"
     [ -z "$FIT_NOTE" ] || say "$FIT_NOTE"
+    [ -z "$CPU_FIT_NOTE" ] || say "$CPU_FIT_NOTE"
     [ -z "$CAP_NOTE" ] || say "$CAP_NOTE"
     [ -z "$CLASS_NOTE" ] || say "$CLASS_NOTE"
-    say "totals busy=$busy idle=$idle starting=$starting queued=$queued jobs_done=$(count_of jobs) failures=$(count_of failures) runner_updates=$(count_of updates) memory_reserved=$(mib "$reserved")MiB of $(mib "$BUDGET")MiB slots_cap=$MAX_SLOTS"
+    if [ "$MEMORY_MODE" = ceiling ]; then
+      memory="memory_ceilings=$(mib "$slot_memory")MiB memory_budget=$(mib "$BUDGET")MiB"
+    else
+      memory="memory_reserved=$(mib "$slot_memory")MiB of $(mib "$BUDGET")MiB"
+    fi
+    say "totals busy=$busy idle=$idle starting=$starting queued=$queued jobs_done=$(count_of jobs) failures=$(count_of failures) runner_updates=$(count_of updates) $memory slots_cap=$MAX_SLOTS"
   } | tee "$POOL_LOGS/status.txt.new"
   mv "$POOL_LOGS/status.txt.new" "$POOL_LOGS/status.txt"
 }
@@ -1731,7 +1812,7 @@ print_status() {
 #   (give_a_place, and slot_retire in the slot).
 # What this is not: a cap on running jobs. A just-in-time runner cannot be told to wait, so every registered runner may
 # take a job at any moment, and a runner that has one is never retired: a class whose place is held by runners at work
-# waits until one ends. Nor is a place memory: a slot still starts only when its whole size fits.
+# waits until one ends. In reserved mode a slot also needs memory for its whole size.
 # These functions read and change the controller's own variables (pool's): bash lets a function it calls do so.
 
 # The pass that hands out places looks at every slot without a runner once. round_begin lists them for each class in
@@ -1821,7 +1902,7 @@ give_a_place() {
   CLASS_NOTE=''
   if [ "$CLASSES" -gt 1 ] && [ "$live" -ge "$MAX_SLOTS" ]; then
     for ((c = 0; c < CLASSES; c++)); do
-      [ "${class_live[$c]}" = 0 ] || continue
+      [ "${class_live[$c]}" = 0 ] && [ -n "${SLOT_CPUSET[${CLASS_FIRST[$c]}]}" ] || continue
       waiting+=("$c")
       names="${names:+$names, }${CLASS_NAMES[$c]}"
     done
@@ -1865,10 +1946,13 @@ give_a_place() {
     CLASS_NOTE="WARNING: $names, and no class that holds two or more has a runner that can be asked to give its place up. A runner that has a job, that is starting, or that GitHub gave no id for, is never retired, and one that is updating itself not before its update is over: the class waits until a job ends or an update is over"
     return 0
   fi
-  # The class the place is asked for: the first of those without a runner whose slot would have its memory.
+  # The class the place is asked for: the first of those without a runner whose slot could start in its place.
   for c in "${waiting[@]}"; do
     need=${SLOT_MEM[${CLASS_FIRST[$c]}]}
-    if [ $((reserved - SLOT_MEM[give] + need)) -le "$BUDGET" ] && [ "${available:-0}" -ge "$need" ]; then
+    [ "$need" -le "$BUDGET" ] || continue
+    if [ "$MEMORY_MODE" = ceiling ] || {
+      [ $((reserved - SLOT_MEM[give] + need)) -le "$BUDGET" ] && [ "${available:-0}" -ge "$need" ];
+    }; then
       want=$c
       break
     fi
@@ -1971,7 +2055,7 @@ pool() {
     NEVER_NOTE="WARNING: a slot of these classes is larger than the $(mib "$BUDGET") MiB the machine has for slots (the $(mib "${total:-0}") MiB it reports, less reserveMemory $(mib "$RESERVE") MiB): $never. Such a slot never starts, and the jobs that ask for its labels wait for ever. Make the class or reserveMemory smaller, or the machine larger, in the template, and create the pool again"
     say "$NEVER_NOTE"
   fi
-  if [ "$SLOTS" -le "$MAX_SLOTS" ] && [ "$wanted" -gt "$BUDGET" ]; then
+  if [ "$MEMORY_MODE" = reserved ] && [ "$SLOTS" -le "$MAX_SLOTS" ] && [ "$wanted" -gt "$BUDGET" ]; then
     FIT_NOTE="WARNING: the $SLOTS slots ask for $(mib "$wanted") MiB together and the machine has $(mib "$BUDGET") MiB for slots (the $(mib "${total:-0}") MiB it reports, less reserveMemory $(mib "$RESERVE") MiB): $(mib $((wanted - BUDGET))) MiB too much, so they never all run at once. A machine reports less memory than the size it was given. Make the slots or reserveMemory smaller, or the machine larger, in the template, and create the pool again"
     say "$FIT_NOTE"
   fi
@@ -1982,6 +2066,7 @@ pool() {
     CAP_NOTE="every class is kept one place under the cap of $MAX_SLOTS: a free place goes to the class with the fewest runners, and when a class has none and every place is held, one runner that waits for a job is retired for it, of the class that holds the most. The cap counts registered runners, not running jobs: a registered runner cannot be told to wait and one that has a job is never retired, so a class can wait until a job ends; and a place is not memory"
     say "$CAP_NOTE"
   fi
+  layout_slot_cpus
   write_slices
 
   local waited=0
@@ -2113,8 +2198,8 @@ pool() {
     pending=0
     [ -z "$REG" ] || reg_token_done
     [ -n "$REG" ] || give_a_place
-    # Admission. A slot starts only while there is a place under the cap and memory for its whole size: memory that
-    # no other slot has reserved, and memory the machine has free now. CPU is not reserved. Every slot without a
+    # Admission. A slot needs its own CPUs and a place under the cap. In reserved mode it also needs memory for
+    # its whole size: memory that no other slot has reserved, and memory the machine has free now. Every slot without a
     # runner is looked at once in a pass. A place goes to the class with the fewest runners first, so every class has
     # one before any has two. Among equals the slots go round-robin: the round starts after the slot admitted last
     # and is read once for the pass. (A pass that moved its start while it walked left slots out.) Round-robin is not
@@ -2124,7 +2209,9 @@ pool() {
     while next_slot; do
       # No slot is begun once the controller is told to stop.
       ! stopping || break
-      if [ -n "$REG" ] && ! registered "$slot" && [ ! -s "$(reg_token)" ]; then
+      if [ -z "${SLOT_CPUSET[$slot]}" ]; then
+        WAIT[slot]="needs ${SLOT_CPU[$slot]} dedicated CPUs"
+      elif [ -n "$REG" ] && ! registered "$slot" && [ ! -s "$(reg_token)" ]; then
         WAIT[slot]='waiting for a registration token (GITHUB_REGISTRATION_TOKEN)'
       elif [ -z "$REG" ] && [ -z "$(credential_kind)" ]; then
         WAIT[slot]='waiting for a credential'
@@ -2134,9 +2221,11 @@ pool() {
         WAIT[slot]="pausing $((until_at - at))s after a failure"
       elif [ "$live" -ge "$MAX_SLOTS" ]; then
         WAIT[slot]="waiting for a place: $MAX_SLOTS slots is the cap"
-      elif [ $((reserved + SLOT_MEM[slot])) -gt "$BUDGET" ]; then
+      elif [ "$MEMORY_MODE" = ceiling ] && [ "${SLOT_MEM[$slot]}" -gt "$BUDGET" ]; then
+        WAIT[slot]='its ceiling exceeds the pool memory budget'
+      elif [ "$MEMORY_MODE" = reserved ] && [ $((reserved + SLOT_MEM[slot])) -gt "$BUDGET" ]; then
         WAIT[slot]="waiting for $(mib "${SLOT_MEM[$slot]}") MiB of unreserved memory"
-      elif [ $((${available:-0} - pending)) -lt "${SLOT_MEM[$slot]}" ]; then
+      elif [ "$MEMORY_MODE" = reserved ] && [ $((${available:-0} - pending)) -lt "${SLOT_MEM[$slot]}" ]; then
         WAIT[slot]="waiting for $(mib "${SLOT_MEM[$slot]}") MiB of free memory"
       else
         WAIT[slot]=''
