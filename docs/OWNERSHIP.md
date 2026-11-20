@@ -1156,8 +1156,9 @@ enter Incus's instance config.
   lists (a create never chooses the version), and a value that is not an image by digest (`image_by_digest`).
   A doctor can set that VM pin with `service_update` and a full image reference by digest. The verb uses the same
   owned guest settings writer and desired-state path as the settings mode. It holds the node's write gate while
-  writing the guest settings and record, restoring the VM's original power state, and checking a running VM with
-  the existing stay-running window. On failure it attempts to restore both writes and the original power state.
+  writing the guest settings, restoring the original power state, and checking a running VM with the existing
+  stay-running window. It saves the record last so an interrupted update can be retried. Rollback restores the guest
+  settings and power state, checks a restarted VM over the same window, and restores the record if its write was attempted.
   Each step is journalled in `service-updates.jsonl`. The VM's root and data disks are preserved.
   `service_status` answers `update`: `pin`, the version read from the service's own record
   (`created_pin`: a container's OCI source or the VM's effective value under that key), `templatePin`, the

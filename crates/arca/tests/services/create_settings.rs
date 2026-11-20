@@ -1009,6 +1009,145 @@ fn vm_settings_file(rig: &Rig) -> Value {
     .unwrap()
 }
 
+fn vm_pin_journal(path: &std::path::Path) -> Vec<Value> {
+    fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+#[test]
+fn vm_pin_update_retries_after_interruption_following_the_restart() {
+    let mut rig = pin_update_rig(true, true);
+    let record = entry(&rig, "service-p1").config;
+    let actions = rig.fake.state_actions(PROJECT, "p1").len();
+    let digest = format!("registry.example/runner@sha256:{}", "2".repeat(64));
+    let journal = rig.dir.join("service-updates.jsonl");
+    rig.handlers = service_handlers(
+        rig.kernel.clone(),
+        Arc::new(move || {
+            assert!(
+                !vm_pin_journal(&journal)
+                    .last()
+                    .is_some_and(|row| row["step"] == "power" && row["ok"] == true),
+                "simulated interruption after restart"
+            );
+            NOW
+        }),
+        rig.cfg.clone(),
+    )
+    .into_iter()
+    .collect();
+    let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        vm_pin_update(&rig, &digest)
+    }));
+    assert!(interrupted.is_err());
+    assert_eq!(vm_settings_file(&rig)["pin"], digest);
+    assert_eq!(
+        &rig.fake.state_actions(PROJECT, "p1")[actions..],
+        ["restart"]
+    );
+    assert_eq!(entry(&rig, "service-p1").config, record);
+
+    // The process restart discards the unwound handler and the poisoned in-memory gate.
+    rig.kernel.lock().unwrap().write_gate().clear_poison();
+    rig.handlers = service_handlers(rig.kernel.clone(), Arc::new(|| NOW), rig.cfg.clone())
+        .into_iter()
+        .collect();
+    let requests = rig.fake.service_requests().len();
+    assert_eq!(vm_pin_update(&rig, &digest).unwrap()["updated"], true);
+    assert!(
+        rig.fake.service_requests()[requests..]
+            .iter()
+            .any(|request| {
+                request.method == "POST" && request.path.contains(service::GUEST_SETTINGS_PATH)
+            })
+    );
+    assert_eq!(
+        &rig.fake.state_actions(PROJECT, "p1")[actions..],
+        ["restart", "restart"]
+    );
+    assert_eq!(
+        entry(&rig, "service-p1").config["vm"]["settings"]["pin"],
+        digest
+    );
+}
+
+#[test]
+fn vm_pin_update_refuses_an_unavailable_guest_agent_without_rollback() {
+    let rig = pin_update_rig(true, true);
+    let record = entry(&rig, "service-p1").config;
+    let files = rig.fake.service_files();
+    let requests = rig.fake.service_requests().len();
+    let actions = rig.fake.state_actions(PROJECT, "p1");
+    rig.fake.set_guest_agent_unready(2);
+
+    let digest = format!("registry.example/runner@sha256:{}", "2".repeat(64));
+    let error = vm_pin_update(&rig, &digest).unwrap_err();
+    let (code, message) = error.refusal().unwrap();
+    assert_eq!(code, "refused");
+    assert!(message.ends_with("Nothing was changed"), "{message}");
+    assert_eq!(entry(&rig, "service-p1").config, record);
+    assert_eq!(rig.fake.service_files(), files);
+    assert_eq!(rig.fake.state_actions(PROJECT, "p1"), actions);
+    assert_eq!(rig.fake.service_requests().len(), requests + 1);
+
+    let rows = vm_pin_journal(&rig.dir.join("service-updates.jsonl"));
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[1]["step"], "guest settings");
+    assert_eq!(rows[1]["ok"], false);
+    assert_eq!(
+        rows[1]["detail"]["why"],
+        "could not write the guest settings file"
+    );
+    assert_eq!(rows[2]["detail"]["why"], rows[1]["detail"]["why"]);
+}
+
+#[test]
+fn vm_pin_update_reports_failed_rollback_if_the_restored_vm_does_not_stay_running() {
+    let mut rig = pin_update_rig(true, true);
+    rig.handlers = arca::handlers::service_handlers_updating(
+        rig.kernel.clone(),
+        Arc::new(|| NOW),
+        rig.cfg.clone(),
+        None,
+        arca::handlers::UpdateOptions {
+            pace: std::time::Duration::from_millis(10),
+            ..Default::default()
+        },
+    )
+    .into_iter()
+    .collect();
+    // Both restarted versions stop during health checks. A temporary boot lasts long
+    // enough to write the old file and restart onto it.
+    rig.fake.exit_after_start(PROJECT, "p1", 8, "exited");
+    let old = guest_settings(&rig, "p1");
+    let record = entry(&rig, "service-p1").config;
+    let actions = rig.fake.state_actions(PROJECT, "p1").len();
+
+    let digest = format!("registry.example/runner@sha256:{}", "2".repeat(64));
+    let error = vm_pin_update(&rig, &digest).unwrap_err();
+    assert_eq!(error.refusal().unwrap().0, "rollback_failed");
+    assert_eq!(vm_settings_file(&rig), old);
+    assert_eq!(entry(&rig, "service-p1").config, record);
+    assert_eq!(
+        &rig.fake.state_actions(PROJECT, "p1")[actions..],
+        ["restart", "start", "restart"]
+    );
+    assert_eq!(instance(&rig, "p1")["status"], "Stopped");
+    let rows = vm_pin_journal(&rig.dir.join("service-updates.jsonl"));
+    let failed = rows
+        .iter()
+        .find(|row| row["step"] == "restore health")
+        .unwrap();
+    assert_eq!(failed["ok"], false);
+    assert_eq!(
+        failed["detail"]["why"],
+        "health check: the VM did not stay running"
+    );
+}
+
 #[test]
 fn vm_pin_update_writes_guest_and_record_and_restarts_without_rebuilding() {
     let rig = pin_update_rig(true, true);
@@ -1095,14 +1234,17 @@ fn vm_pin_update_rolls_back_a_vm_that_stops_during_health_check() {
         ["restart", "start", "restart"]
     );
     assert!(rig.fake.rebuilds(PROJECT, "p1").is_empty());
-    let journal = fs::read_to_string(rig.dir.join("service-updates.jsonl")).unwrap();
-    let rows: Vec<Value> = journal
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect();
+    let rows = vm_pin_journal(&rig.dir.join("service-updates.jsonl"));
+    assert!(rows.iter().any(|row| row["step"] == "health"
+        && row["ok"] == false
+        && row["detail"]["why"] == "health check: the VM did not stay running"));
     assert!(
         rows.iter()
-            .any(|row| row["step"] == "health" && row["ok"] == false)
+            .all(|row| row["step"] != "record" && row["step"] != "restore record")
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row["step"] == "restore health" && row["ok"] == true)
     );
     assert_eq!(rows.last().unwrap()["step"], "end");
     assert_eq!(rows.last().unwrap()["detail"]["rolledBack"], true);

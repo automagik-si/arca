@@ -3,7 +3,10 @@ use super::service_update::{Claim, Journal, SERVICE_UPDATES_FILE, health_seconds
 use super::*;
 use crate::service::{self, ServiceConfig, Vm};
 use crate::service_exec::{ExecTarget, ServiceExec};
-use arca_incus::{InstanceState, Owned, StateAction, StateChanger, exec::ServiceFile};
+use arca_incus::{
+    IncusError, InstanceState, Owned, StateAction, StateChanger,
+    exec::{ServiceFile, settings_agent_unavailable},
+};
 use arca_kernel::desired::Entry;
 use serde_json::Map;
 
@@ -82,6 +85,14 @@ struct Guest<'a> {
     first_boot: bool,
 }
 
+#[derive(Default)]
+struct GuestChanges {
+    /// The settings write succeeded or its effect is unknown.
+    settings: bool,
+    /// A power action was attempted.
+    power: bool,
+}
+
 impl<'a> Guest<'a> {
     fn new(
         handler: &'a ServiceHandler,
@@ -106,7 +117,12 @@ impl<'a> Guest<'a> {
         })
     }
 
-    fn write_file(&self, vm: &Vm, wait_for_boot: bool) -> Result<(), CallError> {
+    fn write_file(
+        &self,
+        vm: &Vm,
+        wait_for_boot: bool,
+        settings_changed: &mut bool,
+    ) -> Result<(), CallError> {
         let value = vm.guest_settings().unwrap_or_else(|| json!({}));
         let bytes = serde_json::to_vec(&value).map_err(|_| internal())?;
         let until = Instant::now() + Duration::from_secs(120);
@@ -115,7 +131,14 @@ impl<'a> Guest<'a> {
                 .exec
                 .writer(&self.target, Duration::from_secs(15))
                 .map_err(|e| e.call_error())?;
-            let write = || {
+            let mut write = |file, bytes: &[u8]| {
+                let result = writer.write_service_file(&self.owned, file, bytes);
+                *settings_changed |= result.as_ref().err().is_none_or(|error| {
+                    !matches!(error, IncusError::Refused(_)) && !settings_agent_unavailable(error)
+                });
+                result
+            };
+            let result = (|| {
                 if self
                     .target
                     .service
@@ -123,11 +146,11 @@ impl<'a> Guest<'a> {
                     .as_ref()
                     .is_some_and(|vm| vm.vendor_data.is_none())
                 {
-                    writer.write_service_file(&self.owned, &ServiceFile::GuestSettingsDir, &[])?;
+                    write(&ServiceFile::GuestSettingsDir, &[])?;
                 }
-                writer.write_service_file(&self.owned, &ServiceFile::GuestSettings, &bytes)
-            };
-            match write() {
+                write(&ServiceFile::GuestSettings, &bytes)
+            })();
+            match result {
                 Ok(()) => return Ok(()),
                 Err(_) if wait_for_boot && Instant::now() < until => {
                     thread::sleep(Duration::from_secs(2))
@@ -137,7 +160,7 @@ impl<'a> Guest<'a> {
         }
     }
 
-    fn write_seed(&self, vm: &Vm) -> Result<(), CallError> {
+    fn write_seed(&self, vm: &Vm, settings_changed: &mut bool) -> Result<(), CallError> {
         // A new VM can be waiting for secrets or have a long-running first-boot script.
         // Change the seed without starting that script.
         let writer = self
@@ -147,11 +170,12 @@ impl<'a> Guest<'a> {
         let owned = writer
             .read_owned(self.owned.target())
             .map_err(|_| service_refused("could not read the VM's ownership"))?;
-        writer
-            .patch(
-                &owned,
-                &BTreeMap::from([("cloud-init.vendor-data".into(), vm.vendor_data.clone())]),
-            )
+        let result = writer.patch(
+            &owned,
+            &BTreeMap::from([("cloud-init.vendor-data".into(), vm.vendor_data.clone())]),
+        );
+        *settings_changed |= !matches!(&result, Err(IncusError::Refused(_)));
+        result
             .map_err(|_| service_refused("could not write the VM's first-boot settings"))
             .map(|_| ())
     }
@@ -162,9 +186,10 @@ impl<'a> Guest<'a> {
             .map_err(|_| service_refused("could not read the VM power state"))
     }
 
-    fn start_for_write(&self) -> Result<bool, CallError> {
+    fn start_for_write(&self, power_attempted: &mut bool) -> Result<bool, CallError> {
         let stopped = self.power()?.is_stopped();
         if stopped {
+            *power_attempted = true;
             self.changer
                 .change(&self.initial, StateAction::Start)
                 .map_err(|_| service_refused("could not start the VM to write its settings"))?;
@@ -173,10 +198,12 @@ impl<'a> Guest<'a> {
     }
 
     fn deliver(&self, vm: &Vm) -> Result<(), CallError> {
+        let mut changes = GuestChanges::default();
         if self.first_boot {
-            return self.write_seed(vm);
+            return self.write_seed(vm, &mut changes.settings);
         }
-        let written = self.write_file(vm, self.start_for_write()?);
+        let started = self.start_for_write(&mut changes.power)?;
+        let written = self.write_file(vm, started, &mut changes.settings);
         if self.initial.is_stopped() {
             // Return a temporarily booted VM to its original state even if the write failed.
             self.changer
@@ -192,15 +219,16 @@ impl<'a> Guest<'a> {
         }
     }
 
-    fn write_pin_settings(&self, vm: &Vm) -> Result<(), CallError> {
+    fn write_pin_settings(&self, vm: &Vm, changes: &mut GuestChanges) -> Result<(), CallError> {
         if self.first_boot {
-            self.write_seed(vm)
+            self.write_seed(vm, &mut changes.settings)
         } else {
-            self.write_file(vm, self.start_for_write()?)
+            let started = self.start_for_write(&mut changes.power)?;
+            self.write_file(vm, started, &mut changes.settings)
         }
     }
 
-    fn finish_pin(&self) -> Result<(), CallError> {
+    fn finish_pin(&self, power_attempted: &mut bool) -> Result<(), CallError> {
         if self.first_boot {
             return Ok(());
         }
@@ -211,6 +239,7 @@ impl<'a> Guest<'a> {
             (false, true) => StateAction::Start,
             (false, false) => StateAction::Restart,
         };
+        *power_attempted = true;
         self.changer
             .change(&self.initial, action)
             .map_err(|_| {
@@ -221,6 +250,24 @@ impl<'a> Guest<'a> {
             })
             .map(|_| ())
     }
+
+    fn check_health(&self, seconds: u64, pace: Duration) -> Result<(), CallError> {
+        stays_running(seconds, pace, || {
+            self.power().is_ok_and(|state| {
+                state.is_running()
+                    && state.uuid == self.initial.uuid
+                    && state.kind == self.initial.kind
+            })
+        })
+        .then_some(())
+        .ok_or_else(|| service_refused("health check: the VM did not stay running"))
+    }
+}
+
+fn pin_error_why(error: &CallError) -> &str {
+    error
+        .refusal()
+        .map_or("could not save or apply VM settings", |(_, why)| why)
 }
 
 fn pin_step(
@@ -229,7 +276,11 @@ fn pin_step(
     run: impl FnOnce() -> Result<(), CallError>,
 ) -> Result<(), CallError> {
     let result = run();
-    journal.step(name, result.is_ok(), json!({}));
+    let detail = match &result {
+        Ok(()) => json!({}),
+        Err(error) => json!({"why": pin_error_why(error)}),
+    };
+    journal.step(name, result.is_ok(), detail);
     result
 }
 
@@ -330,46 +381,59 @@ impl ServiceHandler {
         journal.line("begin", true, json!({
             "pin": key, "from": old_pin.filter(|pin| service::image_by_digest(pin)), "to": digest, "timeoutSeconds": seconds,
         })).map_err(|_| said("the update journal could not be written"))?;
+        let mut changes = GuestChanges::default();
         let mut record_attempted = false;
         let applied = (|| {
-            pin_step(&journal, "guest settings", || guest.write_pin_settings(vm))?;
+            pin_step(&journal, "guest settings", || {
+                guest.write_pin_settings(vm, &mut changes)
+            })?;
+            pin_step(&journal, "power", || guest.finish_pin(&mut changes.power))?;
+            if running {
+                pin_step(&journal, "health", || {
+                    guest.check_health(seconds, self.update.pace)
+                })?;
+            }
+            // Keep the old record until the delivery and restart are complete so a retry
+            // after interruption still writes the pin and applies it to the guest.
             record_attempted = true;
             pin_step(&journal, "record", || {
                 self.put(std::slice::from_ref(&next), (self.clock)())
-            })?;
-            pin_step(&journal, "power", || guest.finish_pin())?;
-            if running {
-                pin_step(&journal, "health", || {
-                    stays_running(seconds, self.update.pace, || {
-                        guest.power().is_ok_and(|state| {
-                            state.is_running()
-                                && state.uuid == guest.initial.uuid
-                                && state.kind == guest.initial.kind
-                        })
-                    })
-                    .then_some(())
-                    .ok_or_else(|| service_refused("health check: the VM did not stay running"))
-                })?;
-            }
-            Ok::<_, CallError>(())
+            })
         })();
         if let Err(error) = applied {
+            let why = pin_error_why(&error);
+            if !changes.settings && !changes.power && !record_attempted {
+                journal.step("end", false, json!({"why": why}));
+                return Err(said(why));
+            }
             let record = !record_attempted
                 || pin_step(&journal, "restore record", || {
                     self.put(std::slice::from_ref(&service), (self.clock)())
                 })
                 .is_ok();
-            let file = pin_step(&journal, "restore guest settings", || {
-                guest.write_pin_settings(old_vm)
-            })
-            .is_ok();
-            let power = (!running || file)
-                && pin_step(&journal, "restore power", || guest.finish_pin()).is_ok();
+            let mut recovery = GuestChanges::default();
+            let file = !changes.settings
+                || pin_step(&journal, "restore guest settings", || {
+                    guest.write_pin_settings(old_vm, &mut recovery)
+                })
+                .is_ok();
+            let power = if running && !file {
+                // An unconfirmed file is unsafe to activate. The VM may still be
+                // in its original power state if no power action was needed.
+                !changes.power && !recovery.power
+            } else {
+                pin_step(&journal, "restore power", || {
+                    guest.finish_pin(&mut recovery.power)
+                })
+                .is_ok()
+                    && (!running
+                        || pin_step(&journal, "restore health", || {
+                            guest.check_health(seconds, self.update.pace)
+                        })
+                        .is_ok())
+            };
             let restored = record && file && power;
-            journal.step("end", false, json!({ "rolledBack": restored, "recordRestored": record, "guestRestored": file, "powerRestored": power }));
-            let why = error
-                .refusal()
-                .map_or("could not save or apply VM settings", |(_, why)| why);
+            journal.step("end", false, json!({ "why": why, "rolledBack": restored, "recordRestored": record, "guestRestored": file, "powerRestored": power }));
             return Err(CallError::Refused {
                 code: if restored {
                     "rolled_back"

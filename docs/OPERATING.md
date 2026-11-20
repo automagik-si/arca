@@ -1975,13 +1975,15 @@ digest, or fingerprint, in one call. It is a destructive verb (it takes the opti
 token and asks the owner for nothing, except for `eraseData` (see below); it works inside a tenant as outside one.
 For a VM whose template declares `update.pin`, call `service_update` with `{name, digest, timeoutSeconds?, tenant?}`.
 Give a full image reference, `<registry>/<name>@sha256:<64 lower-case hex digits>`. The registry and repository may
-change. Arca writes the pin into the guest settings file and service record, then restarts a running VM. It checks
-that the VM stays running for 10 seconds, capped by `timeoutSeconds`. The guest software pulls and checks the image.
+change. Arca writes the pin into the guest settings file, then restarts a running VM. It checks that the VM stays
+running for 10 seconds, capped by `timeoutSeconds`, before saving the new pin in the service record. If Arca stops
+before saving the record, retry the same update to finish it. The guest software pulls and checks the image.
 A previously used, stopped VM boots briefly to receive the file and returns to stopped. A VM that has never booted
 receives the new pin in its cloud-init seed and stays stopped. Both read the pin on the next boot.
 
-If a VM update fails after a write, Arca restores the previous settings and record, and restarts a VM that had been
-running. The call reports `rolled_back` when Arca confirms restoration and `rollback_failed` otherwise.
+If a VM update fails after a write, Arca restores the previous settings and, if the record write was attempted, the
+previous record. It restarts a VM that had been running and checks it over the same window. The call reports
+`rolled_back` when Arca confirms restoration and `rollback_failed` otherwise.
 `service_status.update.pin` shows the recorded pin. The journal records the steps. The root disk and data are preserved.
 Use the separate `{name, settings, tenant?}` mode under **Settings for one service** for other guest settings.
 

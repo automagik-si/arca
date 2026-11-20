@@ -25,6 +25,20 @@ fn bad() -> IncusError {
     IncusError::Decode("invalid service exec answer".into())
 }
 
+/// Whether Incus rejected the settings-file request before opening a file in the guest.
+pub fn settings_agent_unavailable(error: &IncusError) -> bool {
+    matches!(
+        error,
+        IncusError::Status { code: 500, message }
+            if matches!(
+                message.as_str(),
+                "Instance is not running"
+                    | "VM agent isn't currently running"
+                    | "Failed to connect to the agent"
+            )
+    )
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct JournalLines(u16);
 impl JournalLines {
@@ -532,6 +546,16 @@ impl UnixIncusWriter {
         )?;
         checked_envelope(&framed.into_raw())
             .map(|_| ())
-            .map_err(exec_error)
+            .map_err(|error| {
+                if matches!(
+                    file,
+                    ServiceFile::GuestSettings | ServiceFile::GuestSettingsDir
+                ) && settings_agent_unavailable(&error)
+                {
+                    error
+                } else {
+                    exec_error(error)
+                }
+            })
     }
 }
