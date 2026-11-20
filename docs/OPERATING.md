@@ -1104,8 +1104,9 @@ upgrade, as any shipped template nobody edited. A service made before keeps runn
 is its own instance, and the upgrade does not touch it. Its `service_status` shows the newer release under `update`
 (`"state": "differs"`, the new digest as `templatePin`). A new `automagik-server` service pulls 3.136.4.
 
-An installed, unedited `automagik-workspace` template receives the new install pin the same way. Each existing VM
-keeps the keeper, settings and install pin it was created with.
+An installed, unedited `automagik-workspace` template receives the new install pin the same way. Workspaces created
+before this release keep their original keeper, settings and install pin, so they do not follow the server lane.
+Their `service_status` shows `update.state` as `differs` against the new install pin.
 
 Keep a running service on the release it has, unless you move it yourself: Arca does not move one to its template's
 version by itself. A container moves in place with `service_update {name, digest}`: to the digest an OCI template now
@@ -6678,7 +6679,7 @@ settings (the template lists them in `createSettings`). The template supplies th
 | `accessTeamDomain`, `accessAudience`, `accessEmails` | Your Cloudflare Access application for that address: the team's host name alone (`<team>.cloudflareaccess.com`, no `https://`, and no other domain), the application's audience tag, and the e-mail addresses that may sign in: text, one address or several separated by commas (`"owner@example.com, second@example.com"`, 1 to 16). A create that gives a list is refused (`settings.accessEmails: expected a string, the type of the template's default`); a workspace made before with a list keeps it, and its own keeper reads it. None is a secret. Set all three or none; they need `publicUrl`. They ship empty. The gate gets them as `AUTOMAGIK_GATE_ACCESS_TEAM_DOMAIN`, `AUTOMAGIK_GATE_ACCESS_AUD` and `AUTOMAGIK_GATE_ACCESS_EMAILS`: the text unchanged (the gate trims each address and compares without regard to case). An address the script does not take stops the workspace with `settings.accessEmails is 1 to 16 e-mail addresses ...`. |
 | `automagikPnpm` | Required absolute path of pnpm 10 baked into the server image, supplied by its owner. Passed as `AUTOMAGIK_PNPM`, with no fallback. Explicitly pins `/usr/local/bin/pnpm` from the image contract; an empty or missing setting refuses startup. Reconfirm the path for the final reviewed image. |
 | `serverImage` | The verified install digest for both the server and the gate (Automagik 3.160.2). The `service_status` pin reports this install version. The VM follows the server lane on its own after first boot. |
-
+| `serverVersion` | The install image's Automagik version (3.160.2), supplied by the template. The keeper uses it for the first comparison with the server lane. |
 | `reach` | How people reach the workspace: `cloudflare` (the steps above; also when the setting is left out) or `tailnet` (see "On a tailnet instead" below). |
 
 Three things are not settings. The gate's port is 3082, as Automagik's compose file fixes it. The connector's image

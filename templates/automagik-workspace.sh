@@ -118,6 +118,7 @@ set -u
 : "${WS_RUN:=/run/automagik-workspace}"
 : "${WS_FOLLOW_STATE:=${WS_DATA%/*}/follow.json}"  # root's record beside the data, across keeper and VM restarts
 : "${WS_FOLLOW_EVERY:=3600}"   # seconds between lane checks, starting when the install image is healthy
+: "${WS_FOLLOW_TIMEOUT:=300}"  # seconds before stopping each lane provenance check or pull
 : "${WS_FOLLOW_HEALTH:=300}"   # seconds for an update to become healthy before restoring the previous image
 : "${WS_CONSOLE:=/dev/console}"
 : "${WS_INSTALLED:=/usr/local/sbin/arca-automagik-workspace}"
@@ -228,7 +229,7 @@ RELAY_PROGRAM='const net=require("net");const [ip,port]=process.argv.slice(1);ne
 # Every program this script starts that bash does not have built in. The first boot refuses to go on while one of
 # them is missing, and names it.
 WS_PROGRAMS='docker jq systemctl apt-get hostname sha256sum install tr cut date sleep cat chmod chown mv rm grep
-tail mkdir stat curl uname readlink git setpriv find rmdir'
+tail mkdir stat curl uname readlink git setpriv find rmdir timeout'
 
 # The Debian packages the first boot installs. Recommended packages are not installed, so every package that is needed
 # is named here. docker.io is the daemon alone: on Debian 13 the `docker` command is a package of its own, docker-cli,
@@ -1044,6 +1045,8 @@ keep_server() {
   case $state in
     running)
       leave_stale_namespace
+      # In the rare case that the checkout is unavailable through the move window, rollback is safe because the old
+      # server is still running.
       if [ "$CHECKOUT_READY" = true ] && [ -n "$FOLLOW_STATE" ] &&
         image=$(image_of "$SERVER") && [ -n "$image" ] && [ "$image" != "$SERVER_IMAGE" ]; then
         leave_server_parts
@@ -1120,11 +1123,13 @@ server_image_here() {
 # cosign's check of the server's image, with a home of its own on the machine's memory for Sigstore's root, which it
 # refreshes from Sigstore's own address. It needs no account: the image and its attestation are public.
 verify_provenance() {
+  local digest_ref=$1
+  shift
   mkdir -p "$WS_RUN/cosign" &&
-    HOME="$WS_RUN/cosign" "$WS_COSIGN" verify-attestation --type slsaprovenance1 \
+    HOME="$WS_RUN/cosign" "$@" "$WS_COSIGN" verify-attestation --type slsaprovenance1 \
       --certificate-oidc-issuer "$PROVENANCE_ISSUER" \
       --certificate-identity-regexp "^https://github\\.com/$PROVENANCE_REPO/" \
-      --certificate-github-workflow-repository "$PROVENANCE_REPO" "$1"
+      --certificate-github-workflow-repository "$PROVENANCE_REPO" "$digest_ref"
 }
 
 # The gate: the same image and digest as the server, the gate's entrypoint, the server's namespace, a file system it
@@ -1665,8 +1670,16 @@ follow_above() {
   return 1
 }
 
+follow_error() {
+  case $1 in
+    124 | 137) printf 'timed out after %s seconds' "$WS_FOLLOW_TIMEOUT" ;;
+    *) last_line "$2" ;;
+  esac
+}
+
 follow_step() {
   local lane fixed ref version out state before=$SERVER_VERSION
+  local -a limit=(timeout -k 5 "$WS_FOLLOW_TIMEOUT")
   if ! lane=$(follow_record "$SERVER_RELEASES/server-lane/server-image.json" 2>&1); then
     say "follow: the server lane could not be read: $lane"
     return
@@ -1692,14 +1705,14 @@ follow_step() {
     say "follow: the fixed release record disagrees with the server lane for $version; keeping $SERVER_VERSION"
     return
   fi
-  if ! out=$(verify_provenance "$ref" 2>&1 >/dev/null); then
-    say "follow: build provenance for $version failed; leaving the image unpulled: $(last_line "$out")"
+  out=$(verify_provenance "$ref" "${limit[@]}" 2>&1 >/dev/null) 2>/dev/null || {
+    say "follow: build provenance for $version failed; leaving the image unpulled: $(follow_error "$?" "$out")"
     return
-  fi
-  if ! out=$(docker pull -q "$ref" 2>&1 >/dev/null); then
-    say "follow: the verified image for $version could not be pulled: $(last_line "$out")"
+  }
+  out=$("${limit[@]}" docker pull -q "$ref" 2>&1 >/dev/null) 2>/dev/null || {
+    say "follow: the verified image for $version could not be pulled: $(follow_error "$?" "$out")"
     return
-  fi
+  }
   state=$(jq -c --arg ref "$ref" --arg version "$version" '
     .retired = .previous | .previous = .current | .current = {ref: $ref, version: $version} | .checking = "move"
     ' <<<"$FOLLOW_STATE") || return 1
@@ -1771,7 +1784,7 @@ keep_workspace() {
     nap "$WS_REFUSE_EVERY"
   done
   until follow_read; do
-    say "workspace $WS_NAME does not start: the follow state $WS_FOLLOW_STATE cannot be read"
+    say "workspace $WS_NAME does not start: the follow state $WS_FOLLOW_STATE cannot be read. Removing this file starts again from settings.serverImage"
     nap "$WS_REFUSE_EVERY"
   done
   kill -USR1 "$$"

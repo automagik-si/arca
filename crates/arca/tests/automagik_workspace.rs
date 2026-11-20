@@ -121,7 +121,7 @@ fn tailnet_image() -> String {
 /// standard error and fails, as cosign does for an image without a matching attestation.
 fn fake_cosign() -> String {
     format!(
-        "#!{}\nprintf 'cosign %s\\n' \"$*\" >>\"$FAKE_DOCKER_DIR/calls.log\"\nprintf '%s\\n' \"$HOME\" >\"$FAKE_DOCKER_DIR/cosign-home\"\nimage=${{*: -1}}\nfor fail in \"$FAKE_DOCKER_DIR/cosign-fail\" \"$FAKE_DOCKER_DIR/cosign-fail-${{image##*@}}\"; do\n  if [ -e \"$fail\" ]; then\n    cat \"$fail\" >&2\n    exit 1\n  fi\ndone\necho '{{\"payloadType\":\"application/vnd.in-toto+json\"}}'\n",
+        "#!{}\nprintf 'cosign %s\\n' \"$*\" >>\"$FAKE_DOCKER_DIR/calls.log\"\nprintf '%s\\n' \"$HOME\" >\"$FAKE_DOCKER_DIR/cosign-home\"\nimage=${{*: -1}}\nhang=\"$FAKE_DOCKER_DIR/cosign-hang-${{image##*@}}\"\nif [ -p \"$hang\" ]; then\n  : >\"$hang.started\"\n  read -r <\"$hang\"\nfi\nfor fail in \"$FAKE_DOCKER_DIR/cosign-fail\" \"$FAKE_DOCKER_DIR/cosign-fail-${{image##*@}}\"; do\n  if [ -e \"$fail\" ]; then\n    cat \"$fail\" >&2\n    exit 1\n  fi\ndone\necho '{{\"payloadType\":\"application/vnd.in-toto+json\"}}'\n",
         which("bash").display()
     )
 }
@@ -338,6 +338,7 @@ impl Workspace {
             .env("WS_GATE_DATA", self.dir.join("gate"))
             .env("WS_RUN", self.dir.join("run"))
             .env("WS_FOLLOW_EVERY", "1")
+            .env("WS_FOLLOW_TIMEOUT", "2")
             .env("WS_FOLLOW_HEALTH", "2")
             .env("WS_CONSOLE", self.dir.join("console.log"))
             .env("WS_INSTALLED", self.dir.join("installed"))
@@ -1605,7 +1606,7 @@ fn a_server_image_whose_provenance_does_not_verify_is_not_pulled_and_nothing_sta
 }
 
 fn lane_workspace(failure: Option<&str>) -> Workspace {
-    let mut settings = settings(URL);
+    let mut settings = settings_with_access(URL);
     settings["serverImage"] = json!(format!("{LANE_IMAGE}@{INSTALL_DIGEST}"));
     settings["serverVersion"] = json!(INSTALL_VERSION);
     let workspace = Workspace::new(&settings);
@@ -1654,6 +1655,11 @@ fn lane_workspace(failure: Option<&str>) -> Workspace {
     workspace
 }
 
+fn lane_image_file(workspace: &Workspace, digest: &str) -> PathBuf {
+    let image_file = format!("{LANE_IMAGE}@{digest}").replace(['/', ':', '@'], "_");
+    workspace.dir.join("docker/images").join(image_file)
+}
+
 fn assert_lane_runs(workspace: &Workspace, digests: &[&str]) {
     for (name, mount) in [("automagik-server", "data"), ("automagik-gate", "gate")] {
         let runs = workspace.runs(name);
@@ -1674,6 +1680,71 @@ fn assert_lane_runs(workspace: &Workspace, digests: &[&str]) {
     assert_eq!(
         serde_json::from_str::<Value>(&install).unwrap()["serverImage"],
         format!("{LANE_IMAGE}@{INSTALL_DIGEST}")
+    );
+}
+
+fn assert_keeper_recovers_from_a_hung_follow_command(command: &str, message: &str) {
+    let mut workspace = lane_workspace(None);
+    workspace.secret(TOKEN);
+    let hang = workspace
+        .dir
+        .join(format!("docker/{command}-hang-{NEXT_DIGEST}"));
+    assert!(
+        Command::new(which("mkfifo"))
+            .arg(&hang)
+            .status()
+            .unwrap()
+            .success()
+    );
+    workspace.start();
+    wait_for(&workspace, "the lane command to hang", || {
+        hang.with_extension("started").exists()
+    });
+    workspace.end("automagik-gate", 1);
+    workspace.end("automagik-tunnel", 1);
+    let timeout = format!("follow: {message}: timed out after 2 seconds");
+    says(&workspace, &timeout);
+    wait_for(&workspace, "the gate and tunnel to restart", || {
+        workspace.started("automagik-gate", 2) && workspace.started("automagik-tunnel", 2)
+    });
+    wait_for(&workspace, "a status line after the timeout", || {
+        workspace
+            .output()
+            .split_once(&timeout)
+            .is_some_and(|(_, after)| {
+                after.lines().any(|line| {
+                    line.contains("status:")
+                        && line.contains("the gate is healthy")
+                        && line.contains("the tunnel is running")
+                })
+            })
+    });
+    assert!(!lane_image_file(&workspace, NEXT_DIGEST).exists());
+    assert!(!workspace.dir.join("follow.json").exists());
+    assert_eq!(workspace.runs("automagik-server").len(), 1);
+    if command == "cosign" {
+        let calls = workspace.read("docker/calls.log");
+        assert!(!calls.contains(&format!("pull -q {LANE_IMAGE}@{NEXT_DIGEST}")));
+    }
+    fs::remove_file(hang).unwrap();
+    says(&workspace, "follow: 3.161.0 is healthy");
+    assert!(!workspace.output().contains("Killed"));
+    assert_eq!(workspace.stop(), Some(0));
+}
+
+#[test]
+fn the_keeper_supervises_and_retries_after_a_lane_provenance_timeout() {
+    assert_keeper_recovers_from_a_hung_follow_command(
+        "cosign",
+        "build provenance for 3.161.0 failed; leaving the image unpulled",
+    );
+}
+
+#[test]
+fn the_keeper_supervises_and_retries_after_a_lane_pull_timeout() {
+    assert_keeper_recovers_from_a_hung_follow_command(
+        "pull",
+        "the verified image for 3.161.0 could not be pulled",
     );
 }
 
@@ -1716,6 +1787,53 @@ fn the_workspace_does_not_pull_a_mismatched_or_unverified_lane_digest() {
 }
 
 #[test]
+fn the_workspace_ignores_older_and_equal_lane_versions_even_with_another_digest() {
+    for version in ["3.159.9", INSTALL_VERSION] {
+        let mut workspace = lane_workspace(None);
+        let mut lane: Value = serde_json::from_str(&workspace.read("lane.json")).unwrap();
+        lane["version"] = json!(version);
+        fs::write(workspace.dir.join("lane.json"), lane.to_string()).unwrap();
+        workspace.start();
+        says(
+            &workspace,
+            &format!("follow: the server lane names {version}; keeping {INSTALL_VERSION}"),
+        );
+        assert_lane_runs(&workspace, &[INSTALL_DIGEST]);
+        assert!(!workspace.read("docker/calls.log").contains(NEXT_DIGEST));
+        assert!(!workspace.dir.join("follow.json").exists());
+        assert_eq!(workspace.stop(), Some(0));
+    }
+}
+
+#[test]
+fn restarting_the_keeper_resumes_a_recorded_move() {
+    let mut workspace = lane_workspace(None);
+    fs::remove_file(workspace.dir.join("lane.json")).unwrap();
+    workspace.start();
+    says(&workspace, "follow: the server lane could not be read");
+    assert_lane_runs(&workspace, &[INSTALL_DIGEST]);
+    assert_eq!(workspace.stop(), Some(0));
+
+    // Model a stop after the verified pull and the state write, before the old containers were removed.
+    fs::write(lane_image_file(&workspace, NEXT_DIGEST), "").unwrap();
+    let state = json!({
+        "schema": 1,
+        "checking": "move",
+        "current": { "ref": format!("{LANE_IMAGE}@{NEXT_DIGEST}"), "version": NEXT_VERSION },
+        "previous": { "ref": format!("{LANE_IMAGE}@{INSTALL_DIGEST}"), "version": INSTALL_VERSION },
+    });
+    fs::write(workspace.dir.join("follow.json"), state.to_string()).unwrap();
+    workspace.start();
+    says(&workspace, "follow: 3.161.0 is healthy");
+    assert_lane_runs(&workspace, &[INSTALL_DIGEST, NEXT_DIGEST]);
+    let settled: Value = serde_json::from_str(&workspace.read("follow.json")).unwrap();
+    assert!(settled.get("checking").is_none());
+    assert_eq!(settled["current"], state["current"]);
+    assert_eq!(settled["previous"], state["previous"]);
+    assert_eq!(workspace.stop(), Some(0));
+}
+
+#[test]
 fn the_workspace_rolls_back_when_the_new_gate_is_unhealthy_and_keeps_its_data() {
     let mut workspace = lane_workspace(Some("health"));
     workspace.start();
@@ -1735,6 +1853,37 @@ fn the_workspace_rolls_back_when_the_new_gate_is_unhealthy_and_keeps_its_data() 
             .count(),
         1
     );
+    assert!(calls.contains(&format!("image rm {LANE_IMAGE}@{NEXT_DIGEST}\n")));
+    assert!(!lane_image_file(&workspace, NEXT_DIGEST).exists());
+    assert!(lane_image_file(&workspace, INSTALL_DIGEST).exists());
+    assert_eq!(workspace.stop(), Some(0));
+}
+
+#[test]
+fn a_corrupt_follow_state_reports_how_to_restart_from_the_install_image() {
+    let mut workspace = lane_workspace(None);
+    fs::remove_file(workspace.dir.join("lane.json")).unwrap();
+    let path = workspace.dir.join("follow.json");
+    let corrupt = "{ broken";
+    fs::write(&path, corrupt).unwrap();
+    workspace.start();
+    says(
+        &workspace,
+        &format!(
+            "the follow state {} cannot be read. Removing this file starts again from settings.serverImage",
+            path.display()
+        ),
+    );
+    let calls = workspace.read("docker/calls.log");
+    assert!(
+        !calls.contains("pull ") && !calls.contains("run "),
+        "{calls}"
+    );
+    assert_eq!(workspace.read("follow.json"), corrupt);
+
+    fs::remove_file(path).unwrap();
+    says(&workspace, "follow: the server lane could not be read");
+    assert_lane_runs(&workspace, &[INSTALL_DIGEST]);
     assert_eq!(workspace.stop(), Some(0));
 }
 

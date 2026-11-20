@@ -180,6 +180,12 @@ case $command in
     ;;
   pull)
     [ "${1-}" = -q ] && shift
+    hang="$root/pull-hang-${1##*@}"
+    if [ -p "$hang" ]; then
+      trap '' TERM
+      : >"$hang.started"
+      read -r <"$hang"
+    fi
     if [ -e "$root/fail-pull" ]; then
       cat "$root/fail-pull" >&2
       exit 1
