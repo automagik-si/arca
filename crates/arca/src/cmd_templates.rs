@@ -91,6 +91,11 @@ pub const EARLIER: &[(&str, &str)] = &[
         "tailscale.sh",
         "5cc08fec28a57c18c16a641239a7cfd98524beaa371da60bfdbc4cc7c87ba38f",
     ),
+    // Before the keeper reported how to change settings in place.
+    (
+        "automagik-workspace.sh",
+        "6ac3761917b086391fdd24c6134d1de617c8447564ae7cd4014547758306618a",
+    ),
     // Before repository checkout delivery.
     (
         "automagik-workspace.json",
