@@ -4,6 +4,11 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 
 ## Unreleased
 
+New `automagik-workspace` VMs install Automagik 3.160.2 by verified digest, then follow the stable server lane.
+The keeper checks each newer digest against its fixed release record and verifies its build provenance before
+pulling it. If the new server or gate fails its health check, the keeper restores the previous image. Both moves
+reuse the existing `/data` mounts and appear in `service_logs`.
+
 ## 0.38.0 (2026-11-19)
 
 Arca can now take an Incus snapshot of a service's instance together with each custom volume it mounts, under one
