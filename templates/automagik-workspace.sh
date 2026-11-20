@@ -72,7 +72,7 @@
 #     refused at the first boot, in words, unless the file is on the machine already.
 #
 # What it reads:
-# - /etc/arca/settings.json: the service's settings, written by cloud-init at the first boot and fixed from then on.
+# - /etc/arca/settings.json: the service's settings, written at first boot and updated in place by service_update.
 #   Those a service_create gave (the template lists which it may) stand in place of the template's own.
 #   publicUrl is the workspace's exact public origin (https://<host>, no path); empty, as the template ships it,
 #   means "not set". accessTeamDomain, accessAudience and accessEmails are the owner's Cloudflare Access application for
@@ -293,9 +293,8 @@ install_workspace() {
     printf '%s\n' '{ "log-driver": "local", "log-opts": { "max-size": "20m", "max-file": "2" } }' \
       >"$WS_DOCKER_ETC/daemon.json"
   fi
-  # Settings that cannot be used never change: they are part of the machine. That is said now, on the console, and
-  # the keeper is installed all the same, so that every later look at service_logs finds the reason again.
-  load_settings || boot_say "first boot: the settings cannot be used: $REFUSAL. The workspace will not start; service_remove it and create it again with settings that are right"
+  # Install the keeper even when the initial settings need an owner-approved correction.
+  load_settings || boot_say "first boot: the settings cannot be used: $REFUSAL. Propose corrected settings with service_update"
   if ! data_directories; then
     boot_say "first boot failed: the data directories $WS_DATA and $WS_GATE_DATA could not be made for the server's user ($WS_DATA_OWNER). The machine has no workspace"
     exit 1
@@ -1579,7 +1578,7 @@ keep_workspace() {
     nap "$WS_REFUSE_EVERY"
   done
   until load_settings; do
-    say "workspace $WS_NAME does not start: its settings cannot be used: $REFUSAL. They are fixed when the machine is created: service_remove it and create it again with settings that are right"
+    say "workspace $WS_NAME does not start: its settings cannot be used: $REFUSAL. Propose corrected settings with service_update"
     nap "$WS_REFUSE_EVERY"
   done
   until mkdir -p "$WS_RUN" && chmod 0700 "$WS_RUN" && data_directories; do

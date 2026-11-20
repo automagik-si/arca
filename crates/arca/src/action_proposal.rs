@@ -267,6 +267,9 @@ impl ActionKind {
     /// [`Self::undo_words`] for these arguments: an update that states `eraseData` cannot be undone, since the data is
     /// gone.
     pub fn undo_words_for(self, args: &Value) -> &'static str {
+        if self == Self::ServiceUpdate && args.get("settings").is_some() {
+            return "Propose another settings update to restore previous values or choose a different supported value for a newly added setting.";
+        }
         if self == Self::ServiceUpdate
             && args.get("eraseData").and_then(Value::as_bool) == Some(true)
         {
@@ -646,6 +649,16 @@ impl ActionKind {
             }
             Self::ServiceRemove | Self::ServiceUnpublish | Self::ReachDisconnect => {
                 vec![row("Name", text("name"))]
+            }
+            Self::ServiceUpdate if args.get("settings").is_some() => {
+                let mut rows = vec![row("Name", text("name"))];
+                for (key, change) in args["changes"]["settings"].as_object().into_iter().flatten() {
+                    let old = change.get("old").map(Value::to_string).unwrap_or_else(|| "(unset)".into());
+                    rows.push(row(&format!("Previous {key}"), &old));
+                    rows.push(row(&format!("New {key}"), &change["new"].to_string()));
+                }
+                rows.push(row("Effect", "A running VM restarts after its settings change. A stopped VM stays stopped if it has never booted, or starts briefly for delivery and stops again."));
+                rows
             }
             Self::ServiceUpdate => {
                 let mut rows = vec![row("Name", text("name"))];
@@ -1118,6 +1131,9 @@ impl ActionKind {
                 text("template")
             ),
             Self::ServiceRemove => format!("Remove the service {}", text("name")),
+            Self::ServiceUpdate if args.get("settings").is_some() => {
+                format!("Update settings of the VM service {}", text("name"))
+            }
             Self::ServiceUpdate if args.get("eraseData").and_then(Value::as_bool) == Some(true) => {
                 format!(
                     "Update the service {} and ERASE ALL OF ITS DATA",

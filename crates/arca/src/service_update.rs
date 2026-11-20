@@ -137,6 +137,35 @@ pub fn digest_ok(text: &str) -> bool {
     })
 }
 
+pub(super) fn health_seconds(args: &Value) -> Result<u64, CallError> {
+    match args.get("timeoutSeconds") {
+        None => Ok(DEFAULT_HEALTH_SECONDS),
+        Some(value) => value
+            .as_u64()
+            .filter(|seconds| (1..=MAX_HEALTH_SECONDS).contains(seconds))
+            .ok_or_else(|| {
+                CallError::Invalid(format!(
+                    "timeoutSeconds: expected a whole number from 1 to {MAX_HEALTH_SECONDS}"
+                ))
+            }),
+    }
+}
+
+pub(super) fn stays_running(seconds: u64, pace: Duration, running: impl Fn() -> bool) -> bool {
+    // Look over a few seconds: one look at the first moment says little.
+    let begun = Instant::now();
+    let limit = Duration::from_secs(seconds.min(STAY_RUNNING_SECONDS));
+    loop {
+        if !running() {
+            return false;
+        }
+        if begun.elapsed() >= limit {
+            return true;
+        }
+        thread::sleep(pace);
+    }
+}
+
 /// `source` with its image replaced by `digest`: `<repository>@sha256:<new>` for an OCI image by digest on a registry,
 /// or the three fields of a local image pinned by the new fingerprint. `pinned_alias` is the alias of the image the
 /// installed template pins when that template pins the same fingerprint: a local source takes it, since Incus decides
@@ -514,6 +543,11 @@ pub(super) fn check_proposal(
     entries: &[Entry],
     payload: &Value,
 ) -> Result<Value, CallError> {
+    if payload.get("settings").is_some() {
+        let mut bound = payload.clone();
+        bound["changes"] = service_vm_settings::plan(cfg, entries, payload)?.changes;
+        return Ok(bound);
+    }
     // The template's difference is the node's to work out: what a caller sent there is never kept.
     let mut payload = payload.clone();
     if let Some(object) = payload.as_object_mut() {
@@ -791,6 +825,18 @@ impl ServiceHandler {
                 .ok_or_else(|| CallError::Invalid("follow: expected true or false".into()))?;
             return self.set_follow(&name, follow, entries);
         }
+        let service = service_entries(entries)
+            .into_iter()
+            .find(|(_, config)| config.name == name);
+        if !with
+            && !erase
+            && args.get("noNewPrivileges").is_none()
+            && let Some((entry, config)) = &service
+            && config.vm.is_some()
+            && !config.adopted
+        {
+            return self.update_vm_pin(entry, &name, args);
+        }
         let digest = args["digest"]
             .as_str()
             .filter(|digest| digest_ok(digest))
@@ -798,21 +844,8 @@ impl ServiceHandler {
                 CallError::Invalid("digest: expected sha256: and 64 lower-case hex digits".into())
             })?
             .to_string();
-        let seconds = match args.get("timeoutSeconds") {
-            None => DEFAULT_HEALTH_SECONDS,
-            Some(value) => value
-                .as_u64()
-                .filter(|seconds| (1..=MAX_HEALTH_SECONDS).contains(seconds))
-                .ok_or_else(|| {
-                    CallError::Invalid(format!(
-                        "timeoutSeconds: expected a whole number from 1 to {MAX_HEALTH_SECONDS}"
-                    ))
-                })?,
-        };
-        let Some((entry, config)) = service_entries(entries)
-            .into_iter()
-            .find(|(_, config)| config.name == name)
-        else {
+        let seconds = health_seconds(args)?;
+        let Some((entry, config)) = service else {
             return Err(service_not_found(format!("service {name}: not found")));
         };
         let said =
@@ -1595,24 +1628,14 @@ impl Run<'_> {
 
     fn answers_within(&self, seconds: u64) -> bool {
         let options = &self.handler.update;
-        let begun = Instant::now();
         if let Reach::Running = self.reach {
-            // Looked at over a few seconds: one look at the first moment says little.
-            let limit = Duration::from_secs(seconds.min(STAY_RUNNING_SECONDS));
-            loop {
-                let up = self
-                    .changer
+            return stays_running(seconds, options.pace, || {
+                self.changer
                     .read(&self.config.project, &self.config.instance)
-                    .is_ok_and(|state| state.is_running());
-                if !up {
-                    return false;
-                }
-                if begun.elapsed() >= limit {
-                    return true;
-                }
-                std::thread::sleep(options.pace);
-            }
+                    .is_ok_and(|state| state.is_running())
+            });
         }
+        let begun = Instant::now();
         let limit = Duration::from_secs(seconds);
         loop {
             let up = match self.reach {

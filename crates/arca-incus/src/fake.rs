@@ -236,7 +236,7 @@ struct Shared {
     console: Mutex<BTreeMap<(String, String), String>>,
     /// What an instance's program does after each start, by project and name: how many reads of the instance it stays
     /// running for, and what it has written to its console when it exits by itself.
-    exit_plans: Mutex<BTreeMap<(String, String), (u32, String)>>,
+    exit_plans: Mutex<BTreeMap<(String, String), ExitPlan>>,
     /// The exits armed by a start that has not ended yet.
     exits: Mutex<BTreeMap<(String, String), (u32, String)>>,
     /// Instances something outside the kernel starts, by project and name: how many reads of the instance it still
@@ -263,6 +263,12 @@ struct Shared {
     migration: Mutex<MigrationFake>,
     /// The fake a push from this one lands on, as a target daemon on the network would take it.
     peer: Mutex<Option<Arc<Shared>>>,
+}
+
+struct ExitPlan {
+    reads: u32,
+    output: String,
+    once: bool,
 }
 
 /// The served state: the server document, the pools, every object and every operation.
@@ -571,9 +577,22 @@ impl FakeIncus {
     /// running for `reads` reads of it, then it is stopped and its console log is `output`. It records no write. A
     /// stop sent before the exit ends the run, and the console keeps what a test set.
     pub fn exit_after_start(&self, project: &str, name: &str, reads: u32, output: &str) {
+        self.plan_exit(project, name, reads, output, false);
+    }
+
+    /// Like [`Self::exit_after_start`], but only for the next start or restart.
+    pub fn exit_after_next_start(&self, project: &str, name: &str, reads: u32, output: &str) {
+        self.plan_exit(project, name, reads, output, true);
+    }
+
+    fn plan_exit(&self, project: &str, name: &str, reads: u32, output: &str, once: bool) {
         lock(&self.shared.exit_plans).insert(
             (project.to_string(), name.to_string()),
-            (reads, output.to_string()),
+            ExitPlan {
+                reads,
+                output: output.to_string(),
+                once,
+            },
         );
     }
 
@@ -4192,6 +4211,17 @@ fn rebuild(shared: &Shared, store: &mut Store, request: &Request, address: &Addr
     answered(shared, store, "instance", "PUT", Ok(()))
 }
 
+fn arm_exit(shared: &Shared, address: &Address) {
+    let key = (address.project.clone(), address.name.clone());
+    let mut plans = lock(&shared.exit_plans);
+    if let Some(plan) = plans.get(&key) {
+        lock(&shared.exits).insert(key.clone(), (plan.reads, plan.output.clone()));
+        if plan.once {
+            plans.remove(&key);
+        }
+    }
+}
+
 /// Starts, stops or restarts an instance from a PUT of its state, as an operation. A stop or a restart of a hung instance fails
 /// inside its operation and leaves it running, unless it is forced and only the graceful stop hangs.
 fn change_state(
@@ -4273,10 +4303,7 @@ fn change_state(
                 config.insert("volatile.last_state.power".to_string(), json!("RUNNING"));
             }
             store.start(index, shared.counter.fetch_add(1, Ordering::SeqCst));
-            let key = (address.project.clone(), address.name.clone());
-            if let Some(plan) = lock(&shared.exit_plans).get(&key).cloned() {
-                lock(&shared.exits).insert(key, plan);
-            }
+            arm_exit(shared, address);
             answered(shared, store, "instance", "PUT", Ok(()))
         }
         "stop" if !running => bad("The instance is already stopped"),
@@ -4321,11 +4348,7 @@ fn change_state(
                 return answered(shared, store, "instance", "PUT", Err((400, reason)));
             }
             store.start(index, shared.counter.fetch_add(1, Ordering::SeqCst));
-            // The instance that exits after a start exits after a restart too.
-            let key = (address.project.clone(), address.name.clone());
-            if let Some(plan) = lock(&shared.exit_plans).get(&key).cloned() {
-                lock(&shared.exits).insert(key, plan);
-            }
+            arm_exit(shared, address);
             answered(shared, store, "instance", "PUT", Ok(()))
         }
         _ => bad("the fake takes only a start, a stop or a restart"),

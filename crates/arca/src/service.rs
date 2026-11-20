@@ -173,7 +173,7 @@ impl PrivateListen {
 pub const PRIVATE_DEVICE: &str = "private";
 
 /// A virtual-machine template's `update`: the key of its `settings` that holds the version its service runs, an image
-/// by digest. It is how `service_status` knows the version a machine was created with from the one the installed
+/// by digest. It is how `service_status` knows the version a machine records from the one the installed
 /// template names now. A container template needs none: its version is its `digest`.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -267,29 +267,32 @@ pub struct Vm {
     /// template's, with the values its create replaced.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vendor_data: Option<String>,
-    /// The settings its create replaced, by key, when it replaced any. The machine got them merged into the
-    /// template's ([`Vm::guest_settings`]); they are kept apart here so the record says what was asked for.
+    /// Overrides approved at creation or later. Vendor data stays the original first-boot seed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settings: Option<Map<String, Value>>,
 }
 
 impl Vm {
-    /// The settings object the machine was created with, exactly as its guest reads it at
-    /// [`GUEST_SETTINGS_PATH`]: read back from the cloud-init data the create carried, so a template edited since
-    /// changes nothing here. `None` for a machine without settings.
+    /// Current settings start with the original cloud-init seed, including its pinned defaults.
+    /// Later approvals change only the named overrides, even if the installed template has changed.
     pub fn guest_settings(&self) -> Option<Value> {
         use base64::Engine as _;
-        let content = self
-            .vendor_data
-            .as_deref()?
-            .lines()
-            .find_map(|line| line.strip_prefix("  content: "))?;
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(content.trim())
-            .ok()?;
-        serde_json::from_slice::<Value>(&bytes)
-            .ok()
-            .filter(Value::is_object)
+        let mut settings: Map<String, Value> = match self.vendor_data.as_deref() {
+            Some(seed) => {
+                let content = seed
+                    .lines()
+                    .find_map(|line| line.strip_prefix("  content: "))?;
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(content.trim())
+                    .ok()?;
+                serde_json::from_slice(&bytes).ok()?
+            }
+            None => self.settings.as_ref().map(|_| Map::new())?,
+        };
+        if let Some(overrides) = &self.settings {
+            settings.extend(overrides.clone());
+        }
+        Some(Value::Object(settings))
     }
 }
 
@@ -401,7 +404,7 @@ pub fn raw_lxc_line_ok(line: &str) -> bool {
 }
 
 /// Where a virtual machine's guest finds its template's `settings`, as one JSON object.
-pub const GUEST_SETTINGS_PATH: &str = "/etc/arca/settings.json";
+pub use arca_incus::exec::GUEST_SETTINGS_PATH;
 /// The largest first-boot script a template may carry, in bytes.
 const FIRST_BOOT_MAX: usize = 256 * 1024;
 /// The largest `settings` object a template may carry, as compact JSON, in bytes.
@@ -2555,10 +2558,20 @@ pub fn create_settings(
     template: &Template,
     given: Option<&Value>,
 ) -> Result<ServiceSettings, TemplateError> {
+    merge_settings(template, template.settings.as_ref(), given)
+}
+
+/// Validate the requested keys against today's template, and check its rules on the object's
+/// actual resulting values. Updating an existing VM preserves all unrequested first-boot values.
+pub(crate) fn merge_settings(
+    template: &Template,
+    current: Option<&Value>,
+    given: Option<&Value>,
+) -> Result<ServiceSettings, TemplateError> {
     let name = &template.name;
     let refused = |why: String| Err(TemplateError::refused(why));
     let unchanged = || ServiceSettings {
-        merged: template.settings.clone(),
+        merged: current.cloned(),
         replaced: None,
     };
     let Some(given) = given else {
@@ -2580,7 +2593,10 @@ pub fn create_settings(
             "settings: template {name} lets a create set none (its createSettings lists none)"
         ));
     };
-    let mut merged = defaults.clone();
+    let mut merged = current
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
     for (key, value) in given {
         let Some(default) = defaults
             .get(key)
@@ -3013,9 +3029,8 @@ pub fn template_pin(template: &Template) -> Option<String> {
     source_pin(&source(template).ok()?)
 }
 
-/// The version a service was created with, from its own record: a container's OCI source, or what its machine's
-/// settings hold under the key its template's `update.pin` names. The record keeps both from the create, so a template
-/// edited since changes nothing here. `None` for an adopted instance, a system image, and a machine whose installed
+/// The version a service records: a container's OCI source, or what its machine's settings hold under the key
+/// its template's `update.pin` names. `None` for an adopted instance, a system image, and a machine whose installed
 /// template names no such key.
 pub fn created_pin(cfg: &ServiceConfig, template: Option<&Template>) -> Option<String> {
     if cfg.adopted {
@@ -3030,7 +3045,7 @@ pub fn created_pin(cfg: &ServiceConfig, template: Option<&Template>) -> Option<S
     }
 }
 
-/// What `service_status` answers under `update`: the version the service was created with (`pin`), the one its
+/// What `service_status` answers under `update`: the version the service records (`pin`), the one its
 /// installed template names now (`templatePin`), and whether the two are the `same` or the template's `differs`. Two
 /// digests carry no order, so nothing here says which is newer. `unknown`, with the reason in `problem`, when the
 /// installed template cannot say: it is gone, cannot be read, or is of another kind now. `None` for a service whose

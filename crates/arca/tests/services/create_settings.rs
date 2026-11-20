@@ -719,3 +719,582 @@ fn kernel_access_and_create_settings_belong_to_two_kinds_of_template_and_neither
         .expect("status");
     assert!(status.get("settings").is_some() && status.get("kernelAccess").is_none());
 }
+
+fn propose_settings(rig: &Rig, settings: Value) -> Result<Value, CallError> {
+    let handlers: HashMap<_, _> = arca::handlers::plan_handlers_served(
+        rig.kernel.clone(),
+        Arc::new(|| NOW),
+        None,
+        None,
+        None,
+        None,
+        arca::handlers::ActionSlot::default(),
+        Some(rig.cfg.clone()),
+    )
+    .into_iter()
+    .collect();
+    handlers["action_propose"].call(
+        json!({"action":"service_update","args":{"name":"p1","settings":settings,"changes":{"forged":true}}}), &doctor()
+    )
+}
+
+fn approve_settings(rig: &Rig, key: &common::SkKey, card: &Value) -> Result<Value, CallError> {
+    let statement = action_statement(
+        common::HOST,
+        card["id"].as_str().unwrap(),
+        "service_update",
+        card["argsDigest"].as_str().unwrap(),
+        NOW,
+        &format!("{:032x}", SEQ.fetch_add(1, Ordering::SeqCst)),
+    )
+    .unwrap();
+    let approval = common::approve_statement(key, &statement);
+    let approved = approve_action(
+        &mut rig.kernel.lock().unwrap(),
+        &json!({"plan":card["id"], "approval":approval}),
+        NOW,
+    )
+    .unwrap();
+    ActionExecutor::new(rig.handlers.iter().map(|(v, h)| (*v, h.clone()))).run(
+        &approved.action,
+        &approved.args,
+        &approved.grant,
+    )
+}
+
+#[test]
+fn vm_settings_update_an_older_guest_on_the_approved_card() {
+    let key = common::SkKey::from_seed(64);
+    let rig = Rig::with(mixed_kernel(&["br0"], roomy()), Some(&key), vec![]);
+    let mut template = pool_template();
+    template["secrets"] = json!(["ACCESS_KEY"]);
+    rig.template("pool", template.clone());
+    create_with(&rig, "p1", json!({"note":"custom","group":3})).unwrap();
+    rig.call(
+        "service_secret_set",
+        json!({"name":"p1","key":"ACCESS_KEY","value":"test fixture"}),
+    )
+    .unwrap();
+    let life = super::vm_secrets::life(&rig, std::time::Duration::from_secs(1));
+    super::vm_secrets::start(&life, "p1").unwrap();
+    rig.fake.add_volume(
+        PROJECT,
+        "vmpool",
+        "workspace-data",
+        json!({"description":"persistent data"}),
+    );
+    rig.fake.set_instance_device(
+        PROJECT,
+        "p1",
+        "work",
+        json!({
+            "type":"disk", "pool":"vmpool", "source":"workspace-data", "path":"/var/lib/workspace"
+        }),
+    );
+    let volume_path =
+        format!("/1.0/storage-pools/vmpool/volumes/custom/workspace-data?project={PROJECT}");
+    let volume = rig.get(&volume_path).expect("attached volume");
+    let data = "/var/lib/workspace/data";
+    rig.fake.write_guest_file(PROJECT, "p1", data, b"retained");
+    let files = rig.fake.service_files();
+    let original = instance(&rig, "p1");
+    let record = entry(&rig, "service-p1").config;
+    let acl = "/1.0/network-acls/arcak-svc-svc-p1?project=default";
+    let rules = rig.get(acl).unwrap();
+    let seed = guest_settings(&rig, "p1");
+    template["settings"]["signIn"] = json!("single");
+    template["createSettings"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!("signIn"));
+    template["settings"]["ratio"] = json!(4.5);
+    rig.template("pool", template);
+
+    let writes = rig.fake.writes().len();
+    for invalid in [
+        json!({"group":4,"missing":true}),
+        json!({"group":"4"}),
+        json!({"pin":"wrong"}),
+    ] {
+        propose_settings(&rig, invalid).expect_err("refused before approval");
+    }
+    let patch = json!({"signIn":"members","group":4});
+    rig.call("service_update", json!({"name":"p1","settings":patch}))
+        .expect_err("approval required");
+    let stale = propose_settings(&rig, json!({"group":6})).unwrap();
+    let card = propose_settings(&rig, patch).unwrap();
+    let rows = card["details"].as_array().unwrap();
+    for (label, value) in [
+        ("Previous group", "3"),
+        ("New group", "4"),
+        ("Previous signIn", "(unset)"),
+        ("New signIn", "\"members\""),
+    ] {
+        assert!(
+            rows.contains(&json!({"label":label,"value":value})),
+            "{card}"
+        );
+    }
+    assert_eq!(rig.fake.writes().len(), writes);
+    let result = approve_settings(&rig, &key, &card).unwrap();
+    assert_eq!(result["restarted"], true);
+    let requests = rig.fake.service_requests();
+    let wrote = requests
+        .iter()
+        .position(|r| r.method == "POST" && r.path.ends_with(service::GUEST_SETTINGS_PATH))
+        .unwrap();
+    assert!(requests[wrote + 1..].iter().any(|r| r.method == "PUT"
+        && serde_json::from_slice::<Value>(&r.body).is_ok_and(|v| v["action"] == "restart")));
+    let changes = json!({"settings":{"signIn":{"new":"members"}, "group":{"old":3,"new":4}}});
+    assert_eq!(result["changes"], changes);
+    let mut expected = seed;
+    expected["signIn"] = json!("members");
+    expected["group"] = json!(4);
+    let mut after_files = rig.fake.service_files();
+    let contents = after_files
+        .remove(&format!("{PROJECT}/p1:{}", service::GUEST_SETTINGS_PATH))
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&contents).unwrap(),
+        expected
+    );
+    assert_eq!(after_files, files, "data and guest secret bytes");
+    assert_eq!(
+        rig.call("service_status", json!({"name":"p1"})).unwrap()["settings"],
+        expected
+    );
+    assert_eq!(instance(&rig, "p1")["devices"], original["devices"]);
+    assert_eq!(
+        guest_settings(&rig, "p1")["group"],
+        3,
+        "cloud-init seed is untouched"
+    );
+    let after = entry(&rig, "service-p1").config;
+    assert_eq!(rig.get(&volume_path).unwrap(), volume);
+    for field in ["ipv4", "secretRefs"] {
+        assert_eq!(after[field], record[field]);
+    }
+    assert_eq!(
+        instance(&rig, "p1")["config"]["volatile.uuid"],
+        original["config"]["volatile.uuid"]
+    );
+    assert_eq!(rig.get(acl).unwrap(), rules);
+    let journal = fs::read_to_string(rig.dir.join("service-updates.jsonl")).unwrap();
+    assert!(
+        journal
+            .lines()
+            .map(|l| serde_json::from_str::<Value>(l).unwrap())
+            .any(|v| v["step"] == "begin" && v["detail"] == changes)
+    );
+    let writes = rig.fake.writes().len();
+    let stale = approve_settings(&rig, &key, &stale).unwrap_err();
+    assert!(
+        stale
+            .refusal()
+            .unwrap()
+            .1
+            .contains("changed since the owner's card")
+    );
+    assert_eq!(rig.fake.writes().len(), writes);
+}
+
+#[test]
+fn updating_stopped_vm_settings_returns_it_to_stopped() {
+    let key = common::SkKey::from_seed(65);
+    let rig = Rig::with(mixed_kernel(&["br0"], roomy()), Some(&key), vec![]);
+    rig.template("pool", pool_template());
+    rig.call(
+        "service_create",
+        json!({"name":"p1","template":"pool","start":false}),
+    )
+    .unwrap();
+    rig.fake
+        .set_last_used(PROJECT, "p1", "2020-01-01T00:00:00Z");
+    let card = propose_settings(&rig, json!({"open":true})).unwrap();
+    assert_eq!(
+        approve_settings(&rig, &key, &card).unwrap()["updated"],
+        true
+    );
+    assert_eq!(instance(&rig, "p1")["status"], "Stopped");
+    let writes = rig.fake.writes().len();
+    let card = propose_settings(&rig, json!({"open":true})).unwrap();
+    assert_eq!(
+        approve_settings(&rig, &key, &card).unwrap()["updated"],
+        false
+    );
+    assert_eq!(rig.fake.writes().len(), writes);
+}
+
+#[test]
+fn vm_settings_before_first_boot_update_the_seed_without_starting() {
+    let key = common::SkKey::from_seed(66);
+    let rig = Rig::with(mixed_kernel(&["br0"], roomy()), Some(&key), vec![]);
+    rig.template("pool", pool_template());
+    rig.call(
+        "service_create",
+        json!({"name":"p1","template":"pool","start":false}),
+    )
+    .unwrap();
+    rig.fake
+        .set_last_used(PROJECT, "p1", "0001-01-01T00:00:00Z");
+    let card = propose_settings(&rig, json!({"group":5})).unwrap();
+    let before = rig.fake.writes().len();
+    assert_eq!(
+        approve_settings(&rig, &key, &card).unwrap()["restarted"],
+        false
+    );
+    assert_eq!(guest_settings(&rig, "p1")["group"], 5);
+    assert!(rig.fake.service_files().is_empty());
+    assert!(
+        rig.fake.writes()[before..]
+            .iter()
+            .all(|r| !r.path.contains("/state?"))
+    );
+}
+
+#[test]
+fn vm_settings_restore_the_guest_file_and_record_if_the_restart_fails() {
+    let key = common::SkKey::from_seed(67);
+    let rig = Rig::with(mixed_kernel(&["br0"], roomy()), Some(&key), vec![]);
+    rig.template("pool", pool_template());
+    create_with(&rig, "p1", json!({"group":9})).unwrap();
+    let old = guest_settings(&rig, "p1");
+    rig.fake.hang_stop("p1", false);
+    let card = propose_settings(&rig, json!({"group":5})).unwrap();
+    let error = approve_settings(&rig, &key, &card).unwrap_err();
+    assert!(
+        error
+            .refusal()
+            .unwrap()
+            .1
+            .contains("could not restart the VM"),
+        "{error:?}"
+    );
+    let files = rig.fake.service_files();
+    let bytes = &files[&format!("{PROJECT}/p1:{}", service::GUEST_SETTINGS_PATH)];
+    assert_eq!(serde_json::from_slice::<Value>(bytes).unwrap(), old);
+    assert_eq!(
+        rig.call("service_status", json!({"name":"p1"})).unwrap()["settings"],
+        old
+    );
+}
+
+fn pin_update_rig(start: bool, with_pin: bool) -> Rig {
+    let rig = Rig::with(mixed_kernel(&["br0"], roomy()), None, vec![]);
+    let mut template = pool_template();
+    template["settings"]["pin"] = json!(format!("registry.example/runner@{DIGEST}"));
+    if with_pin {
+        template["update"] = json!({"pin":"pin"});
+    }
+    rig.template("pool", template);
+    rig.call(
+        "service_create",
+        json!({"name":"p1","template":"pool","settings":{"group":9},"start":start}),
+    )
+    .unwrap();
+    rig
+}
+
+fn vm_pin_update(rig: &Rig, digest: &str) -> Result<Value, CallError> {
+    rig.call(
+        "service_update",
+        json!({"name":"p1","digest":digest,"timeoutSeconds":1}),
+    )
+}
+
+fn vm_settings_file(rig: &Rig) -> Value {
+    serde_json::from_slice(
+        &rig.fake.service_files()[&format!("{PROJECT}/p1:{}", service::GUEST_SETTINGS_PATH)],
+    )
+    .unwrap()
+}
+
+fn vm_pin_journal(path: &std::path::Path) -> Vec<Value> {
+    fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+#[test]
+fn vm_pin_update_retries_after_interruption_following_the_restart() {
+    let mut rig = pin_update_rig(true, true);
+    let record = entry(&rig, "service-p1").config;
+    let actions = rig.fake.state_actions(PROJECT, "p1").len();
+    let digest = format!("registry.example/runner@sha256:{}", "2".repeat(64));
+    let journal = rig.dir.join("service-updates.jsonl");
+    rig.handlers = service_handlers(
+        rig.kernel.clone(),
+        Arc::new(move || {
+            assert!(
+                !vm_pin_journal(&journal)
+                    .last()
+                    .is_some_and(|row| row["step"] == "power" && row["ok"] == true),
+                "simulated interruption after restart"
+            );
+            NOW
+        }),
+        rig.cfg.clone(),
+    )
+    .into_iter()
+    .collect();
+    let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        vm_pin_update(&rig, &digest)
+    }));
+    assert!(interrupted.is_err());
+    assert_eq!(vm_settings_file(&rig)["pin"], digest);
+    assert_eq!(
+        &rig.fake.state_actions(PROJECT, "p1")[actions..],
+        ["restart"]
+    );
+    assert_eq!(entry(&rig, "service-p1").config, record);
+
+    // The process restart discards the unwound handler and the poisoned in-memory gate.
+    rig.kernel.lock().unwrap().write_gate().clear_poison();
+    rig.handlers = service_handlers(rig.kernel.clone(), Arc::new(|| NOW), rig.cfg.clone())
+        .into_iter()
+        .collect();
+    let requests = rig.fake.service_requests().len();
+    assert_eq!(vm_pin_update(&rig, &digest).unwrap()["updated"], true);
+    assert!(
+        rig.fake.service_requests()[requests..]
+            .iter()
+            .any(|request| {
+                request.method == "POST" && request.path.contains(service::GUEST_SETTINGS_PATH)
+            })
+    );
+    assert_eq!(
+        &rig.fake.state_actions(PROJECT, "p1")[actions..],
+        ["restart", "restart"]
+    );
+    assert_eq!(
+        entry(&rig, "service-p1").config["vm"]["settings"]["pin"],
+        digest
+    );
+}
+
+#[test]
+fn vm_pin_update_refuses_an_unavailable_guest_agent_without_rollback() {
+    let rig = pin_update_rig(true, true);
+    let record = entry(&rig, "service-p1").config;
+    let files = rig.fake.service_files();
+    let requests = rig.fake.service_requests().len();
+    let actions = rig.fake.state_actions(PROJECT, "p1");
+    rig.fake.set_guest_agent_unready(2);
+
+    let digest = format!("registry.example/runner@sha256:{}", "2".repeat(64));
+    let error = vm_pin_update(&rig, &digest).unwrap_err();
+    let (code, message) = error.refusal().unwrap();
+    assert_eq!(code, "refused");
+    assert!(message.ends_with("Nothing was changed"), "{message}");
+    assert_eq!(entry(&rig, "service-p1").config, record);
+    assert_eq!(rig.fake.service_files(), files);
+    assert_eq!(rig.fake.state_actions(PROJECT, "p1"), actions);
+    assert_eq!(rig.fake.service_requests().len(), requests + 1);
+
+    let rows = vm_pin_journal(&rig.dir.join("service-updates.jsonl"));
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[1]["step"], "guest settings");
+    assert_eq!(rows[1]["ok"], false);
+    assert_eq!(
+        rows[1]["detail"]["why"],
+        "could not write the guest settings file"
+    );
+    assert_eq!(rows[2]["detail"]["why"], rows[1]["detail"]["why"]);
+}
+
+#[test]
+fn vm_pin_update_reports_failed_rollback_if_the_restored_vm_does_not_stay_running() {
+    let mut rig = pin_update_rig(true, true);
+    rig.handlers = arca::handlers::service_handlers_updating(
+        rig.kernel.clone(),
+        Arc::new(|| NOW),
+        rig.cfg.clone(),
+        None,
+        arca::handlers::UpdateOptions {
+            pace: std::time::Duration::from_millis(10),
+            ..Default::default()
+        },
+    )
+    .into_iter()
+    .collect();
+    // Both restarted versions stop during health checks. A temporary boot lasts long
+    // enough to write the old file and restart onto it.
+    rig.fake.exit_after_start(PROJECT, "p1", 8, "exited");
+    let old = guest_settings(&rig, "p1");
+    let record = entry(&rig, "service-p1").config;
+    let actions = rig.fake.state_actions(PROJECT, "p1").len();
+
+    let digest = format!("registry.example/runner@sha256:{}", "2".repeat(64));
+    let error = vm_pin_update(&rig, &digest).unwrap_err();
+    assert_eq!(error.refusal().unwrap().0, "rollback_failed");
+    assert_eq!(vm_settings_file(&rig), old);
+    assert_eq!(entry(&rig, "service-p1").config, record);
+    assert_eq!(
+        &rig.fake.state_actions(PROJECT, "p1")[actions..],
+        ["restart", "start", "restart"]
+    );
+    assert_eq!(instance(&rig, "p1")["status"], "Stopped");
+    let rows = vm_pin_journal(&rig.dir.join("service-updates.jsonl"));
+    let failed = rows
+        .iter()
+        .find(|row| row["step"] == "restore health")
+        .unwrap();
+    assert_eq!(failed["ok"], false);
+    assert_eq!(
+        failed["detail"]["why"],
+        "health check: the VM did not stay running"
+    );
+}
+
+#[test]
+fn vm_pin_update_writes_guest_and_record_and_restarts_without_rebuilding() {
+    let rig = pin_update_rig(true, true);
+    let before = instance(&rig, "p1");
+    let actions = rig.fake.state_actions(PROJECT, "p1").len();
+    let digest = format!("other.example/team/runner@sha256:{}", "2".repeat(64));
+    let verb = arca_api::verb("service_update").unwrap();
+    arca_api::conforms(&(verb.params)(), &json!({"name":"p1","digest":digest})).unwrap();
+
+    let result = vm_pin_update(&rig, &digest).expect("update");
+    arca_api::conforms(&(verb.result)(), &result).unwrap();
+    assert_eq!(result["updated"], true);
+    assert_eq!(result["digest"], digest);
+    assert_eq!(result["restarted"], true);
+    assert_eq!(
+        &rig.fake.state_actions(PROJECT, "p1")[actions..],
+        ["restart"]
+    );
+    assert!(rig.fake.rebuilds(PROJECT, "p1").is_empty());
+    let after = instance(&rig, "p1");
+    assert_eq!(after["status"], "Running");
+    assert_eq!(after["devices"], before["devices"]);
+    assert_eq!(
+        after["config"]["volatile.uuid"],
+        before["config"]["volatile.uuid"]
+    );
+    let status = rig.call("service_status", json!({"name":"p1"})).unwrap();
+    assert_eq!(status["update"]["pin"], digest);
+    assert_eq!(status["update"]["state"], "differs");
+    assert_eq!(status["settings"], vm_settings_file(&rig));
+    assert_eq!(status["settings"]["group"], 9);
+    assert_eq!(
+        entry(&rig, "service-p1").config["vm"]["settings"]["pin"],
+        digest
+    );
+    let writes = rig.fake.writes().len();
+    assert_eq!(vm_pin_update(&rig, &digest).unwrap()["updated"], false);
+    assert_eq!(rig.fake.writes().len(), writes);
+}
+
+#[test]
+fn vm_pin_update_rejects_malformed_digest_without_writing() {
+    let rig = pin_update_rig(true, true);
+    let writes = rig.fake.writes().len();
+    let record = entry(&rig, "service-p1").config;
+    for digest in [
+        DIGEST.to_string(),
+        "registry.example/runner:latest".into(),
+        "registry.example/runner@sha256:1234".into(),
+        format!("registry.example/@{DIGEST}"),
+        format!("registry.example//runner@{DIGEST}"),
+    ] {
+        assert!(
+            matches!(vm_pin_update(&rig, &digest), Err(CallError::Invalid(message)) if message.contains("<registry>/<name>@sha256:")),
+            "{digest}"
+        );
+    }
+    assert_eq!(rig.fake.writes().len(), writes);
+    assert_eq!(entry(&rig, "service-p1").config, record);
+    assert!(!rig.dir.join("service-updates.jsonl").exists());
+}
+
+#[test]
+fn vm_pin_update_rolls_back_a_vm_that_stops_during_health_check() {
+    let rig = pin_update_rig(true, true);
+    let record = entry(&rig, "service-p1").config;
+    let old = guest_settings(&rig, "p1");
+    let actions = rig.fake.state_actions(PROJECT, "p1").len();
+    rig.fake.exit_after_next_start(PROJECT, "p1", 2, "exited");
+
+    let digest = format!("registry.example/runner@sha256:{}", "2".repeat(64));
+    let error = vm_pin_update(&rig, &digest).unwrap_err();
+    let (code, message) = error.refusal().expect("update refusal");
+    assert_eq!(code, "rolled_back");
+    assert!(
+        message.contains("health check") && message.contains("rolled back"),
+        "{message}"
+    );
+    assert_eq!(entry(&rig, "service-p1").config, record);
+    assert_eq!(vm_settings_file(&rig), old);
+    assert_eq!(instance(&rig, "p1")["status"], "Running");
+    assert_eq!(
+        &rig.fake.state_actions(PROJECT, "p1")[actions..],
+        ["restart", "start", "restart"]
+    );
+    assert!(rig.fake.rebuilds(PROJECT, "p1").is_empty());
+    let rows = vm_pin_journal(&rig.dir.join("service-updates.jsonl"));
+    assert!(rows.iter().any(|row| row["step"] == "health"
+        && row["ok"] == false
+        && row["detail"]["why"] == "health check: the VM did not stay running"));
+    assert!(
+        rows.iter()
+            .all(|row| row["step"] != "record" && row["step"] != "restore record")
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row["step"] == "restore health" && row["ok"] == true)
+    );
+    assert_eq!(rows.last().unwrap()["step"], "end");
+    assert_eq!(rows.last().unwrap()["detail"]["rolledBack"], true);
+}
+
+#[test]
+fn vm_pin_update_keeps_a_previously_used_stopped_vm_stopped() {
+    let rig = pin_update_rig(false, true);
+    rig.fake
+        .set_last_used(PROJECT, "p1", "2020-01-01T00:00:00Z");
+    let actions = rig.fake.state_actions(PROJECT, "p1").len();
+    let digest = format!("registry.example/runner@sha256:{}", "2".repeat(64));
+    let result = vm_pin_update(&rig, &digest).unwrap();
+    assert_eq!(result["restarted"], false);
+    assert_eq!(vm_settings_file(&rig)["pin"], digest);
+    assert_eq!(instance(&rig, "p1")["status"], "Stopped");
+    assert_eq!(
+        &rig.fake.state_actions(PROJECT, "p1")[actions..],
+        ["start", "stop"]
+    );
+}
+
+#[test]
+fn vm_pin_update_preserves_the_refusal_for_a_vm_without_a_pin() {
+    let rig = pin_update_rig(true, false);
+    let writes = rig.fake.writes().len();
+    let error = vm_pin_update(&rig, DIGEST).unwrap_err();
+    assert!(
+        error
+            .refusal()
+            .unwrap()
+            .1
+            .contains("only a container service")
+    );
+    assert_eq!(rig.fake.writes().len(), writes);
+}
+
+#[test]
+fn vm_pin_update_updates_the_first_boot_seed_without_starting() {
+    let rig = pin_update_rig(false, true);
+    rig.fake
+        .set_last_used(PROJECT, "p1", "0001-01-01T00:00:00Z");
+    let digest = format!("registry.example/runner@sha256:{}", "2".repeat(64));
+    let actions = rig.fake.state_actions(PROJECT, "p1");
+    assert_eq!(vm_pin_update(&rig, &digest).unwrap()["restarted"], false);
+    assert_eq!(rig.fake.state_actions(PROJECT, "p1"), actions);
+    assert!(rig.fake.service_files().is_empty());
+    assert_eq!(guest_settings(&rig, "p1")["pin"], digest);
+    assert_eq!(
+        rig.call("service_status", json!({"name":"p1"})).unwrap()["update"]["pin"],
+        digest
+    );
+}

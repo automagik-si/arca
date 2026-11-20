@@ -1105,20 +1105,20 @@ is its own instance, and the upgrade does not touch it. Its `service_status` sho
 
 From the release after 0.30.0, an unedited `automagik-workspace` moves to Automagik 3.146.5 the same way, with the
 provenance check before the pull and `accessEmails` as text. A workspace made before keeps its machine, its keeper,
-its image and its list of addresses: a virtual machine is not updated in place. Its `service_status` shows the pin as
-`differs`; `service_remove` and `service_create` give a new one at 3.146.5.
+its image and its list of addresses when the template is installed. Its `service_status` shows the pin as
+`differs`. Use `service_update` to set the existing workspace's image pin.
 
 Keep a running service on the release it has, unless you move it yourself: Arca does not move one to its template's
 version by itself. A container moves in place with `service_update {name, digest}`: to the digest an OCI template now
 names, or, for a service made from a local image pinned by fingerprint, to that image's fingerprint, which must
-already be in the service project's image store. An update in place needs an image pinned by digest or fingerprint, a
+already be in the service project's image store. A container update needs an image pinned by digest or fingerprint, a
 template port for the health check, and the service's data on a declared volume (a template `data` path): the rebuild
 replaces the root, so whatever the service keeps there is gone, and a service whose template declares a volume it does
 not have is refused. A service that keeps data on its root, whose image is not pinned, or whose template declares no
 port, is not updatable in place: copy the data out, or create a new service. Keep the old image in the store until the
 update has succeeded, since a rollback in a project without snapshots rebuilds the old root from it. A virtual machine
-has no update path: the way is a `service_remove` and a `service_create`, and the remove deletes the service's data,
-which Arca cannot put back into the new service:
+with `update.pin` can move to a different guest image while keeping its disks. Removing and recreating either service
+deletes its data:
 
 - The server's `/data` is its own volume, `<name>-data`, which `service_remove` deletes with the instance. A snapshot
   of the instance leaves that volume out; it needs its own: `snapshot_create` with `{project: "arcak-svc", volume:
@@ -1973,8 +1973,21 @@ moves a running container service made from an image by digest (today `automagik
 pinned by fingerprint (a template's `local:<alias>` beside a `digest`, see "A local image may be pinned") to another
 digest, or fingerprint, in one call. It is a destructive verb (it takes the optional `confirm`), needs a `doctor`
 token and asks the owner for nothing, except for `eraseData` (see below); it works inside a tenant as outside one.
-There is no update path for `automagik-workspace` yet: it is a virtual machine, whose Docker pulls its own server
-image, and the verb refuses it. In order, each step a line in `service-updates.jsonl` in the
+For a VM whose template declares `update.pin`, call `service_update` with `{name, digest, timeoutSeconds?, tenant?}`.
+Give a full image reference, `<registry>/<name>@sha256:<64 lower-case hex digits>`. The registry and repository may
+change. Arca writes the pin into the guest settings file, then restarts a running VM. It checks that the VM stays
+running for 10 seconds, capped by `timeoutSeconds`, before saving the new pin in the service record. If Arca stops
+before saving the record, retry the same update to finish it. The guest software pulls and checks the image.
+A previously used, stopped VM boots briefly to receive the file and returns to stopped. A VM that has never booted
+receives the new pin in its cloud-init seed and stays stopped. Both read the pin on the next boot.
+
+If a VM update fails after a write, Arca restores the previous settings and, if the record write was attempted, the
+previous record. It restarts a VM that had been running and checks it over the same window. The call reports
+`rolled_back` when Arca confirms restoration and `rollback_failed` otherwise.
+`service_status.update.pin` shows the recorded pin. The journal records the steps. The root disk and data are preserved.
+Use the separate `{name, settings, tenant?}` mode under **Settings for one service** for other guest settings.
+
+For containers, in order, each step is a line in `service-updates.jsonl` in the
 state directory (an append-only file of JSON lines: a `begin`, one line per step, an `end`; never a secret):
 
 1. the instance is stopped, if it runs, and a snapshot of it, `pre-update-<time>`, is taken where the project allows
@@ -2191,8 +2204,8 @@ run at once.
 
 A service made from the `automagik-server` template follows Automagik's releases by default, so it stays easy to
 update: the node moves it to each newer server image Automagik publishes, with `service_update`, and nobody has to ask.
-(`automagik-workspace` is a virtual machine, which `service_update` does not move, so it does not follow.) Only a
-container of the node's own project made from `ghcr.io/automagik-si/automagik-server` by digest can follow.
+Only a container of the node's own project made from `ghcr.io/automagik-si/automagik-server` by digest can use
+`follow`.
 
 On a timer of its own, every 10 minutes (`follow.intervalSeconds` in the node config, 60 to 86400), the node reads
 Automagik's record of its newest server image, `releases/download/server-lane/server-image.json` of
@@ -6004,13 +6017,25 @@ refused, before anything is created, and in words that name the setting:
   under a key named `memory` more than the machine's own memory (the template's `limits.memory`);
 - settings that pass 16KiB once merged.
 
-Settings are fixed at create, like the rest of a virtual machine's first boot: to change one, create the service
-again. They never hold a secret, and Arca shows them: `service_status` answers `settings`, the object the machine
-was created with, and when a create is proposed the owner's card has one row for each setting it replaces, with its
-value in words, so an address is seen before it is approved. A list has one row for each element (`Setting classes
-1`, `Setting classes 2`), each with its fields, so a long list is shown whole. The card cuts nothing: a proposal whose
-setting would need a row of more than 160 characters is refused when it is made, naming the row, and nothing is asked
-of the owner. The service's record keeps the replaced values as `vm.settings`.
+To change an existing VM, propose `service_update` with the names and values to replace.
+For example, an owner's assistant can submit this to `action_propose`:
+
+```json
+{"action":"service_update","args":{"name":"ci","settings":{"maxSlots":8}}}
+```
+
+The current template determines which keys and types it accepts. The VM's recorded settings supply all other
+values, including its original image pin. A template can add a key after the VM was created. The owner's card
+shows its previous value as `(unset)`. The node checks the old and new values again at approval.
+
+Arca writes the merged JSON to `/etc/arca/settings.json` through the guest agent and restarts a running VM.
+For a stopped VM it starts the machine briefly to deliver the file, then stops it again. If the VM has never
+booted, Arca updates its cloud-init seed and leaves it stopped. Its next boot reads the new values. The guest software must support the selected setting. This operation keeps the installed
+guest software, the disks, address, secrets and network rules. `service_status.settings` shows the effective
+values. The service update journal records each changed name and its previous and new values.
+
+Settings are public to the guest. Store secrets separately with `service_secret_set`. On a create card, Arca
+shows a list one element per row and refuses a setting whose row would exceed 160 characters.
 
 **What must hold between settings.** A template may also say what must hold between its settings, in
 `settingRules`, so that a create the machine itself would refuse at its first boot is refused before anything is
@@ -6807,8 +6832,7 @@ What to know:
   `https://<team>.cloudflareaccess.com`, an outgoing call the service network allows like any other.
 - **All three Access settings, or none.** The gate does not start with one or two. The first boot checks the
   settings and says on the console what is wrong, and the keeper repeats it; nothing is started with settings that
-  cannot be used. Settings are fixed when the machine is created, so the cure is a corrected template and a new
-  machine.
+  cannot be used. Propose the corrected Access settings together with `service_update`.
 - **Where the token lives.** In Arca's private `secrets/` directory, in the machine's `/etc/arca-secrets/TUNNEL_TOKEN`
   (root's, mode 0600), and in a copy in the machine's memory (`/run/automagik-workspace/tunnel/token`) that only the
   connector's user reads. The connector reads that file; the token is not in its environment, on any command line or
@@ -6863,9 +6887,10 @@ What to know:
 
   `systemctl status automagik-member-runner` and `journalctl -u automagik-member-runner` inside the machine say how it
   runs. Its refusals and failures also reach the console (`service_logs`).
-- **The settings are fixed.** They are read when the machine is created. To change the reach, the public address
-  or the Access settings, create the workspace again with other settings. To move the server's image pin, edit
-  `serverImage` in the template: workspaces created afterwards run the new build.
+- **Changing workspace settings.** Propose the reach, public address and Access settings together with
+  `service_update`. The keeper reads them when the VM restarts. Use `service_update` with a full image reference in
+  `digest` to change the `serverImage` pin of an existing workspace. Edit the template's `serverImage` to change the
+  pin supplied to new workspaces.
 
 ## A pool of GitHub Actions runners
 
