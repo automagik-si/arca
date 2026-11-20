@@ -1088,10 +1088,11 @@ A new Automagik starts from Automagik's published image, and nothing is built on
 pinned to one of Automagik's releases by its digest: `automagik-server`, a container on the node reachable on its LAN
 address at port 3081, at 3.136.4 (`ghcr.io/automagik-si/automagik-server@sha256:49e997e3…`, one linux/amd64 image,
 about 190 MiB to pull), and `automagik-workspace`, a virtual machine of its own reached through a Cloudflare Tunnel or
-the tailnet, at 3.146.5 (`…@sha256:cc804cb0…`; see "An Automagik workspace in its own virtual machine"). For `automagik-server`, Incus pulls the image from the
+the tailnet, which installs 3.160.2 (`…@sha256:1b8fd166…`; see "An Automagik workspace in its own virtual machine"). For `automagik-server`, Incus pulls the image from the
 registry by that digest at the create. A workspace is created stopped, and Docker inside its machine pulls the image
 by its digest when the keeper first starts the server, after `instance_start`, once the image's GitHub build
-provenance verifies; the machine needs a route to `ghcr.io` then. Omni channels are not in 3.136.4: in Automagik's design the welcome installs Omni, and 3.136.4 has a bug
+provenance verifies. The VM then follows Automagik's stable server lane. It needs a route to `ghcr.io`.
+Omni channels are not in 3.136.4: in Automagik's design the welcome installs Omni, and 3.136.4 has a bug
 that loses the plugin. They come through the welcome once Automagik's fixed release is pinned here. The hand-built
 `automagik` template below stays as it is for what the published image does not give today: the Omni channels plugin
 until then, and being published on the tailnet with `service_publish`, which an OCI service cannot be. Build
@@ -1103,10 +1104,9 @@ upgrade, as any shipped template nobody edited. A service made before keeps runn
 is its own instance, and the upgrade does not touch it. Its `service_status` shows the newer release under `update`
 (`"state": "differs"`, the new digest as `templatePin`). A new `automagik-server` service pulls 3.136.4.
 
-From the release after 0.30.0, an unedited `automagik-workspace` moves to Automagik 3.146.5 the same way, with the
-provenance check before the pull and `accessEmails` as text. A workspace made before keeps its machine, its keeper,
-its image and its list of addresses: a virtual machine is not updated in place. Its `service_status` shows the pin as
-`differs`; `service_remove` and `service_create` give a new one at 3.146.5.
+An installed, unedited `automagik-workspace` template receives the new install pin the same way. Workspaces created
+before this release keep their original keeper, settings and install pin, so they do not follow the server lane.
+Their `service_status` shows `update.state` as `differs` against the new install pin.
 
 Keep a running service on the release it has, unless you move it yourself: Arca does not move one to its template's
 version by itself. A container moves in place with `service_update {name, digest}`: to the digest an OCI template now
@@ -1116,9 +1116,9 @@ template port for the health check, and the service's data on a declared volume 
 replaces the root, so whatever the service keeps there is gone, and a service whose template declares a volume it does
 not have is refused. A service that keeps data on its root, whose image is not pinned, or whose template declares no
 port, is not updatable in place: copy the data out, or create a new service. Keep the old image in the store until the
-update has succeeded, since a rollback in a project without snapshots rebuilds the old root from it. A virtual machine
-has no update path: the way is a `service_remove` and a `service_create`, and the remove deletes the service's data,
-which Arca cannot put back into the new service:
+update has succeeded, since a rollback in a project without snapshots rebuilds the old root from it. Replacing a
+virtual machine with `service_remove` and `service_create` deletes its data. The workspace keeper updates the server
+and gate inside the VM and reuses their existing mounts.
 
 - The server's `/data` is its own volume, `<name>-data`, which `service_remove` deletes with the instance. A snapshot
   of the instance leaves that volume out; it needs its own: `snapshot_create` with `{project: "arcak-svc", volume:
@@ -1973,9 +1973,9 @@ moves a running container service made from an image by digest (today `automagik
 pinned by fingerprint (a template's `local:<alias>` beside a `digest`, see "A local image may be pinned") to another
 digest, or fingerprint, in one call. It is a destructive verb (it takes the optional `confirm`), needs a `doctor`
 token and asks the owner for nothing, except for `eraseData` (see below); it works inside a tenant as outside one.
-There is no update path for `automagik-workspace` yet: it is a virtual machine, whose Docker pulls its own server
-image, and the verb refuses it. In order, each step a line in `service-updates.jsonl` in the
-state directory (an append-only file of JSON lines: a `begin`, one line per step, an `end`; never a secret):
+An `automagik-workspace` VM follows the server lane through its own keeper. For a container update, each step
+records a line in `service-updates.jsonl` in the state directory (an append-only file with a `begin`,
+one line per step, and an `end`):
 
 1. the instance is stopped, if it runs, and a snapshot of it, `pre-update-<time>`, is taken where the project allows
    one. Every project Arca makes is restricted, and Incus answers that it does not allow snapshot creation, unless
@@ -2191,8 +2191,8 @@ run at once.
 
 A service made from the `automagik-server` template follows Automagik's releases by default, so it stays easy to
 update: the node moves it to each newer server image Automagik publishes, with `service_update`, and nobody has to ask.
-(`automagik-workspace` is a virtual machine, which `service_update` does not move, so it does not follow.) Only a
-container of the node's own project made from `ghcr.io/automagik-si/automagik-server` by digest can follow.
+This node-side follower moves containers in the node's own project made from `ghcr.io/automagik-si/automagik-server`
+by digest. The `automagik-workspace` VM checks the lane from inside the guest.
 
 On a timer of its own, every 10 minutes (`follow.intervalSeconds` in the node config, 60 to 86400), the node reads
 Automagik's record of its newest server image, `releases/download/server-lane/server-image.json` of
@@ -6671,16 +6671,15 @@ token passes through that assistant's conversation.
    own sign-in for your e-mail address first, and then the workspace.
 
 The settings. A `service_create` may give `reach`, `publicUrl`, `automagikPnpm`, `memberRunner` and the three Access
-settings (the template lists them in `createSettings`); `serverImage` is the template's own, since the image a workspace runs is not for a
-create to choose.
+settings (the template lists them in `createSettings`). The template supplies the install pin.
 
 | Setting | Meaning |
 |---------|---------|
 | `publicUrl` | With `reach` `tailnet`, the machine's own `https://<machine>.<tailnet>.ts.net`. Otherwise the workspace's exact public origin, as a browser writes it, and a name, never an IP address: `https://` and a host name in lower case; no path and no closing slash; a port only when it is not 443 (1 to 65535, without a leading 0). The gate gets it as `AUTOMAGIK_GATE_ORIGIN` and stops on any other spelling, so the script refuses those first. The server is not given it. It ships empty, which means "not set": the server then starts alone, no gate is started, and every status line says so. |
 | `accessTeamDomain`, `accessAudience`, `accessEmails` | Your Cloudflare Access application for that address: the team's host name alone (`<team>.cloudflareaccess.com`, no `https://`, and no other domain), the application's audience tag, and the e-mail addresses that may sign in: text, one address or several separated by commas (`"owner@example.com, second@example.com"`, 1 to 16). A create that gives a list is refused (`settings.accessEmails: expected a string, the type of the template's default`); a workspace made before with a list keeps it, and its own keeper reads it. None is a secret. Set all three or none; they need `publicUrl`. They ship empty. The gate gets them as `AUTOMAGIK_GATE_ACCESS_TEAM_DOMAIN`, `AUTOMAGIK_GATE_ACCESS_AUD` and `AUTOMAGIK_GATE_ACCESS_EMAILS`: the text unchanged (the gate trims each address and compares without regard to case). An address the script does not take stops the workspace with `settings.accessEmails is 1 to 16 e-mail addresses ...`. |
 | `automagikPnpm` | Required absolute path of pnpm 10 baked into the server image, supplied by its owner. Passed as `AUTOMAGIK_PNPM`, with no fallback. Explicitly pins `/usr/local/bin/pnpm` from the image contract; an empty or missing setting refuses startup. Reconfirm the path for the final reviewed image. |
-| `serverImage` | The Automagik server's public image, pinned by digest (Automagik 3.146.5). The server and the gate both run from this one value: to move to another build, replace it. A workspace needs a build that has the gate and its Cloudflare Access sign-in (see below), and one with GitHub build provenance from `automagik-si/automagik` (see "The image's provenance" below). |
-
+| `serverImage` | The verified install digest for both the server and the gate (Automagik 3.160.2). The `service_status` pin reports this install version. The VM follows the server lane on its own after first boot. |
+| `serverVersion` | The install image's Automagik version (3.160.2), supplied by the template. The keeper uses it for the first comparison with the server lane. |
 | `reach` | How people reach the workspace: `cloudflare` (the steps above; also when the setting is left out) or `tailnet` (see "On a tailnet instead" below). |
 
 Three things are not settings. The gate's port is 3082, as Automagik's compose file fixes it. The connector's image
@@ -6764,19 +6763,17 @@ What to know about this reach:
 
 What to know:
 
-- **The pinned server image.** `settings.serverImage` is Automagik's published release 3.146.5 (the Automagik
-  repository's commit `393254f`, image tag `3.146.5-393254fa`), the digest its release record `server-image.json`
-  names. It is no longer the image the `automagik-server` template pins (3.136.4). It has the gate, its
-  Cloudflare Access sign-in, and the gate's own sign-in with passkeys, which the tailnet reach uses; both reaches run
-  it. The gate's files (`compose.gate.yml`, `gate-entrypoint.mjs`, `gate-access.mjs`, `gate-claim.mjs`) are the same
-  as at commit `5fe0be6`, the build pinned up to Arca 0.16.0. The image's health check was rewritten since; it still
-  prints the code of the port it asks (the gate's in the gate's container, the server's in the server's), which is
-  all the keeper reads. Nothing of the Access sign-in changed between the build pinned before that (`8fb2e6f`) and
-  `5fe0be6`. An older build has no gate: its gate container stops at once, the keeper says `the gate stopped (exit code ...)` and
-  tries again after a pause, and the public address leads nowhere. Everything this script takes from the image
-  (three paths, the two ports, the claim code's place and the seven variable names) is in one block at the top of
-  `automagik-workspace.sh`, as commit `393254f` (release 3.146.5) has them; check the block when you move the pin to
-  a later build.
+- **The install image.** `settings.serverImage` starts the server and gate from the digest in the
+  `server-image.json` record for Automagik 3.160.2. Both reach modes use that image. The ports, entrypoints, and
+  gate environment the keeper expects are at the top of `automagik-workspace.sh`.
+- **Following the stable server lane.** Once the install image is healthy, the keeper checks
+  `server-lane/server-image.json` and repeats the check hourly while the workspace is healthy. It accepts a
+  newer version only if the digest matches that version's fixed release record and its build provenance
+  verifies. The server and gate restart with their existing `/data` mounts. If the server or the configured
+  gate fails to become healthy within five minutes, the keeper restarts both from the previous digest and skips
+  the failed digest while the lane still names it. The VM records its chosen digest and rollback state across
+  restarts. Look for `follow:` lines in `service_logs` to see which version the keeper tried and whether it
+  stayed on that version or rolled back.
 - **The image's provenance.** The keeper pulls the server's image only once its GitHub build-provenance attestation
   verifies: a SLSA v1 attestation of that digest whose signing certificate GitHub Actions issued to a workflow of
   `automagik-si/automagik` (Automagik's `server-image.yml` makes it at each release). The verifier is cosign v3.1.4,

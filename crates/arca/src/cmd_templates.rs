@@ -144,6 +144,16 @@ pub const EARLIER: &[(&str, &str)] = &[
         "automagik-workspace.sh",
         "8cdcf3d1403c4c130edaf95efd7024a67dc8ca9ba9503d54b3c298ec4efc5b50",
     ),
+    // 0.36.0 to 0.38.0: the workspace template pinned Automagik 3.146.5.
+    (
+        "automagik-workspace.json",
+        "81fbec6b91da5492de5b71357260a2a5314fb8d51d1bccc84a4e1e804816d883",
+    ),
+    // 0.35.0 to 0.38.0: before the keeper followed the server lane.
+    (
+        "automagik-workspace.sh",
+        "6ac3761917b086391fdd24c6134d1de617c8447564ae7cd4014547758306618a",
+    ),
     // 0.17.0 to 0.30.0: Automagik's release 3.136.4, and accessEmails a list only.
     (
         "automagik-workspace.json",
