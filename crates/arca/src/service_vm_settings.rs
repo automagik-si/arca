@@ -1,7 +1,7 @@
-//! Owner-approved updates to the non-secret settings file of an existing VM.
-use super::service_update::{Journal, SERVICE_UPDATES_FILE};
+//! In-place updates to the non-secret settings of an existing VM.
+use super::service_update::{Claim, Journal, SERVICE_UPDATES_FILE, health_seconds, stays_running};
 use super::*;
-use crate::service::{ServiceConfig, Vm};
+use crate::service::{self, ServiceConfig, Vm};
 use crate::service_exec::{ExecTarget, ServiceExec};
 use arca_incus::{InstanceState, Owned, StateAction, StateChanger, exec::ServiceFile};
 use arca_kernel::desired::Entry;
@@ -82,9 +82,33 @@ struct Guest<'a> {
     first_boot: bool,
 }
 
-impl Guest<'_> {
-    fn write_file(&self, value: &Value, wait_for_boot: bool) -> Result<(), CallError> {
-        let bytes = serde_json::to_vec(value).map_err(|_| internal())?;
+impl<'a> Guest<'a> {
+    fn new(
+        handler: &'a ServiceHandler,
+        entry: &Entry,
+        service: &ServiceConfig,
+    ) -> Result<Self, CallError> {
+        let owned = handler.live_owned(entry, service)?;
+        let changer = handler.state_changer(service)?;
+        let (initial, instance) = changer
+            .read_with(&service.project, &service.instance)
+            .map_err(|_| service_refused("could not read the VM power state"))?;
+        if initial.uuid.as_deref() != owned.uuid() || initial.kind != "virtual-machine" {
+            return Err(service_refused("the VM instance changed since it was read"));
+        }
+        Ok(Self {
+            exec: &handler.exec,
+            target: handler.exec_target(entry, service)?,
+            owned,
+            changer,
+            first_boot: initial.is_stopped() && instance["last_used_at"] == "0001-01-01T00:00:00Z",
+            initial,
+        })
+    }
+
+    fn write_file(&self, vm: &Vm, wait_for_boot: bool) -> Result<(), CallError> {
+        let value = vm.guest_settings().unwrap_or_else(|| json!({}));
+        let bytes = serde_json::to_vec(&value).map_err(|_| internal())?;
         let until = Instant::now() + Duration::from_secs(120);
         loop {
             let writer = self
@@ -113,37 +137,46 @@ impl Guest<'_> {
         }
     }
 
-    fn deliver(&self, vm: &Vm) -> Result<(), CallError> {
-        if self.first_boot {
-            // A new VM can be waiting for secrets or have a long-running first-boot script.
-            // Change the seed without starting that script.
-            let writer = self
-                .exec
-                .writer(&self.target, Duration::from_secs(15))
-                .map_err(|e| e.call_error())?;
-            let owned = writer
-                .read_owned(self.owned.target())
-                .map_err(|_| service_refused("could not read the VM's ownership"))?;
-            writer
-                .patch(
-                    &owned,
-                    &BTreeMap::from([("cloud-init.vendor-data".into(), vm.vendor_data.clone())]),
-                )
-                .map_err(|_| service_refused("could not write the VM's first-boot settings"))?;
-            return Ok(());
-        }
+    fn write_seed(&self, vm: &Vm) -> Result<(), CallError> {
+        // A new VM can be waiting for secrets or have a long-running first-boot script.
+        // Change the seed without starting that script.
+        let writer = self
+            .exec
+            .writer(&self.target, Duration::from_secs(15))
+            .map_err(|e| e.call_error())?;
+        let owned = writer
+            .read_owned(self.owned.target())
+            .map_err(|_| service_refused("could not read the VM's ownership"))?;
+        writer
+            .patch(
+                &owned,
+                &BTreeMap::from([("cloud-init.vendor-data".into(), vm.vendor_data.clone())]),
+            )
+            .map_err(|_| service_refused("could not write the VM's first-boot settings"))
+            .map(|_| ())
+    }
 
-        let now = self
-            .changer
+    fn power(&self) -> Result<InstanceState, CallError> {
+        self.changer
             .read(&self.initial.project, &self.initial.name)
-            .map_err(|_| service_refused("could not read the VM power state"))?;
-        if now.is_stopped() {
+            .map_err(|_| service_refused("could not read the VM power state"))
+    }
+
+    fn start_for_write(&self) -> Result<bool, CallError> {
+        let stopped = self.power()?.is_stopped();
+        if stopped {
             self.changer
                 .change(&self.initial, StateAction::Start)
                 .map_err(|_| service_refused("could not start the VM to write its settings"))?;
         }
-        let value = vm.guest_settings().unwrap_or_else(|| json!({}));
-        let written = self.write_file(&value, now.is_stopped());
+        Ok(stopped)
+    }
+
+    fn deliver(&self, vm: &Vm) -> Result<(), CallError> {
+        if self.first_boot {
+            return self.write_seed(vm);
+        }
+        let written = self.write_file(vm, self.start_for_write()?);
         if self.initial.is_stopped() {
             // Return a temporarily booted VM to its original state even if the write failed.
             self.changer
@@ -158,9 +191,213 @@ impl Guest<'_> {
             Ok(())
         }
     }
+
+    fn write_pin_settings(&self, vm: &Vm) -> Result<(), CallError> {
+        if self.first_boot {
+            self.write_seed(vm)
+        } else {
+            self.write_file(vm, self.start_for_write()?)
+        }
+    }
+
+    fn finish_pin(&self) -> Result<(), CallError> {
+        if self.first_boot {
+            return Ok(());
+        }
+        let stopped = self.power()?.is_stopped();
+        let action = match (self.initial.is_stopped(), stopped) {
+            (true, true) => return Ok(()),
+            (true, false) => StateAction::Stop,
+            (false, true) => StateAction::Start,
+            (false, false) => StateAction::Restart,
+        };
+        self.changer
+            .change(&self.initial, action)
+            .map_err(|_| {
+                service_refused(format!(
+                    "could not {} the VM after writing settings",
+                    action.as_str()
+                ))
+            })
+            .map(|_| ())
+    }
+}
+
+fn pin_step(
+    journal: &Journal,
+    name: &str,
+    run: impl FnOnce() -> Result<(), CallError>,
+) -> Result<(), CallError> {
+    let result = run();
+    journal.step(name, result.is_ok(), json!({}));
+    result
+}
+
+fn pin_digest(args: &Value) -> Result<&str, CallError> {
+    // Require a registry with an optional port and nonempty OCI repository components.
+    static NAME: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(concat!(
+            r"^[a-z0-9]+(?:-+[a-z0-9]+)*(?:\.[a-z0-9]+(?:-+[a-z0-9]+)*)*(?::[0-9]+)?",
+            r"(?:/[a-z0-9]+(?:(?:\.|__?|-+)[a-z0-9]+)*)+$"
+        ))
+        .expect("image name pattern")
+    });
+    args["digest"]
+        .as_str()
+        .filter(|pin| {
+            service::image_by_digest(pin)
+                && pin
+                    .split_once('@')
+                    .is_some_and(|(name, _)| NAME.is_match(name))
+        })
+        .ok_or_else(|| {
+            CallError::Invalid(
+                "digest: expected <registry>/<name>@sha256:<64 lower-case hex digits>".into(),
+            )
+        })
 }
 
 impl ServiceHandler {
+    pub(super) fn update_vm_pin(
+        &self,
+        seen: &Entry,
+        name: &str,
+        args: &Value,
+    ) -> Result<Value, CallError> {
+        let said = |why: &str| {
+            service_refused(format!("update service {name}: {why}. Nothing was changed"))
+        };
+        let _claim = Claim::take(&format!("{}\n{}", self.cfg.state_dir.display(), seen.id.0))
+            .ok_or_else(|| said("another update of this service is running"))?;
+        let _write = self.writes.lock().map_err(|_| internal())?;
+        let seconds = health_seconds(args)?;
+        let (entry, service) = service_entries(lock(&self.kernel)?.entries())
+            .into_iter()
+            .find(|(entry, service)| {
+                entry.id == seen.id
+                    && entry.config["id"] == seen.config["id"]
+                    && service.vm.is_some()
+                    && !service.adopted
+            })
+            .ok_or_else(|| said("the service's record changed before the update"))?;
+        let old_vm = service.vm.as_ref().expect("VM record");
+        let template =
+            service::load_template(&self.cfg.state_dir.join("templates"), &service.template)
+                .ok()
+                .filter(service::Template::is_vm);
+        let Some(key) = template
+            .as_ref()
+            .and_then(|template| template.update.as_ref())
+            .map(|update| &update.pin)
+        else {
+            return Err(said(
+                "only a container service made from an image by digest or a local image pinned by fingerprint can be updated",
+            ));
+        };
+        let digest = pin_digest(args)?;
+        let old_pin = service::created_pin(&service, template.as_ref());
+        let result = |updated, restarted, message: &str| json!({ "service": name, "digest": digest, "updated": updated, "restarted": restarted, "message": message });
+        if old_pin.as_deref() == Some(digest) {
+            return Ok(result(
+                false,
+                false,
+                "The VM already has the requested pin.",
+            ));
+        }
+
+        let guest = Guest::new(self, &entry, &service)?;
+        let mut next = service.clone();
+        let vm = next.vm.as_mut().expect("VM record");
+        vm.settings
+            .get_or_insert_default()
+            .insert(key.clone(), json!(digest));
+        let merged = vm
+            .guest_settings()
+            .ok_or_else(|| said("the VM's recorded settings could not be read"))?;
+        let seed = service::vendor_data_of(&service.template, Some(&merged))
+            .map_err(service_template_error)?;
+        if guest.first_boot {
+            vm.vendor_data = seed;
+        }
+        let vm = next.vm.as_ref().expect("VM record");
+        let running = !guest.initial.is_stopped();
+        let journal = Journal {
+            path: self.cfg.state_dir.join(SERVICE_UPDATES_FILE),
+            id: format!("pin-{}-{}", entry.id.0, (self.clock)()),
+            service: name.to_string(),
+            clock: self.clock.clone(),
+        };
+        journal.line("begin", true, json!({
+            "pin": key, "from": old_pin.filter(|pin| service::image_by_digest(pin)), "to": digest, "timeoutSeconds": seconds,
+        })).map_err(|_| said("the update journal could not be written"))?;
+        let mut record_attempted = false;
+        let applied = (|| {
+            pin_step(&journal, "guest settings", || guest.write_pin_settings(vm))?;
+            record_attempted = true;
+            pin_step(&journal, "record", || {
+                self.put(std::slice::from_ref(&next), (self.clock)())
+            })?;
+            pin_step(&journal, "power", || guest.finish_pin())?;
+            if running {
+                pin_step(&journal, "health", || {
+                    stays_running(seconds, self.update.pace, || {
+                        guest.power().is_ok_and(|state| {
+                            state.is_running()
+                                && state.uuid == guest.initial.uuid
+                                && state.kind == guest.initial.kind
+                        })
+                    })
+                    .then_some(())
+                    .ok_or_else(|| service_refused("health check: the VM did not stay running"))
+                })?;
+            }
+            Ok::<_, CallError>(())
+        })();
+        if let Err(error) = applied {
+            let record = !record_attempted
+                || pin_step(&journal, "restore record", || {
+                    self.put(std::slice::from_ref(&service), (self.clock)())
+                })
+                .is_ok();
+            let file = pin_step(&journal, "restore guest settings", || {
+                guest.write_pin_settings(old_vm)
+            })
+            .is_ok();
+            let power = (!running || file)
+                && pin_step(&journal, "restore power", || guest.finish_pin()).is_ok();
+            let restored = record && file && power;
+            journal.step("end", false, json!({ "rolledBack": restored, "recordRestored": record, "guestRestored": file, "powerRestored": power }));
+            let why = error
+                .refusal()
+                .map_or("could not save or apply VM settings", |(_, why)| why);
+            return Err(CallError::Refused {
+                code: if restored {
+                    "rolled_back"
+                } else {
+                    "rollback_failed"
+                }
+                .into(),
+                message: if restored {
+                    format!("update service {name}: {why}. The VM pin was rolled back.")
+                } else {
+                    format!(
+                        "update service {name}: {why}. Rollback could not be confirmed. Previous record restored: {record}. Previous guest settings restored: {file}. Previous power state restored: {power}."
+                    )
+                },
+            });
+        }
+        journal.step("end", true, json!({"restarted": running}));
+        Ok(result(
+            true,
+            running,
+            if running {
+                "Updated the VM pin and restarted the VM."
+            } else {
+                "Updated the VM pin. The VM is stopped and will read it on its next boot."
+            },
+        ))
+    }
+
     /// The caller holds the node write gate, so another settings or wiring change cannot be lost.
     pub(super) fn update_vm_settings(&self, args: &Value) -> Result<Value, CallError> {
         let plan = plan(&self.cfg, lock(&self.kernel)?.entries(), args)?;
@@ -187,27 +424,11 @@ impl ServiceHandler {
             ));
         }
 
-        let owned = self.live_owned(&plan.entry, service)?;
-        let changer = self.state_changer(service)?;
-        let (initial, instance) = changer
-            .read_with(&service.project, &service.instance)
-            .map_err(|_| service_refused("could not read the VM power state"))?;
-        if initial.uuid.as_deref() != owned.uuid() || initial.kind != "virtual-machine" {
-            return Err(service_refused("the VM instance changed since it was read"));
-        }
-        let first_boot = initial.is_stopped() && instance["last_used_at"] == "0001-01-01T00:00:00Z";
-        let guest = Guest {
-            exec: &self.exec,
-            target: self.exec_target(&plan.entry, service)?,
-            owned,
-            changer,
-            initial,
-            first_boot,
-        };
+        let guest = Guest::new(self, &plan.entry, service)?;
         let mut next = service.clone();
         let vm = next.vm.as_mut().expect("VM plan");
         vm.settings = Some(plan.overrides);
-        if first_boot {
+        if guest.first_boot {
             vm.vendor_data = crate::service::vendor_data_of(&service.template, Some(&plan.merged))
                 .map_err(service_template_error)?;
         }

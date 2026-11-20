@@ -978,3 +978,181 @@ fn vm_settings_restore_the_guest_file_and_record_if_the_restart_fails() {
         old
     );
 }
+
+fn pin_update_rig(start: bool, with_pin: bool) -> Rig {
+    let rig = Rig::with(mixed_kernel(&["br0"], roomy()), None, vec![]);
+    let mut template = pool_template();
+    template["settings"]["pin"] = json!(format!("registry.example/runner@{DIGEST}"));
+    if with_pin {
+        template["update"] = json!({"pin":"pin"});
+    }
+    rig.template("pool", template);
+    rig.call(
+        "service_create",
+        json!({"name":"p1","template":"pool","settings":{"group":9},"start":start}),
+    )
+    .unwrap();
+    rig
+}
+
+fn vm_pin_update(rig: &Rig, digest: &str) -> Result<Value, CallError> {
+    rig.call(
+        "service_update",
+        json!({"name":"p1","digest":digest,"timeoutSeconds":1}),
+    )
+}
+
+fn vm_settings_file(rig: &Rig) -> Value {
+    serde_json::from_slice(
+        &rig.fake.service_files()[&format!("{PROJECT}/p1:{}", service::GUEST_SETTINGS_PATH)],
+    )
+    .unwrap()
+}
+
+#[test]
+fn vm_pin_update_writes_guest_and_record_and_restarts_without_rebuilding() {
+    let rig = pin_update_rig(true, true);
+    let before = instance(&rig, "p1");
+    let actions = rig.fake.state_actions(PROJECT, "p1").len();
+    let digest = format!("other.example/team/runner@sha256:{}", "2".repeat(64));
+    let verb = arca_api::verb("service_update").unwrap();
+    arca_api::conforms(&(verb.params)(), &json!({"name":"p1","digest":digest})).unwrap();
+
+    let result = vm_pin_update(&rig, &digest).expect("update");
+    arca_api::conforms(&(verb.result)(), &result).unwrap();
+    assert_eq!(result["updated"], true);
+    assert_eq!(result["digest"], digest);
+    assert_eq!(result["restarted"], true);
+    assert_eq!(
+        &rig.fake.state_actions(PROJECT, "p1")[actions..],
+        ["restart"]
+    );
+    assert!(rig.fake.rebuilds(PROJECT, "p1").is_empty());
+    let after = instance(&rig, "p1");
+    assert_eq!(after["status"], "Running");
+    assert_eq!(after["devices"], before["devices"]);
+    assert_eq!(
+        after["config"]["volatile.uuid"],
+        before["config"]["volatile.uuid"]
+    );
+    let status = rig.call("service_status", json!({"name":"p1"})).unwrap();
+    assert_eq!(status["update"]["pin"], digest);
+    assert_eq!(status["update"]["state"], "differs");
+    assert_eq!(status["settings"], vm_settings_file(&rig));
+    assert_eq!(status["settings"]["group"], 9);
+    assert_eq!(
+        entry(&rig, "service-p1").config["vm"]["settings"]["pin"],
+        digest
+    );
+    let writes = rig.fake.writes().len();
+    assert_eq!(vm_pin_update(&rig, &digest).unwrap()["updated"], false);
+    assert_eq!(rig.fake.writes().len(), writes);
+}
+
+#[test]
+fn vm_pin_update_rejects_malformed_digest_without_writing() {
+    let rig = pin_update_rig(true, true);
+    let writes = rig.fake.writes().len();
+    let record = entry(&rig, "service-p1").config;
+    for digest in [
+        DIGEST.to_string(),
+        "registry.example/runner:latest".into(),
+        "registry.example/runner@sha256:1234".into(),
+        format!("registry.example/@{DIGEST}"),
+        format!("registry.example//runner@{DIGEST}"),
+    ] {
+        assert!(
+            matches!(vm_pin_update(&rig, &digest), Err(CallError::Invalid(message)) if message.contains("<registry>/<name>@sha256:")),
+            "{digest}"
+        );
+    }
+    assert_eq!(rig.fake.writes().len(), writes);
+    assert_eq!(entry(&rig, "service-p1").config, record);
+    assert!(!rig.dir.join("service-updates.jsonl").exists());
+}
+
+#[test]
+fn vm_pin_update_rolls_back_a_vm_that_stops_during_health_check() {
+    let rig = pin_update_rig(true, true);
+    let record = entry(&rig, "service-p1").config;
+    let old = guest_settings(&rig, "p1");
+    let actions = rig.fake.state_actions(PROJECT, "p1").len();
+    rig.fake.exit_after_next_start(PROJECT, "p1", 2, "exited");
+
+    let digest = format!("registry.example/runner@sha256:{}", "2".repeat(64));
+    let error = vm_pin_update(&rig, &digest).unwrap_err();
+    let (code, message) = error.refusal().expect("update refusal");
+    assert_eq!(code, "rolled_back");
+    assert!(
+        message.contains("health check") && message.contains("rolled back"),
+        "{message}"
+    );
+    assert_eq!(entry(&rig, "service-p1").config, record);
+    assert_eq!(vm_settings_file(&rig), old);
+    assert_eq!(instance(&rig, "p1")["status"], "Running");
+    assert_eq!(
+        &rig.fake.state_actions(PROJECT, "p1")[actions..],
+        ["restart", "start", "restart"]
+    );
+    assert!(rig.fake.rebuilds(PROJECT, "p1").is_empty());
+    let journal = fs::read_to_string(rig.dir.join("service-updates.jsonl")).unwrap();
+    let rows: Vec<Value> = journal
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(
+        rows.iter()
+            .any(|row| row["step"] == "health" && row["ok"] == false)
+    );
+    assert_eq!(rows.last().unwrap()["step"], "end");
+    assert_eq!(rows.last().unwrap()["detail"]["rolledBack"], true);
+}
+
+#[test]
+fn vm_pin_update_keeps_a_previously_used_stopped_vm_stopped() {
+    let rig = pin_update_rig(false, true);
+    rig.fake
+        .set_last_used(PROJECT, "p1", "2020-01-01T00:00:00Z");
+    let actions = rig.fake.state_actions(PROJECT, "p1").len();
+    let digest = format!("registry.example/runner@sha256:{}", "2".repeat(64));
+    let result = vm_pin_update(&rig, &digest).unwrap();
+    assert_eq!(result["restarted"], false);
+    assert_eq!(vm_settings_file(&rig)["pin"], digest);
+    assert_eq!(instance(&rig, "p1")["status"], "Stopped");
+    assert_eq!(
+        &rig.fake.state_actions(PROJECT, "p1")[actions..],
+        ["start", "stop"]
+    );
+}
+
+#[test]
+fn vm_pin_update_preserves_the_refusal_for_a_vm_without_a_pin() {
+    let rig = pin_update_rig(true, false);
+    let writes = rig.fake.writes().len();
+    let error = vm_pin_update(&rig, DIGEST).unwrap_err();
+    assert!(
+        error
+            .refusal()
+            .unwrap()
+            .1
+            .contains("only a container service")
+    );
+    assert_eq!(rig.fake.writes().len(), writes);
+}
+
+#[test]
+fn vm_pin_update_updates_the_first_boot_seed_without_starting() {
+    let rig = pin_update_rig(false, true);
+    rig.fake
+        .set_last_used(PROJECT, "p1", "0001-01-01T00:00:00Z");
+    let digest = format!("registry.example/runner@sha256:{}", "2".repeat(64));
+    let actions = rig.fake.state_actions(PROJECT, "p1");
+    assert_eq!(vm_pin_update(&rig, &digest).unwrap()["restarted"], false);
+    assert_eq!(rig.fake.state_actions(PROJECT, "p1"), actions);
+    assert!(rig.fake.service_files().is_empty());
+    assert_eq!(guest_settings(&rig, "p1")["pin"], digest);
+    assert_eq!(
+        rig.call("service_status", json!({"name":"p1"})).unwrap()["update"]["pin"],
+        digest
+    );
+}

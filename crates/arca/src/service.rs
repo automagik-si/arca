@@ -173,7 +173,7 @@ impl PrivateListen {
 pub const PRIVATE_DEVICE: &str = "private";
 
 /// A virtual-machine template's `update`: the key of its `settings` that holds the version its service runs, an image
-/// by digest. It is how `service_status` knows the version a machine was created with from the one the installed
+/// by digest. It is how `service_status` knows the version a machine records from the one the installed
 /// template names now. A container template needs none: its version is its `digest`.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -3029,9 +3029,8 @@ pub fn template_pin(template: &Template) -> Option<String> {
     source_pin(&source(template).ok()?)
 }
 
-/// The version a service was created with, from its own record: a container's OCI source, or what its machine's
-/// settings hold under the key its template's `update.pin` names. The record keeps both from the create, so a template
-/// edited since changes nothing here. `None` for an adopted instance, a system image, and a machine whose installed
+/// The version a service records: a container's OCI source, or what its machine's settings hold under the key
+/// its template's `update.pin` names. `None` for an adopted instance, a system image, and a machine whose installed
 /// template names no such key.
 pub fn created_pin(cfg: &ServiceConfig, template: Option<&Template>) -> Option<String> {
     if cfg.adopted {
@@ -3046,7 +3045,7 @@ pub fn created_pin(cfg: &ServiceConfig, template: Option<&Template>) -> Option<S
     }
 }
 
-/// What `service_status` answers under `update`: the version the service was created with (`pin`), the one its
+/// What `service_status` answers under `update`: the version the service records (`pin`), the one its
 /// installed template names now (`templatePin`), and whether the two are the `same` or the template's `differs`. Two
 /// digests carry no order, so nothing here says which is newer. `unknown`, with the reason in `problem`, when the
 /// installed template cannot say: it is gone, cannot be read, or is of another kind now. `None` for a service whose

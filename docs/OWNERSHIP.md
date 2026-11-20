@@ -1154,8 +1154,13 @@ enter Incus's instance config.
 - `update` is `{ "pin": "<key>" }`, on a virtual-machine template only: the key of `settings` that holds the version
   its service runs. `validate_vm_template` refuses a key that `settings` does not have, one that `createSettings`
   lists (a create never chooses the version), and a value that is not an image by digest (`image_by_digest`).
-  `service_status` answers `update`: `pin`, the version the service was created with, read from its own record
-  (`created_pin`: a container's OCI source, or what the record's vendor data holds under that key), `templatePin`, the
+  A doctor can set that VM pin with `service_update` and a full image reference by digest. The verb uses the same
+  owned guest settings writer and desired-state path as the settings mode. It holds the node's write gate while
+  writing the guest settings and record, restoring the VM's original power state, and checking a running VM with
+  the existing stay-running window. On failure it attempts to restore both writes and the original power state.
+  Each step is journalled in `service-updates.jsonl`. The VM's root and data disks are preserved.
+  `service_status` answers `update`: `pin`, the version read from the service's own record
+  (`created_pin`: a container's OCI source or the VM's effective value under that key), `templatePin`, the
   one the template installed in `<stateDir>/templates` names now (`template_pin`), and `state`, `same` or `differs`, or
   `unknown` with a `problem` when the installed template cannot say. `service_list` carries `update` only on a row that
   differs. It is a read of the node's own records and files and writes nothing: no registry or network is asked, no

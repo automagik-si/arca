@@ -345,10 +345,10 @@
             },
             "update": {
               "additionalProperties": false,
-              "description": "The version the service runs beside the one its template, as installed on this node, names now. Both come from this node's own records and files: no registry is asked. service_list carries it only when the two differ, with state alone; service_status carries it for every service whose own version is known (a container made from an image by digest, or a virtual machine whose template names its version's setting in update.pin). Two digests carry no order: differs says the template names another version, never which one is newer. A container made from an image by digest moves to another digest with service_update; a virtual machine's only way to the template's version is service_remove and service_create.",
+              "description": "The version the service runs beside the one its template, as installed on this node, names now. Both come from this node's own records and files: no registry is asked. service_list carries it only when the two differ, with state alone; service_status carries it for every service whose own version is known (a container made from an image by digest, or a virtual machine whose template names its version's setting in update.pin). Two digests carry no order: differs says the template names another version, never which one is newer. Use service_update to move either service to another digest.",
               "properties": {
                 "pin": {
-                  "description": "service_status only: the version the service was created with, an image by digest.",
+                  "description": "service_status only: the recorded version of the service, an image by digest.",
                   "maxLength": 512,
                   "type": "string"
                 },
@@ -827,10 +827,10 @@
       },
       "update": {
         "additionalProperties": false,
-        "description": "The version the service runs beside the one its template, as installed on this node, names now. Both come from this node's own records and files: no registry is asked. service_list carries it only when the two differ, with state alone; service_status carries it for every service whose own version is known (a container made from an image by digest, or a virtual machine whose template names its version's setting in update.pin). Two digests carry no order: differs says the template names another version, never which one is newer. A container made from an image by digest moves to another digest with service_update; a virtual machine's only way to the template's version is service_remove and service_create.",
+        "description": "The version the service runs beside the one its template, as installed on this node, names now. Both come from this node's own records and files: no registry is asked. service_list carries it only when the two differ, with state alone; service_status carries it for every service whose own version is known (a container made from an image by digest, or a virtual machine whose template names its version's setting in update.pin). Two digests carry no order: differs says the template names another version, never which one is newer. Use service_update to move either service to another digest.",
         "properties": {
           "pin": {
-            "description": "service_status only: the version the service was created with, an image by digest.",
+            "description": "service_status only: the recorded version of the service, an image by digest.",
             "maxLength": 512,
             "type": "string"
           },

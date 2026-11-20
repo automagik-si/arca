@@ -7,6 +7,9 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 Owners can change a VM's named `createSettings` in place by approving a `service_update` card. The card and
 service update journal show each changed value. Arca writes the guest settings file and restarts a running VM.
 
+A VM whose template declares `update.pin` can move to another image by digest with `service_update`. Arca records
+the new guest pin, restarts a running VM, and restores its previous pin if the update fails. The VM keeps its disks.
+
 ## 0.38.0 (2026-11-19)
 
 Arca can now take an Incus snapshot of a service's instance together with each custom volume it mounts, under one

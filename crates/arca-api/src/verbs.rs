@@ -535,7 +535,7 @@ static VERBS: [Verb; 103] = [
     },
     Verb {
         name: "service_update",
-        summary: "Update a service in place. For a VM, propose settings from its template's createSettings. The owner sees the old and new values, then Arca writes the guest file and restarts the running VM. For a container, move to an OCI digest or an existing local image fingerprint, keeping its data volume, config, secrets and firewall rules. The node checks health within timeoutSeconds (default 120) and rolls back on failure. eraseData permits rebuilding a root that holds service data. withTemplate applies the current template in the same restart. settings, eraseData and withTemplate require owner approval. Use follow to change automatic Automagik image updates.",
+        summary: "Update a service in place. For a VM with update.pin, digest sets that guest setting to a full image reference by digest and restarts a running VM, preserving its disks. Use settings to change createSettings. For a container, move to an OCI digest or an existing local image fingerprint, keeping its data volume, config, secrets and firewall rules. The node checks health within timeoutSeconds (default 120) and rolls back on failure. eraseData permits rebuilding a root that holds service data. withTemplate applies the current template in the same restart. settings, eraseData and withTemplate require owner approval. Use follow to change automatic Automagik image updates.",
         class: VerbClass::L,
         min_scope: Scope::Doctor,
         writes: true,
@@ -5492,10 +5492,10 @@ pub fn service_view_schema() -> Value {
             },
             "update": {
                 "additionalProperties": false,
-                "description": "The version the service runs beside the one its template, as installed on this node, names now. Both come from this node's own records and files: no registry is asked. service_list carries it only when the two differ, with state alone; service_status carries it for every service whose own version is known (a container made from an image by digest, or a virtual machine whose template names its version's setting in update.pin). Two digests carry no order: differs says the template names another version, never which one is newer. A container made from an image by digest moves to another digest with service_update; a virtual machine's only way to the template's version is service_remove and service_create.",
+                "description": "The version the service runs beside the one its template, as installed on this node, names now. Both come from this node's own records and files: no registry is asked. service_list carries it only when the two differ, with state alone; service_status carries it for every service whose own version is known (a container made from an image by digest, or a virtual machine whose template names its version's setting in update.pin). Two digests carry no order: differs says the template names another version, never which one is newer. Use service_update to move either service to another digest.",
                 "properties": {
                     "pin": {
-                        "description": "service_status only: the version the service was created with, an image by digest.",
+                        "description": "service_status only: the recorded version of the service, an image by digest.",
                         "maxLength": 512,
                         "type": "string"
                     },
@@ -6318,6 +6318,9 @@ fn service_update_params() -> Value {
     with_tenant(service_update_params_base())
 }
 
+const SERVICE_UPDATE_DIGEST_PATTERN: &str =
+    r"^(?:[a-z0-9][a-z0-9._/:-]*/[a-z0-9._/-]+@)?sha256:[0-9a-f]{64}$";
+
 fn service_update_params_base() -> Value {
     let mut changes = template_changes_schema(
         "With withTemplate or VM settings, action_propose supplies the changes for owner approval.",
@@ -6338,8 +6341,8 @@ fn service_update_params_base() -> Value {
                 "description": "For a VM, propose replacements for names in its installed template's createSettings. The card shows each previous and new value. A running VM restarts. A previously used, stopped VM boots briefly for delivery. A new VM receives the settings on first boot."
             },
             "digest": {
-                "description": "The image to move to: sha256: and 64 lower-case hex digits. For an OCI image, the digest, and the service keeps its image's repository; for a service made from a local image pinned by fingerprint, the new image's fingerprint. Give it, or follow, not both.",
-                "pattern": "^sha256:[0-9a-f]{64}$",
+                "description": "For a VM whose template declares update.pin, a full image reference <registry>/<name>@sha256:<64 lower-case hex digits>. For an OCI container, sha256: and 64 lower-case hex digits, keeping its repository. For a service made from a local image pinned by fingerprint, the new image's fingerprint with the same sha256: prefix. Give digest or follow.",
+                "pattern": SERVICE_UPDATE_DIGEST_PATTERN,
                 "type": "string"
             },
             "eraseData": {
@@ -6356,7 +6359,7 @@ fn service_update_params_base() -> Value {
                 "type": "boolean"
             },
             "timeoutSeconds": {
-                "description": "How many seconds the service's first port has to answer TCP after the start, 1 to 900. 120 when absent.",
+                "description": "How many seconds the service's first port has to answer TCP after the start, 1 to 900. 120 when absent. For a running VM updated by digest, the VM must stay running for 10 seconds or this timeout, whichever is shorter.",
                 "maximum": 900,
                 "minimum": 1,
                 "type": "integer"
@@ -6379,7 +6382,7 @@ fn service_update_result() -> Value {
                 "description": "Present with VM settings or withTemplate: the changes applied, as the owner's card showed them. No secret value is in it.",
                 "type": "object"
             },
-            "digest": { "pattern": "^sha256:[0-9a-f]{64}$", "type": "string" },
+            "digest": { "pattern": SERVICE_UPDATE_DIGEST_PATTERN, "type": "string" },
             "follow": {
                 "description": "Present when the call set whether the service follows Automagik's releases: what it set.",
                 "type": "boolean"
@@ -6391,7 +6394,7 @@ fn service_update_result() -> Value {
             },
             "readBack": read_back_schema(),
             "restarted": {
-                "description": "Present with settings or noNewPrivileges: whether the service was restarted for it (true when it was running).",
+                "description": "Present with VM settings, a VM digest, or noNewPrivileges. True when the change restarted a running service.",
                 "type": "boolean"
             },
             "service": { "type": "string" },
