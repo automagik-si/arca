@@ -142,6 +142,7 @@ case $command in
         fi
         ;;
       '{{.HostConfig.NetworkMode}}') cat "$root/containers/$name/netmode" ;;
+      '{{.Config.Image}}') cat "$root/containers/$name/image" ;;
       '{{.State.Pid}}')
         if [ -e "$root/containers/$name/running" ]; then cat "$root/containers/$name/pid"; else echo 0; fi
         ;;
@@ -162,6 +163,10 @@ case $command in
     echo "$1"
     ;;
   image)
+    if [ "${1-}" = rm ]; then
+      rm -f "$(image_file "${2-}")"
+      exit
+    fi
     [ "${1-}" = inspect ] || exit 2
     if [ -e "$root/fail-inspect" ]; then
       echo "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?" >&2
@@ -238,7 +243,8 @@ case $command in
       cat "$root/tailnet-status.json" 2>/dev/null || echo '{"BackendState":"Starting","Self":{"DNSName":""}}'
       exit 0
     fi
-    code=$(cat "$root/health-$1" 2>/dev/null || echo 401)
+    image=$(cat "$root/containers/$1/image")
+    code=$(cat "$root/health-$1-${image##*@}" 2>/dev/null || cat "$root/health-$1" 2>/dev/null || echo 401)
     echo "$code"
     [ "$code" = 401 ]
     ;;
