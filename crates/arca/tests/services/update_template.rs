@@ -204,7 +204,6 @@ fn one_card_moves_the_image_and_the_template_from_no_entrypoint_to_a_shell_one_w
         [
             "begin",
             "stop",
-            "snapshot",
             "rebuild",
             "apply",
             "empty /run",
@@ -242,16 +241,11 @@ fn a_failed_health_check_puts_back_the_old_root_and_no_entrypoint_exactly() {
             "{message}"
         );
 
-        // The old root: from the snapshot where the project allows one, else rebuilt from the old digest.
-        if snapshots {
-            assert_eq!(rig.fake.rebuilds(PROJECT, "app"), vec!["registry"]);
-            assert_eq!(rig.fake.restores(PROJECT, "app").len(), 1);
-        } else {
-            assert_eq!(
-                rig.fake.rebuilds(PROJECT, "app"),
-                vec!["registry", "registry"]
-            );
-        }
+        assert_eq!(
+            rig.fake.rebuilds(PROJECT, "app"),
+            vec!["registry", "registry"]
+        );
+        assert!(rig.fake.restores(PROJECT, "app").is_empty());
         // The old record, exactly: no entrypoint, the old environment, the old digest.
         let record = rig.service_config("app");
         assert_eq!(record.entrypoint, None);
@@ -259,7 +253,7 @@ fn a_failed_health_check_puts_back_the_old_root_and_no_entrypoint_exactly() {
         assert_eq!(record.ports, before.ports);
         assert_eq!(alias_of_record(&rig), old_alias);
         // And the old config on the instance: the template's entrypoint and its new value are gone, so the image's own
-        // command runs again. The fake keeps config across a restore, so this is the record put back, not the snapshot.
+        // command runs again.
         let after = config(&rig);
         assert!(after.get("oci.entrypoint").is_none(), "{after}");
         assert!(after.get(service::ENTRYPOINT_KEY).is_none(), "{after}");
@@ -472,7 +466,6 @@ fn without_the_flag_an_update_keeps_the_record_and_answers_as_before() {
         [
             "begin",
             "stop",
-            "snapshot",
             "rebuild",
             "empty /run",
             "start",
@@ -828,14 +821,11 @@ fn a_rollback_of_an_older_service_leaves_the_old_roots_run_on_its_disk() {
         let (code, message) = refusal_words(approve(&rig, &key, &proposed));
         assert_eq!(code, "rolled_back", "{message}");
         assert!(message.contains("health check"), "{message}");
-        if snapshots {
-            assert_eq!(rig.fake.restores(PROJECT, "app").len(), 1);
-        } else {
-            assert_eq!(
-                rig.fake.rebuilds(PROJECT, "app"),
-                vec!["registry", "registry"]
-            );
-        }
+        assert_eq!(
+            rig.fake.rebuilds(PROJECT, "app"),
+            vec!["registry", "registry"]
+        );
+        assert!(rig.fake.restores(PROJECT, "app").is_empty());
 
         // The old record and config: no memory /run, and its root keeps what the image ships in /run.
         assert!(!rig.service_config("app").run_tmpfs);
@@ -851,7 +841,7 @@ fn a_rollback_of_an_older_service_leaves_the_old_roots_run_on_its_disk() {
         let steps: Vec<String> = journal(&rig).into_iter().map(|(step, _)| step).collect();
         let back = steps
             .iter()
-            .position(|step| step == "restore" || step == "rebuild back")
+            .position(|step| step == "rebuild back")
             .unwrap_or_else(|| panic!("the old root in {steps:?}"));
         let emptied: Vec<usize> = steps
             .iter()

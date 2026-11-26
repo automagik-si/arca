@@ -161,7 +161,7 @@ fn update_options(up: Arc<AtomicBool>) -> UpdateOptions {
 }
 
 fn follower(rig: &Rig, up: &Arc<AtomicBool>, source: &Source) -> Follower {
-    // A clock that moves, since a snapshot is named after the time.
+    // Give successive updates distinct journal IDs.
     static TICKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(NOW);
     Follower::new(
         rig.kernel.clone(),
@@ -253,7 +253,6 @@ fn a_service_of_the_automagik_template_moves_to_a_newer_lane_record_and_the_chan
             "follow",
             "begin",
             "stop",
-            "snapshot",
             "rebuild",
             "empty /run",
             "start",
