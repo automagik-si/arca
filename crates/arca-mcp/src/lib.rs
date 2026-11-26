@@ -15,6 +15,7 @@
 
 pub mod auth;
 pub mod elicit;
+mod flight;
 mod fresh;
 pub mod http;
 pub mod jsonrpc;

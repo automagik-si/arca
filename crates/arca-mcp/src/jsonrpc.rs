@@ -484,11 +484,29 @@ async fn call_tool(
         .clone()
         .map(|services| (services, arguments.clone()));
     let owned_caller = caller.clone();
-    let outcome = tokio::task::spawn_blocking(move || handler.call(arguments, &owned_caller)).await;
+    // A read-only call joins an identical one still running, by the same caller (token, scope, tool list and limits)
+    // with the same arguments, instead of starting a handler of its own: a caller that gave up does not stop its
+    // handler, so retries would pile them up.
+    let outcome = if verb.read_only_hint() {
+        let key = crate::flight::Flights::key(name, &format!("{caller:?}"), &arguments);
+        match server
+            .reads
+            .run(key, move || handler.call(arguments, &owned_caller))
+            .await
+        {
+            crate::flight::Ran::Answered(result) => Ok(result),
+            crate::flight::Ran::Panicked => Err(true),
+            crate::flight::Ran::Stopped => Err(false),
+        }
+    } else {
+        tokio::task::spawn_blocking(move || handler.call(arguments, &owned_caller))
+            .await
+            .map_err(|stopped| stopped.is_panic())
+    };
     let result = match outcome {
         Ok(result) => result,
-        Err(stopped) => {
-            let why = if stopped.is_panic() {
+        Err(panicked) => {
+            let why = if panicked {
                 "its handler panicked"
             } else {
                 "its handler was stopped before it answered"

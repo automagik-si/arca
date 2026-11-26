@@ -166,12 +166,18 @@ impl Fixture {
     /// One call by `token` that gives up after `patience`, as the cloud's meter and a polling page do: it sends the
     /// request, reads until its patience runs out and drops the connection. The server is not told anything else.
     fn give_up(&self, token: &str, name: &str, arguments: Value, patience: Duration) {
-        let body = rpc(json!(1), "tools/call", json!({ "name": name, "arguments": arguments }));
+        let body = rpc(
+            json!(1),
+            "tools/call",
+            json!({ "name": name, "arguments": arguments }),
+        );
         let mut stream = UnixStream::connect(&self.socket).expect("connect");
         stream
             .write_all(&post_bytes(&[bearer(token)], &body))
             .expect("send the call");
-        stream.set_read_timeout(Some(patience)).expect("a read timeout");
+        stream
+            .set_read_timeout(Some(patience))
+            .expect("a read timeout");
         let mut answer = Vec::new();
         let _ = stream.read_to_end(&mut answer);
     }
@@ -229,7 +235,11 @@ fn a_caller_that_waits_gets_the_answer_of_the_run_it_joined_and_a_later_call_rea
             post(
                 &mut stream,
                 &[bearer(&fx.viewer)],
-                &rpc(json!(7), "tools/call", json!({ "name": "arca_status", "arguments": {} })),
+                &rpc(
+                    json!(7),
+                    "tools/call",
+                    json!({ "name": "arca_status", "arguments": {} }),
+                ),
             )
         })
     };
@@ -237,14 +247,25 @@ fn a_caller_that_waits_gets_the_answer_of_the_run_it_joined_and_a_later_call_rea
     fx.gate.open();
     let reply = waiter.join().expect("the waiter");
     assert_eq!(reply.status, 200);
-    assert_eq!(reply.json()["result"]["structuredContent"]["version"], "0.1.0");
-    assert_eq!(fx.started.load(Ordering::SeqCst), 1, "the waiter joined the run");
+    assert_eq!(
+        reply.json()["result"]["structuredContent"]["version"],
+        "0.1.0"
+    );
+    assert_eq!(
+        fx.started.load(Ordering::SeqCst),
+        1,
+        "the waiter joined the run"
+    );
     // The run ended: the next call is a read of its own, not an answer kept from before.
     let mut stream = connect_unix(&fx.socket);
     let again = post(
         &mut stream,
         &[bearer(&fx.viewer)],
-        &rpc(json!(8), "tools/call", json!({ "name": "arca_status", "arguments": {} })),
+        &rpc(
+            json!(8),
+            "tools/call",
+            json!({ "name": "arca_status", "arguments": {} }),
+        ),
     );
     assert_eq!(again.status, 200);
     assert_eq!(fx.started.load(Ordering::SeqCst), 2);
