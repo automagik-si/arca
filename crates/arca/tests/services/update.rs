@@ -107,13 +107,33 @@ fn node_with(up: &Arc<AtomicBool>, key: Option<&common::SkKey>, instances: Vec<V
         rig.cfg.clone(),
         None,
         UpdateOptions {
-            probe: Arc::new(move |_, _, _| answers.load(Ordering::SeqCst)),
+            probe: Arc::new(move |_, _, _, _, _| answers.load(Ordering::SeqCst)),
             pace: Duration::from_millis(10),
         },
     )
     .into_iter()
     .collect();
     rig
+}
+
+/// The node's handlers again, with `clock` and `probe` of the test's own.
+fn handlers_with(
+    rig: &mut Rig,
+    clock: Arc<dyn Fn() -> u64 + Send + Sync>,
+    probe: arca::handlers::UpdateProbe,
+) {
+    rig.handlers = service_handlers_updating(
+        rig.kernel.clone(),
+        clock,
+        rig.cfg.clone(),
+        None,
+        UpdateOptions {
+            probe,
+            pace: Duration::from_millis(10),
+        },
+    )
+    .into_iter()
+    .collect();
 }
 
 fn update(rig: &Rig, args: Value) -> Result<Value, CallError> {
@@ -478,7 +498,7 @@ fn the_health_check_goes_through_the_host_port_proxy_on_loopback() {
         rig.cfg.clone(),
         None,
         UpdateOptions {
-            probe: Arc::new(move |address, port, forwarded| {
+            probe: Arc::new(move |address, port, forwarded, _, _| {
                 log.lock()
                     .unwrap()
                     .push((address.to_string(), port, forwarded));
@@ -489,12 +509,131 @@ fn the_health_check_goes_through_the_host_port_proxy_on_loopback() {
     )
     .into_iter()
     .collect();
-    update(&rig, json!({ "name": "app", "digest": NEW })).expect("update");
+    let done = update(&rig, json!({ "name": "app", "digest": NEW })).expect("update");
+    assert!(
+        done["message"]
+            .as_str()
+            .unwrap()
+            .ends_with("port 8080 answered")
+    );
     assert_eq!(
         *seen.lock().unwrap(),
         vec![("127.0.0.1".to_string(), 8080, true)],
         "the node's own loopback and the proxy's port, never the service's address"
     );
+}
+
+#[test]
+fn an_update_without_a_named_or_reachable_port_only_checks_that_the_instance_keeps_running() {
+    let mut rig = bare_node(&Arc::new(AtomicBool::new(false)), None);
+    let mut template = app_template();
+    template.as_object_mut().unwrap().remove("lan");
+    rig.template("app", template);
+    rig.call(
+        "service_create",
+        json!({ "name": "app", "template": "app" }),
+    )
+    .expect("create");
+    handlers_with(
+        &mut rig,
+        Arc::new(|| NOW),
+        Arc::new(|_, _, _, _, _| panic!("there is no port to probe")),
+    );
+
+    let done = update(
+        &rig,
+        json!({ "name": "app", "digest": NEW, "timeoutSeconds": 1 }),
+    )
+    .expect("running is healthy");
+    assert_eq!(done["updated"], true);
+    assert!(
+        done["message"]
+            .as_str()
+            .unwrap()
+            .ends_with("kept running for 1 s")
+    );
+    let rows = fs::read_to_string(rig.dir.join("service-updates.jsonl")).unwrap();
+    let health = rows
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|row| row["step"] == "health")
+        .unwrap();
+    assert_eq!(health["detail"], json!({ "runningSeconds": 1 }));
+}
+
+#[test]
+fn a_named_port_is_checked_after_start_and_its_failure_restores_the_image_and_acl() {
+    let mut rig = bare_node(&Arc::new(AtomicBool::new(false)), None);
+    let mut template = app_template();
+    template.as_object_mut().unwrap().remove("lan");
+    rig.template("app", template.clone());
+    rig.call(
+        "service_create",
+        json!({ "name": "app", "template": "app" }),
+    )
+    .expect("create without a health port");
+    let old = alias_of_record(&rig);
+    let config = rig.service_config("app");
+    let acl_path = format!("/1.0/network-acls/{}?project=default", config.acl());
+    let before = rig.get(&acl_path).expect("ACL")["ingress"].clone();
+
+    template["health"] = json!({ "port": 9090 });
+    rig.template("app", template);
+    let read = arca_incus::UnixIncus::new(rig.cfg.incus.socket.clone());
+    let healthy = Arc::new(AtomicBool::new(false));
+    let answers = healthy.clone();
+    let checks = Arc::new(AtomicU64::new(0));
+    let seen = checks.clone();
+    let path = acl_path.clone();
+    handlers_with(
+        &mut rig,
+        Arc::new(|| NOW),
+        Arc::new(move |address, port, forwarded, http_path, remaining| {
+            assert_eq!(
+                (address, port, forwarded, http_path),
+                (config.ipv4.as_str(), 9090, false, None)
+            );
+            assert!(remaining <= Duration::from_secs(1));
+            let acl = read.get(&path).expect("the service ACL");
+            assert_eq!(
+                acl["ingress"][0]["source"],
+                format!("{}/32", config.gateway)
+            );
+            assert_eq!(acl["ingress"][0]["destination_port"], "9090");
+            let instance = read
+                .get(&format!("/1.0/instances/app?project={PROJECT}"))
+                .unwrap();
+            assert_eq!(instance["status"], "Running");
+            seen.fetch_add(1, Ordering::SeqCst);
+            answers.load(Ordering::SeqCst)
+        }),
+    );
+    let args = json!({ "name": "app", "digest": NEW, "timeoutSeconds": 1 });
+    let (code, message) = refusal_words(update(&rig, args.clone()));
+    assert_eq!(code, "rolled_back");
+    assert!(
+        message.contains("port 9090 did not answer within 1 s"),
+        "{message}"
+    );
+    assert!(checks.load(Ordering::SeqCst) > 0);
+    assert_eq!(
+        rig.fake.rebuilds(PROJECT, "app"),
+        vec!["registry", "registry"]
+    );
+    assert_eq!(alias_of_record(&rig), old);
+    assert_eq!(instance(&rig)["status"], "Running");
+    assert!(rig.service_config("app").health.is_none());
+    assert_eq!(rig.get(&acl_path).unwrap()["ingress"], before);
+
+    healthy.store(true, Ordering::SeqCst);
+    let done = update(&rig, args).expect("the same image is accepted when it serves");
+    assert!(
+        done["message"]
+            .as_str()
+            .unwrap()
+            .ends_with("port 9090 answered")
+    );
+    assert_eq!(alias_of_record(&rig), format!("app@{NEW}"));
 }
 
 #[test]
@@ -1829,7 +1968,7 @@ fn labels_set_before_and_during_a_failed_update_survive_rollback() {
     rig.handlers = service_handlers_updating(
         rig.kernel.clone(), Arc::new(|| NOW), rig.cfg.clone(), None,
         UpdateOptions {
-            probe: Arc::new(move |_, _, _| {
+            probe: Arc::new(move |_, _, _, _, _| {
                 if !changed.swap(true, Ordering::SeqCst) {
                     let answer = setter.call(json!({"name":"app", "labels":{"during":"kept", "change":"new", "remove":null}}), &Caller {token_id:"doctor".into(), scope:Scope::Doctor, tools:None, limits:Default::default()}).unwrap();
                     assert_eq!(answer["code"], "confirmed");

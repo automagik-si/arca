@@ -63,6 +63,39 @@ pub const SHIPPED: &[(&str, &str)] = shipped![
 /// v<previous>:templates/<name> | sha256sum`). A test checks the list against the release tags where the checkout has
 /// them. A hash is of a file exactly as a release shipped it, so an owner's edit never matches one.
 pub const EARLIER: &[(&str, &str)] = &[
+    // 0.37.0: before these templates named an image update health port.
+    (
+        "arca-edge.json",
+        "94c564d8aa5ba2b46282008c569b14d2f64096bf0f93bdd01129238db5f5fad0",
+    ),
+    (
+        "automagik-server.json",
+        "9bd4243feb2288ce6c86e1879b90fbf3deb8ba38dcf8fbfa2d90e92ed65473a8",
+    ),
+    (
+        "gitlab.json",
+        "b46c0a033f5e6be3dccf87a028ea49d1d3a7e522cc1f352f13cc636a37e48000",
+    ),
+    (
+        "nats-primary.json",
+        "730ced8304e539526427086a0c99ab599a101332dd9d5f9f310c23836c94af00",
+    ),
+    (
+        "nats-replica.json",
+        "936dedb2e6d5cc9ee68abaff90c676044492771d911f93371ff0171a99675f41",
+    ),
+    (
+        "nats.json",
+        "2d43456d23a03db5fe95a51fc85fcb14ed5cb294d892f0076be8d86ca132abd6",
+    ),
+    (
+        "omni-api.json",
+        "824e04ab5b3b71c4c75469ee842db093b4a5a0f470975401e0348a14d869d69e",
+    ),
+    (
+        "postgres-autopg.json",
+        "5371254f9b91dde56b9abce9594361036cb11b3201e1a644d6216e205a2916f0",
+    ),
     // 0.34.0 to 0.35.0: before keyless Tailscale starts waited ten minutes for sign-in.
     (
         "tailscale.sh",
@@ -90,6 +123,11 @@ pub const EARLIER: &[(&str, &str)] = &[
     (
         "tailscale.sh",
         "5cc08fec28a57c18c16a641239a7cfd98524beaa371da60bfdbc4cc7c87ba38f",
+    ),
+    // Before the keeper reported how to change settings in place.
+    (
+        "automagik-workspace.sh",
+        "6ac3761917b086391fdd24c6134d1de617c8447564ae7cd4014547758306618a",
     ),
     // Before repository checkout delivery.
     (
@@ -144,6 +182,16 @@ pub const EARLIER: &[(&str, &str)] = &[
         "automagik-workspace.sh",
         "8cdcf3d1403c4c130edaf95efd7024a67dc8ca9ba9503d54b3c298ec4efc5b50",
     ),
+    // 0.36.0 to 0.38.0: the workspace template pinned Automagik 3.146.5.
+    (
+        "automagik-workspace.json",
+        "81fbec6b91da5492de5b71357260a2a5314fb8d51d1bccc84a4e1e804816d883",
+    ),
+    // 0.35.0 to 0.38.0: before the keeper followed the server lane.
+    (
+        "automagik-workspace.sh",
+        "6ac3761917b086391fdd24c6134d1de617c8447564ae7cd4014547758306618a",
+    ),
     // 0.17.0 to 0.30.0: Automagik's release 3.136.4, and accessEmails a list only.
     (
         "automagik-workspace.json",
@@ -184,6 +232,15 @@ pub const EARLIER: &[(&str, &str)] = &[
     (
         "gitlab-runner-pool.sh",
         "9792af0cb048e8efcce28859eb4e4063ba479d52675d6cd074bef7954ac5204f",
+    ),
+    // 0.30.0 to 0.37.0: before fresh job stores, dedicated CPUs, LXCFS mounts and the memory ceiling setting.
+    (
+        "github-runner-pool.json",
+        "47cd6ead1a7fcdd907d188a932e07f4fbf44d79656798695d9365c0c17fd0684",
+    ),
+    (
+        "github-runner-pool.sh",
+        "7cc2cde111624ad8483546fc43a14b3b1f278a7d38e59a84d9bcd4a1b1cb902d",
     ),
     // 0.14.0 to 0.29.0: before the runner image was built with aptPackages added.
     (

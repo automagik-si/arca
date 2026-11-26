@@ -18,11 +18,11 @@
 //!
 //! The test needs `bash`, `curl`, `jq`, `openssl` and `flock` on the machine that runs it. Every credential is made here.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -1022,6 +1022,20 @@ impl Pool {
             env: Vec::new(),
         };
         pool.memory(memory_total, memory_available);
+        fs::write(pool.dir.join("cpu-status"), "Cpus_allowed_list:\t0-63\n").expect("CPUs");
+        let lxcfs = pool.dir.join("lxcfs");
+        fs::create_dir_all(lxcfs.join("proc")).expect("fake LXCFS");
+        for file in ["meminfo", "cpuinfo", "stat", "loadavg", "swaps", "uptime"] {
+            fs::write(lxcfs.join("proc").join(file), "").expect("an LXCFS file");
+        }
+        fs::write(
+            pool.dir.join("mountinfo"),
+            format!(
+                "41 29 0:42 / {} rw - fuse.lxcfs lxcfs rw\n",
+                lxcfs.display()
+            ),
+        )
+        .expect("a mounted LXCFS");
         fs::copy(
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/runner_pool/fake-docker.sh"),
             pool.dir.join("bin/docker"),
@@ -1032,6 +1046,8 @@ impl Pool {
             fs::Permissions::from_mode(0o755),
         )
         .expect("0755");
+        std::os::unix::fs::symlink("docker", pool.dir.join("bin/nsenter"))
+            .expect("the fake nsenter");
         executable(
             &pool.dir.join("bin/systemctl"),
             &format!(
@@ -1108,6 +1124,9 @@ impl Pool {
             .env("POOL_RUN", self.dir.join("run"))
             .env("POOL_CGROUP", self.dir.join("cgroup"))
             .env("POOL_MEMINFO", self.dir.join("meminfo"))
+            .env("POOL_CPU_STATUS", self.dir.join("cpu-status"))
+            .env("POOL_LXCFS", self.dir.join("lxcfs"))
+            .env("POOL_MOUNTINFO", self.dir.join("mountinfo"))
             .env("POOL_UNITS", self.dir.join("units"))
             .env("POOL_API_URL", &github.url)
             .env("POOL_TICK", "0.1")
@@ -1317,6 +1336,223 @@ fn key_lines(pem: &str) -> Vec<String> {
         .filter(|line| !line.starts_with("-----") && line.len() >= 20)
         .map(str::to_string)
         .collect()
+}
+
+#[test]
+fn each_slot_starts_with_its_own_cpus_and_the_lxcfs_proc_files() {
+    let scratch = scratch_dir();
+    let github = Github::start(&scratch, &format!("/orgs/{ORG}"));
+    github.state().tokens.push(PAT.to_string());
+    let mut large = class_of("large", "9GiB", 1);
+    large["cpu"] = json!(6);
+    let mut pool = Pool::new(
+        &settings(
+            json!([small(2), large]),
+            3,
+            &format!("https://github.com/{ORG}"),
+        ),
+        64 * GIB,
+        60 * GIB,
+    );
+    fs::write(
+        pool.dir.join("cpu-status"),
+        "Cpus_allowed_list:\t2-4,6-12\n",
+    )
+    .expect("CPUs");
+    pool.secret("GITHUB_TOKEN", PAT);
+    pool.start(&github);
+    wait_for(&pool, "all three runner and daemon pairs", || {
+        pool.read("logs/status.txt").contains("idle=3")
+    });
+
+    let calls = pool.read("docker/calls.log");
+    let mut used = BTreeSet::new();
+    for (slot, count, memory) in [(0, 2, 4), (1, 2, 4), (2, 6, 9)] {
+        let cpus_for = |container| {
+            let prefix = format!("run -d --name pool1-s{slot}-{container} ");
+            let run = calls
+                .lines()
+                .find(|line| line.starts_with(&prefix))
+                .expect(&prefix);
+            for file in ["meminfo", "cpuinfo", "stat", "loadavg", "swaps", "uptime"] {
+                let mount = format!(
+                    "--mount type=bind,source={}/lxcfs/proc/{file},target=/proc/{file},readonly",
+                    pool.dir.display()
+                );
+                assert!(run.contains(&mount), "{run}");
+            }
+            run.split_whitespace()
+                .skip_while(|arg| *arg != "--cpuset-cpus")
+                .nth(1)
+                .expect(run)
+        };
+        let cpus = cpus_for("run");
+        assert_eq!(cpus_for("dind"), cpus);
+        let cpu_ids = cpus.split(',').map(|cpu| cpu.parse::<u32>().expect(cpus));
+        assert_eq!(cpu_ids.clone().count(), count);
+        for cpu in cpu_ids {
+            assert!(
+                (2..=4).contains(&cpu) || (6..=12).contains(&cpu),
+                "CPU {cpu}"
+            );
+            assert!(used.insert(cpu), "CPU {cpu} is assigned to two slots");
+        }
+        let slice = pool.read(&format!("units/arcapool-s{slot}.slice"));
+        assert!(slice.contains(&format!("AllowedCPUs={cpus}\n")), "{slice}");
+        assert!(
+            slice.contains(&format!("MemoryMax={}\n", memory * GIB)),
+            "{slice}"
+        );
+    }
+    assert_eq!(pool.stop(), Some(0));
+    let _ = fs::remove_dir_all(scratch);
+}
+
+#[test]
+fn the_slot_budget_names_cpus_and_keeps_slots_without_cpus_queued() {
+    let scratch = scratch_dir();
+    let github = Github::start(&scratch, &format!("/orgs/{ORG}"));
+    github.state().tokens.push(PAT.to_string());
+    let mut pool = Pool::new(
+        &settings(
+            json!([small(2), class_of("other", "4GiB", 1)]),
+            2,
+            &format!("https://github.com/{ORG}"),
+        ),
+        64 * GIB,
+        60 * GIB,
+    );
+    fs::write(pool.dir.join("cpu-status"), "Cpus_allowed_list:\t0-3\n").expect("CPUs");
+    pool.secret("GITHUB_TOKEN", PAT);
+    pool.start(&github);
+    wait_for(
+        &pool,
+        "two slots with CPUs and one waiting for CPUs",
+        || {
+            let status = pool.read("logs/status.txt");
+            status.contains("idle=2") && status.contains("queued (needs 2 dedicated CPUs)")
+        },
+    );
+    let warning = "WARNING: the 3 slots ask for 6 CPUs together and the machine has 4 CPUs";
+    assert!(pool.output().contains(warning));
+    assert!(pool.read("logs/status.txt").contains(warning));
+    assert_eq!(live_slots(&github), ["0", "2"]);
+    assert_eq!(pool.stop(), Some(0));
+    let _ = fs::remove_dir_all(scratch);
+}
+
+#[test]
+fn ceiling_memory_admits_more_slots_and_preserves_their_limits_and_the_machine_reserve() {
+    let scratch = scratch_dir();
+    let mut config = settings(
+        json!([class_of("large", "8GiB", 4)]),
+        4,
+        &format!("https://github.com/{ORG}"),
+    );
+    config["reserveMemory"] = json!("4GiB");
+    for (policy, expected) in [("reserved", 3), ("ceiling", 4)] {
+        let github = Github::start(&scratch, &format!("/orgs/{ORG}"));
+        github.state().tokens.push(PAT.to_string());
+        config["memory"] = json!(policy);
+        let mut pool = Pool::new(&config, 32 * GIB, 28 * GIB);
+        pool.secret("GITHUB_TOKEN", PAT);
+        pool.start(&github);
+        wait_for(
+            &pool,
+            "the expected number of slots under the memory policy",
+            || {
+                pool.read("logs/status.txt").contains(&format!(
+                    "idle={expected} starting=0 queued={}",
+                    4 - expected
+                ))
+            },
+        );
+        assert_eq!(github.registrations().len(), expected);
+        let parent = pool.read("units/arcapool.slice");
+        let status = pool.read("logs/status.txt");
+        if policy == "ceiling" {
+            assert!(
+                parent.contains(&format!("MemoryMax={}\n", 28 * GIB)),
+                "{parent}"
+            );
+            assert!(
+                status.contains("memory_ceilings=32768MiB memory_budget=28672MiB"),
+                "{status}"
+            );
+        } else {
+            assert!(parent.is_empty(), "{parent}");
+            assert!(
+                status.contains("memory_reserved=24576MiB of 28672MiB"),
+                "{status}"
+            );
+        }
+        let calls = pool.read("docker/calls.log");
+        for slot in live_slots(&github) {
+            let slice = pool.read(&format!("units/arcapool-s{slot}.slice"));
+            assert!(
+                slice.contains(&format!("MemoryMax={}\n", 8 * GIB)),
+                "{slice}"
+            );
+            assert!(calls.lines().any(|run| {
+                run.starts_with(&format!("run -d --name pool1-s{slot}-run "))
+                    && run.contains("target=/proc/meminfo,readonly")
+            }));
+        }
+        assert_eq!(pool.stop(), Some(0));
+    }
+    let _ = fs::remove_dir_all(scratch);
+}
+
+#[test]
+fn slots_wait_for_lxcfs_before_registering_in_either_mode() {
+    for persistent in [false, true] {
+        let scratch = scratch_dir();
+        let github = Github::start(&scratch, &format!("/orgs/{ORG}"));
+        github.state().tokens.push(PAT.to_string());
+        github.state().registration_token = Some(REGISTRATION_TOKEN.to_string());
+        let mut config = settings(json!([small(1)]), 1, &format!("https://github.com/{ORG}"));
+        if persistent {
+            config["registration"] = json!("registration-token");
+            config["runnerGroup"] = json!("arca-pool");
+        }
+        let mut pool = Pool::new(&config, 64 * GIB, 60 * GIB);
+        pool.secret("GITHUB_TOKEN", PAT);
+        pool.secret("GITHUB_REGISTRATION_TOKEN", REGISTRATION_TOKEN);
+        let mountinfo = pool.read("mountinfo");
+        fs::write(pool.dir.join("mountinfo"), "").expect("unmounted LXCFS");
+        fs::remove_file(pool.dir.join("lxcfs/proc/meminfo")).expect("required LXCFS file");
+        fs::remove_file(pool.dir.join("lxcfs/proc/uptime")).expect("optional LXCFS file");
+        pool.start(&github);
+        wait_for(&pool, "LXCFS failure before registration", || {
+            pool.output().contains("LXCFS is not mounted at")
+        });
+        assert!(github.registrations().is_empty());
+        assert!(github.state().registered.is_empty());
+
+        fs::write(pool.dir.join("mountinfo"), mountinfo).expect("mounted LXCFS");
+        wait_for(&pool, "the missing LXCFS file is named", || {
+            let output = pool.output();
+            output.contains("LXCFS is missing") && output.contains("/lxcfs/proc/meminfo")
+        });
+        assert!(github.registrations().is_empty());
+        assert!(github.state().registered.is_empty());
+
+        fs::write(pool.dir.join("lxcfs/proc/meminfo"), "").expect("LXCFS meminfo restored");
+        wait_for(&pool, "the runner started once LXCFS is mounted", || {
+            pool.read("logs/status.txt").contains("idle=1")
+        });
+        let calls = pool.read("docker/calls.log");
+        assert!(!calls.contains("target=/proc/uptime"));
+        if persistent {
+            assert!(calls.lines().any(|line| {
+                line.starts_with("run --rm --name pool1-s0-reg ")
+                    && line.contains("--cpuset-cpus 0,1")
+                    && line.contains("target=/proc/meminfo,readonly")
+            }));
+        }
+        assert_eq!(pool.stop(), Some(0));
+        let _ = fs::remove_dir_all(scratch);
+    }
 }
 
 #[test]
@@ -1564,7 +1800,8 @@ fn an_app_registers_a_fresh_runner_per_job_replaces_it_and_prints_no_credential(
             );
         }
     }
-    assert!(calls.contains("rm -fv pool1-s0-run pool1-s0-dind"));
+    assert!(calls.contains("rm -fv pool1-s0-run\n"));
+    assert!(calls.contains("rm -fv pool1-s0-dind\n"));
     assert!(
         pool.read("systemctl.log")
             .contains("stop arcapool-s0.slice")
@@ -2267,6 +2504,14 @@ fn the_shipped_template_is_a_virtual_machine_with_its_script_its_secrets_and_pin
     }
     let settings = template.settings.as_ref().expect("settings");
     assert_eq!(settings["url"], "https://github.com/example-org");
+    assert_eq!(settings["keepBetweenJobs"], false);
+    let keeping =
+        arca::service::create_settings(&template, Some(&json!({"keepBetweenJobs": true})))
+            .expect("the pool can keep its caches when asked at create");
+    assert_eq!(
+        keeping.merged.expect("the settings")["keepBetweenJobs"],
+        true
+    );
     // What GitHub's ubuntu-latest has and the pinned runner image lacks (DEFAULT_PACKAGES). Node.js is not added: a
     // job sets up its own.
     assert_eq!(
@@ -2360,6 +2605,7 @@ fn a_first_boot_names_the_commands_that_are_missing_on_the_console_and_installs_
         ),
         ("util-linux", "flock"),
         ("hostname", "hostname"),
+        ("lxcfs", "the slots' cgroup-aware proc files"),
     ] {
         assert!(
             packages.iter().any(|name| name == package),
@@ -2461,6 +2707,102 @@ fn one_slot_pool(github: &Github, change: impl FnOnce(&mut Value)) -> Pool {
     let pool = Pool::new(&settings, 64 * GIB, 60 * GIB);
     pool.secret("GITHUB_TOKEN", PAT);
     pool
+}
+
+#[test]
+fn job_cache_residue_is_cleared_on_every_slot_unless_keeping_is_enabled() {
+    for (keep, over_budget, expected) in [
+        (None, false, "0"),
+        (Some(false), false, "0"),
+        (Some(true), false, "4"),
+        (Some(true), true, "0"),
+    ] {
+        let scratch = scratch_dir();
+        let github = Github::start(&scratch, &format!("/orgs/{ORG}"));
+        github.state().tokens.push(PAT.to_string());
+        let labels = ["one", "two", "three", "four"];
+        let classes: Vec<_> = labels
+            .iter()
+            .map(|label| class_of(label, "4GiB", 1))
+            .collect();
+        let mut settings = settings(json!(classes), 4, &format!("https://github.com/{ORG}"));
+        if let Some(keep) = keep {
+            settings["keepBetweenJobs"] = json!(keep);
+        }
+        if over_budget {
+            settings["dockerCache"] = json!("4B");
+            settings["dependencyCache"] = json!("4B");
+        }
+        let mut pool = Pool::new(&settings, 64 * GIB, 60 * GIB);
+        pool.secret("GITHUB_TOKEN", PAT);
+        for label in labels {
+            github.queue(&[&format!("arca-{label}")], "write caches", 0.1);
+        }
+        pool.start(&github);
+        wait_for(
+            &pool,
+            "a completed write and a replacement on every slot",
+            || pool.jobs().len() == 4 && github.registrations().len() == 8,
+        );
+        let mut written_slots: Vec<_> = pool.jobs().into_iter().map(|job| job[1].clone()).collect();
+        written_slots.sort();
+        assert_eq!(written_slots, ["0", "1", "2", "3"]);
+        for label in labels {
+            github.queue(&[&format!("arca-{label}")], "read caches", 0.1);
+        }
+        wait_for(&pool, "the jobs on the replacement runners", || {
+            pool.jobs().len() == 8
+        });
+        for slot in 0..4 {
+            assert_eq!(
+                pool.read(&format!("docker/pool1-s{slot}.residue")).trim(),
+                expected,
+                "slot {slot}, keepBetweenJobs={keep:?}, over_budget={over_budget}"
+            );
+        }
+        assert_eq!(pool.stop(), Some(0));
+        let _ = fs::remove_dir_all(scratch);
+    }
+}
+
+#[test]
+fn a_failed_job_cache_reset_blocks_registration_until_the_slot_is_clean() {
+    let scratch = scratch_dir();
+    let github = Github::start(&scratch, &format!("/orgs/{ORG}"));
+    let mut pool = one_slot_pool(&github, |_| {});
+    executable(
+        &pool.dir.join("bin/rm"),
+        &format!(
+            "#!/bin/sh\nfor path do\n\
+             case $path in */slots/0/docker)\n\
+              if [ -e \"$FAKE_DOCKER_DIR/refuse-reset\" ] && [ -e \"$path/images/.job-marker\" ]; then exit 1; fi;;\n\
+             esac\ndone\nexec '{}' \"$@\"\n",
+            which("rm").display()
+        ),
+    );
+    let refused = pool.dir.join("docker/refuse-reset");
+    fs::write(&refused, "").expect("block removal of the Docker store after the first job");
+    github.queue(&["arca"], "write caches", 0.1);
+    pool.start(&github);
+    let failure = "slot 0 (small) failed: the Docker store, tool cache or dependency cache could not be reset";
+    wait_for(&pool, "the failed reap and a failed retry", || {
+        pool.output().matches(failure).count() >= 2
+    });
+    assert_eq!(github.registrations().len(), 1);
+    assert!(
+        pool.dir
+            .join("state/slots/0/docker/images/.job-marker")
+            .is_file()
+    );
+
+    fs::remove_file(refused).expect("allow removal again");
+    github.queue(&["arca"], "read caches", 0.1);
+    wait_for(&pool, "the next job after recovery", || {
+        pool.jobs().len() == 2
+    });
+    assert_eq!(pool.read("docker/pool1-s0.residue").trim(), "0");
+    assert_eq!(pool.stop(), Some(0));
+    let _ = fs::remove_dir_all(scratch);
 }
 
 #[test]
@@ -4714,6 +5056,275 @@ fn mode(pool: &Pool, path: &str) -> u32 {
         & 0o777
 }
 
+#[test]
+fn a_persistent_runner_clears_job_cache_residue_unless_keeping_is_enabled() {
+    for keep in [false, true] {
+        let scratch = scratch_dir();
+        let github = Github::start(&scratch, &format!("/orgs/{ORG}"));
+        github.state().registration_token = Some(REGISTRATION_TOKEN.to_string());
+        let mut pool = registration_pool(1, |settings| {
+            if keep {
+                settings["keepBetweenJobs"] = json!(true);
+            }
+        });
+        pool.secret("GITHUB_REGISTRATION_TOKEN", REGISTRATION_TOKEN);
+        pool.start(&github);
+        github.queue(&["arca"], "write daemon residue", 0.1);
+        wait_for(&pool, "the first job completed its boundary", || {
+            pool.jobs().len() == 1
+        });
+        github.queue(&["arca"], "read daemon residue", 0.1);
+        wait_for(&pool, "the same runner checked its caches", || {
+            pool.jobs().len() == 2
+        });
+        let expected = if keep { "9" } else { "0" };
+        assert_eq!(pool.read("docker/pool1-s0.residue").trim(), expected);
+        let first_daemon = pool.read("docker/pool1-s0.write-daemon");
+        let next_daemon = pool.read("docker/pool1-s0.read-daemon");
+        assert!(!first_daemon.is_empty() && !next_daemon.is_empty());
+        assert_eq!(first_daemon == next_daemon, keep);
+        assert!(pool.jobs().iter().all(|job| job[5] == "Succeeded"));
+        assert_eq!(github.state().registered.len(), 1);
+        let calls = pool.read("docker/calls.log");
+        let mut starts = calls
+            .lines()
+            .filter(|line| line.starts_with("run -d --name pool1-s0-run "));
+        let start = starts.next().expect("one persistent runner");
+        assert!(starts.next().is_none(), "{calls}");
+        assert_eq!(
+            start.contains("-e ACTIONS_RUNNER_HOOK_JOB_STARTED=/run/arca/job-started.sh "),
+            !keep
+        );
+        assert_eq!(
+            start.contains("/run/job-started.sh:/run/arca/job-started.sh:ro "),
+            !keep
+        );
+        assert_eq!(
+            start.contains("-e ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/run/arca/job-completed.sh "),
+            !keep
+        );
+        assert_eq!(
+            start.contains("/run/job-started.sh:/run/arca/job-completed.sh:ro "),
+            !keep
+        );
+        if !keep {
+            assert_eq!(mode(&pool, "run/job-started.sh"), 0o555);
+            let owner = |path| fs::metadata(pool.dir.join(path)).expect(path).uid();
+            assert_eq!(owner("run/job-started.sh"), owner("run"));
+            assert!(start.contains("/boundary:/run/arca/boundary:ro "));
+            assert!(start.contains("/boundary/request:/run/arca/boundary/request:rw "));
+            assert!(start.contains("--network container:pool1-s0-net "));
+            assert!(!pool.dir.join("state/slots/0/work/.job-marker").exists());
+            assert!(
+                !pool
+                    .dir
+                    .join("docker/containers/pool1-s0-run/private-tmp/.job-marker")
+                    .exists()
+            );
+            for daemon in calls
+                .lines()
+                .filter(|line| line.starts_with("run -d --name pool1-s0-dind "))
+            {
+                assert!(
+                    daemon.contains("--network container:pool1-s0-net "),
+                    "{daemon}"
+                );
+                assert!(daemon.contains("--cpuset-cpus "), "{daemon}");
+                assert!(daemon.contains("/proc/meminfo,readonly"), "{daemon}");
+            }
+        }
+        assert_eq!(pool.stop(), Some(0));
+        let _ = fs::remove_dir_all(scratch);
+    }
+}
+
+#[test]
+fn a_fresh_persistent_runner_clears_root_owned_work_and_shared_network_residue() {
+    let scratch = scratch_dir();
+    let github = Github::start(&scratch, &format!("/orgs/{ORG}"));
+    github.state().registration_token = Some(REGISTRATION_TOKEN.to_string());
+    let mut pool = registration_pool(1, |_| {});
+    pool.secret("GITHUB_REGISTRATION_TOKEN", REGISTRATION_TOKEN);
+    pool.start(&github);
+
+    let mut finished = 0;
+    let mut observed = Vec::new();
+    for residue in ["root work", "network residue"] {
+        for action in ["write", "read"] {
+            github.queue(&["arca"], &format!("{action} {residue}"), 0.1);
+            finished += 1;
+            wait_for(&pool, "the job completed its boundary", || {
+                pool.jobs().len() == finished
+            });
+        }
+        observed.push(pool.read("docker/pool1-s0.residue").trim().to_owned());
+    }
+    assert_eq!(observed, ["0", "0"], "root-owned work and network markers");
+    assert!(pool.jobs().iter().all(|job| job[5] == "Succeeded"));
+    assert_eq!(github.state().registered.len(), 1);
+    assert_eq!(pool.stop(), Some(0));
+    let _ = fs::remove_dir_all(scratch);
+}
+
+#[test]
+fn a_failed_daemon_reset_stops_the_persistent_runner_until_it_can_start_clean() {
+    let scratch = scratch_dir();
+    let github = Github::start(&scratch, &format!("/orgs/{ORG}"));
+    github.state().registration_token = Some(REGISTRATION_TOKEN.to_string());
+    let mut pool = registration_pool(1, |_| {});
+    pool.secret("GITHUB_REGISTRATION_TOKEN", REGISTRATION_TOKEN);
+    pool.start(&github);
+    github.queue(&["arca"], "fail daemon reset", 0.1);
+    let refused = pool.dir.join("docker/refuse-hook-cleanup");
+    wait_for(&pool, "the failed boundary stopped the runner", || {
+        pool.output().contains(
+            "the job boundary could not verify or reset the slot's Docker daemon and caches",
+        ) && !pool.dir.join("docker/containers/pool1-s0-run").exists()
+    });
+    github.queue(&["arca"], "read caches", 0.1);
+    wait_for(
+        &pool,
+        "a dirty daemon still blocks the slot on retry",
+        || {
+            pool.output()
+                .contains("the previous runner or Docker daemon could not be removed")
+        },
+    );
+    assert!(!pool.dir.join("docker/pool1-s0.residue").exists());
+    assert_eq!(github.state().registered.len(), 1);
+
+    fs::remove_file(refused).expect("allow the controller to clean the slot");
+    wait_for(&pool, "the next job started with clean stores", || {
+        pool.jobs()
+            .iter()
+            .any(|job| job[4] == "read caches" && job[5] == "Succeeded")
+    });
+    assert_eq!(pool.read("docker/pool1-s0.residue").trim(), "0");
+    assert_eq!(github.state().registered.len(), 1);
+    assert_eq!(pool.stop(), Some(0));
+    let _ = fs::remove_dir_all(scratch);
+}
+
+#[test]
+fn a_persistent_runner_cannot_reuse_a_generation_when_completion_was_interrupted() {
+    let scratch = scratch_dir();
+    let github = Github::start(&scratch, &format!("/orgs/{ORG}"));
+    github.state().registration_token = Some(REGISTRATION_TOKEN.to_string());
+    let mut pool = registration_pool(1, |_| {});
+    pool.secret("GITHUB_REGISTRATION_TOKEN", REGISTRATION_TOKEN);
+    pool.start(&github);
+    github.queue(&["arca"], "interrupted job", 0.1);
+    wait_for(
+        &pool,
+        "the first job ended without running its completed hook",
+        || {
+            pool.jobs()
+                .iter()
+                .any(|job| job[4] == "interrupted job" && job[5] == "Failed")
+        },
+    );
+    assert!(
+        pool.read("state/slots/0/boundary/state")
+            .starts_with("running ")
+    );
+    github.queue(&["arca"], "read caches", 0.1);
+    wait_for(
+        &pool,
+        "the started hook rejected reuse and the slot failed",
+        || {
+            pool.output().contains(
+                "the job boundary could not verify or reset the slot's Docker daemon and caches",
+            )
+        },
+    );
+    assert!(!pool.dir.join("docker/pool1-s0.residue").exists());
+    assert_eq!(github.state().registered.len(), 1);
+    assert_eq!(pool.stop(), Some(0));
+    let _ = fs::remove_dir_all(scratch);
+}
+
+#[test]
+fn fresh_slots_check_work_and_layer_removal_again_after_an_interrupted_reset() {
+    for (blocked, failure) in [
+        (
+            "work",
+            "the runner work or socket directory could not be removed",
+        ),
+        (
+            "layer",
+            "the layered runner home could not be unmounted or removed",
+        ),
+        (
+            "unmount",
+            "the layered runner home could not be unmounted or removed",
+        ),
+        (
+            "interrupted",
+            "the runner work or socket directory could not be removed",
+        ),
+    ] {
+        let scratch = scratch_dir();
+        let github = Github::start(&scratch, &format!("/orgs/{ORG}"));
+        let mut pool = one_slot_pool(&github, |_| {});
+        let slot = pool.dir.join("state/slots/0");
+        for folder in ["work", "sock", "layer/home", "layer/upper", "layer/work"] {
+            fs::create_dir_all(slot.join(folder)).expect("a previous job's directory");
+            fs::write(slot.join(folder).join(".job-marker"), "residue").expect("a marker");
+        }
+        executable(
+            &pool.dir.join("bin/rm"),
+            &format!(
+                "#!/bin/sh\nblocked=$(cat \"$FAKE_DOCKER_DIR/refuse-cleanup\" 2>/dev/null)\n\
+                 for path do\n\
+                 case $blocked:$path in\n\
+                  work:*/slots/0/work|layer:*/slots/0/layer) exit 1;;\n\
+                  interrupted:*/slots/0/work) '{}' -rf \"$path\"; exit 1;;\n\
+                 esac\ndone\nexec '{}' \"$@\"\n",
+                which("rm").display(),
+                which("rm").display()
+            ),
+        );
+        if blocked == "unmount" {
+            executable(
+                &pool.dir.join("bin/umount"),
+                "#!/bin/sh\n[ ! -e \"$FAKE_DOCKER_DIR/refuse-cleanup\" ]\n",
+            );
+            executable(
+                &pool.dir.join("bin/mountpoint"),
+                &format!(
+                    "#!/bin/sh\n[ ! -e \"$FAKE_DOCKER_DIR/refuse-cleanup\" ] || exit 0\nexec '{}' \"$@\"\n",
+                    which("mountpoint").display()
+                ),
+            );
+        }
+        let refused = pool.dir.join("docker/refuse-cleanup");
+        fs::write(&refused, blocked).expect("inject a failed or interrupted removal");
+        pool.start(&github);
+        wait_for(&pool, "the slot reports the cleanup failure", || {
+            pool.output().contains(failure)
+        });
+        assert!(github.registrations().is_empty(), "{blocked}");
+        assert!(!pool.containers().contains(&"pool1-s0-run".to_string()));
+        assert_eq!(pool.stop(), Some(0));
+        if blocked == "interrupted" {
+            assert!(!slot.join("work").exists());
+            assert!(slot.join("sock/.job-marker").is_file());
+        }
+
+        fs::remove_file(refused).expect("allow the reset to finish");
+        pool.start(&github);
+        wait_for(&pool, "a runner starts after a successful reset", || {
+            pool.containers().contains(&"pool1-s0-run".to_string())
+        });
+        assert_eq!(github.registrations().len(), 1);
+        for folder in ["work", "sock", "layer/home", "layer/upper", "layer/work"] {
+            assert!(!slot.join(folder).join(".job-marker").exists(), "{folder}");
+        }
+        assert_eq!(pool.stop(), Some(0));
+        let _ = fs::remove_dir_all(scratch);
+    }
+}
+
 /// The person's policy forbids a key that can register runners anywhere in the organisation. An owner makes one
 /// registration token instead; the pool registers each slot once with it, as a persistent runner in the named group
 /// with the class's labels, keeps each runner's registration where only root reads it, deletes the token, and asks
@@ -4873,7 +5484,7 @@ fn a_registration_token_github_refuses_is_said_and_deleted_after_its_hour_and_th
     // The default group is taken, for an organisation that has no other, and said in every status block.
     let mut pool = registration_pool(1, |settings| settings["runnerGroup"] = json!("Default"));
     pool.start(&github);
-    let warning = "runner group \"Default\", registration-token mode: one persistent runner per slot, registered once, which keeps its container, work directory and caches between jobs, WARNING: the default runner group: every repository it admits can send jobs to these persistent runners; a group limited to selected repositories is safer";
+    let warning = "runner group \"Default\", registration-token mode: one persistent runner per slot, registered once, which keeps its container between jobs, with the Docker daemon and caches reset after each job, WARNING: the default runner group: every repository it admits can send jobs to these persistent runners; a group limited to selected repositories is safer";
     wait_for(&pool, "the default group's warning at the start", || {
         pool.output()
             .contains(&format!("registering runners in {warning}"))

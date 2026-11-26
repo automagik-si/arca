@@ -14,9 +14,10 @@
 #   self-hosted runner) and put in the secret GITHUB_REGISTRATION_TOKEN, as a persistent runner: config.sh, not
 #   --ephemeral. The runner's own registration (.runner, .credentials, .credentials_rsaparams) is kept per slot in
 #   /var/lib/arca-runner-pool/registered, which only root enters, and the slot's runner takes job after job: its
-#   container, its Docker daemon, its work directory and its caches stay between jobs. The token is deleted once every
-#   slot is registered, or after an hour, when GitHub's own has ended. A slot that has its registration starts without
-#   one. This mode keeps per-slot state between jobs: it is a bridge until each job runs in a machine of its own.
+#   container and registration stay between jobs. By default a completed hook waits for the controller to replace
+#   the slot's Docker daemon, clear its work and caches, and reset its network. The started hook checks the reset.
+#   The token is deleted once every slot is registered, or after an hour, when GitHub's own has ended.
+#   A slot that has its registration starts without one.
 #
 # What it reads:
 # - /etc/arca/settings.json: the service's settings (the template's, with what its service_create replaced), written
@@ -47,6 +48,9 @@ set -u
 : "${POOL_RUN:=/run/arca-runner-pool}"
 : "${POOL_CGROUP:=/sys/fs/cgroup}"
 : "${POOL_MEMINFO:=/proc/meminfo}"
+: "${POOL_CPU_STATUS:=/proc/self/status}"
+: "${POOL_LXCFS:=/var/lib/lxcfs}"
+: "${POOL_MOUNTINFO:=/proc/self/mountinfo}"
 : "${POOL_UNITS:=/run/systemd/system}"
 : "${POOL_CONSOLE:=/dev/console}"
 : "${POOL_TICK:=5}"            # seconds between two passes of the controller
@@ -62,21 +66,23 @@ set -u
 : "${POOL_GROUP_EVERY:=600}"   # seconds between two reads of the runner group (or the repository) on GitHub
 : "${POOL_BUILD_RETRY:=60}"    # seconds before the first retry at building the runner image with its packages
 : "${POOL_TOKEN_LIFE:=3600}"   # seconds a registration token is kept; GitHub's lasts one hour
+POOL_RESET_WAIT=300            # seconds for a persistent slot's whole between-job reset
 
 INSTALLED=/usr/local/sbin/arca-runner-pool
 
 # Every program this script starts that bash does not have built in. The first boot refuses to go on while one of
 # them is missing, and names it. crates/arca/tests/runner_pool.rs runs the controller with nothing else on its PATH,
 # so a program used below and not listed here fails that test.
-POOL_PROGRAMS='docker jq curl openssl flock systemctl apt-get hostname awk sed grep find cat chmod chown cut date du
-fold head id install mkdir mount mv od rm sha256sum sleep stat tail tee touch tr umount'
+POOL_PROGRAMS='docker jq curl openssl flock systemctl apt-get lxcfs hostname awk sed grep find cat chmod chown cut date du
+fold head id install mkdir mount mountpoint mv od rm sha256sum sleep stat tail tee timeout touch tr umount
+nsenter ip nft iptables-legacy-save iptables-legacy-restore ip6tables-legacy-save ip6tables-legacy-restore'
 
 # The Debian packages the first boot installs. Recommended packages are not installed, so every package that is needed
 # is named here. docker.io is the daemon alone: on Debian 13 the `docker` command is a package of its own, docker-cli,
 # which docker.io only recommends. mount and umount, which layer the runner's files, are the package mount, not
 # util-linux. The ones the image already carries are named too, so the list says what the script
 # stands on.
-POOL_PACKAGES='docker.io docker-cli curl jq openssl ca-certificates util-linux mount coreutils hostname'
+POOL_PACKAGES='docker.io docker-cli curl jq openssl ca-certificates util-linux mount coreutils hostname lxcfs iproute2 nftables iptables'
 # The Ubuntu packages added to the runner image when the settings name none (aptPackages): what GitHub's own
 # ubuntu-latest has and the pinned runner image lacks. libatomic1 is what Node.js-based tools such as pnpm load;
 # build-essential is make, gcc and g++; zstd is what actions/cache compresses with when it is there (without it the
@@ -158,8 +164,8 @@ install_pool() {
   cat >/etc/systemd/system/arca-runner-pool.service <<UNIT
 [Unit]
 Description=Arca GitHub Actions runner pool
-After=docker.service network-online.target
-Wants=network-online.target
+After=docker.service lxcfs.service network-online.target
+Wants=lxcfs.service network-online.target
 Requires=docker.service
 
 [Service]
@@ -218,6 +224,7 @@ SLOT_LABELS=()
 SLOT_LABELS_JSON=()
 SLOT_REG_LABELS=()
 SLOT_CPU=()
+SLOT_CPUSET=()
 SLOT_MEM=()
 CLASS_NAMES=()
 # The first slot of each class: every slot of a class has the same size.
@@ -330,6 +337,7 @@ load_settings() {
     }
   fi
   [ -z "$repo" ] || GROUP_NAME=''
+  KEEP_BETWEEN_JOBS=$(jq -r '.keepBetweenJobs == true' "$POOL_SETTINGS")
   MAX_SLOTS=$(setting .maxSlots)
   RUNNER_IMAGE=$(setting .runnerImage)
   DOCKER_IMAGE=$(setting .dockerImage)
@@ -351,6 +359,11 @@ load_settings() {
     say "settings: reserveMemory, dockerCache and dependencyCache are sizes such as 4GiB"
     return 1
   fi
+  MEMORY_MODE=$(jq -r 'if has("memory") then .memory else "reserved" end' "$POOL_SETTINGS")
+  case $MEMORY_MODE in
+    reserved | ceiling) ;;
+    *) say "settings: memory is reserved (the default) or ceiling"; return 1 ;;
+  esac
   if [ -z "$RUNNER_IMAGE" ] || [ -z "$DOCKER_IMAGE" ]; then
     say "settings: runnerImage and dockerImage are required"
     return 1
@@ -422,7 +435,7 @@ load_settings() {
   DOCKER_BUDGET=$((docker_cache / SLOTS))
   DEPENDENCY_BUDGET=$((dependency_cache / SLOTS))
   POOL_NAME=${POOL_NAME:-$(hostname 2>/dev/null)}
-  POOL_NAME=$(printf '%s' "$POOL_NAME" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9-' '-' | cut -c1-20)
+  POOL_NAME=$(printf '%s' "$POOL_NAME" | LC_ALL=C tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-' | cut -c1-20)
   : "${POOL_NAME:=pool}"
 }
 
@@ -683,23 +696,151 @@ slot_failed() {
   say "slot $slot (${SLOT_CLASS[$slot]}) failed: $*. Slots start again in $pause seconds"
 }
 
-# Removes a slot's containers and what the job left: the per-job cleanup. The Docker layer cache and the dependency
-# caches stay, unless the slot's share of their budget is passed, and then they are emptied.
+slot_keeps_caches() { [ "$KEEP_BETWEEN_JOBS" = true ]; }
+
+# The controller runs as root. Replace the file atomically so a runner with the old file mounted can finish safely.
+write_job_hooks() {
+  local hook="$POOL_RUN/tmp/job-started.sh"
+  {
+    # Allow a controller poll and a margin for scheduling and timeout's final kill.
+    printf '#!/bin/bash\nboundary_wait=%s\n' "$((POOL_RESET_WAIT + ${POOL_POLL%.*} + 15))" && cat <<'HOOK'
+set -u
+PATH=/usr/bin:/bin
+unset DOCKER_CONTEXT DOCKER_TLS DOCKER_TLS_VERIFY DOCKER_CERT_PATH DOCKER_API_VERSION
+
+boundary=/run/arca/boundary
+generation=''
+
+stop_job() {
+  printf 'arca-runner-pool: %s\n' "$1" >&2
+  printf 'abort %s\n' "$generation" >"$boundary/request" || :
+  # Stop Runner.Worker before run.sh forwards a signal to the listening runner. An always() step must not run.
+  kill -KILL "$PPID" || :
+  kill -TERM 1 || :
+  exit 1
+}
+
+wait_for_boundary() {
+  local wanted=$1 phase id deadline=$((SECONDS + boundary_wait))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    read -r phase id work <"$boundary/state" || return 1
+    [ "$phase" != failed ] || return 1
+    if [ "$phase" = "$wanted" ]; then
+      case $wanted in
+        running) [ "$id" = "$generation" ] && return 0 ;;
+        ready) [ "$id" != "$generation" ] && [ "$work" = work-clean ] && return 0 ;;
+      esac
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
+slot_docker() { docker --host=unix:///var/run/docker.sock --config=/run/arca "$@"; }
+
+docker_is_empty() {
+  local counts networks
+  # Docker reports images, containers, volumes and build cache in that order.
+  counts=$(slot_docker system df --format '{{.TotalCount}}') &&
+    [ "$counts" = $'0\n0\n0\n0' ] &&
+    networks=$(slot_docker network ls -q --filter type=custom) && [ -z "$networks" ]
+}
+
+read -r phase generation work <"$boundary/state" || stop_job 'the slot has no job boundary'
+if [ "${0##*/}" = job-started.sh ]; then
+  [ "$phase" = ready ] || stop_job 'the previous job did not finish its slot reset'
+  [ "$work" = work-clean ] || stop_job 'the slot could not verify a clean work directory before the job'
+  if ! { printf 'start %s\n' "$generation" >"$boundary/request" && wait_for_boundary running; }; then
+    stop_job 'the slot could not verify a fresh Docker daemon before the job'
+  fi
+  docker_is_empty 2>/dev/null || stop_job 'the new Docker daemon was unavailable or its store was not empty'
+  residue=$(sudo -n /usr/bin/find /opt/hostedtoolcache /var/cache/pool -xdev -mindepth 1 -print -quit) &&
+    [ -z "$residue" ] || stop_job 'the tool or dependency cache was not empty before the job'
+else
+  [ "$phase" = running ] || stop_job 'the job has no active Docker daemon generation'
+  find /tmp /home/runner/_work -xdev -mindepth 1 -delete 2>/dev/null ||
+    printf 'arca-runner-pool: some runner temporary or work files could not be removed\n' >&2
+  if ! { printf 'complete %s\n' "$generation" >"$boundary/request" && wait_for_boundary ready; }; then
+    stop_job 'the slot could not reset after the job'
+  fi
+fi
+HOOK
+  } >"$hook" && chmod 555 "$hook" && mv -f "$hook" "$POOL_RUN/job-started.sh"
+}
+
+# Only the between-job reset sets this deadline. Each blocking operation gets the time still available.
+reset_exec() {
+  if [ -z "${reset_deadline:-}" ]; then "$@"; return; fi
+  local remaining=$((reset_deadline - SECONDS))
+  [ "$remaining" -gt 0 ] && timeout -k 1 "$remaining" "$@"
+}
+
+# Docker's remove can fail because a container is already gone. Confirm absence before clearing its files.
+remove_containers() {
+  local names container
+  reset_exec docker rm -fv "$@" >/dev/null 2>&1 && return 0
+  names=$(reset_exec docker ps -a --format '{{.Names}}' 2>/dev/null) || return 1
+  for container; do
+    if grep -Fxq -- "$container" <<<"$names"; then return 1; fi
+  done
+}
+
+slot_remove_containers() {
+  local slot=$1 runner=$2 daemon=$3
+  # The runner can share the daemon's network namespace. Docker removes its arguments in parallel.
+  if remove_containers "$runner" && remove_containers "$daemon" &&
+    { [ -z "$REG" ] || remove_containers "$POOL_NAME-s$slot-net"; }; then return 0; fi
+  slot_failed "$slot" "the previous runner or Docker daemon could not be removed"
+  return 1
+}
+
+slot_clear_caches() {
+  local slot=$1 dir=$2
+  if ! { rm -rf "${dir:?}/docker" "$dir/toolcache" "$dir/cache" &&
+    mkdir -p "$dir/docker" "$dir/toolcache" "$dir/cache"; } >/dev/null 2>&1; then
+    slot_failed "$slot" "the Docker store, tool cache or dependency cache could not be reset"
+    return 1
+  fi
+}
+
+slot_reset_files() {
+  local slot=$1 dir=$2
+  if ! unlayer_home "$slot"; then
+    slot_failed "$slot" "the layered runner home could not be unmounted or removed"
+    return 1
+  fi
+  if ! rm -rf "${dir:?}/work" "$dir/sock" "$dir/boundary" "${POOL_RUN:?}/jit/$slot" "$dir/kept" ||
+    [ -e "$dir/work" ] || [ -L "$dir/work" ] || [ -e "$dir/sock" ] || [ -L "$dir/sock" ]; then
+    slot_failed "$slot" "the runner work or socket directory could not be removed"
+    return 1
+  fi
+  slot_clear_caches "$slot" "$dir"
+}
+
+# Takes away the job's containers and files when the runner exits.
 slot_reap() {
-  local slot=$1 dir runner daemon used
+  local slot=$1 dir runner daemon
   dir=$(slot_dir "$slot")
   runner="$POOL_NAME-s$slot-run"
   daemon="$POOL_NAME-s$slot-dind"
   set_state "$slot" cleaning
-  # Inside the slot's own Docker daemon: the job's containers, volumes and networks go; images and build cache stay.
-  docker exec "$daemon" sh -c 'c=$(docker ps -aq); [ -z "$c" ] || docker rm -fv $c; docker volume prune -af; docker network prune -f' >/dev/null 2>&1
-  slot_trim_docker "$slot" "$daemon"
-  docker rm -fv "$runner" "$daemon" >/dev/null 2>&1
+  if slot_keeps_caches; then
+    # Inside the slot's own Docker daemon: containers, volumes and networks go; images and build cache may stay.
+    docker exec "$daemon" sh -c 'c=$(docker ps -aq); [ -z "$c" ] || docker rm -fv $c; docker volume prune -af; docker network prune -f' >/dev/null 2>&1
+    slot_trim_docker "$slot" "$daemon"
+    docker rm -fv "$runner" "$daemon" >/dev/null 2>&1
+  else
+    slot_remove_containers "$slot" "$runner" "$daemon" || return 1
+  fi
   # Whatever is left in the slot's slice ends with it, and its memory peak starts from nothing for the next job.
   systemctl stop "$(slot_slice "$slot")" >/dev/null 2>&1
-  rm -rf "${dir:?}/work" "${dir:?}/sock" "${POOL_RUN:?}/jit/$slot" "${dir:?}/kept"
-  unlayer_home "$slot"
-  slot_trim_dependencies "$slot"
+  if slot_keeps_caches; then
+    rm -rf "${dir:?}/work" "$dir/sock" "${POOL_RUN:?}/jit/$slot" "$dir/kept"
+    unlayer_home "$slot"
+    slot_trim_dependencies "$slot"
+  else
+    slot_reset_files "$slot" "$dir"
+  fi
 }
 
 # The slot's Docker layer cache, emptied once it passes the slot's share of dockerCache.
@@ -801,11 +942,12 @@ persistent_look() {
     read -r peak cpu_mark <<<"$(slot_usage "$slot")"
     set_state "$slot" busy "$name ${job:+job \"$job\"}"
   elif [ "$begun" -le "$recorded" ] && [ "$ended" -gt 0 ] && [ "$updating" != 1 ]; then
-    # Back to waiting for its next job; the caches are trimmed between jobs, as a fresh runner's are.
     if [ "$(cut -f1 "$POOL_RUN/slots/$slot" 2>/dev/null)" = busy ]; then
       set_state "$slot" idle "$name"
-      slot_trim_docker "$slot" "$daemon"
-      slot_trim_dependencies "$slot"
+      if slot_keeps_caches; then
+        slot_trim_docker "$slot" "$daemon"
+        slot_trim_dependencies "$slot"
+      fi
     fi
   fi
 }
@@ -821,6 +963,7 @@ persistent_look() {
 # the runner image prints too); config.sh shows the token as *** in them, and the words hold none.
 slot_register() {
   local slot=$1 reg new copy args code out words='' line
+  shift
   REGISTER_ERROR=''
   reg=$(slot_registration "$slot")
   new="$reg.new"
@@ -858,6 +1001,7 @@ slot_register() {
   docker rm -fv "$POOL_NAME-s$slot-reg" >/dev/null 2>&1
   # shellcheck disable=SC2016
   docker run --rm --name "$POOL_NAME-s$slot-reg" --label "arca.pool=$POOL_NAME" \
+    "$@" \
     -v "$copy:/run/arca/token:ro" -v "$new:/run/arca/registration" \
     "$RUNNER_RUN_IMAGE" /bin/bash -c 'ACTIONS_RUNNER_INPUT_TOKEN=$(cat /run/arca/token) && export ACTIONS_RUNNER_INPUT_TOKEN && cd /home/runner && ./config.sh --unattended --replace "$@" && cp .runner .credentials .credentials_rsaparams /run/arca/registration/' \
     config.sh "${args[@]}" >"$out" 2>&1
@@ -877,13 +1021,194 @@ slot_register() {
   return 1
 }
 
+# The slot must see its own limits before it registers. Check the mount as well as the files: an unmounted
+# directory can still have files in it. Docker's --mount fails if a source disappears before the container starts.
+slot_limits() {
+  local slot=$1 slice=$2 file
+  # The field references belong to awk.
+  # shellcheck disable=SC2016
+  if ! reset_exec awk -v path="$POOL_LXCFS" '$5 == path {
+      for (i = 7; i < NF; i++) if ($i == "-" && $(i + 1) == "fuse.lxcfs") mounted = 1
+    } END { exit !mounted }' "$POOL_MOUNTINFO"; then
+    slot_failed "$slot" "LXCFS is not mounted at $POOL_LXCFS. Check lxcfs.service inside the pool machine"
+    return 1
+  fi
+  limits=(--cgroup-parent "$slice" --cpuset-cpus "${SLOT_CPUSET[$slot]}")
+  for file in meminfo cpuinfo stat loadavg swaps uptime; do
+    if [ ! -f "$POOL_LXCFS/proc/$file" ]; then
+      case $file in swaps | uptime) continue ;; esac
+      slot_failed "$slot" "LXCFS is missing $POOL_LXCFS/proc/$file. Check lxcfs.service inside the pool machine"
+      return 1
+    fi
+    limits+=(--mount "type=bind,source=$POOL_LXCFS/proc/$file,target=/proc/$file,readonly")
+  done
+}
+
+# A persistent runner and all generations of its daemon share a separate network namespace so that localhost
+# still works for service containers. The holder has no slot mounts or Docker socket.
+slot_network_state() {
+  local sandbox
+  sandbox=$(reset_exec docker inspect -f '{{.NetworkSettings.SandboxKey}}' "$network") || return 1
+  # Docker uses a short hex key for a private sandbox. Refuse its host namespace and any unexpected path.
+  [[ $sandbox =~ ^/(var/)?run/docker/netns/[0-9a-f]{12}$ ]] || return 1
+  reset_exec nsenter --net="$sandbox" -- bash -e -o pipefail -s -- "$1" "$dir/boundary/network" <<'NETWORK'
+cd "$2" || exit 1
+if [ "$1" = save ]; then
+  nft list ruleset > nftables
+  iptables-legacy-save > iptables
+  ip6tables-legacy-save > ip6tables
+  for family in -4 -6; do
+    ip "$family" route save table all > "routes$family"
+    ip "$family" rule save > "rules$family"
+  done
+  exit 0
+fi
+
+# Leave the outer Docker link and loopback in place. The old daemon's bridges belong to this namespace.
+links=$(ip -j link show type bridge | jq -r '.[].ifname')
+while IFS= read -r link; do
+  [ -z "$link" ] || ip link delete dev "$link"
+done <<< "$links"
+for family in -4 -6; do
+  ip "$family" route flush table all
+  ip "$family" route restore < "routes$family"
+  ip "$family" rule flush
+  ip "$family" rule restore < "rules$family"
+done
+{ printf 'flush ruleset\n'; cat nftables; } | nft -f -
+# Legacy xtables are separate from nftables. Clear every loaded table and restore its original policies and rules.
+for tables in iptables ip6tables; do
+  "$tables-legacy-save" | awk '/^\*/ || /^COMMIT$/ { print } /^:/ && $2 != "-" { print $1, "ACCEPT [0:0]" }' |
+    "$tables-legacy-restore" -w
+  "$tables-legacy-restore" -w < "$tables"
+done
+NETWORK
+}
+
+slot_start_daemon() {
+  local tries=0 daemon_home=() daemon_network=()
+  if [ -n "$layered" ]; then
+    daemon_home=(-v "$dir/layer/home:/home/runner:ro")
+  else
+    daemon_home=(-v "$EXTERNALS:/home/runner/externals:ro")
+  fi
+  [ "$network" = "$daemon" ] || daemon_network=(--network "container:$network")
+  daemon_id=$(reset_exec docker run -d --name "$daemon" --label "arca.pool=$POOL_NAME" --privileged "${limits[@]}" \
+    "${daemon_network[@]}" -v "$dir/sock:/var/run" "${daemon_home[@]}" -v "$dir/work:/home/runner/_work" \
+    -v "$dir/toolcache:/opt/hostedtoolcache" -v "$dir/docker:/var/lib/docker" \
+    "$DOCKER_IMAGE" dockerd --host=unix:///var/run/docker.sock --group="$DOCKER_GID" 2>/dev/null) || return 1
+  [ -n "$daemon_id" ] || return 1
+  until reset_exec docker exec "$daemon" docker info >/dev/null 2>&1; do
+    tries=$((tries + 1))
+    if stopping || [ "$tries" -gt "$POOL_READY_WAIT" ] ||
+      [ "${reset_deadline:-$((SECONDS + 1))}" -le "$SECONDS" ]; then return 1; fi
+    nap 1
+  done
+}
+
+boundary_state() {
+  (umask 022 && printf '%s\n' "$*" >"$dir/boundary/state.new") &&
+    reset_exec mv -f "$dir/boundary/state.new" "$dir/boundary/state"
+}
+
+boundary_ready() {
+  local residue
+  # Runner.Worker creates the next job's directories and downloads actions before its started hook runs.
+  residue=$(reset_exec find "$dir/work" -xdev -mindepth 1 -print -quit) && [ -z "$residue" ] &&
+    boundary_state ready "$daemon_id" work-clean
+}
+
+slot_prepare_boundary() {
+  mkdir -m 755 "$dir/boundary" &&
+    (umask 077 && : >"$dir/boundary/request") &&
+    { [ "$(id -u)" != 0 ] || chown "$RUNNER_UID:$DOCKER_GID" "$dir/boundary/request"; } &&
+    mkdir -m 700 "$dir/boundary/network" && slot_network_state save
+}
+
+# The runner keeps these bind mount inodes. Delete their contents after the old daemon and its jobs have stopped.
+slot_replace_daemon() {
+  # The daemon's shell expands its own container IDs.
+  # shellcheck disable=SC2016
+  reset_exec docker exec "$daemon" sh -ec 'ids=$(docker ps -aq); [ -z "$ids" ] || docker rm -fv $ids' >/dev/null 2>&1 &&
+    remove_containers "$daemon" &&
+    reset_exec rm -rf "${dir:?}/docker" && [ ! -e "$dir/docker" ] && [ ! -L "$dir/docker" ] &&
+    reset_exec mkdir "$dir/docker" &&
+    reset_exec find "$dir/work" "$dir/sock" "$dir/toolcache" "$dir/cache" -xdev -mindepth 1 -delete &&
+    slot_network_state restore &&
+    slot_limits "$slot" "$slice" &&
+    slot_start_daemon
+}
+
+# Grant a daemon generation to exactly one job. Once granted, only that job's completed hook can request its
+# replacement. A missing completion, interrupted reset or failed identity check forces a fresh slot start.
+slot_job_boundary() {
+  local phase generation work action requested actual reset_deadline
+  if read -r phase generation work <"$dir/boundary/state" && [ -n "$generation" ]; then
+    case $phase in
+      ready | running)
+        read -r action requested <"$dir/boundary/request" || return 0
+        [ "$requested" = "$generation" ] || return 0
+        case "$phase:$action" in
+          ready:start)
+            if [ "$work" = work-clean ] && actual=$(docker inspect -f '{{.Id}} {{.State.Running}}' "$daemon" 2>/dev/null) &&
+              [ "$actual" = "$generation true" ] && boundary_state running "$generation"; then return 0; fi
+            ;;
+          running:complete)
+            reset_deadline=$((SECONDS + POOL_RESET_WAIT))
+            if boundary_state resetting "$generation" && slot_replace_daemon && [ "$daemon_id" != "$generation" ] &&
+              boundary_ready; then return 0; fi
+            unset reset_deadline
+            ;;
+          *:abort) ;;
+          *) return 0 ;;
+        esac
+        ;;
+    esac
+  fi
+  boundary_state failed "${generation:-unknown}"
+  slot_failed "$slot" "the job boundary could not verify or reset the slot's Docker daemon and caches"
+  # Even a failed forced removal leaves the state failed. The started hook cannot authorize another job.
+  docker rm -fv "$runner" >/dev/null 2>&1
+  return 1
+}
+
+slot_prepare_files() {
+  mkdir -p "$dir/work" "$dir/sock" "$dir/docker" "$dir/toolcache" "$dir/cache" &&
+    chmod 755 "$dir" "$dir/work" "$dir/sock" "$dir/toolcache" "$dir/cache" &&
+    { [ "$(id -u)" != 0 ] || chown "$RUNNER_UID:$DOCKER_GID" "$dir/work" "$dir/toolcache" "$dir/cache"; }
+}
+
+slot_prepare_home() {
+  layer_home "$slot"
+  case $? in
+    0) layered=1 ;;
+    1) ;;
+    *) return 1 ;;
+  esac
+}
+
 # The first part of a slot's life: register a fresh runner and start it, with its own Docker daemon. It sets the
 # variables of the slot_cycle that calls it, and returns 1 when the slot ends here.
 slot_begin() {
+  local home=()
   set_state "$slot" registering
 
   # A slot begun just as the controller was told to stop registers no runner.
   ! stopping || return 1
+  if ! slot_keeps_caches; then
+    # A failed reap or an interrupted controller can leave old data on disk.
+    slot_remove_containers "$slot" "$runner" "$daemon" && slot_reset_files "$slot" "$dir" || return 1
+    ! stopping || return 1
+  fi
+  slot_limits "$slot" "$slice" || return 1
+  if ! slot_keeps_caches; then
+    if ! slot_prepare_files; then
+      slot_failed "$slot" "the runner's work, socket or cache directories could not be created"
+      return 1
+    fi
+    slot_prepare_home || return 1
+    ! stopping || return 1
+  fi
   if [ -n "$REG" ]; then
     # Registration-token mode: the slot's one runner, registered once and kept. Its name carries the pool's own id, as
     # a just-in-time runner's does: config.sh --replace takes over a runner of the same name, and it must never take
@@ -891,7 +1216,7 @@ slot_begin() {
     name="$POOL_NAME-$POOL_ID-$slot"
     runner_id=''
     if ! registered "$slot"; then
-      if ! slot_register "$slot"; then
+      if ! slot_register "$slot" "${limits[@]}"; then
         slot_failed "$slot" "$REGISTER_ERROR"
         return 1
       fi
@@ -925,43 +1250,25 @@ slot_begin() {
   # runner has reached GitHub only once it listens for jobs (persistent_look).
   [ -n "$REG" ] || rm -f "$POOL_RUN/backoff" "$POOL_RUN/backoff-until"
 
-  # A fresh work directory and socket directory for this runner. The caches are the slot's own and are kept.
-  rm -rf "${dir:?}/work" "${dir:?}/sock"
-  mkdir -p "$dir/work" "$dir/sock" "$dir/docker" "$dir/toolcache" "$dir/cache"
-  chmod 755 "$dir" "$dir/work" "$dir/sock" "$dir/toolcache" "$dir/cache"
-  if [ "$(id -u)" = 0 ]; then chown "$RUNNER_UID:$DOCKER_GID" "$dir/work" "$dir/toolcache" "$dir/cache"; fi
   set_state "$slot" starting "$name"
-  docker rm -fv "$runner" "$daemon" >/dev/null 2>&1
-  # The runner's files for this job. Layered: one fresh copy that the runner writes and the daemon reads, both at the
-  # runner's own path. Plain: the runner keeps its image's own files, and the daemon has the pinned bundled tools,
-  # read-only. Either way the runner's tools are no mount of their own, so the runner can replace them when GitHub
-  # tells it to update itself.
-  if layer_home "$slot"; then
-    layered=1
-    home=(-v "$dir/layer/home:/home/runner:ro")
-  else
-    home=(-v "$EXTERNALS:/home/runner/externals:ro")
+  if slot_keeps_caches; then
+    rm -rf "${dir:?}/work" "${dir:?}/sock"
+    slot_prepare_files
+    docker rm -fv "$runner" "$daemon" >/dev/null 2>&1
+    slot_prepare_home
   fi
-  # The slot's own Docker daemon. Its data directory is the slot's layer cache. It sees the runner's bundled tools at
-  # the runner's own path, because a job that runs in a container has them mounted from there by this daemon.
-  if ! docker run -d --name "$daemon" --label "arca.pool=$POOL_NAME" --privileged --cgroup-parent "$slice" \
-    -v "$dir/sock:/var/run" "${home[@]}" -v "$dir/work:/home/runner/_work" \
-    -v "$dir/toolcache:/opt/hostedtoolcache" -v "$dir/docker:/var/lib/docker" \
-    "$DOCKER_IMAGE" dockerd --host=unix:///var/run/docker.sock --group="$DOCKER_GID" >/dev/null 2>&1; then
+  if [ "$network" != "$daemon" ] &&
+    ! { docker run -d --name "$network" --label "arca.pool=$POOL_NAME" "${limits[@]}" --entrypoint /bin/sleep \
+      "$DOCKER_IMAGE" infinity >/dev/null 2>&1 && slot_prepare_boundary; }; then
     slot_abandon "$slot" "$runner_id"
-    slot_failed "$slot" "the slot's Docker daemon could not be started"
+    slot_failed "$slot" "the slot's shared network could not be started or saved"
     return 1
   fi
-  tries=0
-  until docker exec "$daemon" docker info >/dev/null 2>&1; do
-    tries=$((tries + 1))
-    if stopping || [ "$tries" -gt "$POOL_READY_WAIT" ]; then
-      slot_abandon "$slot" "$runner_id"
-      stopping || slot_failed "$slot" "the slot's Docker daemon did not come up within $POOL_READY_WAIT seconds"
-      return 1
-    fi
-    nap 1
-  done
+  if ! slot_start_daemon; then
+    slot_abandon "$slot" "$runner_id"
+    stopping || slot_failed "$slot" "the slot's Docker daemon could not be started or made ready"
+    return 1
+  fi
   # The runner: a fresh container from the pool's runner image (build_runner_image), sharing the daemon's network so
   # a job's service containers answer on localhost. Its own files, the bundled tools among them, are the image's and
   # are writable and not a mount, so the runner can replace them when GitHub tells it to update itself. Its just-in-time configuration is a file on
@@ -970,12 +1277,27 @@ slot_begin() {
   home=()
   [ -z "$layered" ] || home=(-v "$dir/layer/home:/home/runner")
   if [ -n "$REG" ]; then
+    local hook_args=()
+    if ! slot_keeps_caches; then
+      if ! boundary_ready; then
+        slot_abandon "$slot" ''
+        slot_failed "$slot" "the slot's job boundary could not be created"
+        return 1
+      fi
+      hook_args=(-e ACTIONS_RUNNER_HOOK_JOB_STARTED=/run/arca/job-started.sh
+        -e ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/run/arca/job-completed.sh
+        -v "$POOL_RUN/job-started.sh:/run/arca/job-started.sh:ro"
+        -v "$POOL_RUN/job-started.sh:/run/arca/job-completed.sh:ro"
+        -v "$dir/boundary:/run/arca/boundary:ro"
+        -v "$dir/boundary/request:/run/arca/boundary/request:rw")
+    fi
     # The persistent runner: its registration is mounted read-only from the slot's root-only folder and copied into
     # the runner's home, where run.sh reads it; run.sh then takes job after job until the container is stopped.
     # shellcheck disable=SC2016
     if ! docker run -d --name "$runner" --label "arca.pool=$POOL_NAME" \
-      --cgroup-parent "$slice" --network "container:$daemon" \
+      "${limits[@]}" --network "container:$network" \
       -e DOCKER_HOST=unix:///var/run/docker.sock \
+      "${hook_args[@]}" \
       -e RUNNER_TOOL_CACHE=/opt/hostedtoolcache -e POOL_CACHE_DIR=/var/cache/pool \
       -v "$(slot_registration "$slot"):/run/arca/registration:ro" \
       -v "$dir/sock:/var/run" "${home[@]}" -v "$dir/work:/home/runner/_work" \
@@ -997,7 +1319,7 @@ slot_begin() {
   jit=''
   # shellcheck disable=SC2016
   if ! docker run -d --name "$runner" --label "arca.pool=$POOL_NAME" \
-    --cgroup-parent "$slice" --network "container:$daemon" \
+    "${limits[@]}" --network "container:$daemon" \
     -e DOCKER_HOST=unix:///var/run/docker.sock \
     -e RUNNER_TOOL_CACHE=/opt/hostedtoolcache -e POOL_CACHE_DIR=/var/cache/pool \
     -v "$POOL_RUN/jit/$slot:/run/arca/jitconfig:ro" \
@@ -1051,8 +1373,8 @@ slot_keep() {
 # persistent one: it is watched through job after job, and the slot ends only when its container does.
 slot_cycle() {
   local slot=$1
-  local class=${SLOT_CLASS[$slot]} dir runner daemon slice token name body jit runner_id tries state code
-  local started busy_since='' job='' result='' peak cpu seconds finished cgroup updating='' layered='' home=() lines
+  local class=${SLOT_CLASS[$slot]} dir runner daemon daemon_id network slice token name body jit runner_id state code
+  local started busy_since='' job='' result='' peak cpu seconds finished cgroup updating='' layered='' limits=() lines
   local retired='' asked='' recorded=0 cpu_mark=0 connected=
   # A slot takes no signal. It reads the same line as the controller: a slot begun as the controller is told to stop
   # finds the stop at once.
@@ -1060,12 +1382,17 @@ slot_cycle() {
   dir=$(slot_dir "$slot")
   runner="$POOL_NAME-s$slot-run"
   daemon="$POOL_NAME-s$slot-dind"
+  network=$daemon
+  if [ -n "$REG" ] && ! slot_keeps_caches; then network="$POOL_NAME-s$slot-net"; fi
   slice=$(slot_slice "$slot")
   cgroup=$(slot_cgroup "$slot")
   if [ "${2-}" = adopt ]; then
     slot_adopt
   else
-    slot_begin || return 0
+    if ! slot_begin; then
+      [ -z "$layered" ] || slot_keeps_caches || unlayer_home "$slot"
+      return 0
+    fi
   fi
 
   while ! stopping; do
@@ -1079,6 +1406,7 @@ slot_cycle() {
       # A persistent runner's output is read at every look: it begins and ends job after job.
       lines=$(docker logs "$runner" 2>&1)
       persistent_look "$lines"
+      if ! slot_keeps_caches && ! slot_job_boundary; then break; fi
     else
       [ -n "$busy_since" ] || lines=$(docker logs "$runner" 2>&1)
       case $lines in *'Running job: '*)
@@ -1125,7 +1453,11 @@ slot_cycle() {
     fi
     rm -f "$dir/kept"
     [ -n "$busy_since" ] || slot_abandon "$slot" "$runner_id"
-    docker rm -fv "$runner" "$daemon" >/dev/null 2>&1
+    if slot_keeps_caches; then
+      docker rm -fv "$runner" "$daemon" >/dev/null 2>&1
+    else
+      slot_remove_containers "$slot" "$runner" "$daemon"
+    fi
     systemctl stop "$slice" >/dev/null 2>&1
     rm -f "$POOL_RUN/jit/$slot"
     unlayer_home "$slot"
@@ -1192,7 +1524,10 @@ slot_cycle() {
     record_job "$slot" "$finished" "$job" "$result" "$seconds" "$peak" "$cpu" "$name"
     slot_reap "$slot"
   else
-    slot_reap "$slot"
+    if ! slot_reap "$slot"; then
+      slot_abandon "$slot" "$runner_id"
+      return 0
+    fi
     slot_abandon "$slot" "$runner_id"
     if [ -n "$asked" ]; then
       # GitHub was asked to take this runner off and can have done so though no yes came: it answered with a server
@@ -1294,7 +1629,11 @@ slot_retire() {
 # removes an offline ephemeral runner by itself after a day.
 slot_abandon() {
   local slot=$1 runner_id=$2
-  docker rm -fv "$POOL_NAME-s$slot-run" "$POOL_NAME-s$slot-dind" >/dev/null 2>&1
+  if slot_keeps_caches; then
+    docker rm -fv "$POOL_NAME-s$slot-run" "$POOL_NAME-s$slot-dind" >/dev/null 2>&1
+  else
+    slot_remove_containers "$slot" "$POOL_NAME-s$slot-run" "$POOL_NAME-s$slot-dind"
+  fi
   systemctl stop "$(slot_slice "$slot")" >/dev/null 2>&1
   rm -f "$POOL_RUN/jit/$slot" "$(slot_dir "$slot")/kept"
   unlayer_home "$slot"
@@ -1311,12 +1650,52 @@ slot_abandon() {
 
 meminfo_bytes() { awk -v key="$1:" '$1 == key { printf "%d", $2 * 1024 }' "$POOL_MEMINFO"; }
 
-# Each slot's slice: memory is capped at the slot's size and never swapped, so a slot cannot take another's, and CPU is
-# a ceiling that slots share.
+# Set aside distinct CPUs for each slot, fitting the first slot of each class before the rest. The kernel's list
+# can contain gaps. Keep a slot queued if its whole CPU count does not fit, just as with the memory budget.
+layout_slot_cpus() {
+  local cpus=() slot offset cpuset next=0 wanted=0
+  mapfile -t cpus < <(awk '$1 == "Cpus_allowed_list:" {
+    n = split($2, ranges, ",")
+    for (i = 1; i <= n; i++) {
+      len = split(ranges[i], ends, "-")
+      last = (len == 2 ? ends[2] : ends[1]) + 0
+      for (cpu = ends[1] + 0; cpu <= last; cpu++) print cpu
+    }
+  }' "$POOL_CPU_STATUS")
+  for slot in "${CLASS_FIRST[@]}" "${!SLOT_CPU[@]}"; do
+    [ -z "${SLOT_CPUSET[$slot]+set}" ] || continue
+    SLOT_CPUSET[slot]=''
+    wanted=$((wanted + SLOT_CPU[slot]))
+    [ $((next + SLOT_CPU[slot])) -le "${#cpus[@]}" ] || continue
+    cpuset=${cpus[next]}
+    for ((offset = 1; offset < SLOT_CPU[slot]; offset++)); do
+      cpuset+=,${cpus[next + offset]}
+    done
+    SLOT_CPUSET[slot]=$cpuset
+    next=$((next + SLOT_CPU[slot]))
+  done
+  CPU_FIT_NOTE=''
+  if [ "$wanted" -gt "${#cpus[@]}" ]; then
+    CPU_FIT_NOTE="WARNING: the $SLOTS slots ask for $wanted CPUs together and the machine has ${#cpus[@]} CPUs: slots without their own CPUs stay queued. Make the slots smaller or fewer, or the machine larger, in the template, and create the pool again"
+    say "$CPU_FIT_NOTE"
+  fi
+}
+
+# Each slice caps and accounts for the runner, its Docker daemon and the containers that daemon starts.
 write_slices() {
   local slot
   mkdir -p "$POOL_UNITS"
+  if [ "$MEMORY_MODE" = ceiling ] && [ "$BUDGET" -gt 0 ]; then
+    cat >"$POOL_UNITS/arcapool.slice" <<UNIT
+[Unit]
+Description=Arca runner pool memory budget
+
+[Slice]
+MemoryMax=$BUDGET
+UNIT
+  fi
   for ((slot = 0; slot < SLOTS; slot++)); do
+    [ -n "${SLOT_CPUSET[$slot]}" ] || continue
     cat >"$POOL_UNITS/$(slot_slice "$slot")" <<UNIT
 [Unit]
 Description=Arca runner pool slot $slot (${SLOT_CLASS[$slot]})
@@ -1325,6 +1704,7 @@ Description=Arca runner pool slot $slot (${SLOT_CLASS[$slot]})
 MemoryMax=${SLOT_MEM[$slot]}
 MemorySwapMax=0
 CPUQuota=$((SLOT_CPU[slot] * 100))%
+AllowedCPUs=${SLOT_CPUSET[$slot]}
 UNIT
   done
   systemctl daemon-reload >/dev/null 2>&1
@@ -1409,7 +1789,10 @@ layer_home() {
   local slot=$1 dir
   dir=$(slot_dir "$slot")
   [ ! -e "$POOL_RUN/plain-home" ] || return 1
-  unlayer_home "$slot"
+  if ! unlayer_home "$slot" && ! slot_keeps_caches; then
+    slot_failed "$slot" "the layered runner home could not be unmounted or removed"
+    return 2
+  fi
   mkdir -p "$dir/layer/home" "$dir/layer/upper" "$dir/layer/work"
   # The runner's home is its own and open, as the image has it.
   chmod 777 "$dir/layer/upper"
@@ -1418,17 +1801,30 @@ layer_home() {
     mkdir -p "$dir/layer/home/_work"; then
     return 0
   fi
-  unlayer_home "$slot"
+  if ! unlayer_home "$slot" && ! slot_keeps_caches; then
+    slot_failed "$slot" "the failed runner home layer could not be unmounted or removed"
+    return 2
+  fi
   plain_home "The runner's files could not be layered on this machine (overlay mount)"
   return 1
 }
 
 # Takes a slot's layered copy away, with everything the job's runner wrote into it.
 unlayer_home() {
-  local dir
+  local dir mounted=0
   dir=$(slot_dir "$1")
-  umount -l "$dir/layer/home" >/dev/null 2>&1
-  rm -rf "${dir:?}/layer"
+  if slot_keeps_caches; then
+    umount -l "$dir/layer/home" >/dev/null 2>&1
+    rm -rf "${dir:?}/layer"
+    return
+  fi
+  if [ -e "$dir/layer/home" ]; then
+    umount -l "$dir/layer/home" >/dev/null 2>&1 || :
+    mountpoint -q "$dir/layer/home" || mounted=$?
+    # mountpoint exits 32 when the path is present but is not a mount.
+    [ "$mounted" = 32 ] || return 1
+  fi
+  rm -rf "${dir:?}/layer" && [ ! -e "$dir/layer" ] && [ ! -L "$dir/layer" ]
 }
 
 # From now on every runner starts with the image's own files, and the daemon with the pinned tools: said once.
@@ -1456,25 +1852,28 @@ find_kept() {
 # The containers an earlier controller left on this machine, but for those of a runner left at its job: it is watched
 # to its end (find_kept), with its slice and its layered files.
 clean_containers() {
-  local ids='' id name slot
+  local ids='' networks='' id name slot
   while read -r id name; do
-    case $name in "$POOL_NAME"-s*-run | "$POOL_NAME"-s*-dind)
+    case $name in "$POOL_NAME"-s*-run | "$POOL_NAME"-s*-dind | "$POOL_NAME"-s*-net)
       slot=${name#"$POOL_NAME"-s}
       slot=${slot%-*}
       case $slot in '' | *[!0-9]*) ;; *) [ -z "${ADOPT[$slot]:-}" ] || continue ;; esac
       ;;
     esac
+    case $name in "$POOL_NAME"-s*-net) networks="$networks $id"; continue ;; esac
     ids="$ids $id"
   done < <(docker ps -a --filter "label=arca.pool=$POOL_NAME" --format '{{.ID}} {{.Names}}' 2>/dev/null)
   # shellcheck disable=SC2086
   [ -z "$ids" ] || docker rm -fv $ids >/dev/null 2>&1
+  # shellcheck disable=SC2086
+  [ -z "$networks" ] || docker rm -fv $networks >/dev/null 2>&1
   if [ ${#ADOPT[@]} = 0 ]; then
     systemctl stop 'arcapool-s*.slice' >/dev/null 2>&1
   fi
   for ((slot = 0; slot < SLOTS; slot++)); do
     [ -z "${ADOPT[$slot]:-}" ] || continue
     [ ${#ADOPT[@]} = 0 ] || systemctl stop "$(slot_slice "$slot")" >/dev/null 2>&1
-    unlayer_home "$slot"
+    if slot_keeps_caches; then unlayer_home "$slot"; fi
   done
 }
 
@@ -1596,7 +1995,7 @@ count_of() { stat -c %s "$POOL_RUN/$1" 2>/dev/null || echo 0; }
 
 # The status block: one line per slot, one per class with what its jobs used, and the totals.
 print_status() {
-  local slot phase since words busy=0 idle=0 starting=0 queued=0 reserved=0 at line class
+  local slot phase since words busy=0 idle=0 starting=0 queued=0 slot_memory=0 at line class memory
   at=$(now)
   {
     for ((slot = 0; slot < SLOTS; slot++)); do
@@ -1606,7 +2005,7 @@ print_status() {
           since=$at
           words=''
         }
-        reserved=$((reserved + SLOT_MEM[slot]))
+        slot_memory=$((slot_memory + SLOT_MEM[slot]))
         case $phase in
           busy) busy=$((busy + 1)) ;;
           idle | updating) idle=$((idle + 1)) ;;
@@ -1631,9 +2030,15 @@ print_status() {
     say "pool $POOL_NAME id $POOL_ID for $URL, $GROUP_NOTE"
     [ -z "$NEVER_NOTE" ] || say "$NEVER_NOTE"
     [ -z "$FIT_NOTE" ] || say "$FIT_NOTE"
+    [ -z "$CPU_FIT_NOTE" ] || say "$CPU_FIT_NOTE"
     [ -z "$CAP_NOTE" ] || say "$CAP_NOTE"
     [ -z "$CLASS_NOTE" ] || say "$CLASS_NOTE"
-    say "totals busy=$busy idle=$idle starting=$starting queued=$queued jobs_done=$(count_of jobs) failures=$(count_of failures) runner_updates=$(count_of updates) memory_reserved=$(mib "$reserved")MiB of $(mib "$BUDGET")MiB slots_cap=$MAX_SLOTS"
+    if [ "$MEMORY_MODE" = ceiling ]; then
+      memory="memory_ceilings=$(mib "$slot_memory")MiB memory_budget=$(mib "$BUDGET")MiB"
+    else
+      memory="memory_reserved=$(mib "$slot_memory")MiB of $(mib "$BUDGET")MiB"
+    fi
+    say "totals busy=$busy idle=$idle starting=$starting queued=$queued jobs_done=$(count_of jobs) failures=$(count_of failures) runner_updates=$(count_of updates) $memory slots_cap=$MAX_SLOTS"
   } | tee "$POOL_LOGS/status.txt.new"
   mv "$POOL_LOGS/status.txt.new" "$POOL_LOGS/status.txt"
 }
@@ -1648,7 +2053,7 @@ print_status() {
 #   (give_a_place, and slot_retire in the slot).
 # What this is not: a cap on running jobs. A just-in-time runner cannot be told to wait, so every registered runner may
 # take a job at any moment, and a runner that has one is never retired: a class whose place is held by runners at work
-# waits until one ends. Nor is a place memory: a slot still starts only when its whole size fits.
+# waits until one ends. In reserved mode a slot also needs memory for its whole size.
 # These functions read and change the controller's own variables (pool's): bash lets a function it calls do so.
 
 # The pass that hands out places looks at every slot without a runner once. round_begin lists them for each class in
@@ -1738,7 +2143,7 @@ give_a_place() {
   CLASS_NOTE=''
   if [ "$CLASSES" -gt 1 ] && [ "$live" -ge "$MAX_SLOTS" ]; then
     for ((c = 0; c < CLASSES; c++)); do
-      [ "${class_live[$c]}" = 0 ] || continue
+      [ "${class_live[$c]}" = 0 ] && [ -n "${SLOT_CPUSET[${CLASS_FIRST[$c]}]}" ] || continue
       waiting+=("$c")
       names="${names:+$names, }${CLASS_NAMES[$c]}"
     done
@@ -1782,10 +2187,13 @@ give_a_place() {
     CLASS_NOTE="WARNING: $names, and no class that holds two or more has a runner that can be asked to give its place up. A runner that has a job, that is starting, or that GitHub gave no id for, is never retired, and one that is updating itself not before its update is over: the class waits until a job ends or an update is over"
     return 0
   fi
-  # The class the place is asked for: the first of those without a runner whose slot would have its memory.
+  # The class the place is asked for: the first of those without a runner whose slot could start in its place.
   for c in "${waiting[@]}"; do
     need=${SLOT_MEM[${CLASS_FIRST[$c]}]}
-    if [ $((reserved - SLOT_MEM[give] + need)) -le "$BUDGET" ] && [ "${available:-0}" -ge "$need" ]; then
+    [ "$need" -le "$BUDGET" ] || continue
+    if [ "$MEMORY_MODE" = ceiling ] || {
+      [ $((reserved - SLOT_MEM[give] + need)) -le "$BUDGET" ] && [ "${available:-0}" -ge "$need" ];
+    }; then
       want=$c
       break
     fi
@@ -1856,6 +2264,10 @@ pool() {
   mkdir -p "$POOL_STATE/slots" "$POOL_LOGS" "$POOL_RUN/slots" "$POOL_RUN/tmp" "$POOL_RUN/jit" "$POOL_RUN/retire"
   chmod 700 "$POOL_RUN" "$POOL_RUN/tmp" "$POOL_RUN/jit"
   rm -f "${POOL_RUN:?}"/slots/* "${POOL_RUN:?}"/jit/* "${POOL_RUN:?}/jobs" "${POOL_RUN:?}/failures" "${POOL_RUN:?}/updates" "${POOL_RUN:?}/backoff" "${POOL_RUN:?}/backoff-until" "${POOL_RUN:?}/plain-home" "${POOL_RUN:?}"/tmp/* "${POOL_RUN:?}"/retire/*
+  if [ -n "$REG" ] && ! slot_keeps_caches && ! write_job_hooks; then
+    say "registration-token mode: the job boundary hooks could not be installed"
+    return 1
+  fi
   load_pool_id
   JOBS_HEADER=$(printf 'finished\tslot\tclass\tlabels\tjob\tresult\tseconds\tpeak_memory_bytes\tcpu_seconds\trunner')
   [ -s "$POOL_LOGS/jobs.tsv" ] || printf '%s\n' "$JOBS_HEADER" >"$POOL_LOGS/jobs.tsv"
@@ -1884,7 +2296,7 @@ pool() {
     NEVER_NOTE="WARNING: a slot of these classes is larger than the $(mib "$BUDGET") MiB the machine has for slots (the $(mib "${total:-0}") MiB it reports, less reserveMemory $(mib "$RESERVE") MiB): $never. Such a slot never starts, and the jobs that ask for its labels wait for ever. Make the class or reserveMemory smaller, or the machine larger, in the template, and create the pool again"
     say "$NEVER_NOTE"
   fi
-  if [ "$SLOTS" -le "$MAX_SLOTS" ] && [ "$wanted" -gt "$BUDGET" ]; then
+  if [ "$MEMORY_MODE" = reserved ] && [ "$SLOTS" -le "$MAX_SLOTS" ] && [ "$wanted" -gt "$BUDGET" ]; then
     FIT_NOTE="WARNING: the $SLOTS slots ask for $(mib "$wanted") MiB together and the machine has $(mib "$BUDGET") MiB for slots (the $(mib "${total:-0}") MiB it reports, less reserveMemory $(mib "$RESERVE") MiB): $(mib $((wanted - BUDGET))) MiB too much, so they never all run at once. A machine reports less memory than the size it was given. Make the slots or reserveMemory smaller, or the machine larger, in the template, and create the pool again"
     say "$FIT_NOTE"
   fi
@@ -1895,6 +2307,7 @@ pool() {
     CAP_NOTE="every class is kept one place under the cap of $MAX_SLOTS: a free place goes to the class with the fewest runners, and when a class has none and every place is held, one runner that waits for a job is retired for it, of the class that holds the most. The cap counts registered runners, not running jobs: a registered runner cannot be told to wait and one that has a job is never retired, so a class can wait until a job ends; and a place is not memory"
     say "$CAP_NOTE"
   fi
+  layout_slot_cpus
   write_slices
 
   local waited=0
@@ -1935,7 +2348,9 @@ pool() {
   # In registration-token mode the pool has none and asks GitHub nothing: each runner registers and connects itself.
   local pause=0 verdict
   if [ -n "$REG" ]; then
-    GROUP_NOTE="${GROUP_NAME:+runner group \"$GROUP_NAME\", }registration-token mode: one persistent runner per slot, registered once, which keeps its container, work directory and caches between jobs"
+    local kept='its container between jobs, with the Docker daemon and caches reset after each job'
+    if slot_keeps_caches; then kept='its container, work directory and caches between jobs'; fi
+    GROUP_NOTE="${GROUP_NAME:+runner group \"$GROUP_NAME\", }registration-token mode: one persistent runner per slot, registered once, which keeps $kept"
     # The default group is taken, as an organisation without others has no choice, and said in every status block:
     # every repository it admits can send jobs to these runners.
     if [ "${GROUP_NAME,,}" = default ]; then
@@ -2024,8 +2439,8 @@ pool() {
     pending=0
     [ -z "$REG" ] || reg_token_done
     [ -n "$REG" ] || give_a_place
-    # Admission. A slot starts only while there is a place under the cap and memory for its whole size: memory that
-    # no other slot has reserved, and memory the machine has free now. CPU is not reserved. Every slot without a
+    # Admission. A slot needs its own CPUs and a place under the cap. In reserved mode it also needs memory for
+    # its whole size: memory that no other slot has reserved, and memory the machine has free now. Every slot without a
     # runner is looked at once in a pass. A place goes to the class with the fewest runners first, so every class has
     # one before any has two. Among equals the slots go round-robin: the round starts after the slot admitted last
     # and is read once for the pass. (A pass that moved its start while it walked left slots out.) Round-robin is not
@@ -2035,7 +2450,9 @@ pool() {
     while next_slot; do
       # No slot is begun once the controller is told to stop.
       ! stopping || break
-      if [ -n "$REG" ] && ! registered "$slot" && [ ! -s "$(reg_token)" ]; then
+      if [ -z "${SLOT_CPUSET[$slot]}" ]; then
+        WAIT[slot]="needs ${SLOT_CPU[$slot]} dedicated CPUs"
+      elif [ -n "$REG" ] && ! registered "$slot" && [ ! -s "$(reg_token)" ]; then
         WAIT[slot]='waiting for a registration token (GITHUB_REGISTRATION_TOKEN)'
       elif [ -z "$REG" ] && [ -z "$(credential_kind)" ]; then
         WAIT[slot]='waiting for a credential'
@@ -2045,9 +2462,11 @@ pool() {
         WAIT[slot]="pausing $((until_at - at))s after a failure"
       elif [ "$live" -ge "$MAX_SLOTS" ]; then
         WAIT[slot]="waiting for a place: $MAX_SLOTS slots is the cap"
-      elif [ $((reserved + SLOT_MEM[slot])) -gt "$BUDGET" ]; then
+      elif [ "$MEMORY_MODE" = ceiling ] && [ "${SLOT_MEM[$slot]}" -gt "$BUDGET" ]; then
+        WAIT[slot]='its ceiling exceeds the pool memory budget'
+      elif [ "$MEMORY_MODE" = reserved ] && [ $((reserved + SLOT_MEM[slot])) -gt "$BUDGET" ]; then
         WAIT[slot]="waiting for $(mib "${SLOT_MEM[$slot]}") MiB of unreserved memory"
-      elif [ $((${available:-0} - pending)) -lt "${SLOT_MEM[$slot]}" ]; then
+      elif [ "$MEMORY_MODE" = reserved ] && [ $((${available:-0} - pending)) -lt "${SLOT_MEM[$slot]}" ]; then
         WAIT[slot]="waiting for $(mib "${SLOT_MEM[$slot]}") MiB of free memory"
       else
         WAIT[slot]=''

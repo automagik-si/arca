@@ -1,11 +1,12 @@
 {
   "name": "gitlab",
-  "description": "GitLab CE 19.4.8 by the publisher's image index digest. Config, data and logs share /data. Create stopped, set GITLAB_EXTERNAL_URL to the owner's http/https URL, then start. Arca generates GITLAB_ROOT_PASSWORD for a fresh install. Link the edge to HTTP 80 for external HTTPS; no host listener or SSH port. No template readiness probe: check /-/readiness manually. Not yet run on a live node; rehearse first. See docs/GITLAB-MIGRATION.md for the runbook and optional SSH variant.",
+  "description": "GitLab CE 19.4.8 by the publisher's image index digest. Config, data and logs share /data. Create stopped, set GITLAB_EXTERNAL_URL to the owner's http/https URL, then start. Arca generates GITLAB_ROOT_PASSWORD for a fresh install. Link the edge to HTTP 80 for external HTTPS; no host listener or SSH port. Check /-/readiness manually. Not yet run on a live node; rehearse first. See docs/GITLAB-MIGRATION.md for the runbook and optional SSH variant.",
   "kind": "oci",
   "image": "docker.io/gitlab/gitlab-ce",
   "digest": "sha256:798929a9c80d45a0396ec8d534fdc52301d13082f358e224e67fba035e2e916e",
   "entrypoint": ["/bin/sh", "-ec", { "file": "gitlab.sh" }, "gitlab"],
   "ports": [80, 443],
+  "health": { "port": 80 },
   "data": { "path": "/data", "uid": 0, "gid": 0, "size": "100GiB" },
   "rootSize": "40GiB",
   "limits": { "cpu": "8", "memory": "16GiB" },

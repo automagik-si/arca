@@ -73,7 +73,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::net::IpAddr;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -936,6 +936,16 @@ impl FakeIncus {
         ));
     }
 
+    /// Closes the next `times` GETs whose target starts with `path_prefix` without an answer, as a reset connection.
+    pub fn drop_reads(&self, path_prefix: &str, times: u32) {
+        lock(&self.shared.read_faults).push((path_prefix.to_string(), times, ReadFault::Dropped));
+    }
+
+    /// Cuts the next `times` GETs whose target starts with `path_prefix` half way through the answer's body.
+    pub fn cut_reads(&self, path_prefix: &str, times: u32) {
+        lock(&self.shared.read_faults).push((path_prefix.to_string(), times, ReadFault::Cut));
+    }
+
     pub fn set_operations_unreadable(&self, unreadable: bool) {
         self.shared
             .operations_unreadable
@@ -1323,6 +1333,10 @@ fn serve(mut stream: UnixStream, shared: &Shared) {
     };
     if let Some((status, body)) = service_response(shared, &request) {
         record(shared, &request, status);
+        if std::mem::take(&mut lock(&shared.service).cut_answer) {
+            respond_cut(&mut stream, status, &body);
+            return;
+        }
         let extra = file_headers(shared, &request, status);
         let _ = respond(&mut stream, status, reason(status), &extra, &body);
         drain(&mut stream);
@@ -1343,6 +1357,21 @@ fn serve(mut stream: UnixStream, shared: &Shared) {
         // Recorded with no status, as no answer was given.
         record(shared, &request, 0);
         hold_until_hung_up(&mut stream);
+        return;
+    }
+    if let Some(ReadFault::Dropped) = fault {
+        record(shared, &request, 0);
+        drain(&mut stream);
+        return;
+    }
+    if let Some(ReadFault::Cut) = fault {
+        let (status, _, envelope) = handle(shared, &request, None);
+        record(shared, &request, status);
+        respond_cut(
+            &mut stream,
+            status,
+            &serde_json::to_vec(&envelope).unwrap_or_default(),
+        );
         return;
     }
     if request.method == "PATCH" {
@@ -1559,6 +1588,23 @@ enum ReadFault {
     Unanswered,
     /// It waits this long, then answers as usual.
     Slow(Duration),
+    /// It closes the connection without an answer, as a connection that was reset.
+    Dropped,
+    /// It sends the head of its usual answer and half of the body, then closes the connection.
+    Cut,
+}
+
+/// Sends an answer's head, which names the whole body's length, and the first half of the body, then closes.
+fn respond_cut(stream: &mut UnixStream, status: u16, body: &[u8]) {
+    let head = format!(
+        "HTTP/1.1 {status} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        reason(status),
+        body.len()
+    );
+    let _ = stream.write_all(head.as_bytes());
+    let _ = stream.write_all(&body[..body.len() / 2]);
+    let _ = stream.flush();
+    drain(stream);
 }
 
 /// The fault a GET of `target` meets, when one is left for it. One read is taken from the first fault that matches.
@@ -1607,7 +1653,8 @@ fn handle(shared: &Shared, request: &Request, fault: Option<ReadFault>) -> (u16,
             }
             Some(ReadFault::Metadata(metadata)) => return sync(metadata),
             Some(ReadFault::Slow(delay)) => std::thread::sleep(delay),
-            Some(ReadFault::Pass | ReadFault::Unanswered) | None => {}
+            Some(ReadFault::Pass | ReadFault::Unanswered | ReadFault::Dropped | ReadFault::Cut)
+            | None => {}
         }
     }
     let route = parse(&request.target);
@@ -4867,6 +4914,8 @@ struct ServiceFake {
     file_meta: BTreeMap<String, [String; 4]>,
     /// Whether a directory request for a path that exists is refused. Incus 7.6 answers it with success.
     refuse_existing_directory: bool,
+    /// Whether the answer to the exec just started is cut half way ([`ExecScript::cut_answer`]).
+    cut_answer: bool,
 }
 
 /// Request evidence for tests only; bodies may contain test secrets, so this has no Debug implementation.
@@ -4886,6 +4935,10 @@ pub struct ExecScript {
     pub held: bool,
     pub swap_uuid: bool,
     pub post_status: u16,
+    /// The command starts, but the answer to its request is cut half way.
+    pub cut_answer: bool,
+    /// The command's operation fails, as one whose program could not be run does.
+    pub op_failed: bool,
 }
 impl ExecScript {
     pub fn new(argv: Vec<String>, exit: i64, stdout: &str) -> Self {
@@ -4897,6 +4950,8 @@ impl ExecScript {
             held: false,
             swap_uuid: false,
             post_status: 200,
+            cut_answer: false,
+            op_failed: false,
         }
     }
 }
@@ -5212,7 +5267,11 @@ fn service_response(shared: &Shared, request: &Request) -> Option<(u16, Vec<u8>)
     let mut op = running_operation(&id, &place_of_stored(&store.objects[index]));
     op["description"] = json!("Executing command");
     op["metadata"] = json!({"return":script.exit});
-    if !script.held {
+    if script.op_failed {
+        op["status"] = json!("Failure");
+        op["status_code"] = json!(400);
+        op["err"] = json!("the command could not be run");
+    } else if !script.held {
         op["status"] = json!("Success");
         op["status_code"] = json!(200);
     } else {
@@ -5236,6 +5295,7 @@ fn service_response(shared: &Shared, request: &Request) -> Option<(u16, Vec<u8>)
         );
     }
     store.operations.insert(id, op.clone());
+    service.cut_answer = script.cut_answer;
     Some((200, serde_json::to_vec(&op).unwrap()))
 }
 

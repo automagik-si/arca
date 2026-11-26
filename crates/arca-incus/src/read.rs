@@ -461,9 +461,11 @@ fn read_response<R: BufRead>(reader: &mut R, max_body: usize) -> Result<RawRespo
     read_framed(reader, max_body).map(Framed::into_raw)
 }
 
-/// Reads one answer. The head shares one byte budget. The body is framed by a chunked coding, a `Content-Length`, or the
-/// connection's end, in that order, and never grows past `max_body`.
-fn read_framed<R: BufRead>(reader: &mut R, max_body: usize) -> Result<Framed, IncusError> {
+/// An answer's status code, its reason and its headers.
+type Head = (u16, String, Vec<(String, String)>);
+
+/// The status line and the headers of one answer, under one byte budget.
+fn read_head<R: BufRead>(reader: &mut R) -> Result<Head, IncusError> {
     let mut budget = MAX_HEAD;
     let status_line = read_line(reader, &mut budget)?;
     let (status, reason) = parse_status_line(&status_line)?;
@@ -475,7 +477,113 @@ fn read_framed<R: BufRead>(reader: &mut R, max_body: usize) -> Result<Framed, In
         }
         headers.push(parse_header(&line)?);
     }
+    Ok((status, reason, headers))
+}
 
+/// The end of a body that is read as a stream: its last bytes, at most the number the reader keeps, and whether the
+/// body was longer than that. A longer body is never an error.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Tail {
+    pub bytes: Vec<u8>,
+    pub cut: bool,
+}
+
+#[cfg(any(test, feature = "write"))]
+impl Tail {
+    fn push(&mut self, bytes: &[u8], keep: usize) {
+        self.bytes.extend_from_slice(bytes);
+        // The front is dropped once the buffer holds twice what is kept, so each byte is moved at most twice.
+        if self.bytes.len() > keep.saturating_mul(2) {
+            self.trim(keep);
+        }
+    }
+    fn trim(&mut self, keep: usize) {
+        if self.bytes.len() > keep {
+            let cut = self.bytes.len() - keep;
+            self.bytes.drain(..cut);
+            self.cut = true;
+        }
+    }
+}
+
+/// Exchanges one request and reads its answer's body as a stream, keeping only its last `keep` bytes, under one
+/// deadline of `timeout` from the connect. The head is read as [`exchange_capped`] reads it; only the body has no cap.
+#[cfg(feature = "write")]
+pub(crate) fn exchange_tail(
+    socket: &Path,
+    timeout: Duration,
+    request: &[u8],
+    keep: usize,
+) -> Result<(u16, Tail), IncusError> {
+    guard_request(request)?;
+    if timeout.is_zero() {
+        return Err(IncusError::Timeout);
+    }
+    let deadline = deadline_for(timeout);
+    let mut stream = UnixStream::connect(socket).map_err(io_error)?;
+    stream.set_write_timeout(Some(timeout)).map_err(io_error)?;
+    stream.write_all(request).map_err(io_error)?;
+    let mut reader = BufReader::new(Deadline {
+        stream: &stream,
+        deadline,
+    });
+    read_tail(&mut reader, keep)
+}
+
+/// One answer whose body is framed as [`read_framed`] frames it, and of which only the last `keep` bytes are kept.
+#[cfg(any(test, feature = "write"))]
+fn read_tail<R: BufRead>(reader: &mut R, keep: usize) -> Result<(u16, Tail), IncusError> {
+    let (status, _, headers) = read_head(reader)?;
+    let mut tail = Tail::default();
+    let mut piece = vec![0u8; 8 * 1024];
+    let mut take = |reader: &mut R, mut length: u64, tail: &mut Tail| -> Result<(), IncusError> {
+        while length > 0 {
+            let size = length.min(piece.len() as u64) as usize;
+            reader.read_exact(&mut piece[..size]).map_err(read_error)?;
+            tail.push(&piece[..size], keep);
+            length -= size as u64;
+        }
+        Ok(())
+    };
+    if status == 204 || status == 304 {
+        return Ok((status, tail));
+    }
+    if let Some(coding) = single_header(&headers, "transfer-encoding")? {
+        if !coding.eq_ignore_ascii_case("chunked") {
+            return Err(decode_error("an unsupported transfer coding"));
+        }
+        loop {
+            let mut budget = MAX_HEAD;
+            let line = read_line(reader, &mut budget)?;
+            let size = parse_chunk_size(line.split(|b| *b == b';').next().unwrap_or_default())?;
+            if size == 0 {
+                while !read_line(reader, &mut budget)?.is_empty() {}
+                break;
+            }
+            take(reader, size, &mut tail)?;
+            if !read_line(reader, &mut budget)?.is_empty() {
+                return Err(decode_error("a chunk was not followed by a line break"));
+            }
+        }
+    } else if let Some(length) = single_header(&headers, "content-length")? {
+        take(reader, parse_length(length)?, &mut tail)?;
+    } else {
+        loop {
+            let read = reader.read(&mut piece).map_err(read_error)?;
+            if read == 0 {
+                break;
+            }
+            tail.push(&piece[..read], keep);
+        }
+    }
+    tail.trim(keep);
+    Ok((status, tail))
+}
+
+/// Reads one answer. The head shares one byte budget. The body is framed by a chunked coding, a `Content-Length`, or the
+/// connection's end, in that order, and never grows past `max_body`.
+fn read_framed<R: BufRead>(reader: &mut R, max_body: usize) -> Result<Framed, IncusError> {
+    let (status, reason, headers) = read_head(reader)?;
     let body = if status == 204 || status == 304 {
         Vec::new()
     } else if let Some(coding) = single_header(&headers, "transfer-encoding")? {
@@ -989,6 +1097,43 @@ mod tests {
             reason: reason.to_string(),
             body: body.to_vec(),
         }
+    }
+
+    #[test]
+    fn a_body_read_as_a_stream_keeps_its_last_bytes_in_every_framing_and_is_never_too_large() {
+        let long: Vec<u8> = (0..50_000u32).map(|n| b'a' + (n % 26) as u8).collect();
+        let mut framed =
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", long.len()).into_bytes();
+        framed.extend_from_slice(&long);
+        let mut chunked = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        for piece in long.chunks(7_000) {
+            chunked.extend_from_slice(format!("{:x}\r\n", piece.len()).as_bytes());
+            chunked.extend_from_slice(piece);
+            chunked.extend_from_slice(b"\r\n");
+        }
+        chunked.extend_from_slice(b"0\r\n\r\n");
+        let mut closed = b"HTTP/1.1 200 OK\r\n\r\n".to_vec();
+        closed.extend_from_slice(&long);
+        for bytes in [&framed, &chunked, &closed] {
+            for keep in [1, 100, 49_999] {
+                let (status, tail) = read_tail(&mut &bytes[..], keep).expect("a tail");
+                assert_eq!(status, 200);
+                assert!(tail.cut, "{keep}");
+                assert_eq!(tail.bytes, long[long.len() - keep..], "{keep}");
+            }
+            let (_, whole) = read_tail(&mut &bytes[..], 50_000).expect("the whole body");
+            assert!(!whole.cut);
+            assert_eq!(whole.bytes, long);
+        }
+        let (_, empty) = read_tail(&mut &b"HTTP/1.1 204 No Content\r\n\r\n"[..], 10).expect("none");
+        assert_eq!(empty, Tail::default());
+        assert!(
+            read_tail(
+                &mut &b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nshort"[..],
+                10
+            )
+            .is_err()
+        );
     }
 
     #[test]

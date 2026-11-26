@@ -1266,6 +1266,7 @@ fn source_template(kind: &str, image: &str, digest: Option<&str>) -> service::Te
         entrypoint: None,
         generate: std::collections::BTreeMap::new(),
         droidd_port: None,
+        health: None,
         limits: None,
         autostart: false,
         data: None,
@@ -4213,6 +4214,8 @@ mod destinations;
 mod external;
 #[path = "services/follow.rs"]
 mod follow;
+#[path = "services/formula_exec.rs"]
+mod formula_exec;
 #[path = "services/golden.rs"]
 mod golden;
 #[path = "services/kernel_access.rs"]
@@ -4339,13 +4342,12 @@ fn runtime_template_fields_are_strict_and_old_documents_keep_their_defaults() {
 const AUTOMAGIK_3_136_4: &str =
     "sha256:49e997e36dc35b79b704fac45f2f14cc07cbe7cf3c943e0a5ceebb5a4c1d5dcc";
 
-/// Automagik's published release 3.146.5 (tag v3.146.5, commit 393254f; its release record, server-image.json, names
-/// this digest): the image a new workspace starts from.
-const AUTOMAGIK_3_146_5: &str =
-    "sha256:cc804cb0c3a60219e4db57d309d8029e2b47c3450fdb7c435eabfe98a568a8dd";
+/// The digest in Automagik's v3.160.2 server-image.json, used to install a new workspace.
+const AUTOMAGIK_3_160_2: &str =
+    "sha256:1b8fd1667accfc8d3e08b9646cc0b9a97d83b4021ecea40bde1c2787694ec2d7";
 
 /// A new Automagik starts from Automagik's own published image, pulled by its digest: the server template names
-/// release 3.136.4, the workspace's server release 3.146.5 from the same repository, and neither names an image built
+/// release 3.136.4, the workspace's install image for release 3.160.2 from the same repository, and neither names an image built
 /// on the node.
 #[test]
 fn the_server_and_the_workspace_pin_automagiks_published_releases_by_digest() {
@@ -4365,7 +4367,7 @@ fn the_server_and_the_workspace_pin_automagiks_published_releases_by_digest() {
     let workspace = service::load_template(&dir, "automagik-workspace").unwrap();
     assert_eq!(
         workspace.settings.as_ref().unwrap()["serverImage"],
-        format!("{}@{AUTOMAGIK_3_146_5}", server.image)
+        format!("{}@{AUTOMAGIK_3_160_2}", server.image)
     );
     assert!(
         server
@@ -4399,6 +4401,7 @@ fn a_node_with_the_automagik_server_of_before_keeps_its_service_and_a_new_one_pu
     // The template as it shipped before: another description and another digest.
     let text = fs::read_to_string(templates.join("automagik-server.json")).unwrap();
     let old_text = text
+        .replace("  \"health\": { \"port\": 3081 },\n", "")
         .replace(AUTOMAGIK_3_136_4, BEFORE)
         .replace(
             "Automagik server 3.136.4 (ghcr.io/automagik-si/automagik-server pinned by digest; Automagik's published image, the default way to run a new Automagik)",

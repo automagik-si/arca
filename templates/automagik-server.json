@@ -6,6 +6,7 @@
   "digest": "sha256:49e997e36dc35b79b704fac45f2f14cc07cbe7cf3c943e0a5ceebb5a4c1d5dcc",
   "entrypoint": ["/nodejs/bin/node", "/opt/automagik/entrypoint.mjs"],
   "ports": [3081],
+  "health": { "port": 3081 },
   "data": { "path": "/data", "uid": 1000, "gid": 1000 },
   "limits": { "cpu": "4", "memory": "4GiB" },
   "autostart": true,

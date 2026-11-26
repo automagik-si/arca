@@ -267,29 +267,32 @@ pub struct Vm {
     /// template's, with the values its create replaced.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vendor_data: Option<String>,
-    /// The settings its create replaced, by key, when it replaced any. The machine got them merged into the
-    /// template's ([`Vm::guest_settings`]); they are kept apart here so the record says what was asked for.
+    /// Overrides approved at creation or later. Vendor data stays the original first-boot seed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settings: Option<Map<String, Value>>,
 }
 
 impl Vm {
-    /// The settings object the machine was created with, exactly as its guest reads it at
-    /// [`GUEST_SETTINGS_PATH`]: read back from the cloud-init data the create carried, so a template edited since
-    /// changes nothing here. `None` for a machine without settings.
+    /// Current settings start with the original cloud-init seed, including its pinned defaults.
+    /// Later approvals change only the named overrides, even if the installed template has changed.
     pub fn guest_settings(&self) -> Option<Value> {
         use base64::Engine as _;
-        let content = self
-            .vendor_data
-            .as_deref()?
-            .lines()
-            .find_map(|line| line.strip_prefix("  content: "))?;
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(content.trim())
-            .ok()?;
-        serde_json::from_slice::<Value>(&bytes)
-            .ok()
-            .filter(Value::is_object)
+        let mut settings: Map<String, Value> = match self.vendor_data.as_deref() {
+            Some(seed) => {
+                let content = seed
+                    .lines()
+                    .find_map(|line| line.strip_prefix("  content: "))?;
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(content.trim())
+                    .ok()?;
+                serde_json::from_slice(&bytes).ok()?
+            }
+            None => self.settings.as_ref().map(|_| Map::new())?,
+        };
+        if let Some(overrides) = &self.settings {
+            settings.extend(overrides.clone());
+        }
+        Some(Value::Object(settings))
     }
 }
 
@@ -401,7 +404,7 @@ pub fn raw_lxc_line_ok(line: &str) -> bool {
 }
 
 /// Where a virtual machine's guest finds its template's `settings`, as one JSON object.
-pub const GUEST_SETTINGS_PATH: &str = "/etc/arca/settings.json";
+pub use arca_incus::exec::GUEST_SETTINGS_PATH;
 /// The largest first-boot script a template may carry, in bytes.
 const FIRST_BOOT_MAX: usize = 256 * 1024;
 /// The largest `settings` object a template may carry, as compact JSON, in bytes.
@@ -418,6 +421,9 @@ pub struct ServiceConfig {
     pub instance: String,
     pub ipv4: String,
     pub ports: Vec<u16>,
+    /// The port check applied at create or by the last update.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health: Option<PortHealth>,
     #[serde(default)]
     pub links: Vec<ServiceLink>,
     #[serde(default)]
@@ -663,6 +669,14 @@ impl DataVolumeLocator {
     }
 }
 impl ServiceConfig {
+    fn has_health_proxy(&self, port: u16) -> bool {
+        self.lan.as_ref().is_some_and(|proxy| proxy.port == port)
+            || self
+                .private_port
+                .as_ref()
+                .is_some_and(|proxy| proxy.port == port)
+    }
+
     pub fn data_locator(&self) -> DataVolumeLocator {
         self.data_volume
             .clone()
@@ -1028,6 +1042,19 @@ pub fn ingress(cfg: &ServiceConfig) -> Vec<Value> {
             "protocol": "tcp",
             "destination_port": port.to_string(),
             "description": format!("droidd from the host bridge address to port {port}"),
+            "state": "enabled"
+        })));
+    }
+    if let Some(port) = cfg.health.as_ref().map(|health| health.port)
+        && Some(port) != cfg.droidd_port
+        && !cfg.has_health_proxy(port)
+    {
+        rules.push(rule(json!({
+            "action": "allow",
+            "source": format!("{}/32", cfg.gateway),
+            "protocol": "tcp",
+            "destination_port": port.to_string(),
+            "description": format!("health check from the host bridge address to port {port}"),
             "state": "enabled"
         })));
     }
@@ -1655,6 +1682,8 @@ pub struct Template {
     #[serde(default)]
     pub ports: Vec<u16>,
     #[serde(default)]
+    pub health: Option<PortHealth>,
+    #[serde(default)]
     pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub provides: Option<Value>,
@@ -1749,6 +1778,16 @@ pub struct Template {
     /// kind sets it. Its own name, apart from `update`, which is a virtual machine's pinned version.
     #[serde(default)]
     pub app_update: Option<crate::app_formula::AppUpdate>,
+}
+
+/// The port the node checks after starting a container during an image update.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PortHealth {
+    pub port: u16,
+    /// An HTTP GET request target. Without it the node checks the TCP connection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_path: Option<String>,
 }
 
 /// A service's connector kind, including a service made before its record carried the kind.
@@ -2115,6 +2154,19 @@ pub const IMAGE_RUNNING: &str = " running ";
 
 fn validate_template(template: &Template, dir: &Path) -> Result<(), TemplateError> {
     let name = &template.name;
+    if let Some(health) = &template.health
+        && (template.is_vm()
+            || health.port == 0
+            || health.http_path.as_ref().is_some_and(|path| {
+                !path.starts_with('/')
+                    || path.contains('#')
+                    || path.parse::<axum::http::uri::PathAndQuery>().is_err()
+            }))
+    {
+        return Err(TemplateError::refused(format!(
+            "template {name}: health is for a container, with a port from 1 to 65535 and an optional HTTP path starting with /"
+        )));
+    }
     if let Some(key) = template.limits.as_ref().and_then(Limits::invalid_io_limit) {
         return Err(TemplateError::refused(format!(
             "template {name}: invalid limits.{key}: use a positive integer in Incus byte/s or iops units for disk, bit/s units for network, within signed 64-bit range"
@@ -2555,10 +2607,20 @@ pub fn create_settings(
     template: &Template,
     given: Option<&Value>,
 ) -> Result<ServiceSettings, TemplateError> {
+    merge_settings(template, template.settings.as_ref(), given)
+}
+
+/// Validate the requested keys against today's template, and check its rules on the object's
+/// actual resulting values. Updating an existing VM preserves all unrequested first-boot values.
+pub(crate) fn merge_settings(
+    template: &Template,
+    current: Option<&Value>,
+    given: Option<&Value>,
+) -> Result<ServiceSettings, TemplateError> {
     let name = &template.name;
     let refused = |why: String| Err(TemplateError::refused(why));
     let unchanged = || ServiceSettings {
-        merged: template.settings.clone(),
+        merged: current.cloned(),
         replaced: None,
     };
     let Some(given) = given else {
@@ -2580,7 +2642,10 @@ pub fn create_settings(
             "settings: template {name} lets a create set none (its createSettings lists none)"
         ));
     };
-    let mut merged = defaults.clone();
+    let mut merged = current
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
     for (key, value) in given {
         let Some(default) = defaults
             .get(key)

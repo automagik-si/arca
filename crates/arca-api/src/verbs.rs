@@ -490,7 +490,7 @@ static VERBS: [Verb; 103] = [
     },
     Verb {
         name: "service_status",
-        summary: "One service, named by its name: its address, its ports, its links and its state, its recorded I/O limits when set, and for a virtual machine the settings it was created with. Never a secret. Use service_list first when the name is not known.",
+        summary: "One service, named by its name: its address, its ports, its links and its state, its recorded I/O limits when set, and for a virtual machine its current settings. Never a secret. Use service_list first when the name is not known.",
         class: VerbClass::L,
         min_scope: Scope::Viewer,
         writes: false,
@@ -535,7 +535,7 @@ static VERBS: [Verb; 103] = [
     },
     Verb {
         name: "service_update",
-        summary: "Move a running container service made from an image by digest, or a local image pinned by fingerprint, to another one (or, with follow, say whether the node moves an Automagik server by itself): stopped, root rebuilt from the new image (data volume, config, secrets and firewall rules kept), started, checked within timeoutSeconds (120 by default); on any failure the old version is put back. A local image must already be in the project's image store. A service keeping its data on its root is refused unless eraseData. withTemplate also applies what its CURRENT template says, as service_reconfigure would, in the same restart. eraseData and withTemplate need an owner card (action_propose).",
+        summary: "Update a service in place. For a VM, propose settings from its template's createSettings. The owner sees the old and new values, then Arca writes the guest file and restarts the running VM. For a container, move to an OCI digest or an existing local image fingerprint, keeping its data volume, config, secrets and firewall rules. The node checks health within timeoutSeconds (default 120) and rolls back on failure. eraseData permits rebuilding a root that holds service data. withTemplate applies the current template in the same restart. settings, eraseData and withTemplate require owner approval. Use follow to change automatic Automagik image updates.",
         class: VerbClass::L,
         min_scope: Scope::Doctor,
         writes: true,
@@ -5776,7 +5776,7 @@ fn service_create_params_base() -> Value {
                 "type": "boolean"
             },
             "settings": {
-                "description": "For a virtual-machine template that lists createSettings: the settings this one service gets in place of the template's defaults, by name. Only a listed name is taken, and a value has the type of the template's default; an address is a plain https address. Never a secret: service_status shows them. Fixed at create.",
+                "description": "For a virtual-machine template that lists createSettings: the settings this one service gets in place of the template's defaults, by name. Only a listed name is taken, and a value has the type of the template's default; an address is a plain https address. Never a secret: service_status shows them. The owner can change listed settings later with service_update.",
                 "type": "object"
             }
         },
@@ -6205,6 +6205,12 @@ pub fn summary_service_release(_: &Value) -> String {
 
 /// A short line for a successful `service_update`.
 pub fn summary_service_update(v: &Value) -> String {
+    if v["changes"].get("settings").is_some() {
+        return v["message"]
+            .as_str()
+            .unwrap_or("VM settings updated.")
+            .to_string();
+    }
     if v.get("follow").is_some() {
         "Service's follow setting changed.".to_string()
     } else if v["updated"] == false {
@@ -6313,16 +6319,24 @@ fn service_update_params() -> Value {
 }
 
 fn service_update_params_base() -> Value {
+    let mut changes = template_changes_schema(
+        "With withTemplate or VM settings, action_propose supplies the changes for owner approval.",
+    );
+    changes["properties"]["settings"] = json!({"type":"object", "description":"The requested VM settings that differ, by name, with new and (when previously set) old values."});
     with_confirm(json!({
         "additionalProperties": false,
         "properties": {
             "approval": {
-                "description": "Only with eraseData or withTemplate: the one-shot grant of the approved action proposal. The owner approves the proposal, which says in words that the update erases the service's data, or shows every setting its template changes; this verb is not called with an approval of its own.",
+                "description": "Only with settings, eraseData or withTemplate: the one-shot grant of the approved action proposal. The owner approves the proposal, which says in words that the update erases the service's data, or shows every setting its template changes; this verb is not called with an approval of its own.",
                 "maxLength": 16384,
                 "minLength": 1,
                 "type": "string"
             },
-            "changes": template_changes_schema("Only with withTemplate: a proposal made with action_propose fills it in; the approved call applies it, in the same restart as the new image, only while it is still the difference."),
+            "changes": changes,
+            "settings": {
+                "type": "object",
+                "description": "For a VM, propose replacements for names in its installed template's createSettings. The card shows each previous and new value. A running VM restarts. A previously used, stopped VM boots briefly for delivery. A new VM receives the settings on first boot."
+            },
             "digest": {
                 "description": "The image to move to: sha256: and 64 lower-case hex digits. For an OCI image, the digest, and the service keeps its image's repository; for a service made from a local image pinned by fingerprint, the new image's fingerprint. Give it, or follow, not both.",
                 "pattern": "^sha256:[0-9a-f]{64}$",
@@ -6342,7 +6356,7 @@ fn service_update_params_base() -> Value {
                 "type": "boolean"
             },
             "timeoutSeconds": {
-                "description": "How many seconds the service's first port has to answer TCP after the start, 1 to 900. 120 when absent.",
+                "description": "How many seconds the service's health check has after the start, 1 to 900. 120 when absent.",
                 "maximum": 900,
                 "minimum": 1,
                 "type": "integer"
@@ -6362,7 +6376,7 @@ fn service_update_result() -> Value {
         "additionalProperties": false,
         "properties": {
             "changes": {
-                "description": "Present with withTemplate: the template's difference that was applied with the new image, as the owner's card showed it. No secret value is in it.",
+                "description": "Present with VM settings or withTemplate: the changes applied, as the owner's card showed them. No secret value is in it.",
                 "type": "object"
             },
             "digest": { "pattern": "^sha256:[0-9a-f]{64}$", "type": "string" },
@@ -6377,7 +6391,7 @@ fn service_update_result() -> Value {
             },
             "readBack": read_back_schema(),
             "restarted": {
-                "description": "Present with noNewPrivileges: whether the service was restarted for it (true when it was running).",
+                "description": "Present with settings or noNewPrivileges: whether the service was restarted for it (true when it was running).",
                 "type": "boolean"
             },
             "service": { "type": "string" },
@@ -6386,7 +6400,7 @@ fn service_update_result() -> Value {
                 "type": ["string", "null"]
             },
             "updated": {
-                "description": "False when the service already ran this digest and nothing was changed. True when the image moved, or when only the no-new-privileges setting changed to match the template.",
+                "description": "Whether this call changed the image, VM settings or no-new-privileges setting.",
                 "type": "boolean"
             }
         },

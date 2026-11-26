@@ -29,6 +29,12 @@ use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
 const SERVER_IMAGE: &str = "registry.example/server@sha256:1111111111111111111111111111111111111111111111111111111111111111";
+const LANE_IMAGE: &str = "ghcr.io/automagik-si/automagik-server";
+const INSTALL_VERSION: &str = "3.160.2";
+const INSTALL_DIGEST: &str =
+    "sha256:1b8fd1667accfc8d3e08b9646cc0b9a97d83b4021ecea40bde1c2787694ec2d7";
+const NEXT_VERSION: &str = "3.161.0";
+const NEXT_DIGEST: &str = "sha256:2222222222222222222222222222222222222222222222222222222222222222";
 const PNPM: &str = "/usr/local/bin/pnpm";
 const TOKEN: &str = "eyJzeW50aGV0aWMiOiJ0dW5uZWwtdG9rZW4tZm9yLXRlc3RzLW9ubHkifQ";
 const OTHER_TOKEN: &str = "eyJzeW50aGV0aWMiOiJhLXNlY29uZC10dW5uZWwtdG9rZW4ifQ";
@@ -115,7 +121,7 @@ fn tailnet_image() -> String {
 /// standard error and fails, as cosign does for an image without a matching attestation.
 fn fake_cosign() -> String {
     format!(
-        "#!{}\nprintf 'cosign %s\\n' \"$*\" >>\"$FAKE_DOCKER_DIR/calls.log\"\nprintf '%s\\n' \"$HOME\" >\"$FAKE_DOCKER_DIR/cosign-home\"\nif [ -e \"$FAKE_DOCKER_DIR/cosign-fail\" ]; then\n  cat \"$FAKE_DOCKER_DIR/cosign-fail\" >&2\n  exit 1\nfi\necho '{{\"payloadType\":\"application/vnd.in-toto+json\"}}'\n",
+        "#!{}\nprintf 'cosign %s\\n' \"$*\" >>\"$FAKE_DOCKER_DIR/calls.log\"\nprintf '%s\\n' \"$HOME\" >\"$FAKE_DOCKER_DIR/cosign-home\"\nimage=${{*: -1}}\nhang=\"$FAKE_DOCKER_DIR/cosign-hang-${{image##*@}}\"\nif [ -p \"$hang\" ]; then\n  : >\"$hang.started\"\n  read -r <\"$hang\"\nfi\nfor fail in \"$FAKE_DOCKER_DIR/cosign-fail\" \"$FAKE_DOCKER_DIR/cosign-fail-${{image##*@}}\"; do\n  if [ -e \"$fail\" ]; then\n    cat \"$fail\" >&2\n    exit 1\n  fi\ndone\necho '{{\"payloadType\":\"application/vnd.in-toto+json\"}}'\n",
         which("bash").display()
     )
 }
@@ -331,6 +337,9 @@ impl Workspace {
             .env("WS_DATA", self.dir.join("data"))
             .env("WS_GATE_DATA", self.dir.join("gate"))
             .env("WS_RUN", self.dir.join("run"))
+            .env("WS_FOLLOW_EVERY", "1")
+            .env("WS_FOLLOW_TIMEOUT", "2")
+            .env("WS_FOLLOW_HEALTH", "2")
             .env("WS_CONSOLE", self.dir.join("console.log"))
             .env("WS_INSTALLED", self.dir.join("installed"))
             .env("WS_UNIT", self.dir.join("unit.service"))
@@ -690,10 +699,7 @@ fn the_shipped_template_is_a_virtual_machine_with_its_script_its_secrets_and_pin
                 .any(|(shipped, _)| *shipped == name)
         );
     }
-    // The server's image is one value in settings, by digest: this template's own to move (the gate runs from the
-    // same value), since a workspace needs a server that has the gate. The connector is no setting: the script
-    // fixes it, at the cloudflare-tunnel template's pin, digest and all. The settings are only what a workspace's
-    // owner decides.
+    // The template supplies the install digest and its version, and Arca reports the digest as its update pin.
     let settings = template.settings.as_ref().expect("settings");
     let mut keys: Vec<&str> = settings
         .as_object()
@@ -714,7 +720,8 @@ fn the_shipped_template_is_a_virtual_machine_with_its_script_its_secrets_and_pin
             "reach",
             "repoRef",
             "repoUrl",
-            "serverImage"
+            "serverImage",
+            "serverVersion"
         ]
     );
     // The reach it ships with is the Cloudflare Tunnel. The tailnet node is no setting either: the script fixes it,
@@ -731,6 +738,8 @@ fn the_shipped_template_is_a_virtual_machine_with_its_script_its_secrets_and_pin
             .is_some_and(|text| text.contains("Tailscale 1.104.4"))
     );
     let image = settings["serverImage"].as_str().expect("an image");
+    assert_eq!(image, format!("{LANE_IMAGE}@{INSTALL_DIGEST}"));
+    assert_eq!(settings["serverVersion"], INSTALL_VERSION);
     let (repository, digest) = image.split_once("@sha256:").expect("a digest");
     assert!(repository.ends_with("/automagik-server"));
     assert!(digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()));
@@ -1596,6 +1605,288 @@ fn a_server_image_whose_provenance_does_not_verify_is_not_pulled_and_nothing_sta
     assert_eq!(workspace.stop(), Some(0));
 }
 
+fn lane_workspace(failure: Option<&str>) -> Workspace {
+    let mut settings = settings_with_access(URL);
+    settings["serverImage"] = json!(format!("{LANE_IMAGE}@{INSTALL_DIGEST}"));
+    settings["serverVersion"] = json!(INSTALL_VERSION);
+    let workspace = Workspace::new(&settings);
+    let record = |digest: &str| {
+        json!({"schema":1, "image":LANE_IMAGE, "digest":digest,
+               "ref":format!("{LANE_IMAGE}@{digest}"), "version":NEXT_VERSION})
+        .to_string()
+    };
+    fs::write(workspace.dir.join("lane.json"), record(NEXT_DIGEST)).unwrap();
+    let fixed_digest = if failure == Some("record") {
+        INSTALL_DIGEST
+    } else {
+        NEXT_DIGEST
+    };
+    fs::write(workspace.dir.join("release.json"), record(fixed_digest)).unwrap();
+    executable(
+        &workspace.dir.join("bin/curl"),
+        &format!(
+            "#!{}\ncase ${{*: -1}} in\n */server-lane/server-image.json) record=lane.json ;;\n */v{NEXT_VERSION}/server-image.json) record=release.json ;;\n *api.github.com/repos/*) echo '{{\"id\":42}}'; exit ;;\n *) exit 22 ;;\nesac\ncat '{}/'\"$record\"\n",
+            which("bash").display(),
+            workspace.dir.display()
+        ),
+    );
+    if failure == Some("provenance") {
+        fs::write(
+            workspace
+                .dir
+                .join(format!("docker/cosign-fail-{NEXT_DIGEST}")),
+            "no matching attestation\n",
+        )
+        .unwrap();
+    }
+    if failure == Some("health") {
+        fs::write(
+            workspace
+                .dir
+                .join(format!("docker/health-automagik-gate-{NEXT_DIGEST}")),
+            "502\n",
+        )
+        .unwrap();
+    }
+    for mount in ["data", "gate"] {
+        fs::create_dir(workspace.dir.join(mount)).unwrap();
+        fs::write(workspace.dir.join(mount).join("retained"), mount).unwrap();
+    }
+    workspace
+}
+
+fn lane_image_file(workspace: &Workspace, digest: &str) -> PathBuf {
+    let image_file = format!("{LANE_IMAGE}@{digest}").replace(['/', ':', '@'], "_");
+    workspace.dir.join("docker/images").join(image_file)
+}
+
+fn assert_lane_runs(workspace: &Workspace, digests: &[&str]) {
+    for (name, mount) in [("automagik-server", "data"), ("automagik-gate", "gate")] {
+        let runs = workspace.runs(name);
+        assert_eq!(runs.len(), digests.len(), "{runs:?}");
+        for (run, digest) in runs.iter().zip(digests) {
+            assert!(run.contains("--pull never"), "{run}");
+            let image = format!("{LANE_IMAGE}@{digest}");
+            assert!(run.split_whitespace().any(|word| word == image), "{run}");
+            let source = workspace.dir.join(mount);
+            assert!(
+                run.contains(&format!("-v {}:/data ", source.display())),
+                "{run}"
+            );
+        }
+        assert_eq!(workspace.read(&format!("{mount}/retained")), mount);
+    }
+    let install = workspace.read("etc/settings.json");
+    assert_eq!(
+        serde_json::from_str::<Value>(&install).unwrap()["serverImage"],
+        format!("{LANE_IMAGE}@{INSTALL_DIGEST}")
+    );
+}
+
+fn assert_keeper_recovers_from_a_hung_follow_command(command: &str, message: &str) {
+    let mut workspace = lane_workspace(None);
+    workspace.secret(TOKEN);
+    let hang = workspace
+        .dir
+        .join(format!("docker/{command}-hang-{NEXT_DIGEST}"));
+    assert!(
+        Command::new(which("mkfifo"))
+            .arg(&hang)
+            .status()
+            .unwrap()
+            .success()
+    );
+    workspace.start();
+    wait_for(&workspace, "the lane command to hang", || {
+        hang.with_extension("started").exists()
+    });
+    workspace.end("automagik-gate", 1);
+    workspace.end("automagik-tunnel", 1);
+    let timeout = format!("follow: {message}: timed out after 2 seconds");
+    says(&workspace, &timeout);
+    wait_for(&workspace, "the gate and tunnel to restart", || {
+        workspace.started("automagik-gate", 2) && workspace.started("automagik-tunnel", 2)
+    });
+    wait_for(&workspace, "a status line after the timeout", || {
+        workspace
+            .output()
+            .split_once(&timeout)
+            .is_some_and(|(_, after)| {
+                after.lines().any(|line| {
+                    line.contains("status:")
+                        && line.contains("the gate is healthy")
+                        && line.contains("the tunnel is running")
+                })
+            })
+    });
+    assert!(!lane_image_file(&workspace, NEXT_DIGEST).exists());
+    assert!(!workspace.dir.join("follow.json").exists());
+    assert_eq!(workspace.runs("automagik-server").len(), 1);
+    if command == "cosign" {
+        let calls = workspace.read("docker/calls.log");
+        assert!(!calls.contains(&format!("pull -q {LANE_IMAGE}@{NEXT_DIGEST}")));
+    }
+    fs::remove_file(hang).unwrap();
+    says(&workspace, "follow: 3.161.0 is healthy");
+    assert!(!workspace.output().contains("Killed"));
+    assert_eq!(workspace.stop(), Some(0));
+}
+
+#[test]
+fn the_keeper_supervises_and_retries_after_a_lane_provenance_timeout() {
+    assert_keeper_recovers_from_a_hung_follow_command(
+        "cosign",
+        "build provenance for 3.161.0 failed; leaving the image unpulled",
+    );
+}
+
+#[test]
+fn the_keeper_supervises_and_retries_after_a_lane_pull_timeout() {
+    assert_keeper_recovers_from_a_hung_follow_command(
+        "pull",
+        "the verified image for 3.161.0 could not be pulled",
+    );
+}
+
+#[test]
+fn the_workspace_follows_a_verified_newer_server_lane_and_keeps_its_data() {
+    let mut workspace = lane_workspace(None);
+    workspace.start();
+    says(&workspace, "follow: 3.161.0 is healthy");
+    assert_lane_runs(&workspace, &[INSTALL_DIGEST, NEXT_DIGEST]);
+    let calls = workspace.read("docker/calls.log");
+    let next = format!("{LANE_IMAGE}@{NEXT_DIGEST}");
+    let verified = calls.find(&cosign_call(&next)).expect("provenance checked");
+    let pulled = calls
+        .find(&format!("pull -q {next}"))
+        .expect("new digest pulled");
+    assert!(verified < pulled, "{calls}");
+    assert_eq!(workspace.stop(), Some(0));
+    workspace.start();
+    says(&workspace, "the server is healthy");
+    assert_lane_runs(&workspace, &[INSTALL_DIGEST, NEXT_DIGEST]);
+    assert_eq!(workspace.stop(), Some(0));
+}
+
+#[test]
+fn the_workspace_does_not_pull_a_mismatched_or_unverified_lane_digest() {
+    for (failure, reason) in [
+        ("record", "fixed release record disagrees"),
+        ("provenance", "no matching attestation"),
+    ] {
+        let mut workspace = lane_workspace(Some(failure));
+        workspace.start();
+        says(&workspace, reason);
+        assert_lane_runs(&workspace, &[INSTALL_DIGEST]);
+        let calls = workspace.read("docker/calls.log");
+        let next = format!("{LANE_IMAGE}@{NEXT_DIGEST}");
+        assert!(!calls.contains(&format!("pull -q {next}")), "{calls}");
+        assert_eq!(calls.contains(&cosign_call(&next)), failure == "provenance");
+        assert_eq!(workspace.stop(), Some(0));
+    }
+}
+
+#[test]
+fn the_workspace_ignores_older_and_equal_lane_versions_even_with_another_digest() {
+    for version in ["3.159.9", INSTALL_VERSION] {
+        let mut workspace = lane_workspace(None);
+        let mut lane: Value = serde_json::from_str(&workspace.read("lane.json")).unwrap();
+        lane["version"] = json!(version);
+        fs::write(workspace.dir.join("lane.json"), lane.to_string()).unwrap();
+        workspace.start();
+        says(
+            &workspace,
+            &format!("follow: the server lane names {version}; keeping {INSTALL_VERSION}"),
+        );
+        assert_lane_runs(&workspace, &[INSTALL_DIGEST]);
+        assert!(!workspace.read("docker/calls.log").contains(NEXT_DIGEST));
+        assert!(!workspace.dir.join("follow.json").exists());
+        assert_eq!(workspace.stop(), Some(0));
+    }
+}
+
+#[test]
+fn restarting_the_keeper_resumes_a_recorded_move() {
+    let mut workspace = lane_workspace(None);
+    fs::remove_file(workspace.dir.join("lane.json")).unwrap();
+    workspace.start();
+    says(&workspace, "follow: the server lane could not be read");
+    assert_lane_runs(&workspace, &[INSTALL_DIGEST]);
+    assert_eq!(workspace.stop(), Some(0));
+
+    // Model a stop after the verified pull and the state write, before the old containers were removed.
+    fs::write(lane_image_file(&workspace, NEXT_DIGEST), "").unwrap();
+    let state = json!({
+        "schema": 1,
+        "checking": "move",
+        "current": { "ref": format!("{LANE_IMAGE}@{NEXT_DIGEST}"), "version": NEXT_VERSION },
+        "previous": { "ref": format!("{LANE_IMAGE}@{INSTALL_DIGEST}"), "version": INSTALL_VERSION },
+    });
+    fs::write(workspace.dir.join("follow.json"), state.to_string()).unwrap();
+    workspace.start();
+    says(&workspace, "follow: 3.161.0 is healthy");
+    assert_lane_runs(&workspace, &[INSTALL_DIGEST, NEXT_DIGEST]);
+    let settled: Value = serde_json::from_str(&workspace.read("follow.json")).unwrap();
+    assert!(settled.get("checking").is_none());
+    assert_eq!(settled["current"], state["current"]);
+    assert_eq!(settled["previous"], state["previous"]);
+    assert_eq!(workspace.stop(), Some(0));
+}
+
+#[test]
+fn the_workspace_rolls_back_when_the_new_gate_is_unhealthy_and_keeps_its_data() {
+    let mut workspace = lane_workspace(Some("health"));
+    workspace.start();
+    says(&workspace, "follow: back on 3.160.2, healthy");
+    says(&workspace, "was already rolled back");
+    assert_lane_runs(&workspace, &[INSTALL_DIGEST, NEXT_DIGEST, INSTALL_DIGEST]);
+    let calls = workspace.read("docker/calls.log");
+    assert_eq!(
+        calls
+            .matches(&format!("pull -q {LANE_IMAGE}@{INSTALL_DIGEST}"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        calls
+            .matches(&format!("pull -q {LANE_IMAGE}@{NEXT_DIGEST}"))
+            .count(),
+        1
+    );
+    assert!(calls.contains(&format!("image rm {LANE_IMAGE}@{NEXT_DIGEST}\n")));
+    assert!(!lane_image_file(&workspace, NEXT_DIGEST).exists());
+    assert!(lane_image_file(&workspace, INSTALL_DIGEST).exists());
+    assert_eq!(workspace.stop(), Some(0));
+}
+
+#[test]
+fn a_corrupt_follow_state_reports_how_to_restart_from_the_install_image() {
+    let mut workspace = lane_workspace(None);
+    fs::remove_file(workspace.dir.join("lane.json")).unwrap();
+    let path = workspace.dir.join("follow.json");
+    let corrupt = "{ broken";
+    fs::write(&path, corrupt).unwrap();
+    workspace.start();
+    says(
+        &workspace,
+        &format!(
+            "the follow state {} cannot be read. Removing this file starts again from settings.serverImage",
+            path.display()
+        ),
+    );
+    let calls = workspace.read("docker/calls.log");
+    assert!(
+        !calls.contains("pull ") && !calls.contains("run "),
+        "{calls}"
+    );
+    assert_eq!(workspace.read("follow.json"), corrupt);
+
+    fs::remove_file(path).unwrap();
+    says(&workspace, "follow: the server lane could not be read");
+    assert_lane_runs(&workspace, &[INSTALL_DIGEST]);
+    assert_eq!(workspace.stop(), Some(0));
+}
+
 #[test]
 fn a_part_that_is_not_healthy_and_a_start_that_fails_are_said_in_words() {
     // 200 without a sign-in is not health: the sign-in fence is what a healthy part shows.
@@ -1851,7 +2142,7 @@ fn settings_that_cannot_be_used_are_said_in_words_and_nothing_is_started() {
             &workspace,
             "workspace team1 does not start: its settings cannot be used: ",
         );
-        says(&workspace, "They are fixed when the machine is created");
+        says(&workspace, "Propose corrected settings with service_update");
         assert_eq!(workspace.stop(), Some(0));
         assert_eq!(workspace.read("docker/calls.log"), "", "{words}");
 

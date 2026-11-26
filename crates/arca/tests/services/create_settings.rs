@@ -367,9 +367,8 @@ fn a_template_lists_only_keys_of_its_own_settings_and_only_a_virtual_machine_lis
             "only a virtual-machine template has a firstBoot, settings or createSettings"
         )
     );
-    // The shipped runner pool lets a create set where it registers, how it is sized, which packages its runner image
-    // gets and how its runners are registered (registration, runnerGroup), and nothing else: not its pins, not its
-    // API address, not the switch for the default runner group.
+    // The shipped runner pool lets a create set its scope, slot sizes, memory policy, runner packages,
+    // registration mode and cache policy.
     let shipped = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../templates");
     let pool =
         service::load_template(&shipped, "github-runner-pool").expect("the shipped template");
@@ -380,10 +379,22 @@ fn a_template_lists_only_keys_of_its_own_settings_and_only_a_virtual_machine_lis
             "runnerGroupId",
             "classes",
             "maxSlots",
+            "memory",
             "aptPackages",
             "registration",
-            "runnerGroup"
+            "runnerGroup",
+            "keepBetweenJobs"
         ]
+    );
+    assert_eq!(
+        pool.settings.as_ref().expect("pool settings")["memory"],
+        "reserved"
+    );
+    let ceiling = service::create_settings(&pool, Some(&json!({"memory": "ceiling"})))
+        .expect("a create can choose the ceiling policy");
+    assert_eq!(
+        ceiling.merged.expect("merged settings")["memory"],
+        "ceiling"
     );
 }
 
@@ -718,4 +729,263 @@ fn kernel_access_and_create_settings_belong_to_two_kinds_of_template_and_neither
         .call("service_status", json!({ "name": "p1" }))
         .expect("status");
     assert!(status.get("settings").is_some() && status.get("kernelAccess").is_none());
+}
+
+fn propose_settings(rig: &Rig, settings: Value) -> Result<Value, CallError> {
+    let handlers: HashMap<_, _> = arca::handlers::plan_handlers_served(
+        rig.kernel.clone(),
+        Arc::new(|| NOW),
+        None,
+        None,
+        None,
+        None,
+        arca::handlers::ActionSlot::default(),
+        Some(rig.cfg.clone()),
+    )
+    .into_iter()
+    .collect();
+    handlers["action_propose"].call(
+        json!({"action":"service_update","args":{"name":"p1","settings":settings,"changes":{"forged":true}}}), &doctor()
+    )
+}
+
+fn approve_settings(rig: &Rig, key: &common::SkKey, card: &Value) -> Result<Value, CallError> {
+    let statement = action_statement(
+        common::HOST,
+        card["id"].as_str().unwrap(),
+        "service_update",
+        card["argsDigest"].as_str().unwrap(),
+        NOW,
+        &format!("{:032x}", SEQ.fetch_add(1, Ordering::SeqCst)),
+    )
+    .unwrap();
+    let approval = common::approve_statement(key, &statement);
+    let approved = approve_action(
+        &mut rig.kernel.lock().unwrap(),
+        &json!({"plan":card["id"], "approval":approval}),
+        NOW,
+    )
+    .unwrap();
+    ActionExecutor::new(rig.handlers.iter().map(|(v, h)| (*v, h.clone()))).run(
+        &approved.action,
+        &approved.args,
+        &approved.grant,
+    )
+}
+
+#[test]
+fn vm_settings_update_an_older_guest_on_the_approved_card() {
+    let key = common::SkKey::from_seed(64);
+    let rig = Rig::with(mixed_kernel(&["br0"], roomy()), Some(&key), vec![]);
+    let mut template = pool_template();
+    template["secrets"] = json!(["ACCESS_KEY"]);
+    rig.template("pool", template.clone());
+    create_with(&rig, "p1", json!({"note":"custom","group":3})).unwrap();
+    rig.call(
+        "service_secret_set",
+        json!({"name":"p1","key":"ACCESS_KEY","value":"test fixture"}),
+    )
+    .unwrap();
+    let life = super::vm_secrets::life(&rig, std::time::Duration::from_secs(1));
+    super::vm_secrets::start(&life, "p1").unwrap();
+    rig.fake.add_volume(
+        PROJECT,
+        "vmpool",
+        "workspace-data",
+        json!({"description":"persistent data"}),
+    );
+    rig.fake.set_instance_device(
+        PROJECT,
+        "p1",
+        "work",
+        json!({
+            "type":"disk", "pool":"vmpool", "source":"workspace-data", "path":"/var/lib/workspace"
+        }),
+    );
+    let volume_path =
+        format!("/1.0/storage-pools/vmpool/volumes/custom/workspace-data?project={PROJECT}");
+    let volume = rig.get(&volume_path).expect("attached volume");
+    let data = "/var/lib/workspace/data";
+    rig.fake.write_guest_file(PROJECT, "p1", data, b"retained");
+    let files = rig.fake.service_files();
+    let original = instance(&rig, "p1");
+    let record = entry(&rig, "service-p1").config;
+    let acl = "/1.0/network-acls/arcak-svc-svc-p1?project=default";
+    let rules = rig.get(acl).unwrap();
+    let seed = guest_settings(&rig, "p1");
+    template["settings"]["signIn"] = json!("single");
+    template["createSettings"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!("signIn"));
+    template["settings"]["ratio"] = json!(4.5);
+    rig.template("pool", template);
+
+    let writes = rig.fake.writes().len();
+    for invalid in [
+        json!({"group":4,"missing":true}),
+        json!({"group":"4"}),
+        json!({"pin":"wrong"}),
+    ] {
+        propose_settings(&rig, invalid).expect_err("refused before approval");
+    }
+    let patch = json!({"signIn":"members","group":4});
+    rig.call("service_update", json!({"name":"p1","settings":patch}))
+        .expect_err("approval required");
+    let stale = propose_settings(&rig, json!({"group":6})).unwrap();
+    let card = propose_settings(&rig, patch).unwrap();
+    let rows = card["details"].as_array().unwrap();
+    for (label, value) in [
+        ("Previous group", "3"),
+        ("New group", "4"),
+        ("Previous signIn", "(unset)"),
+        ("New signIn", "\"members\""),
+    ] {
+        assert!(
+            rows.contains(&json!({"label":label,"value":value})),
+            "{card}"
+        );
+    }
+    assert_eq!(rig.fake.writes().len(), writes);
+    let result = approve_settings(&rig, &key, &card).unwrap();
+    assert_eq!(result["restarted"], true);
+    let requests = rig.fake.service_requests();
+    let wrote = requests
+        .iter()
+        .position(|r| r.method == "POST" && r.path.ends_with(service::GUEST_SETTINGS_PATH))
+        .unwrap();
+    assert!(requests[wrote + 1..].iter().any(|r| r.method == "PUT"
+        && serde_json::from_slice::<Value>(&r.body).is_ok_and(|v| v["action"] == "restart")));
+    let changes = json!({"settings":{"signIn":{"new":"members"}, "group":{"old":3,"new":4}}});
+    assert_eq!(result["changes"], changes);
+    let mut expected = seed;
+    expected["signIn"] = json!("members");
+    expected["group"] = json!(4);
+    let mut after_files = rig.fake.service_files();
+    let contents = after_files
+        .remove(&format!("{PROJECT}/p1:{}", service::GUEST_SETTINGS_PATH))
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&contents).unwrap(),
+        expected
+    );
+    assert_eq!(after_files, files, "data and guest secret bytes");
+    assert_eq!(
+        rig.call("service_status", json!({"name":"p1"})).unwrap()["settings"],
+        expected
+    );
+    assert_eq!(instance(&rig, "p1")["devices"], original["devices"]);
+    assert_eq!(
+        guest_settings(&rig, "p1")["group"],
+        3,
+        "cloud-init seed is untouched"
+    );
+    let after = entry(&rig, "service-p1").config;
+    assert_eq!(rig.get(&volume_path).unwrap(), volume);
+    for field in ["ipv4", "secretRefs"] {
+        assert_eq!(after[field], record[field]);
+    }
+    assert_eq!(
+        instance(&rig, "p1")["config"]["volatile.uuid"],
+        original["config"]["volatile.uuid"]
+    );
+    assert_eq!(rig.get(acl).unwrap(), rules);
+    let journal = fs::read_to_string(rig.dir.join("service-updates.jsonl")).unwrap();
+    assert!(
+        journal
+            .lines()
+            .map(|l| serde_json::from_str::<Value>(l).unwrap())
+            .any(|v| v["step"] == "begin" && v["detail"] == changes)
+    );
+    let writes = rig.fake.writes().len();
+    let stale = approve_settings(&rig, &key, &stale).unwrap_err();
+    assert!(
+        stale
+            .refusal()
+            .unwrap()
+            .1
+            .contains("changed since the owner's card")
+    );
+    assert_eq!(rig.fake.writes().len(), writes);
+}
+
+#[test]
+fn updating_stopped_vm_settings_returns_it_to_stopped() {
+    let key = common::SkKey::from_seed(65);
+    let rig = Rig::with(mixed_kernel(&["br0"], roomy()), Some(&key), vec![]);
+    rig.template("pool", pool_template());
+    rig.call(
+        "service_create",
+        json!({"name":"p1","template":"pool","start":false}),
+    )
+    .unwrap();
+    rig.fake
+        .set_last_used(PROJECT, "p1", "2020-01-01T00:00:00Z");
+    let card = propose_settings(&rig, json!({"open":true})).unwrap();
+    assert_eq!(
+        approve_settings(&rig, &key, &card).unwrap()["updated"],
+        true
+    );
+    assert_eq!(instance(&rig, "p1")["status"], "Stopped");
+    let writes = rig.fake.writes().len();
+    let card = propose_settings(&rig, json!({"open":true})).unwrap();
+    assert_eq!(
+        approve_settings(&rig, &key, &card).unwrap()["updated"],
+        false
+    );
+    assert_eq!(rig.fake.writes().len(), writes);
+}
+
+#[test]
+fn vm_settings_before_first_boot_update_the_seed_without_starting() {
+    let key = common::SkKey::from_seed(66);
+    let rig = Rig::with(mixed_kernel(&["br0"], roomy()), Some(&key), vec![]);
+    rig.template("pool", pool_template());
+    rig.call(
+        "service_create",
+        json!({"name":"p1","template":"pool","start":false}),
+    )
+    .unwrap();
+    rig.fake
+        .set_last_used(PROJECT, "p1", "0001-01-01T00:00:00Z");
+    let card = propose_settings(&rig, json!({"group":5})).unwrap();
+    let before = rig.fake.writes().len();
+    assert_eq!(
+        approve_settings(&rig, &key, &card).unwrap()["restarted"],
+        false
+    );
+    assert_eq!(guest_settings(&rig, "p1")["group"], 5);
+    assert!(rig.fake.service_files().is_empty());
+    assert!(
+        rig.fake.writes()[before..]
+            .iter()
+            .all(|r| !r.path.contains("/state?"))
+    );
+}
+
+#[test]
+fn vm_settings_restore_the_guest_file_and_record_if_the_restart_fails() {
+    let key = common::SkKey::from_seed(67);
+    let rig = Rig::with(mixed_kernel(&["br0"], roomy()), Some(&key), vec![]);
+    rig.template("pool", pool_template());
+    create_with(&rig, "p1", json!({"group":9})).unwrap();
+    let old = guest_settings(&rig, "p1");
+    rig.fake.hang_stop("p1", false);
+    let card = propose_settings(&rig, json!({"group":5})).unwrap();
+    let error = approve_settings(&rig, &key, &card).unwrap_err();
+    assert!(
+        error
+            .refusal()
+            .unwrap()
+            .1
+            .contains("could not restart the VM"),
+        "{error:?}"
+    );
+    let files = rig.fake.service_files();
+    let bytes = &files[&format!("{PROJECT}/p1:{}", service::GUEST_SETTINGS_PATH)];
+    assert_eq!(serde_json::from_slice::<Value>(bytes).unwrap(), old);
+    assert_eq!(
+        rig.call("service_status", json!({"name":"p1"})).unwrap()["settings"],
+        old
+    );
 }

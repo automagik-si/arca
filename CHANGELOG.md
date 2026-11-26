@@ -7,6 +7,40 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 `service_update` checks for instance snapshots before changing the service. If any exist, it names them and leaves the
 service alone. The update takes no snapshot. Rollback rebuilds the root from the old image.
 
+## 0.39.0 (2026-11-26)
+
+Owners can change a VM's named `createSettings` in place by approving a `service_update` card. The card and
+service update journal show each changed value. Arca writes the guest settings file and restarts a running VM.
+
+GitHub runner pool slots start each job with clean Docker, tool and dependency caches. `jit` also checks that
+the old work, socket and home layer are gone before it requests a runner. In `registration-token` mode the
+completed hook waits while the controller clears `_work` as root, empties the caches, restores the slot network's
+routes and firewall rules, and replaces the Docker daemon. The persistent runner keeps its registration, and
+changes to its files can still affect its later jobs. Set `keepBetweenJobs: true` at create to reuse caches within
+their shares in either mode.
+
+Arca can now run a formula's command inside its service's container: a `system` container or an OCI container of the
+node's own service project. It is started as the formula names it, as root and with no environment added, under the
+image's `/usr/bin/timeout`, and waited on until its `seconds` and 5 more. The last 64 KiB of each output is kept, a
+longer output is no error, and what is kept is masked as `service_logs` masks a log. When the kept tail starts inside a
+secret or a key, it can still show part of it; issue #292 closes that, and it must land before any verb runs a formula
+command. A command whose end Incus does not show, by the deadline or because its answer was lost, marks the instance
+hung until Arca sees it stopped. No verb runs a formula yet, so nothing changes on a node by this release alone. See
+OPERATING.md.
+
+New `automagik-workspace` VMs install Automagik 3.160.2 by verified digest, then follow the stable server lane.
+The keeper checks each newer digest against its fixed release record and verifies its build provenance before
+pulling it. If the new server or gate fails its health check, the keeper restores the previous image. Both moves
+reuse the existing `/data` mounts and appear in `service_logs`.
+
+- Merge PR 298: Automagik workspace follows Automagik's server lane, install pinned to 3.160.2
+- Merge PR 269: formula command for app updates
+- Merge PR 283 fix 3: clear workspace and network residue between jobs
+- Merge PR 283: runner pool slots start each job clean
+- Merge PR 284: runner slots get cpuset and the limits the job sees, memory ceiling setting, registration-token mode
+- Merge PR 282: change a VM service's create settings in place
+- Merge PR 274: service_update health port asked, not assumed
+
 ## 0.38.0 (2026-11-19)
 
 Arca can now take an Incus snapshot of a service's instance together with each custom volume it mounts, under one
@@ -27,10 +61,24 @@ The approval page now shows pending owner approval requests from linked kernels,
 relays passkey approvals and declines. The linked kernel decides the request, and only the requesting token can read
 the approval string there. See OPERATING.md for the relay token's tool list.
 
+Container templates can declare a TCP port or an HTTP path and port in `health`. All eight shipped templates that
+serve on a port now declare `health`. New services made from those templates carry `health` in their records at
+create. Existing services gain it at their next successful `service_update` using the updated template. A direct
+check keeps a permanent TCP ACL rule from the node's bridge address to the service's health port while the record
+carries that check.
+`service_update` now names the check it ran. An image that starts but never serves on its named port is rolled back.
+Older releases refuse templates that carry `health`. Once a service record carries `health`, downgrading past
+this release is unsupported. Older releases silently skip those records, so the services disappear from list
+and status.
+
 - Merge PR 271: a linked kernel's owner approval requests reach the owner's page
 - Merge PR 268: an appUpdate formula of several ordered components
 - Merge PR 267: app update design addendum for #266 and #265
 - Merge PR 264: service snapshots of an instance with its data volumes, restore and removal
+
+GitHub Actions runner pool slots have dedicated CPUs and report their class's CPU count and memory limit to jobs
+that run directly on the runner. Set `memory` to `ceiling` to admit slots without reserving each one's full memory
+up front. Each slot keeps its own limit, and the pool's running slots share the memory left after `reserveMemory`.
 
 ## 0.37.0 (2026-11-18)
 

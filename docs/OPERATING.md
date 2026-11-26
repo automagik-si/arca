@@ -1085,10 +1085,11 @@ A new Automagik starts from Automagik's published image, and nothing is built on
 pinned to one of Automagik's releases by its digest: `automagik-server`, a container on the node reachable on its LAN
 address at port 3081, at 3.136.4 (`ghcr.io/automagik-si/automagik-server@sha256:49e997e3…`, one linux/amd64 image,
 about 190 MiB to pull), and `automagik-workspace`, a virtual machine of its own reached through a Cloudflare Tunnel or
-the tailnet, at 3.146.5 (`…@sha256:cc804cb0…`; see "An Automagik workspace in its own virtual machine"). For `automagik-server`, Incus pulls the image from the
+the tailnet, which installs 3.160.2 (`…@sha256:1b8fd166…`; see "An Automagik workspace in its own virtual machine"). For `automagik-server`, Incus pulls the image from the
 registry by that digest at the create. A workspace is created stopped, and Docker inside its machine pulls the image
 by its digest when the keeper first starts the server, after `instance_start`, once the image's GitHub build
-provenance verifies; the machine needs a route to `ghcr.io` then. Omni channels are not in 3.136.4: in Automagik's design the welcome installs Omni, and 3.136.4 has a bug
+provenance verifies. The VM then follows Automagik's stable server lane. It needs a route to `ghcr.io`.
+Omni channels are not in 3.136.4: in Automagik's design the welcome installs Omni, and 3.136.4 has a bug
 that loses the plugin. They come through the welcome once Automagik's fixed release is pinned here. The hand-built
 `automagik` template below stays as it is for what the published image does not give today: the Omni channels plugin
 until then, and being published on the tailnet with `service_publish`, which an OCI service cannot be. Build
@@ -1100,10 +1101,9 @@ upgrade, as any shipped template nobody edited. A service made before keeps runn
 is its own instance, and the upgrade does not touch it. Its `service_status` shows the newer release under `update`
 (`"state": "differs"`, the new digest as `templatePin`). A new `automagik-server` service pulls 3.136.4.
 
-From the release after 0.30.0, an unedited `automagik-workspace` moves to Automagik 3.146.5 the same way, with the
-provenance check before the pull and `accessEmails` as text. A workspace made before keeps its machine, its keeper,
-its image and its list of addresses: a virtual machine is not updated in place. Its `service_status` shows the pin as
-`differs`; `service_remove` and `service_create` give a new one at 3.146.5.
+An installed, unedited `automagik-workspace` template receives the new install pin the same way. Workspaces created
+before this release keep their original keeper, settings and install pin, so they do not follow the server lane.
+Their `service_status` shows `update.state` as `differs` against the new install pin.
 
 Keep a running service on the release it has, unless you move it yourself: Arca does not move one to its template's
 version by itself. A container moves in place with `service_update {name, digest}`: to the digest an OCI template now
@@ -1113,9 +1113,9 @@ template port for the health check, and the service's data on a declared volume 
 replaces the root, so whatever the service keeps there is gone, and a service whose template declares a volume it does
 not have is refused. A service that keeps data on its root, whose image is not pinned, or whose template declares no
 port, is not updatable in place: copy the data out, or create a new service. Keep the old image in the store until the
-update has succeeded, since rollback rebuilds the old root from it. A virtual machine
-has no update path: the way is a `service_remove` and a `service_create`, and the remove deletes the service's data,
-which Arca cannot put back into the new service:
+update has succeeded, since rollback rebuilds the old root from it. Replacing a
+virtual machine with `service_remove` and `service_create` deletes its data. The workspace keeper updates the server
+and gate inside the VM and reuses their existing mounts.
 
 - The server's `/data` is its own volume, `<name>-data`, which `service_remove` deletes with the instance. A snapshot
   of the instance leaves that volume out; it needs its own: `snapshot_create` with `{project: "arcak-svc", volume:
@@ -1201,10 +1201,10 @@ rebuilt: change `noNewPrivileges` in its template (`arca templates install`), th
 the service already runs. When the template and the service differ, that call checks the project as above, saves the
 record, writes `raw.lxc` into the instance and **restarts it if it runs, which interrupts it**. The setting takes effect
 at the next start, so a stopped service has it from then and is not restarted. The image and the data volume are not
-touched and nothing is rebuilt. After the restart the call runs the same health check as a digest update (the service's
-first port must answer, or the instance must stay running) and honours `timeoutSeconds`. If the write is refused, the
-restart fails or the service does not come back healthy, the old setting is put back in the record and in the instance's
-config, the service is restarted again, and the answer says so (`rolled_back` for the health check). The answer says
+touched and nothing is rebuilt. After the restart the call runs the same health check as a digest update and honours
+`timeoutSeconds`. If the write is refused, the restart fails or the service does not come back healthy, the old setting
+is put back in the record and in the instance's config. The service is restarted again, and the answer says so
+(`rolled_back` for the health check). The answer says
 `noNewPrivileges` and `restarted`. A proposal for it (`action_propose`) gets a card of its own: it says it turns
 no-new-privileges on or off, restarts the service, puts the old setting back if the service does not come back healthy,
 and erases nothing; it states no `eraseData`. A call, and a proposal, that also moves the digest are refused while the
@@ -1613,9 +1613,8 @@ others. Arca writes no such rule.
 
 `service_status` and `service_list` show `privatePort: { "address", "port" }`; `service_status` adds `ready`, true when
 the instance carries the device as Arca made it and the host still holds the address, and otherwise false with a
-`problem`. `service_update` leaves the device where it is and checks the service after the update through the private
-address (not the node's loopback, where the proxy does not listen). `service_remove` removes the instance with its
-device and the record, as for any service.
+`problem`. `service_update` leaves the device where it is and checks that port through the private address when it
+is the health check's target. `service_remove` removes the instance with its device and the record, as for any service.
 
 A worked example. Two nodes, joined by a private /24 on a dedicated interface; this node holds `198.51.100.7` on it and
 the other `198.51.100.8`. NATS on this node accepts leafnode connections on 7422, and only the other node dials it.
@@ -1970,12 +1969,13 @@ moves a running container service made from an image by digest (today `automagik
 pinned by fingerprint (a template's `local:<alias>` beside a `digest`, see "A local image may be pinned") to another
 digest, or fingerprint, in one call. It is a destructive verb (it takes the optional `confirm`), needs a `doctor`
 token and asks the owner for nothing, except for `eraseData` (see below); it works inside a tenant as outside one.
-There is no update path for `automagik-workspace` yet: it is a virtual machine, whose Docker pulls its own server
-image, and the verb refuses it. Before changing anything, the update reads the instance's snapshots. If it finds any,
-it names each one and leaves the service alone. Removing them requires a separate plan on the owner's passkey card.
-That plan is not available yet. If Arca cannot read the list, the update does not proceed. The update takes no snapshot
-and returns `snapshot: null` on success. Each step below has a line in `service-updates.jsonl` in the
-state directory (an append-only file of JSON lines: a `begin`, one line per step, an `end`; never a secret):
+For a VM, use the separate `{name, settings, tenant?}` mode described under **Settings for one service**. An
+`automagik-workspace` VM follows the server lane through its own keeper. Before changing a container, the update reads
+the instance's snapshots. If it finds any, it names each one and leaves the service alone. Removing them requires a
+separate plan on the owner's passkey card. That plan is not available yet. If Arca cannot read the list, the update does
+not proceed. The update takes no snapshot and returns `snapshot: null` on success. Each step below has a line in
+`service-updates.jsonl` in the state directory (an append-only file of JSON lines: a `begin`, one line per step, an
+`end`; never a secret):
 
 1. the instance is stopped if it runs;
 2. its root is rebuilt from `<repository>@<digest>`, or, for a local pinned image, from the project's own copy of the
@@ -1987,15 +1987,28 @@ state directory (an append-only file of JSON lines: a `begin`, one line per step
    (`/var/lib/autopg/data`, `/data`, `/app/data`) from 0.23.0; a service made from them up to 0.22.0 keeps its data
    on its root disk and gets no volume by itself;
 3. it is started;
-4. the health check, within `timeoutSeconds` (1 to 900, 120 when absent). The node can reach a service's port only
-   through a proxy, since the firewall opens nothing else to it. A service with a host port (`lan`) is tried
-   through it, on the node's loopback: the connection must stay open. A service whose first port is its droidd port
-   is tried at its address. Any other service must only stay running for 10 seconds;
+4. the health check, within `timeoutSeconds` (1 to 900, 120 when absent). The installed template can name the port
+   and optionally an HTTP path. The answer says which check passed;
 5. the new digest is written into the service's record, so a restart keeps it and `service_status` names it.
 
-Rollback rebuilds the root from the old image. If the old version was running before, Arca starts it and gives it
-30 seconds to answer. A successful rollback returns `rolled_back` with the failing step's words and a note if the
-old version does not answer yet.
+A container template can check TCP or HTTP.
+
+- `"health": { "port": 8080 }` checks that TCP port 8080 accepts a connection.
+- `"health": { "port": 8080, "httpPath": "/ready" }` sends an HTTP GET to that port and requires a 2xx response.
+  The path starts with `/`. The check uses plain HTTP and follows no redirects.
+
+The node tries the matching `lan` or `privatePort` proxy when there is one. Otherwise, it checks the service's
+address directly. At create and on update, a named port reached directly gets an ACL rule for TCP from the node's
+bridge address, like the droidd port. It adds no host listener. An image that starts but never answers the named check
+is rolled back, including any changes to the health rule.
+
+A template that omits `health` keeps the previous check. The node tries the `lan` or private proxy when present,
+or the droidd port when it is the first port. Other services with declared ports must stay running for 10 seconds
+or for `timeoutSeconds`, whichever is shorter. A successful running check says, for example, “kept running for 10 s”.
+
+A failure at any step puts the old version back: the root is rebuilt from the old image, and the old version is started
+if it was running before and given up to 30 seconds, bounded by `timeoutSeconds`, for its own health check. The call is
+refused with code `rolled_back` and the failing step's words (and a note when the old version fails its check).
 When Incus could not fetch the new image, the old root was never taken away: if it cannot fetch the old one either,
 the old version is started as it is, and the refusal says so. If Incus does not finish a rebuild in time, nothing is
 rolled back, so as not to rebuild twice at once: the refusal is `update_unsettled`, and the same update may be asked
@@ -2184,8 +2197,8 @@ run at once.
 
 A service made from the `automagik-server` template follows Automagik's releases by default, so it stays easy to
 update: the node moves it to each newer server image Automagik publishes, with `service_update`, and nobody has to ask.
-(`automagik-workspace` is a virtual machine, which `service_update` does not move, so it does not follow.) Only a
-container of the node's own project made from `ghcr.io/automagik-si/automagik-server` by digest can follow.
+This node-side follower moves containers in the node's own project made from `ghcr.io/automagik-si/automagik-server`
+by digest. The `automagik-workspace` VM checks the lane from inside the guest.
 
 On a timer of its own, every 10 minutes (`follow.intervalSeconds` in the node config, 60 to 86400), the node reads
 Automagik's record of its newest server image, `releases/download/server-lane/server-image.json` of
@@ -5997,13 +6010,25 @@ refused, before anything is created, and in words that name the setting:
   under a key named `memory` more than the machine's own memory (the template's `limits.memory`);
 - settings that pass 16KiB once merged.
 
-Settings are fixed at create, like the rest of a virtual machine's first boot: to change one, create the service
-again. They never hold a secret, and Arca shows them: `service_status` answers `settings`, the object the machine
-was created with, and when a create is proposed the owner's card has one row for each setting it replaces, with its
-value in words, so an address is seen before it is approved. A list has one row for each element (`Setting classes
-1`, `Setting classes 2`), each with its fields, so a long list is shown whole. The card cuts nothing: a proposal whose
-setting would need a row of more than 160 characters is refused when it is made, naming the row, and nothing is asked
-of the owner. The service's record keeps the replaced values as `vm.settings`.
+To change an existing VM, propose `service_update` with the names and values to replace.
+For example, an owner's assistant can submit this to `action_propose`:
+
+```json
+{"action":"service_update","args":{"name":"ci","settings":{"maxSlots":8}}}
+```
+
+The current template determines which keys and types it accepts. The VM's recorded settings supply all other
+values, including its original image pin. A template can add a key after the VM was created. The owner's card
+shows its previous value as `(unset)`. The node checks the old and new values again at approval.
+
+Arca writes the merged JSON to `/etc/arca/settings.json` through the guest agent and restarts a running VM.
+For a stopped VM it starts the machine briefly to deliver the file, then stops it again. If the VM has never
+booted, Arca updates its cloud-init seed and leaves it stopped. Its next boot reads the new values. The guest software must support the selected setting. This operation keeps the installed
+guest software, the disks, address, secrets and network rules. `service_status.settings` shows the effective
+values. The service update journal records each changed name and its previous and new values.
+
+Settings are public to the guest. Store secrets separately with `service_secret_set`. On a create card, Arca
+shows a list one element per row and refuses a setting whose row would exceed 160 characters.
 
 **What must hold between settings.** A template may also say what must hold between its settings, in
 `settingRules`, so that a create the machine itself would refuse at its first boot is refused before anything is
@@ -6152,6 +6177,27 @@ template writes them, each only when the formula has it (an empty list is not sh
 `"appUpdate": { "formula": "template", "components": ["queue", "runtime"], "alsoRestarts": [...], "notUpdated": [...] }`.
 A formula of the single form with neither list answers `{ "formula": "template" }` as before. An Arca older than this
 release refuses a template with any of the three keys.
+
+**How a formula's command runs.** This release can run a formula's command inside its service's container, though no
+verb does so yet. It runs in a `system` container and in an OCI container of the node's own service project, never in an
+adopted instance, a tenant's instance, a virtual machine or a stopped instance. Arca starts the program the formula
+names, with the formula's arguments, as root, with no environment of its own added and no shell. The command runs under
+the image's `/usr/bin/timeout`, which ends it at its `seconds`, so an image without that program fails every check of
+its formula. A health try is cut at 30 seconds, or sooner when less of `health.seconds` is left. Arca waits on the
+command for its `seconds` and 5 more. The last 64 KiB of each of its two outputs is kept, and a longer output is no
+error: the answer says the output was cut. That text is masked as `service_logs` masks a log, so a key, a stored secret,
+one of the instance's own environment values or a credential shows as `[secret]`. What is kept of a longer output begins
+wherever the cut fell, so when it falls inside a secret or a key, the part after the cut can show, until #292 masks a
+cut tail; no verb runs a formula's command before then. Of the update command the last 60 lines are kept, each cut at
+300 characters, and of a failed health check the last 5. Of the version reader only its first line is kept, and only
+when it is a plain version. The recordings are deleted from the instance every time, and the exec audit holds no
+argument and no output. If Incus does not answer for a command by Arca's deadline, the instance is marked hung, and so
+it is when Arca loses the answer in any other way once the command was started (a cut connection, an error in place of
+the operation, an answer that is not the operation), since the command may still run; and so it is when the owner check
+the start makes just before sending it times out, which errs toward the mark. An operation Incus reports failed is an
+answer and marks nothing. No formula command runs in a marked instance, and no command of Rule 50's closed list but its
+cleanups (removing the tailnet key directory, stopping the daemon). The mark stays until Arca sees the instance stopped,
+since a stopped instance runs nothing, or until the instance's uuid changes, since that is another instance.
 
 ### What every virtual machine carries
 
@@ -6664,16 +6710,15 @@ token passes through that assistant's conversation.
    own sign-in for your e-mail address first, and then the workspace.
 
 The settings. A `service_create` may give `reach`, `publicUrl`, `automagikPnpm`, `memberRunner` and the three Access
-settings (the template lists them in `createSettings`); `serverImage` is the template's own, since the image a workspace runs is not for a
-create to choose.
+settings (the template lists them in `createSettings`). The template supplies the install pin.
 
 | Setting | Meaning |
 |---------|---------|
 | `publicUrl` | With `reach` `tailnet`, the machine's own `https://<machine>.<tailnet>.ts.net`. Otherwise the workspace's exact public origin, as a browser writes it, and a name, never an IP address: `https://` and a host name in lower case; no path and no closing slash; a port only when it is not 443 (1 to 65535, without a leading 0). The gate gets it as `AUTOMAGIK_GATE_ORIGIN` and stops on any other spelling, so the script refuses those first. The server is not given it. It ships empty, which means "not set": the server then starts alone, no gate is started, and every status line says so. |
 | `accessTeamDomain`, `accessAudience`, `accessEmails` | Your Cloudflare Access application for that address: the team's host name alone (`<team>.cloudflareaccess.com`, no `https://`, and no other domain), the application's audience tag, and the e-mail addresses that may sign in: text, one address or several separated by commas (`"owner@example.com, second@example.com"`, 1 to 16). A create that gives a list is refused (`settings.accessEmails: expected a string, the type of the template's default`); a workspace made before with a list keeps it, and its own keeper reads it. None is a secret. Set all three or none; they need `publicUrl`. They ship empty. The gate gets them as `AUTOMAGIK_GATE_ACCESS_TEAM_DOMAIN`, `AUTOMAGIK_GATE_ACCESS_AUD` and `AUTOMAGIK_GATE_ACCESS_EMAILS`: the text unchanged (the gate trims each address and compares without regard to case). An address the script does not take stops the workspace with `settings.accessEmails is 1 to 16 e-mail addresses ...`. |
 | `automagikPnpm` | Required absolute path of pnpm 10 baked into the server image, supplied by its owner. Passed as `AUTOMAGIK_PNPM`, with no fallback. Explicitly pins `/usr/local/bin/pnpm` from the image contract; an empty or missing setting refuses startup. Reconfirm the path for the final reviewed image. |
-| `serverImage` | The Automagik server's public image, pinned by digest (Automagik 3.146.5). The server and the gate both run from this one value: to move to another build, replace it. A workspace needs a build that has the gate and its Cloudflare Access sign-in (see below), and one with GitHub build provenance from `automagik-si/automagik` (see "The image's provenance" below). |
-
+| `serverImage` | The verified install digest for both the server and the gate (Automagik 3.160.2). The `service_status` pin reports this install version. The VM follows the server lane on its own after first boot. |
+| `serverVersion` | The install image's Automagik version (3.160.2), supplied by the template. The keeper uses it for the first comparison with the server lane. |
 | `reach` | How people reach the workspace: `cloudflare` (the steps above; also when the setting is left out) or `tailnet` (see "On a tailnet instead" below). |
 
 Three things are not settings. The gate's port is 3082, as Automagik's compose file fixes it. The connector's image
@@ -6757,19 +6802,17 @@ What to know about this reach:
 
 What to know:
 
-- **The pinned server image.** `settings.serverImage` is Automagik's published release 3.146.5 (the Automagik
-  repository's commit `393254f`, image tag `3.146.5-393254fa`), the digest its release record `server-image.json`
-  names. It is no longer the image the `automagik-server` template pins (3.136.4). It has the gate, its
-  Cloudflare Access sign-in, and the gate's own sign-in with passkeys, which the tailnet reach uses; both reaches run
-  it. The gate's files (`compose.gate.yml`, `gate-entrypoint.mjs`, `gate-access.mjs`, `gate-claim.mjs`) are the same
-  as at commit `5fe0be6`, the build pinned up to Arca 0.16.0. The image's health check was rewritten since; it still
-  prints the code of the port it asks (the gate's in the gate's container, the server's in the server's), which is
-  all the keeper reads. Nothing of the Access sign-in changed between the build pinned before that (`8fb2e6f`) and
-  `5fe0be6`. An older build has no gate: its gate container stops at once, the keeper says `the gate stopped (exit code ...)` and
-  tries again after a pause, and the public address leads nowhere. Everything this script takes from the image
-  (three paths, the two ports, the claim code's place and the seven variable names) is in one block at the top of
-  `automagik-workspace.sh`, as commit `393254f` (release 3.146.5) has them; check the block when you move the pin to
-  a later build.
+- **The install image.** `settings.serverImage` starts the server and gate from the digest in the
+  `server-image.json` record for Automagik 3.160.2. Both reach modes use that image. The ports, entrypoints, and
+  gate environment the keeper expects are at the top of `automagik-workspace.sh`.
+- **Following the stable server lane.** Once the install image is healthy, the keeper checks
+  `server-lane/server-image.json` and repeats the check hourly while the workspace is healthy. It accepts a
+  newer version only if the digest matches that version's fixed release record and its build provenance
+  verifies. The server and gate restart with their existing `/data` mounts. If the server or the configured
+  gate fails to become healthy within five minutes, the keeper restarts both from the previous digest and skips
+  the failed digest while the lane still names it. The VM records its chosen digest and rollback state across
+  restarts. Look for `follow:` lines in `service_logs` to see which version the keeper tried and whether it
+  stayed on that version or rolled back.
 - **The image's provenance.** The keeper pulls the server's image only once its GitHub build-provenance attestation
   verifies: a SLSA v1 attestation of that digest whose signing certificate GitHub Actions issued to a workflow of
   `automagik-si/automagik` (Automagik's `server-image.yml` makes it at each release). The verifier is cosign v3.1.4,
@@ -6800,8 +6843,7 @@ What to know:
   `https://<team>.cloudflareaccess.com`, an outgoing call the service network allows like any other.
 - **All three Access settings, or none.** The gate does not start with one or two. The first boot checks the
   settings and says on the console what is wrong, and the keeper repeats it; nothing is started with settings that
-  cannot be used. Settings are fixed when the machine is created, so the cure is a corrected template and a new
-  machine.
+  cannot be used. Propose the corrected Access settings together with `service_update`.
 - **Where the token lives.** In Arca's private `secrets/` directory, in the machine's `/etc/arca-secrets/TUNNEL_TOKEN`
   (root's, mode 0600), and in a copy in the machine's memory (`/run/automagik-workspace/tunnel/token`) that only the
   connector's user reads. The connector reads that file; the token is not in its environment, on any command line or
@@ -6856,8 +6898,8 @@ What to know:
 
   `systemctl status automagik-member-runner` and `journalctl -u automagik-member-runner` inside the machine say how it
   runs. Its refusals and failures also reach the console (`service_logs`).
-- **The settings are fixed.** They are read when the machine is created. To change the reach, the public address
-  or the Access settings, create the workspace again with other settings. To move the server's image pin, edit
+- **Changing workspace settings.** Propose the reach, public address and Access settings together with
+  `service_update`. The keeper reads them when the VM restarts. To move the server's image pin, edit
   `serverImage` in the template: workspaces created afterwards run the new build.
 
 ## A pool of GitHub Actions runners
@@ -6942,9 +6984,11 @@ since it is where the pool's credential will be used.
 | `runnerGroupId` | yes | The number of the runner group the runners join (step 1). Not used for a repository. |
 | `classes` | yes | The label sets, each with its slot size: `name` (a-z, 0-9), `labels` (what a job's `runs-on` asks for), `cpu`, `memory` and `slots` (how many runners of this class the pool keeps). Given at create, it replaces the whole list. Each class is checked like the template's first: whole numbers for `cpu` and `slots`, and a `memory` above zero and at most the machine's. The card shows one row a class. |
 | `maxSlots` | yes | The cap: never more than this many slots at once, whatever the classes add up to. Never below the number of classes: a create with less is refused ("A place for every class" below). |
+| `memory` | yes | `reserved` (default) reserves a slot's full class memory before starting it. `ceiling` lets slots share the pool's memory budget, with each slot capped at its class memory. |
 | `aptPackages` | yes | The Ubuntu packages added to the runner image, which the machine builds once ("The runner image's packages" below). The default is `["libatomic1", "build-essential", "zstd", "wget", "skopeo", "xz-utils", "zip", "rsync", "gh"]`. Given at create, it replaces the whole list, so name the defaults too when you add one; `[]` runs the runner image as it is. |
 | `registration` | yes | `jit` (the default): a just-in-time runner per job, registered with the pool's App or token. `registration-token`: no GitHub credential at all; each slot is registered once with a registration token and keeps its runner between jobs ("Without a GitHub credential" below). |
 | `runnerGroup` | yes | With `registration-token`, the runner group's name as GitHub shows it (config.sh names a group by name). Required for an organisation. |
+| `keepBetweenJobs` | yes | `false` (the default) gives each job clean Docker, tool and dependency caches in both modes. `true` lets slots reuse those caches within their shares. |
 | `allowDefaultRunnerGroup` | no | `true` lets a `jit` pool start on the organisation's default runner group (the registration-token mode does not read it; it takes the default group with a warning). Leave it out. |
 | `reserveMemory` | no | Memory kept back for the virtual machine itself. The slots share what is left. |
 | `dockerCache`, `dependencyCache` | no | The disk the Docker layer caches and the dependency caches may use, over all slots. |
@@ -6963,7 +7007,13 @@ is never started (two slots of 10GiB beside the two small ones would not fit). G
 job needs: a full `cargo test` of a large workspace has been seen to fill a 10GiB slot. Settings are read when the pool is created and are fixed from then on (see "What to
 know").
 
-**Sizing so that every slot fits.** A slot is started only while its whole memory fits, so the rule is:
+**Sizing so that every slot fits.** Add up `cpu × slots` for every class. The pool assigns each slot its own CPUs
+at startup, giving the first slot in each class priority. If the total exceeds the CPUs the machine has, the pool
+logs both numbers and slots without a full CPU assignment stay queued. `maxSlots` caps how many runners start and
+each slot keeps its CPU assignment when it is idle or queued.
+
+With `memory: reserved`, a slot starts only when its whole memory is available. To run every slot at once, their
+combined memory must fit this budget.
 
     the memory of all slots together  <=  the memory the machine reports  -  reserveMemory
 
@@ -6976,6 +7026,22 @@ controller now says this at its start and in every status block, as a `WARNING` 
 much. (It does not say this when `maxSlots` is below the number of slots: then they are not meant to run all at
 once.) A slot that is larger by itself than the memory for slots never starts, whatever `maxSlots` is, and the jobs
 that ask for its labels wait for ever: the controller says that too, as a `WARNING` that names the class.
+
+With `memory: ceiling`, the pool starts slots up to `maxSlots` and their dedicated CPU assignments without waiting
+for each slot's full class memory to be free. Each slot keeps its class's `MemoryMax`. The parent slice caps the pool
+at the machine's reported memory minus `reserveMemory`, so each slot's ceiling still has to fit that budget on its
+own. The sum of the ceilings can exceed the budget. A job can be OOM-killed when it reaches its slot limit or when
+concurrent slots fill the pool budget under memory pressure. Status reports `memory_ceilings` and `memory_budget`
+in this mode.
+
+**What a job sees.** For steps that run directly on the runner, `nproc` reports the class's CPU count and `MemTotal`
+in `/proc/meminfo` reports its memory limit. Docker pins the runner and its daemon with `--cpuset-cpus`, and both
+mount LXCFS views of `/proc/meminfo`, `/proc/cpuinfo`, `/proc/stat` and `/proc/loadavg`, plus `/proc/swaps` and
+`/proc/uptime` when LXCFS serves them. A slot waits to register if its LXCFS mount or a required file is missing and
+logs the cause. The systemd slice enforces `AllowedCPUs`, `CPUQuota`, `MemoryMax` and `MemorySwapMax=0`. Docker's
+`--cgroup-parent` places the runner and daemon in that slice, so containers the daemon starts also share those
+limits and CPU assignment. Those inner containers, including job and service containers, get their own `/proc`
+without the LXCFS mounts and can see the machine's memory in `MemTotal`.
 
 **A place for every class.** `maxSlots` caps registered runners, and a runner that is registered and waits for a job
 keeps its place until a job ends. So that no class is left without a runner behind the idle runners of the others,
@@ -7008,8 +7074,8 @@ What this is not:
   every registered runner may take a job at any moment. A runner that has a job is never retired, and neither is a
   class's only runner; one that is updating itself is not retired before its update is over. So when every runner
   that could give its place up is at work, the class waits until a job ends, or until an update is over.
-- A place is not memory. A slot still starts only when its whole memory fits (above), and the pool retires nothing
-  for a class whose slot would still lack its memory.
+- With `memory: reserved`, the pool retires an idle runner for another class only if the new slot would have
+  enough memory to start. Every admitted slot needs its own CPUs under either memory setting.
 - It is one place a class, not a share. Beyond that one place, the busiest classes can hold all the others.
 
 A pool with one class has nothing to hand out between classes and works as it did.
@@ -7022,8 +7088,8 @@ its line breaks, the one at its end too; a key pasted on one line works too. For
 or log shows a value again. When the App's two secrets and a token are all set, the pool uses the App and says so.
 
 **5. Arca: `instance_start`** with `{"project": "arcak-svc", "instance": "ci-pool"}`. The virtual machine starts and
-the answer names the secrets written into it. Its first boot installs Docker and downloads the two images, which
-takes a few minutes.
+the answer names the secrets written into it. Its first boot installs Docker and LXCFS and downloads the two
+images, which takes a few minutes.
 
 **6. Check.** `service_logs` with `{"name": "ci-pool"}` shows the pool's own lines (below), among them the runner
 group it registers in. On GitHub, the organisation's "Settings", "Actions", "Runners" lists runners named
@@ -7090,14 +7156,20 @@ What the pool does with it:
   can be deleted as unneeded while every slot still looks registered. If a slot then waits for a token, run
   `instance_start` again within the token's hour: Arca writes the stored token again and the slot registers with it.
 
-**This mode keeps per-slot state between jobs.** The slot's runner is persistent: it takes job after job in the same
-container, beside the same Docker daemon, with the same work directory (`_work`), the same Docker layer cache, the
-same tool cache and the same files any job left in the runner's home. The slot is not cleaned per job; only the two
-cache budgets are checked after each job, as in the other mode. A job can therefore see what an earlier job on that
-slot left, and can leave something for a later one: use it only for repositories that trust each other. Each job is
-still recorded in `jobs.tsv` with its name, result and seconds, but its memory peak is the slot's since its runner
-started (a slice's peak cannot be set back while it runs), and its CPU time is the slot's since the job began. This
-mode is a bridge until each job runs in a fresh machine of its own; the `jit` mode stays as it was.
+**The runner keeps its container and registration between jobs.** A root-owned, read-only completed hook waits for
+the controller to clear `_work` as root, empty the Docker store and caches, and replace the daemon. It removes the
+old Docker bridges and restores the shared namespace's routes and firewall rules before starting the replacement.
+Service containers still answer on localhost. The controller allows five minutes for the whole reset, including
+daemon readiness. The hook allows one controller poll and 15 seconds more. Before workflow steps run, the started
+hook requires a fresh daemon, empty caches and confirmation that the controller emptied `_work` before GitHub set
+up the new job. A failed or interrupted reset stops the runner, which can restart with its saved registration.
+Set `keepBetweenJobs: true` to use the existing persistent daemon and cache budgets without these hooks.
+
+The completed hook also clears what the runner user can remove from `/tmp`. A job can still change
+the persistent runner's own files and executables, which can affect its later jobs. Use this mode only for
+repositories that trust each other. In `jit` mode the pool replaces the runner and removes its work, socket and
+home layer before requesting the next runner. Each job is recorded in `jobs.tsv` with its name, result and
+seconds. The memory peak is the slot's since its runner started, and CPU time is the slot's since the job began.
 
 ### Who can reach what
 
@@ -7133,7 +7205,7 @@ arca-runner-pool: totals busy=2 idle=1 starting=0 queued=1 jobs_done=412 failure
 |---------------|---------|
 | `busy`, `idle` | Runners with a job, and runners registered and waiting for one. |
 | `starting` | Slots registering, starting or cleaning up. |
-| `queued` | Slots the pool wants and has not started. The slot's own line says why: the cap, memory no slot has reserved, memory that is free now, a pause after a failure, or no credential. |
+| `queued` | Slots waiting for dedicated CPUs, a place under the cap, memory, a retry after a failure, or a credential. The slot's own line gives the reason. |
 | `jobs_done` | Jobs finished since the controller started, whatever their result. |
 | `failures` | Failures of the pool itself since the controller started: GitHub refused the credential or a registration, the runner group was refused, a container did not start, a runner went away before it took a job. A job that fails its own steps is a job done, with `result=Failed`. |
 | `runner_updates` | Runners that GitHub told to update themselves before their job (see "Pins" below). Above zero means the pool's pinned runner is behind. |
@@ -7209,21 +7281,20 @@ neither has been measured on the pool itself.
   `/var/log/arca-runner-pool/runner-image-build.log` inside the machine. The packages come from Ubuntu's archive on
   the day of the build, so two machines built on different days can differ in their versions; the runner image
   underneath is the pinned one.
-- **Admission by memory.** A slot starts only while there is memory for its whole size: memory that no other slot has
-  reserved, and memory the machine has free at that moment. A slot's memory is a hard limit with no swap, so a job that
-  passes it is stopped by the kernel and no other slot pays for it. CPU is different: each slot has a ceiling of its
-  `cpu`, and slots share the machine's CPUs.
-- **Docker, and how far jobs are apart.** Each slot has a Docker daemon of its own, started fresh for each job. A
-  job's containers, volumes and networks are removed after it; the daemon's images and build cache stay for the next
-  job of that slot. Two jobs therefore never see each other's containers or share a daemon. They are not walled off
+- **Docker, and how far jobs are apart.** In `jit` mode, each slot starts a Docker daemon of its own for each job.
+  The pool removes the job's containers, volumes and networks after it. Jobs are not walled off
   from each other the way two virtual machines are ("Who can reach what" above). One shared daemon would have reused
   more cache and separated jobs less; a daemon without root would separate them more and refuse the jobs that need
   privileged containers.
-- **Caches.** Each slot keeps its Docker layer cache, a tool cache (`RUNNER_TOOL_CACHE`, which the `setup-*` actions
-  fill) and a directory for anything else a workflow wants to keep (`POOL_CACHE_DIR`, `/var/cache/pool` in the job).
-  They are on the virtual machine's disk and survive jobs and restarts. Each slot has an equal share of `dockerCache`
-  and of `dependencyCache`; a cache that passes its share after a job is emptied, and the log says so. A cache is
-  shared by the jobs that run in the same slot one after another, so a job can leave something there for a later one.
+- **Caches.** By default, a `jit` slot replaces its Docker store, tool cache (`RUNNER_TOOL_CACHE` at
+  `/opt/hostedtoolcache`) and dependency cache (`POOL_CACHE_DIR` at `/var/cache/pool`) with empty directories
+  before registering the next runner. If the reset fails, the slot logs the failure and retries before
+  registering. In `registration-token` mode the controller replaces the daemon and clears those caches while
+  the completed hook waits. In both
+  modes each job pulls its images and sets up its tools and dependencies again until a read-only cache is
+  available. With `keepBetweenJobs: true`, images, build cache and the two filesystem caches can survive jobs
+  and restarts. Each slot has an equal share of `dockerCache` and `dependencyCache`. The pool trims and logs any
+  cache that exceeds its share after a job. A later job on the same slot can read what an earlier job left there.
 - **Where the credential lives.** In Arca's private `secrets/` directory, and in the virtual machine in
   `/etc/arca-secrets`, readable by root there. It is not in Incus's config, in Arca's journals or in any log. The
   controller makes every short-lived token from it by itself and prints none. A runner's one-job registration is
@@ -8128,12 +8199,13 @@ against a fake GitHub API (a small HTTP server in the test that checks every tok
 `docker` (`tests/runner_pool/fake-docker.sh`, which plays a runner that takes one job with the configuration it was
 started with). It needs `bash`, `curl`, `jq`, `openssl` and `flock` on the machine that runs it. It covers
 registration with an App and with a token, one job per runner, replacement, admission by reserved and by free memory,
-the cap, the job records and their bound, the pause after failures, the refusal of the default runner group at the
-start and after a later change on GitHub, a public repository's warning, a runner that GitHub tells to update itself,
-the shared layer of the runner's files and both ways back from it, a token renewed before an old runner is removed,
-cleanup of exactly this pool's leftovers, the URL and API host rules, and that no credential is in any output, file
-or command line. `crates/arca/tests/services/vm_secrets.rs` and `create_settings.rs` cover the kernel's half against
-the fake Incus.
+admission with memory ceilings, the cap, distinct CPU assignments and LXCFS mount arguments for each class,
+registration waiting for LXCFS, the job records and their bound, the pause after failures, the refusal of the default
+runner group at the start and after a later change on GitHub, a public repository's warning, a runner that GitHub
+tells to update itself, the shared layer of the runner's files and both ways back from it, a token renewed before an
+old runner is removed, cleanup of exactly this pool's leftovers, the URL and API host rules, and that no credential
+is in any output, file or command line. `crates/arca/tests/services/vm_secrets.rs` and `create_settings.rs` cover the
+kernel's half against the fake Incus.
 
 The controller runs in these tests with nothing on its `PATH` but the stand-ins and the programs the script declares
 (`POOL_PROGRAMS`), so a program it starts without declaring fails them; the first boot checks that same list on the
@@ -8178,6 +8250,7 @@ Not proven yet, by these tests or on that node:
   mounted, and the daemon seeing the updated tools. A machine where it does not work falls back by itself, which is
   tested; that the layered start works is not;
 - jobs that use `container:` and `services:`;
+- the values of `nproc` and `MemTotal` in a real job for each runner class;
 - that GitHub lists a runner as `offline` when it is, and answers a repository's `private` field as its
   documentation says;
 - that the memory limit and the CPU ceiling of a slot's slice hold for a job's own containers, those it starts
@@ -8545,11 +8618,10 @@ own control group when the runner puts a limit there. Today's pool does not (the
 the job cannot read) and gives the job no variable with it, so on the pool the script uses the class's number from
 the workflow (`CI_SLOT_CPUS`). On a hosted runner it tells them nothing.
 
-rustup, the cargo registry, the target directory, npm's cache and the test browser are kept in the pool's
-`POOL_CACHE_DIR`, and Node in the runner's tool cache, so the next job in the same slot does not start from nothing.
-Each slot has its own, and the pool empties one that passes the slot's share of `dependencyCache`. The setup step
-prints what the cache holds; if the target directory alone comes close to that share, give the pool that serves
-this repository a larger `dependencyCache`.
+The setup step uses `POOL_CACHE_DIR` for rustup, the cargo registry, the target directory, npm's cache and the test
+browser, and the runner's tool cache for Node. A pool with `keepBetweenJobs: true` reuses them on the same slot
+until they exceed its share of `dependencyCache`. The setup step prints what the cache holds. With the default
+cache policy, each job sets them up again.
 
 **Comparing with GitHub's runners.** `.github/workflows/bench.yml` is started by hand only. It runs the `test` job
 twice on one commit, on `ubuntu-latest` and on the pool, and writes for each, in the run's summary: the CPU model,

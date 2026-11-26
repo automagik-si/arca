@@ -72,7 +72,7 @@
 #     refused at the first boot, in words, unless the file is on the machine already.
 #
 # What it reads:
-# - /etc/arca/settings.json: the service's settings, written by cloud-init at the first boot and fixed from then on.
+# - /etc/arca/settings.json: the service's settings, written at first boot and updated in place by service_update.
 #   Those a service_create gave (the template lists which it may) stand in place of the template's own.
 #   publicUrl is the workspace's exact public origin (https://<host>, no path); empty, as the template ships it,
 #   means "not set". accessTeamDomain, accessAudience and accessEmails are the owner's Cloudflare Access application for
@@ -102,6 +102,10 @@
 # is not pulled, and the server does not start; the keeper says why and tries again after a pause. Every container
 # made from the server's image is started with `--pull never`, so Docker never pulls it by itself.
 #
+# After the install image is healthy, the keeper follows Automagik's stable server lane. A newer digest must match
+# its fixed release record and pass the same provenance check before the pull. The server and gate restart on their
+# existing data mounts. If either fails its health check, the keeper restarts them from the previous digest.
+#
 # Every path, pause and external program below can be replaced through the environment, which is how the test in
 # crates/arca/tests/automagik_workspace.rs drives the keeper against a fake docker.
 set -u
@@ -112,6 +116,10 @@ set -u
 : "${WS_GATE_DATA:=/var/lib/automagik-workspace/gate}"
 : "${WS_TAILNET_STATE:=/var/lib/automagik-workspace/tailnet}"
 : "${WS_RUN:=/run/automagik-workspace}"
+: "${WS_FOLLOW_STATE:=${WS_DATA%/*}/follow.json}"  # root's record beside the data, across keeper and VM restarts
+: "${WS_FOLLOW_EVERY:=3600}"   # seconds between lane checks, starting when the install image is healthy
+: "${WS_FOLLOW_TIMEOUT:=300}"  # seconds before stopping each lane provenance check or pull
+: "${WS_FOLLOW_HEALTH:=300}"   # seconds for an update to become healthy before restoring the previous image
 : "${WS_CONSOLE:=/dev/console}"
 : "${WS_INSTALLED:=/usr/local/sbin/arca-automagik-workspace}"
 : "${WS_UNIT:=/etc/systemd/system/arca-automagik-workspace.service}"
@@ -154,10 +162,8 @@ TAILNET=automagik-tailnet
 RELAY=automagik-relay
 RELAY_NET=automagik-relay
 
-# What this script takes from the Automagik server image, each in this one place, as the Automagik repository has
-# them at commit 5fe0be6 (server/compose.gate.yml, server/gate-entrypoint.mjs, server/gate-access.mjs,
-# server/gate-claim.mjs). Those four files are the same at 393254f, the commit of release 3.146.5, the build the
-# shipped template pins. A later build that changes one of them changes one line here.
+# The Automagik server image's contract for the keeper (server/compose.gate.yml, server/gate-entrypoint.mjs,
+# server/gate-access.mjs, server/gate-claim.mjs, and server/healthcheck.mjs at release 3.160.2).
 SERVER_PORT=3081                                  # the server's own port, fixed in the image
 GATE_PORT=3082                                    # the gate's port, the one upstream's compose file fixes
 IMAGE_NODE=/nodejs/bin/node                       # the image's node
@@ -193,6 +199,9 @@ COSIGN_AMD64=424e2c97d0b45fd7a6b608a87f090f35633f4c23ece5f092d48bba11aaf4bbfa
 COSIGN_ARM64=ade83b7aac62e131cacfe96d958948b2150cc9efec46a570a2649b8e27dedad2
 PROVENANCE_REPO=automagik-si/automagik
 PROVENANCE_ISSUER=https://token.actions.githubusercontent.com
+LANE_IMAGE=ghcr.io/automagik-si/automagik-server
+SERVER_RELEASES=https://github.com/automagik-si/automagik/releases/download
+VERSION_PATTERN='\A(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\z'
 
 # The member runner (see the head of this file). Its user, its uid and gid range (one /etc/subuid and one /etc/subgid
 # line; far above the ranges useradd hands out from 100000), and the Node it runs on: Node 22.23.5, the Node.js
@@ -220,7 +229,7 @@ RELAY_PROGRAM='const net=require("net");const [ip,port]=process.argv.slice(1);ne
 # Every program this script starts that bash does not have built in. The first boot refuses to go on while one of
 # them is missing, and names it.
 WS_PROGRAMS='docker jq systemctl apt-get hostname sha256sum install tr cut date sleep cat chmod chown mv rm grep
-tail mkdir stat curl uname readlink git setpriv find rmdir'
+tail mkdir stat curl uname readlink git setpriv find rmdir timeout'
 
 # The Debian packages the first boot installs. Recommended packages are not installed, so every package that is needed
 # is named here. docker.io is the daemon alone: on Debian 13 the `docker` command is a package of its own, docker-cli,
@@ -293,9 +302,8 @@ install_workspace() {
     printf '%s\n' '{ "log-driver": "local", "log-opts": { "max-size": "20m", "max-file": "2" } }' \
       >"$WS_DOCKER_ETC/daemon.json"
   fi
-  # Settings that cannot be used never change: they are part of the machine. That is said now, on the console, and
-  # the keeper is installed all the same, so that every later look at service_logs finds the reason again.
-  load_settings || boot_say "first boot: the settings cannot be used: $REFUSAL. The workspace will not start; service_remove it and create it again with settings that are right"
+  # Install the keeper even when the initial settings need an owner-approved correction.
+  load_settings || boot_say "first boot: the settings cannot be used: $REFUSAL. Propose corrected settings with service_update"
   if ! data_directories; then
     boot_say "first boot failed: the data directories $WS_DATA and $WS_GATE_DATA could not be made for the server's user ($WS_DATA_OWNER). The machine has no workspace"
     exit 1
@@ -979,6 +987,10 @@ running() {
   [ "$(state_of "$1")" = running ]
 }
 
+image_of() {
+  docker inspect --type container -f '{{.Config.Image}}' "$1" 2>/dev/null
+}
+
 # The last line of what docker said, on one line and bounded. No secret is on a docker command line here, so none is
 # in its answer.
 last_line() {
@@ -1027,11 +1039,21 @@ leave_stale_namespace() {
 # the namespace with it, so both are removed with it and start again beside the new one. The server is given no
 # public name: see the head of this file.
 keep_server() {
-  local state out
+  local state out image
   state=$(state_of "$SERVER")
   case $state in
     running)
       leave_stale_namespace
+      # In the rare case that the checkout is unavailable through the move window, rollback is safe because the old
+      # server is still running.
+      if [ "$CHECKOUT_READY" = true ] && [ -n "$FOLLOW_STATE" ] &&
+        image=$(image_of "$SERVER") && [ -n "$image" ] && [ "$image" != "$SERVER_IMAGE" ]; then
+        leave_server_parts
+        if docker rm -f "$SERVER" >/dev/null 2>&1; then
+          proven server
+          proven gate
+        fi
+      fi
       return 0
       ;;
     unknown) return 0 ;;
@@ -1078,7 +1100,7 @@ server_image_here() {
   say "verifying the server image's build provenance before pulling it: $SERVER_IMAGE, built on GitHub by a workflow of $PROVENANCE_REPO"
   if [ ! -x "$WS_COSIGN" ]; then
     why="the verifier $WS_COSIGN is not on this machine: the first boot did not finish"
-  elif ! out=$(verify_provenance 2>&1 >/dev/null); then
+  elif ! out=$(verify_provenance "$SERVER_IMAGE" 2>&1 >/dev/null); then
     out=$(last_line "$out")
     why="cosign says: ${out:-nothing}"
   fi
@@ -1100,11 +1122,13 @@ server_image_here() {
 # cosign's check of the server's image, with a home of its own on the machine's memory for Sigstore's root, which it
 # refreshes from Sigstore's own address. It needs no account: the image and its attestation are public.
 verify_provenance() {
+  local digest_ref=$1
+  shift
   mkdir -p "$WS_RUN/cosign" &&
-    HOME="$WS_RUN/cosign" "$WS_COSIGN" verify-attestation --type slsaprovenance1 \
+    HOME="$WS_RUN/cosign" "$@" "$WS_COSIGN" verify-attestation --type slsaprovenance1 \
       --certificate-oidc-issuer "$PROVENANCE_ISSUER" \
       --certificate-identity-regexp "^https://github\\.com/$PROVENANCE_REPO/" \
-      --certificate-github-workflow-repository "$PROVENANCE_REPO" "$SERVER_IMAGE"
+      --certificate-github-workflow-repository "$PROVENANCE_REPO" "$digest_ref"
 }
 
 # The gate: the same image and digest as the server, the gate's entrypoint, the server's namespace, a file system it
@@ -1567,6 +1591,178 @@ UNVERIFIED=''
 GATE_STATE=''
 TUNNEL_STATE=''
 
+# Follow state lives beside the data mounts and is written before containers are replaced. After a restart, a move
+# or rollback still being checked gets a fresh health window. Retired images are removed after the check settles.
+FOLLOW_STATE='' FOLLOW_CHECKING='' FOLLOW_DEADLINE=0 FOLLOW_NEXT=0 SERVER_VERSION=''
+
+follow_use() {
+  local fields
+  fields=$(jq -r '[.current.ref, .current.version, (.checking // "")] | join("|")' <<<"$1") || return 1
+  IFS='|' read -r SERVER_IMAGE SERVER_VERSION FOLLOW_CHECKING <<<"$fields"
+  FOLLOW_STATE=$1
+  FOLLOW_DEADLINE=$(($(now) + WS_FOLLOW_HEALTH))
+}
+
+follow_read() {
+  local state version
+  if [ ! -e "$WS_FOLLOW_STATE" ]; then
+    [ "${SERVER_IMAGE%@sha256:*}" = "$LANE_IMAGE" ] || return 0
+    # Settings from before lane following have no install version to compare with.
+    if ! version=$(jq -er --arg version "$VERSION_PATTERN" '.serverVersion | select(type == "string" and test($version))' "$WS_SETTINGS"); then
+      return 0
+    fi
+    state=$(jq -cn --arg ref "$SERVER_IMAGE" --arg version "$version" \
+      '{schema: 1, current: {ref: $ref, version: $version}}') || return 1
+  else
+    state=$(jq -ces --arg image "$LANE_IMAGE" --arg version "$VERSION_PATTERN" '
+      def digest: type == "string" and startswith($image + "@") and
+        (ltrimstr($image + "@") | test("\\Asha256:[0-9a-f]{64}\\z"));
+      def release: type == "object" and (.ref | digest) and (.version | type == "string" and test($version));
+      select(length == 1) | .[0] |
+      select(.schema == 1 and (.current | release) and (.previous == null or (.previous | release)) and
+        (.retired == null or (.retired | release)) and (.refused == null or (.refused | digest)) and
+        (.checking == null or (.checking == "move" and .previous != null) or .checking == "back"))
+      ' "$WS_FOLLOW_STATE" 2>/dev/null) || return 1
+  fi
+  follow_use "$state"
+}
+
+follow_write() {
+  if (umask 077 && printf '%s\n' "$1" >"$WS_FOLLOW_STATE.new" && mv -f "$WS_FOLLOW_STATE.new" "$WS_FOLLOW_STATE"); then
+    follow_use "$1"
+  else
+    rm -f "$WS_FOLLOW_STATE.new"
+    say "follow: could not save $WS_FOLLOW_STATE; keeping $SERVER_VERSION"
+    return 1
+  fi
+}
+
+# Print the digest ref and version of a single, bounded release record. Callers report any failure on one line.
+follow_record() {
+  local out
+  if ! out=$(curl -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 30 --max-time 60 \
+    --max-filesize 65536 "$1" 2>&1); then
+    last_line "$out" >&2
+    return 1
+  fi
+  jq -ers --arg image "$LANE_IMAGE" --arg version "$VERSION_PATTERN" '
+    select(length == 1) | .[0] |
+    select(.schema == 1 and .image == $image and
+      (.digest | type == "string" and test("\\Asha256:[0-9a-f]{64}\\z")) and
+      .ref == (.image + "@" + .digest) and (.version | type == "string" and test($version)))
+    | .ref + " " + .version' <<<"$out" 2>/dev/null || {
+    printf '%s\n' 'invalid server-image.json record' >&2
+    return 1
+  }
+}
+
+follow_above() {
+  local a b part
+  IFS=. read -r -a a <<<"$1"
+  IFS=. read -r -a b <<<"$2"
+  for part in 0 1 2; do
+    if [ "${a[part]}" -ne "${b[part]}" ]; then
+      [ "${a[part]}" -gt "${b[part]}" ]
+      return
+    fi
+  done
+  return 1
+}
+
+follow_error() {
+  case $1 in
+    124 | 137) printf 'timed out after %s seconds' "$WS_FOLLOW_TIMEOUT" ;;
+    *) last_line "$2" ;;
+  esac
+}
+
+follow_step() {
+  local lane fixed ref version out state before=$SERVER_VERSION
+  local -a limit=(timeout -k 5 "$WS_FOLLOW_TIMEOUT")
+  if ! lane=$(follow_record "$SERVER_RELEASES/server-lane/server-image.json" 2>&1); then
+    say "follow: the server lane could not be read: $lane"
+    return
+  fi
+  read -r ref version <<<"$lane"
+  if [ "$ref" = "$SERVER_IMAGE" ]; then
+    say "follow: the server lane names $version, which already runs"
+    return
+  fi
+  if ! follow_above "$version" "$SERVER_VERSION"; then
+    say "follow: the server lane names $version; keeping $SERVER_VERSION"
+    return
+  fi
+  if [ "$(jq -r '.refused // ""' <<<"$FOLLOW_STATE")" = "$ref" ]; then
+    say "follow: $version ($ref) was already rolled back"
+    return
+  fi
+  if ! fixed=$(follow_record "$SERVER_RELEASES/v$version/server-image.json" 2>&1); then
+    say "follow: the fixed release record for $version could not be read: $fixed"
+    return
+  fi
+  if [ "$fixed" != "$lane" ]; then
+    say "follow: the fixed release record disagrees with the server lane for $version; keeping $SERVER_VERSION"
+    return
+  fi
+  out=$(verify_provenance "$ref" "${limit[@]}" 2>&1 >/dev/null) 2>/dev/null || {
+    say "follow: build provenance for $version failed; leaving the image unpulled: $(follow_error "$?" "$out")"
+    return
+  }
+  out=$("${limit[@]}" docker pull -q "$ref" 2>&1 >/dev/null) 2>/dev/null || {
+    say "follow: the verified image for $version could not be pulled: $(follow_error "$?" "$out")"
+    return
+  }
+  state=$(jq -c --arg ref "$ref" --arg version "$version" '
+    .retired = .previous | .previous = .current | .current = {ref: $ref, version: $version} | .checking = "move"
+    ' <<<"$FOLLOW_STATE") || return 1
+  follow_write "$state" &&
+    say "follow: verified and pulled $version; moving from $before on the same data, with $WS_FOLLOW_HEALTH seconds to become healthy"
+}
+
+follow_healthy() {
+  [[ $SERVER_STATE = 'the server is healthy '* ]] && [ "$(image_of "$SERVER")" = "$SERVER_IMAGE" ] || return 1
+  [ -z "$PUBLIC_URL" ] ||
+    { [[ $GATE_STATE = 'the gate is healthy '* ]] && [ "$(image_of "$GATE")" = "$SERVER_IMAGE" ]; }
+}
+
+follow_settle() {
+  local state retired out cleanup='' version=$SERVER_VERSION phase=$FOLLOW_CHECKING
+  if [ "$phase:$1" = move:unhealthy ]; then
+    state=$(jq -c '
+      .current as $failed | .current = .previous | .previous = .retired |
+      .retired = $failed | .refused = $failed.ref | .checking = "back"' <<<"$FOLLOW_STATE") || return 1
+    follow_write "$state" &&
+      say "follow: $version was not healthy ($SERVER_STATE; $GATE_STATE); rolling back to $SERVER_VERSION on the same data"
+    return
+  fi
+  retired=$(jq -r 'if .retired.ref != .current.ref and .retired.ref != .previous.ref then .retired.ref // "" else "" end' \
+    <<<"$FOLLOW_STATE")
+  if [ -n "$retired" ] && ! out=$(docker image rm "$retired" 2>&1 >/dev/null); then
+    cleanup="; could not remove $retired: $(last_line "$out")"
+  fi
+  state=$(jq -c 'del(.retired, .checking)' <<<"$FOLLOW_STATE") || return 1
+  follow_write "$state" || return 1
+  case $phase:$1 in
+    move:healthy) say "follow: $version is healthy on the same data; the previous image stays available for rollback$cleanup" ;;
+    back:healthy) say "follow: back on $version, healthy$cleanup" ;;
+    back:unhealthy) say "follow: back on $version, still unhealthy ($SERVER_STATE; $GATE_STATE)$cleanup" ;;
+  esac
+}
+
+keep_follow() {
+  [ -n "$FOLLOW_STATE" ] || return 0
+  if [ -n "$FOLLOW_CHECKING" ]; then
+    if follow_healthy; then
+      follow_settle healthy
+    elif [ "$(now)" -ge "$FOLLOW_DEADLINE" ]; then
+      follow_settle unhealthy
+    fi
+  elif [ "$CHECKOUT_READY" = true ] && [ "$(now)" -ge "$FOLLOW_NEXT" ] && follow_healthy; then
+    follow_step
+    FOLLOW_NEXT=$(($(now) + WS_FOLLOW_EVERY))
+  fi
+}
+
 # The keeping itself. It runs as a child of the keeper and takes no signal: the keeper ends it. It tells the keeper,
 # once, that nothing keeps the workspace from starting any more.
 keep_workspace() {
@@ -1579,11 +1775,15 @@ keep_workspace() {
     nap "$WS_REFUSE_EVERY"
   done
   until load_settings; do
-    say "workspace $WS_NAME does not start: its settings cannot be used: $REFUSAL. They are fixed when the machine is created: service_remove it and create it again with settings that are right"
+    say "workspace $WS_NAME does not start: its settings cannot be used: $REFUSAL. Propose corrected settings with service_update"
     nap "$WS_REFUSE_EVERY"
   done
   until mkdir -p "$WS_RUN" && chmod 0700 "$WS_RUN" && data_directories; do
     say "workspace $WS_NAME does not start: $WS_RUN or one of its data directories under ${WS_DATA%/*} could not be made"
+    nap "$WS_REFUSE_EVERY"
+  done
+  until follow_read; do
+    say "workspace $WS_NAME does not start: the follow state $WS_FOLLOW_STATE cannot be read. Removing this file starts again from settings.serverImage"
     nap "$WS_REFUSE_EVERY"
   done
   kill -USR1 "$$"
@@ -1610,6 +1810,7 @@ keep_workspace() {
       last=$state
       said=$(now)
     fi
+    keep_follow
     nap "$WS_TICK"
   done
 }
