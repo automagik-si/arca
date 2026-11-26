@@ -1584,13 +1584,9 @@ impl TenantHandler {
         // A new tenant's block holds no address in use, and a live address is in no record: the state of each running
         // instance on the service network is read, and no other.
         let rows = service_listing(read, None, &subject, "Nothing was created.")?;
-        let rows = with_live_state(
-            read,
-            &rows,
-            on_service_network,
-            &subject,
-            "Nothing was created.",
-        )?;
+        let live = with_live_state(read, &rows, on_service_network);
+        let problem = state_problem(&live.unread);
+        let rows = live.rows;
         let leases = service_leases(read, &subject)?;
         let in_use = service_used(&rows, &leases, entries);
         let held = held_blocks(&self.cfg, entries);
@@ -1667,7 +1663,11 @@ impl TenantHandler {
         }
         let entries = lock(&self.kernel)?.entries().to_vec();
         let scope = scope_of(&self.cfg, &id, &entries)?;
-        Ok(status_json(&scope, &entries, Some(0)))
+        let mut status = status_json(&scope, &entries, Some(0));
+        if let Some(problem) = problem {
+            status["stateProblem"] = json!(problem);
+        }
+        Ok(status)
     }
 
     /// Removes a tenant in the one order Incus accepts: each instance is deleted and read back absent before its NIC

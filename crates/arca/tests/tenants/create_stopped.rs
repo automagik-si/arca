@@ -105,15 +105,32 @@ fn create_bodies(rig: &Rig, instance: &str) -> Vec<Value> {
         .collect()
 }
 
+/// Sorts each run of reads of an instance's `/state` that follow one another: a create reads them side by side.
+fn sort_state_reads(lines: &mut [String]) {
+    let state_read =
+        |line: &String| line.starts_with("GET /1.0/instances/") && line.contains("/state?");
+    let mut at = 0;
+    while at < lines.len() {
+        let run = lines[at..]
+            .iter()
+            .take_while(|line| state_read(line))
+            .count();
+        lines[at..at + run].sort();
+        at += run.max(1);
+    }
+}
+
 /// Everything a rig sent Incus and wrote down: each request with its status, each write with its config keys, each
-/// request's body, and the effect journal.
+/// request's body, and the effect journal. A create reads the live state of several instances side by side, so each run
+/// of reads of an instance's `/state` that follow one another is sorted.
 fn everything(rig: &Rig) -> (Vec<String>, Vec<String>, Vec<String>, String) {
-    let requests = rig
+    let mut requests: Vec<String> = rig
         .fake()
         .requests()
         .iter()
         .map(|request| format!("{} {} {}", request.method, request.path, request.status))
         .collect();
+    sort_state_reads(&mut requests);
     let writes = rig
         .fake()
         .writes()
@@ -128,7 +145,7 @@ fn everything(rig: &Rig) -> (Vec<String>, Vec<String>, Vec<String>, String) {
             )
         })
         .collect();
-    let bodies = rig
+    let mut bodies: Vec<String> = rig
         .fake()
         .service_requests()
         .iter()
@@ -141,6 +158,7 @@ fn everything(rig: &Rig) -> (Vec<String>, Vec<String>, Vec<String>, String) {
             )
         })
         .collect();
+    sort_state_reads(&mut bodies);
     let journal = fs::read_to_string(rig.dir.join("journal.jsonl")).expect("the effect journal");
     (requests, writes, bodies, journal)
 }

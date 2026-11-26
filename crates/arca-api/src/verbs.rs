@@ -1060,7 +1060,7 @@ static VERBS: [Verb; 103] = [
         summary_text: summary_tenant,
         cut: no_cut,
         params: tenant_create_params,
-        result: tenant_status_result,
+        result: tenant_create_result,
         target: Target::Node,
     },
     Verb {
@@ -3198,6 +3198,7 @@ fn function_result() -> Value {
             ])),
         ),
         ("destinations", false, json!({ "type": "array" })),
+        ("stateProblem", false, state_problem_schema()),
         ("internet", true, boolean()),
         ("triggers", true, json!({ "type": "array" })),
         ("limits", true, json!({ "type": "object" })),
@@ -3533,6 +3534,12 @@ fn tenant_status_fields() -> Vec<Field> {
 
 fn tenant_status_result() -> Value {
     result(tenant_status_fields())
+}
+
+fn tenant_create_result() -> Value {
+    let mut fields = tenant_status_fields();
+    fields.push(("stateProblem", false, state_problem_schema()));
+    result(fields)
 }
 
 fn tenant_list_result() -> Value {
@@ -5785,6 +5792,15 @@ fn service_create_params_base() -> Value {
     })
 }
 
+/// The `stateProblem` a create answers when it could not read the live state of some instances its address or MAC check
+/// is about.
+fn state_problem_schema() -> Value {
+    json!({
+        "description": "Present when the create could not read the live state of some instances its address or MAC check is about, in the time it gives those reads: which ones, and why. The create went on and counted their records, leases and devices, so only an address or a MAC that one of their guests set by itself could be missed.",
+        "type": "string"
+    })
+}
+
 fn service_create_result() -> Value {
     let mut view = service_view_schema();
     view["properties"]["stoppedBecause"] = json!({
@@ -5792,6 +5808,7 @@ fn service_create_result() -> Value {
         "maxLength": 4096,
         "type": "string"
     });
+    view["properties"]["stateProblem"] = state_problem_schema();
     with_run(&mut view);
     view
 }

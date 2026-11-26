@@ -6727,6 +6727,10 @@
               ],
               "type": "string"
             },
+            "stateProblem": {
+              "description": "Present when the create could not read the live state of some instances its address or MAC check is about, in the time it gives those reads: which ones, and why. The create went on and counted their records, leases and devices, so only an address or a MAC that one of their guests set by itself could be missed.",
+              "type": "string"
+            },
             "stoppedBecause": {
               "description": "Present when the service was created stopped: why, in words that name a secret and never show one. Either the call said start: false, or its template is created stopped whatever the call says.",
               "maxLength": 4096,
@@ -12336,6 +12340,10 @@
               "minimum": 0,
               "type": "integer"
             },
+            "stateProblem": {
+              "description": "Present when the create could not read the live state of some instances its address or MAC check is about, in the time it gives those reads: which ones, and why. The create went on and counted their records, leases and devices, so only an address or a MAC that one of their guests set by itself could be missed.",
+              "type": "string"
+            },
             "use": {
               "properties": {
                 "containers": {
@@ -13609,6 +13617,10 @@
               },
               "type": "array"
             },
+            "stateProblem": {
+              "description": "Present when the create could not read the live state of some instances its address or MAC check is about, in the time it gives those reads: which ones, and why. The create went on and counted their records, leases and devices, so only an address or a MAC that one of their guests set by itself could be missed.",
+              "type": "string"
+            },
             "triggers": {
               "type": "array"
             }
@@ -13869,6 +13881,10 @@
                       "type": "object"
                     },
                     "type": "array"
+                  },
+                  "stateProblem": {
+                    "description": "Present when the create could not read the live state of some instances its address or MAC check is about, in the time it gives those reads: which ones, and why. The create went on and counted their records, leases and devices, so only an address or a MAC that one of their guests set by itself could be missed.",
+                    "type": "string"
                   },
                   "triggers": {
                     "type": "array"

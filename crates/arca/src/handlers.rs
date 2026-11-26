@@ -7043,10 +7043,13 @@ fn service_listing(
     }
 }
 
-/// Whether the instance `row` has live state: it runs, or is frozen. A stopped instance holds no live address or
-/// interface, and Incus can still take seconds to say so for a virtual machine.
+/// Whether the instance `row` may have live state: Incus lists it in any status but `Stopped` (`Running`, `Frozen`,
+/// `Ready` that a guest sets while it runs, `Error`). A stopped instance holds no live address or interface, and Incus
+/// can still take seconds to say so for a virtual machine.
 fn has_live_state(row: &Value) -> bool {
-    matches!(row["status"].as_str(), Some("Running" | "Frozen"))
+    row["status"]
+        .as_str()
+        .is_some_and(|status| status != "Stopped")
 }
 
 /// Whether the instance `row` has a network card that `on` picks, among its own devices or those its profiles give it.
@@ -7075,39 +7078,121 @@ fn holds_a_live_card(row: &Value) -> bool {
     has_live_state(row) && holds_a_card(row, |_| true)
 }
 
+/// The whole time a create waits for the live state of the instances its checks are about: the time one read is given.
+const LIVE_STATE_BUDGET: Duration = arca_incus::read::TIMEOUT;
+/// How many of those reads are made at the same time.
+const STATE_READS_AT_ONCE: usize = 8;
+
+/// An instance whose live state a create did not read, and why.
+#[derive(Debug, Clone)]
+struct Unread {
+    name: String,
+    project: String,
+    why: String,
+}
+
+/// One state read of [`with_live_state`]: the index of the instance it picked, and the answer, or `None` when the budget
+/// had run out before the read was made.
+type StateAnswer = (usize, Option<Result<Value, arca_incus::IncusError>>);
+
+/// Rows with the live state that was read, and the instances whose state was not.
+struct LiveRows {
+    rows: Vec<Value>,
+    unread: Vec<Unread>,
+}
+
 /// `rows`, with the live state of each row `wanted` picks read from its own `/state` and set as its `state`, as the
-/// listing with state holds it. The other rows are as they were. The reads are made one at a time, in the listing's
-/// order, each with its own deadline, so a create waits for the state of the instances its check is about and never for
-/// that of every instance on the node. An instance gone since the listing is left without state. When one of those reads
-/// is not answered, the call is refused in words, with `subject` and `changed` ([`incus_read_refused`]).
-fn with_live_state(
-    read: &UnixIncus,
-    rows: &[Value],
-    wanted: impl Fn(&Value) -> bool,
-    subject: &str,
-    changed: &str,
-) -> Result<Vec<Value>, CallError> {
+/// listing with state holds it. The other rows are as they were. The reads run side by side, a few at a time, and all of
+/// them together have [`LIVE_STATE_BUDGET`], so a create waits for the state of the instances its checks are about,
+/// never for that of every instance on the node, and never longer than one read is given while it holds the write gate.
+/// An instance gone since the listing is left without state. An instance whose read failed, or was not made before the
+/// budget ran out, is left without state too and named in `unread`: its records, leases and devices still count, and
+/// the call carries on ([`state_problem`] says so in its answer).
+fn with_live_state(read: &UnixIncus, rows: &[Value], wanted: impl Fn(&Value) -> bool) -> LiveRows {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     let mut rows = rows.to_vec();
-    for row in rows.iter_mut().filter(|row| wanted(row)) {
-        let Some(name) = row["name"].as_str().map(str::to_string) else {
-            continue;
-        };
-        let project = row["project"].as_str().unwrap_or("default");
-        let path = format!("/1.0/instances/{name}/state?project={project}");
-        match read_again_once(read, &path) {
-            Ok(state) => row["state"] = state,
-            Err(arca_incus::IncusError::Status { code: 404, .. }) => {}
-            Err(error) => {
-                return Err(incus_read_refused(
-                    &error,
-                    &format!("the live state of the instance {name}"),
-                    subject,
-                    changed,
-                ));
-            }
+    let picked: Vec<(usize, String, String)> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| wanted(row))
+        .filter_map(|(at, row)| {
+            let name = row["name"].as_str()?.to_string();
+            let project = row["project"].as_str().unwrap_or("default").to_string();
+            Some((at, name, project))
+        })
+        .collect();
+    let budgeted = read.clone().with_total_budget(LIVE_STATE_BUDGET);
+    let next = AtomicUsize::new(0);
+    let answers: Mutex<Vec<StateAnswer>> = Mutex::new(Vec::new());
+    thread::scope(|scope| {
+        for _ in 0..picked.len().min(STATE_READS_AT_ONCE) {
+            scope.spawn(|| {
+                loop {
+                    let index = next.fetch_add(1, Ordering::SeqCst);
+                    let Some((_, name, project)) = picked.get(index) else {
+                        break;
+                    };
+                    let path = format!("/1.0/instances/{name}/state?project={project}");
+                    let spent = budgeted
+                        .remaining_budget()
+                        .is_some_and(|left| left.is_zero());
+                    let answer = (!spent).then(|| read_again_once(&budgeted, &path));
+                    answers
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .push((index, answer));
+                }
+            });
         }
+    });
+    let mut answers = answers.into_inner().unwrap_or_else(PoisonError::into_inner);
+    answers.sort_by_key(|(index, _)| *index);
+    let mut unread = Vec::new();
+    for (index, answer) in answers {
+        let (at, name, project) = &picked[index];
+        let why = match answer {
+            Some(Ok(state)) => {
+                rows[*at]["state"] = state;
+                continue;
+            }
+            Some(Err(arca_incus::IncusError::Status { code: 404, .. })) => continue,
+            Some(Err(arca_incus::IncusError::Timeout)) => format!(
+                "Incus did not answer within the {} seconds a create gives these reads",
+                LIVE_STATE_BUDGET.as_secs()
+            ),
+            Some(Err(error)) => incus_read_cause(&error).1,
+            None => format!(
+                "it was not read: the {} seconds a create gives these reads had run out",
+                LIVE_STATE_BUDGET.as_secs()
+            ),
+        };
+        eprintln!(
+            "arca: the live state of the instance {name} in project {project} was not read: {why}"
+        );
+        unread.push(Unread {
+            name: name.clone(),
+            project: project.clone(),
+            why,
+        });
     }
-    Ok(rows)
+    LiveRows { rows, unread }
+}
+
+/// What a create's answer says when the live state of some instances was not read, or `None` when every one was. The
+/// create still picked its address (or checked its MAC) against those instances' records, leases and devices: only an
+/// address or a MAC that such a guest set by itself, which no record holds, could not be seen.
+fn state_problem(unread: &[Unread]) -> Option<String> {
+    if unread.is_empty() {
+        return None;
+    }
+    let each = unread
+        .iter()
+        .map(|one| format!("{} in project {} ({})", one.name, one.project, one.why))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Some(format!(
+        "the live state of these instances was not read: {each}. The create went on and counted their records, leases and devices, so only an address or a MAC that one of their guests set by itself could be missed"
+    ))
 }
 
 fn service_leases(read: &UnixIncus, subject: &str) -> Result<Vec<String>, CallError> {
@@ -7857,7 +7942,8 @@ struct ServiceParts<'a> {
 impl ServiceHandler {
     /// The address a new service takes: in a tenant, the lowest free address of the tenant's block; in the node's own
     /// project, the lowest free address of the plan that no tenant's block holds. Every instance, lease and record on
-    /// the node counts as in use, and so does every address a running instance on the service network holds live.
+    /// the node counts as in use, and so does every address a running instance on the service network holds live. With
+    /// the address comes what the answer says about the instances whose live state was not read ([`state_problem`]).
     fn free_address(
         &self,
         read: &UnixIncus,
@@ -7866,20 +7952,15 @@ impl ServiceHandler {
         entries: &[arca_kernel::desired::Entry],
         tenant: Option<&tenants::TenantScope>,
         subject: &str,
-    ) -> Result<String, CallError> {
+    ) -> Result<(String, Option<String>), CallError> {
         let candidates = crate::service::candidates(cidr).map_err(service_template_error)?;
         let leases = service_leases(read, subject)?;
         // A live address no record holds can only be on the service network: only those instances' state is read.
-        let rows = with_live_state(
-            read,
-            rows,
-            on_service_network,
-            subject,
-            "Nothing was created.",
-        )?;
-        let used = service_used(&rows, &leases, entries);
+        let live = with_live_state(read, rows, on_service_network);
+        let problem = state_problem(&live.unread);
+        let used = service_used(&live.rows, &leases, entries);
         if let Some(scope) = tenant {
-            return tenants::free_address(scope, &used);
+            return tenants::free_address(scope, &used).map(|ipv4| (ipv4, problem));
         }
         let blocks = tenants::held_blocks(&self.cfg, entries);
         let candidates = if blocks.is_empty() {
@@ -7891,7 +7972,7 @@ impl ServiceHandler {
         candidates
             .iter()
             .find(|ip| !used.contains(ip))
-            .map(|ip| ip.to_string())
+            .map(|ip| (ip.to_string(), problem))
             .ok_or_else(|| {
                 CallError::capacity(
                     format!("the service subnet {cidr} has no free address (.10-.239)"),
@@ -9361,22 +9442,19 @@ impl ServiceHandler {
                         }
                         VmNetwork::Managed => {}
                     }
+                    // What the answer says about instances whose live state was not read.
+                    let mut problem = None;
                     if let Some(mac) = &mac {
                         // A MAC a guest set on a card of its own is only in its live state: the state of each running
                         // instance with a card is read for it, and no other.
-                        let held = record_holds_mac(&entries, mac)
-                            || with_live_state(
-                                &read,
-                                &rows,
-                                holds_a_live_card,
-                                &subject,
-                                "Nothing was created.",
-                            )?
-                            .iter()
-                            .any(|row| instance_holds_mac(row, mac));
-                        if held {
+                        if record_holds_mac(&entries, mac) {
                             return Err(service_refused(mac_held(mac)));
                         }
+                        let live = with_live_state(&read, &rows, holds_a_live_card);
+                        if live.rows.iter().any(|row| instance_holds_mac(row, mac)) {
+                            return Err(service_refused(mac_held(mac)));
+                        }
+                        problem = state_problem(&live.unread);
                     }
                     if let Some(refusal) = create_room_refusal(
                         &self.cfg,
@@ -9443,7 +9521,8 @@ impl ServiceHandler {
                     let place = match network {
                         VmNetwork::Host(bridge) => VmPlace::Host { bridge, mac },
                         VmNetwork::Managed => {
-                            let ipv4 = self.free_address(
+                            let ipv4;
+                            (ipv4, problem) = self.free_address(
                                 &read,
                                 &cidr,
                                 &all_rows,
@@ -9494,6 +9573,9 @@ impl ServiceHandler {
                     if !config.start {
                         made["stoppedBecause"] = json!(stopped_because(start, forced));
                     }
+                    if let Some(problem) = problem {
+                        made["stateProblem"] = json!(problem);
+                    }
                     return Ok(made);
                 }
                 if bridged.is_some() && !managed {
@@ -9541,7 +9623,7 @@ impl ServiceHandler {
                 {
                     return Err(service_refused(why));
                 }
-                let ipv4 = self.free_address(
+                let (ipv4, problem) = self.free_address(
                     &read,
                     &cidr,
                     &all_rows,
@@ -9606,6 +9688,9 @@ impl ServiceHandler {
                 }
                 if config.run_tmpfs {
                     service_update::say_run(&self.cfg, &config, &mut made);
+                }
+                if let Some(problem) = problem {
+                    made["stateProblem"] = json!(problem);
                 }
                 // The node's front was made, or made again at another address: every tenant service's ACL follows now.
                 let front = self

@@ -14,6 +14,10 @@
 //! machine slow enough has another log. A rig with such a wait belongs in the file only as one of [`WITHOUT_WAITS`],
 //! whose logs are compared with their waits left out.
 //!
+//! A create reads the live state of several instances side by side, so the fake writes those reads down in the order it
+//! happened to answer them. Each run of reads of an instance's `/state` that follow one another is compared sorted
+//! ([`log_text`]); every other request keeps the order it was sent in.
+//!
 //! A digest names a log and does not show it. `ARCA_GOLDEN_DUMP=<directory>` writes the text each digest is made from,
 //! one file for each rig and digest, so two runs that differ leave two files to compare. A rig that fails the comparison
 //! prints the same text.
@@ -56,19 +60,33 @@ fn is_wait(request: &arca_incus::RecordedRequest) -> bool {
         && request.path.contains("/wait?")
 }
 
-/// The text a rig's digest is made from: each request in the order the fake recorded it, then each write. With `waits`
-/// false the waits on an operation are left out.
+/// Whether a request is a read of one instance's live state.
+fn is_state_read(request: &arca_incus::RecordedRequest) -> bool {
+    request.method == "GET"
+        && request.path.starts_with("/1.0/instances/")
+        && request.path.contains("/state?")
+}
+
+/// The text a rig's digest is made from: each request in the order the fake recorded it, each run of reads of an
+/// instance's state sorted, then each write. With `waits` false the waits on an operation are left out.
 fn log_text(fake: &FakeIncus, waits: bool) -> String {
     let mut text = String::new();
+    let mut states: Vec<String> = Vec::new();
     for request in fake.requests() {
         if !waits && is_wait(&request) {
             continue;
         }
-        text.push_str(&format!(
-            "{} {} {}\n",
-            request.method, request.path, request.status
-        ));
+        let line = format!("{} {} {}\n", request.method, request.path, request.status);
+        if is_state_read(&request) {
+            states.push(line);
+            continue;
+        }
+        states.sort();
+        text.extend(states.drain(..));
+        text.push_str(&line);
     }
+    states.sort();
+    text.extend(states.drain(..));
     for write in fake.writes() {
         text.push_str(&format!(
             "w {} {} {} {}\n",

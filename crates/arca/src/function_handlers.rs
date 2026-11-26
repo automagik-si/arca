@@ -621,7 +621,7 @@ impl ServiceHandler {
             return Err(internal());
         }
         let id = crate::service::entry_id(None, &name);
-        let ipv4 =
+        let (ipv4, problem) =
             self.free_address(read, cidr, rows, entries, None, &format!("function {name}"))?;
         let pool = service_pool(&self.cfg)
             .map_err(|_| service_refused("the default profile does not name a storage pool"))?;
@@ -771,6 +771,10 @@ impl ServiceHandler {
             let _ = self.edge_relinked(edge, before, caller);
         }
         let runner = self.runner()?;
-        Ok(function_view(&config, runner))
+        let mut view = function_view(&config, runner);
+        if let Some(problem) = problem {
+            view["stateProblem"] = json!(problem);
+        }
+        Ok(view)
     }
 }
