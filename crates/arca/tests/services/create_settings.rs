@@ -1091,7 +1091,15 @@ fn vm_pin_update_refuses_an_unavailable_guest_agent_without_rollback() {
     assert_eq!(entry(&rig, "service-p1").config, record);
     assert_eq!(rig.fake.service_files(), files);
     assert_eq!(rig.fake.state_actions(PROJECT, "p1"), actions);
-    assert_eq!(rig.fake.service_requests().len(), requests + 1);
+    // The ownership and power checks read the instance; only one file request reaches the guest.
+    let sent: Vec<_> = rig.fake.service_requests()[requests..]
+        .iter()
+        .filter(|request| request.path.contains("/files?"))
+        .map(|request| (request.method.clone(), request.path.clone()))
+        .collect();
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0].0, "POST");
+    assert!(sent[0].1.contains(service::GUEST_SETTINGS_PATH), "{sent:?}");
 
     let rows = vm_pin_journal(&rig.dir.join("service-updates.jsonl"));
     assert_eq!(rows.len(), 3);
