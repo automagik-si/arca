@@ -2612,24 +2612,31 @@ fn a_private_destination_comes_from_the_nodes_config_and_is_on_the_card() {
 }
 
 #[test]
-fn a_function_create_reads_the_instances_with_their_live_state() {
+fn a_function_create_reads_the_live_state_of_the_instances_on_the_service_network_only() {
     let rig = Rig::new();
     rig.nats();
-    let with_state = |rig: &Rig| {
+    let reads = |rig: &Rig, path: &dyn Fn(&str) -> bool| {
         rig.fake
             .requests()
             .iter()
-            .filter(|request| {
-                request.method == "GET"
-                    && request.path.starts_with("/1.0/instances?")
-                    && request.path.contains("recursion=2")
-            })
+            .filter(|request| request.method == "GET" && path(&request.path))
             .count()
     };
-    let before = with_state(&rig);
+    let listing = |path: &str| path.starts_with("/1.0/instances?") && path.contains("recursion=2");
+    let state_of_nats = |path: &str| path.starts_with("/1.0/instances/nats/state");
+    let (listings, states) = (reads(&rig, &listing), reads(&rig, &state_of_nats));
     rig.approved("function_create", relay_args())
         .expect("the function relay");
-    assert!(with_state(&rig) > before, "the create read no live state");
+    // The running service on the service network may hold an address live; no listing waits for every instance's state.
+    assert!(
+        reads(&rig, &state_of_nats) > states,
+        "the create read no live state"
+    );
+    assert_eq!(
+        reads(&rig, &listing),
+        listings,
+        "the create read every instance's state"
+    );
 }
 
 #[test]

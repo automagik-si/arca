@@ -559,19 +559,181 @@ fn listings_with_state(fake: &FakeIncus) -> usize {
 }
 
 #[test]
-fn a_tenant_create_reads_the_instances_with_their_live_state_and_a_tenant_list_does_not() {
+fn a_tenant_create_reads_the_live_state_of_the_instances_on_the_service_network_and_a_tenant_list_none()
+ {
     let rig = Rig::new(Some(policy()));
-    let before = listings_with_state(rig.fake());
+    rig.template("app", app_template("app"));
     rig.create_tenant(json!({ "id": A })).expect("tenant");
-    let after = listings_with_state(rig.fake());
+    rig.call(
+        "service_create",
+        json!({ "name": "one", "template": "app", "tenant": A }),
+    )
+    .expect("a service in the tenant");
+    let state_of_one = format!("/1.0/instances/one-{A}/state");
+    let states = |fake: &FakeIncus| {
+        fake.requests()
+            .iter()
+            .filter(|request| request.method == "GET" && request.path.starts_with(&state_of_one))
+            .count()
+    };
+    let before = states(rig.fake());
+    rig.create_tenant(json!({ "id": B })).expect("tenant");
+    let after = states(rig.fake());
     assert!(after > before, "the create read no live state");
     rig.call_as("tenant_list", json!({}), Some(&["tenant_list"]))
         .expect("the list");
+    assert_eq!(states(rig.fake()), after, "the list read live state");
     assert_eq!(
         listings_with_state(rig.fake()),
-        after,
-        "the list read live state"
+        0,
+        "a listing with every instance's state"
     );
+}
+
+#[test]
+fn a_tenant_create_does_not_wait_for_the_state_of_an_instance_elsewhere() {
+    let rig = two_tenants(policy());
+    // A large machine of another project, on a host bridge, whose state Incus never answers in time; and the listing of
+    // every instance with its state, which waits for that machine, is never answered either.
+    rig.fake().add_instance(json!({
+        "name": "big", "project": "other", "type": "virtual-machine", "status": "Running",
+        "devices": { "eth0": { "type": "nic", "nictype": "bridged", "parent": "br-lan" } }
+    }));
+    let with_state = "/1.0/instances?all-projects=true&recursion=2";
+    rig.fake().unanswered_reads(with_state, 100);
+    rig.fake()
+        .unanswered_reads("/1.0/instances/big/state?project=other", 100);
+    let began = std::time::Instant::now();
+    rig.call(
+        "service_create",
+        json!({ "name": "one", "template": "app", "tenant": A }),
+    )
+    .expect("a create in the tenant");
+    assert!(
+        began.elapsed() < arca_incus::read::TIMEOUT,
+        "the create took {:?}",
+        began.elapsed()
+    );
+    let reads = |prefix: &str| {
+        rig.fake()
+            .requests()
+            .iter()
+            .filter(|request| request.method == "GET" && request.path.starts_with(prefix))
+            .count()
+    };
+    assert_eq!(reads(with_state), 0);
+    assert_eq!(reads("/1.0/instances/big/state"), 0);
+}
+
+/// Adds a running virtual machine `name` in `project` with a card on the managed service network, as one made by hand.
+fn machine_on_the_service_network(rig: &Rig, project: &str, name: &str) {
+    rig.fake().add_instance(json!({
+        "name": name, "project": project, "type": "virtual-machine", "status": "Running",
+        "devices": { "eth0": { "type": "nic", "network": arca_netproject::BRIDGE } }
+    }));
+}
+
+/// The GETs whose path starts with `prefix` the fake was asked for.
+fn gets(rig: &Rig, prefix: &str) -> usize {
+    rig.fake()
+        .requests()
+        .iter()
+        .filter(|request| request.method == "GET" && request.path.starts_with(prefix))
+        .count()
+}
+
+#[test]
+fn a_tenant_create_goes_on_when_the_state_of_a_machine_on_the_service_network_never_answers_and_names_it()
+ {
+    let rig = two_tenants(policy());
+    machine_on_the_service_network(&rig, "other", "big");
+    rig.fake()
+        .unanswered_reads("/1.0/instances/big/state?project=other", 100);
+    let began = std::time::Instant::now();
+    let made = rig
+        .call(
+            "service_create",
+            json!({ "name": "one", "template": "app", "tenant": A }),
+        )
+        .expect("a create in the tenant");
+    // It waited for that machine's state as long as a create gives these reads, once, and no longer.
+    assert!(began.elapsed() >= arca_incus::read::TIMEOUT);
+    assert!(began.elapsed() < 2 * arca_incus::read::TIMEOUT);
+    assert_eq!(gets(&rig, "/1.0/instances/big/state"), 1);
+    assert_eq!(
+        made["stateProblem"],
+        "the live state of these instances was not read: big in project other (Incus did not answer within the 10 seconds a create gives these reads). The create went on and counted their records, leases and devices, so only an address or a MAC that one of their guests set by itself could be missed"
+    );
+}
+
+#[test]
+fn two_slow_machines_on_the_service_network_are_read_side_by_side_within_one_budget() {
+    let rig = two_tenants(policy());
+    for name in ["big1", "big2"] {
+        machine_on_the_service_network(&rig, "other", name);
+        // Each answers within the time one read is given; the two in a row would not.
+        rig.fake().slow_reads(
+            &format!("/1.0/instances/{name}/state?project=other"),
+            1,
+            std::time::Duration::from_secs(6),
+        );
+    }
+    let began = std::time::Instant::now();
+    let made = rig
+        .call(
+            "service_create",
+            json!({ "name": "one", "template": "app", "tenant": A }),
+        )
+        .expect("a create in the tenant");
+    assert!(
+        began.elapsed() < arca_incus::read::TIMEOUT,
+        "the create took {:?}",
+        began.elapsed()
+    );
+    assert!(made.get("stateProblem").is_none(), "{made}");
+    assert_eq!(gets(&rig, "/1.0/instances/big1/state"), 1);
+    assert_eq!(gets(&rig, "/1.0/instances/big2/state"), 1);
+}
+
+#[test]
+fn two_machines_whose_state_never_answers_cost_one_budget_and_are_both_named() {
+    let rig = two_tenants(policy());
+    for name in ["big1", "big2"] {
+        machine_on_the_service_network(&rig, "other", name);
+        rig.fake()
+            .unanswered_reads(&format!("/1.0/instances/{name}/state?project=other"), 100);
+    }
+    let began = std::time::Instant::now();
+    let made = rig
+        .call(
+            "service_create",
+            json!({ "name": "one", "template": "app", "tenant": A }),
+        )
+        .expect("a create in the tenant");
+    assert!(
+        began.elapsed() < 2 * arca_incus::read::TIMEOUT,
+        "the create took {:?}: the two reads were not given one budget",
+        began.elapsed()
+    );
+    let problem = made["stateProblem"].as_str().expect("the problem");
+    assert!(problem.contains("big1 in project other ("), "{problem}");
+    assert!(problem.contains("big2 in project other ("), "{problem}");
+}
+
+#[test]
+fn a_machine_gone_before_its_state_is_read_is_no_problem() {
+    let rig = two_tenants(policy());
+    machine_on_the_service_network(&rig, "other", "gone");
+    rig.fake()
+        .fail_reads("/1.0/instances/gone/state?project=other", 1, 404);
+    let made = rig
+        .call(
+            "service_create",
+            json!({ "name": "one", "template": "app", "tenant": A }),
+        )
+        .expect("a create in the tenant");
+    assert!(made.get("stateProblem").is_none(), "{made}");
+    assert_eq!(gets(&rig, "/1.0/instances/gone/state"), 1);
 }
 
 #[path = "tenants/token_binding.rs"]

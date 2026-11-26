@@ -2408,7 +2408,17 @@ Among the service verbs, only these read live state:
   call still answers, with `ipv4` empty and `ipv4Problem` saying why. `service_list` reads no state: such a machine's
   row has `ipv4` empty and `ipv4In: "state"`, which says the address is there to be read and is not "none".
 - `service_create` and `function_create`, and `tenant_create`: a new instance's address, MAC or block must not be one
-  that an instance holds live without a record of it.
+  that an instance holds live without a record of it. They never read the listing with every instance's state. They
+  read the state of each running instance with a card on the service network, since only those can hold one of its
+  addresses. A virtual machine on a host bridge that names a `mac` reads the state of each running instance with any
+  card instead. The reads run side by side, eight at a time, and all of them share one budget of 10 seconds, the time
+  one read is given. A stopped instance, or one only on a host bridge, is never waited for.
+
+  A create never fails because one of those reads did not answer. When a state is not read in time (Incus did not
+  answer, failed, or the budget ran out before the read was made), the create counts that instance's records, leases
+  and devices, goes on, and names it in its answer's `stateProblem`, with why. The node's log has a line for each one.
+  The risk is small: only an address or a MAC that such a guest set by itself, and that no record or lease holds,
+  could be handed out again. A machine that `stateProblem` names has a guest agent that is slow or not answering.
 
 Outside the service verbs, the metrics sampler reads each running instance's own state for its CPU and memory, one
 instance at a time with a short deadline, and never the listing with every instance's state (see "Instances" under
