@@ -2438,6 +2438,12 @@ fails, the call is refused in words, with a code of its own in `data.refusal`:
 The sentence says what was being read and for which service, and what the call had changed by then ("Nothing was
 changed.", or that a create did go through). It never holds Incus's own text.
 
+A read-only tool call (one served with `readOnlyHint: true`) that is the same as one still running, by the same token
+with the same arguments, joins that run and gets its answer instead of starting a handler of its own. A handler runs to
+its end even when its caller has gone, so a caller that times out and asks again no longer adds one more handler, and
+one more Incus read, each time. Once the run has answered the next call reads again; nothing is kept. Writes and the
+verbs not served read-only are never shared.
+
 `internal: the tool failed` is left for a fault of Arca's own: a handler that panicked, an answer that does not fit
 the verb's schema, or a failure a handler keeps to itself. A few failures that could be said in words are still among
 them: the kernel refusing to save a create's own state, and the read of the host's addresses a function with

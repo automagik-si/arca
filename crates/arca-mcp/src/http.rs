@@ -114,6 +114,8 @@ pub struct Server {
     oauth: Option<(Arc<dyn IssuedTokens>, String)>,
     /// The linked nodes a call may name with `node` ([`Server::linked_nodes`]).
     pub(crate) linked: Option<Arc<dyn LinkedNodes>>,
+    /// The read-only tool runs in flight: an identical call joins one instead of starting another (issue 303).
+    pub(crate) reads: Arc<crate::flight::Flights>,
 }
 
 /// Answers one GET route with a body. The server runs it on a blocking thread, after the bearer check.
@@ -164,6 +166,7 @@ impl Server {
             terminal: None,
             oauth: None,
             linked: None,
+            reads: Arc::default(),
         }
     }
 

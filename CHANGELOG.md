@@ -4,6 +4,10 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 
 ## Unreleased
 
+Repeated read-only tool calls no longer pile up. A caller that times out and asks again used to start one more handler
+beside the one it left running, so a slow read could fill the node's CPUs with reads nobody was waiting for. Now the
+same read by the same token joins the run that is still going.
+
 `service_update` checks for instance snapshots before changing the service. If any exist, it names them and leaves the
 service alone. The update takes no snapshot. Rollback rebuilds the root from the old image.
 
