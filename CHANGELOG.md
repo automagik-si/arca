@@ -4,6 +4,8 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 
 ## Unreleased
 
+## 0.39.0 (2026-11-26)
+
 Owners can change a VM's named `createSettings` in place by approving a `service_update` card. The card and
 service update journal show each changed value. Arca writes the guest settings file and restarts a running VM.
 
@@ -27,6 +29,14 @@ New `automagik-workspace` VMs install Automagik 3.160.2 by verified digest, then
 The keeper checks each newer digest against its fixed release record and verifies its build provenance before
 pulling it. If the new server or gate fails its health check, the keeper restores the previous image. Both moves
 reuse the existing `/data` mounts and appear in `service_logs`.
+
+- Merge PR 298: Automagik workspace follows Automagik's server lane, install pinned to 3.160.2
+- Merge PR 269: formula command for app updates
+- Merge PR 283 fix 3: clear workspace and network residue between jobs
+- Merge PR 283: runner pool slots start each job clean
+- Merge PR 284: runner slots get cpuset and the limits the job sees, memory ceiling setting, registration-token mode
+- Merge PR 282: change a VM service's create settings in place
+- Merge PR 274: service_update health port asked, not assumed
 
 ## 0.38.0 (2026-11-19)
 
