@@ -157,7 +157,7 @@ fn shape(value: &str) -> (usize, String) {
 
 /// The listing every service call reads: the instances, without their live state.
 const LISTING: &str = "/1.0/instances?all-projects=true&recursion=1";
-/// The listing only a create reads: each instance with its live state, slow where a guest's agent is slow.
+/// The listing of each instance with its live state, slow where a guest's agent is slow: no call reads it.
 const LISTING_WITH_STATE: &str = "/1.0/instances?all-projects=true&recursion=2";
 const MACHINE: &str = "a virtual machine's secret is 8 to 4096 characters, not counting one line break at its end; it may have line breaks, and no other control character";
 const CONTAINER: &str =
@@ -799,11 +799,11 @@ fn a_create_never_hands_out_an_address_or_a_mac_that_only_a_guests_live_state_ho
             ("br-inside", mac, true, own),
         ],
     );
-    let with_state = reads_of(&rig, LISTING_WITH_STATE);
+    let state_of_p1 = reads_of(&rig, "/1.0/instances/p1/state");
     rig.call("service_create", json!({"name":"p3","template":"pool"}))
         .expect("the create");
     assert!(
-        reads_of(&rig, LISTING_WITH_STATE) > with_state,
+        reads_of(&rig, "/1.0/instances/p1/state") > state_of_p1,
         "the create read no live state"
     );
     let given = address_of(&rig, "p3");
@@ -849,8 +849,12 @@ fn a_create_does_not_wait_for_the_live_state_of_an_instance_off_the_service_netw
         .unanswered_reads(&format!("/1.0/instances/p2/state?project={PROJECT}"), 100);
     rig.fake
         .unanswered_reads("/1.0/instances/big/state?project=default", 100);
-    let before = [LISTING_WITH_STATE, "/1.0/instances/p2/state", "/1.0/instances/big/state"]
-        .map(|path| reads_of(&rig, path));
+    let before = [
+        LISTING_WITH_STATE,
+        "/1.0/instances/p2/state",
+        "/1.0/instances/big/state",
+    ]
+    .map(|path| reads_of(&rig, path));
     let began = Instant::now();
     rig.call("service_create", json!({"name":"p3","template":"pool"}))
         .expect("a create on the service network");
@@ -859,8 +863,12 @@ fn a_create_does_not_wait_for_the_live_state_of_an_instance_off_the_service_netw
         "the create took {:?}, as long as a read of a state that never answers is given",
         began.elapsed()
     );
-    let after = [LISTING_WITH_STATE, "/1.0/instances/p2/state", "/1.0/instances/big/state"]
-        .map(|path| reads_of(&rig, path));
+    let after = [
+        LISTING_WITH_STATE,
+        "/1.0/instances/p2/state",
+        "/1.0/instances/big/state",
+    ]
+    .map(|path| reads_of(&rig, path));
     assert_eq!(after, before, "the create read a state it does not need");
     assert!(!address_of(&rig, "p3").is_empty());
 }

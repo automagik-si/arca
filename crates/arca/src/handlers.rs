@@ -7016,36 +7016,98 @@ fn read_again_once(read: &UnixIncus, path: &str) -> Result<Value, arca_incus::In
     read.get_within(path, left)
 }
 
-/// The instances of `project`, or of every project. `with_state` asks Incus for each one's live state too, which for a
-/// running virtual machine it takes from the guest's agent and can take seconds for one machine: only a call that
-/// picks an address or a MAC for a new instance asks for it, since a live address or interface is in no record. Every
-/// other call reads the listing without state, which holds each instance's status, config and devices and is answered
-/// at once. `subject` and `changed` are for the refusal when Incus does not answer ([`incus_read_refused`]).
+/// The instances of `project`, or of every project, as Incus lists them without their live state: each one's status,
+/// config and devices, answered at once. A running virtual machine's live state comes from its guest's agent and can
+/// take seconds for one machine, and a listing with every instance's state is as slow as the slowest of them, so no call
+/// asks for that listing. A call that needs a live address or interface reads the state of the instances its check is
+/// about ([`with_live_state`]). `subject` and `changed` are for the refusal when Incus does not answer
+/// ([`incus_read_refused`]).
 fn service_listing(
     read: &UnixIncus,
     project: Option<&str>,
-    with_state: bool,
     subject: &str,
     changed: &str,
 ) -> Result<Vec<Value>, CallError> {
-    let recursion = if with_state { 2 } else { 1 };
     let path = project
-        .map(|project| format!("/1.0/instances?project={project}&recursion={recursion}"))
-        .unwrap_or_else(|| format!("/1.0/instances?all-projects=true&recursion={recursion}"));
+        .map(|project| format!("/1.0/instances?project={project}&recursion=1"))
+        .unwrap_or_else(|| "/1.0/instances?all-projects=true&recursion=1".to_string());
     match read_again_once(read, &path) {
         Ok(rows) => Ok(rows.as_array().cloned().unwrap_or_default()),
         Err(arca_incus::IncusError::Status { code: 404, .. }) => Ok(Vec::new()),
         Err(error) => Err(incus_read_refused(
             &error,
-            if with_state {
-                "the instances and their live state"
-            } else {
-                "the instances"
-            },
+            "the instances",
             subject,
             changed,
         )),
     }
+}
+
+/// Whether the instance `row` has live state: it runs, or is frozen. A stopped instance holds no live address or
+/// interface, and Incus can still take seconds to say so for a virtual machine.
+fn has_live_state(row: &Value) -> bool {
+    matches!(row["status"].as_str(), Some("Running" | "Frozen"))
+}
+
+/// Whether the instance `row` has a network card that `on` picks, among its own devices or those its profiles give it.
+fn holds_a_card(row: &Value, on: impl Fn(&Value) -> bool) -> bool {
+    ["devices", "expanded_devices"].iter().any(|key| {
+        row[*key].as_object().is_some_and(|devices| {
+            devices
+                .values()
+                .any(|device| device["type"] == "nic" && on(device))
+        })
+    })
+}
+
+/// Whether the instance `row` can hold an address of the managed service network live: it has live state and a card on
+/// the managed bridge, named as its network or as a bridged card's parent. An instance on a host bridge, or on no
+/// network, cannot, so a create's address check does not wait for its state.
+fn on_service_network(row: &Value) -> bool {
+    has_live_state(row)
+        && holds_a_card(row, |card| {
+            card["network"] == arca_netproject::BRIDGE || card["parent"] == arca_netproject::BRIDGE
+        })
+}
+
+/// Whether the instance `row` can hold a MAC live: it has live state and any network card.
+fn holds_a_live_card(row: &Value) -> bool {
+    has_live_state(row) && holds_a_card(row, |_| true)
+}
+
+/// `rows`, with the live state of each row `wanted` picks read from its own `/state` and set as its `state`, as the
+/// listing with state holds it. The other rows are as they were. The reads are made one at a time, in the listing's
+/// order, each with its own deadline, so a create waits for the state of the instances its check is about and never for
+/// that of every instance on the node. An instance gone since the listing is left without state. When one of those reads
+/// is not answered, the call is refused in words, with `subject` and `changed` ([`incus_read_refused`]).
+fn with_live_state(
+    read: &UnixIncus,
+    rows: &[Value],
+    wanted: impl Fn(&Value) -> bool,
+    subject: &str,
+    changed: &str,
+) -> Result<Vec<Value>, CallError> {
+    let mut rows = rows.to_vec();
+    for row in rows.iter_mut().filter(|row| wanted(row)) {
+        let Some(name) = row["name"].as_str().map(str::to_string) else {
+            continue;
+        };
+        let project = row["project"].as_str().unwrap_or("default");
+        let path = format!("/1.0/instances/{name}/state?project={project}");
+        match read_again_once(read, &path) {
+            Ok(state) => row["state"] = state,
+            Err(arca_incus::IncusError::Status { code: 404, .. }) => {}
+            Err(error) => {
+                return Err(incus_read_refused(
+                    &error,
+                    &format!("the live state of the instance {name}"),
+                    subject,
+                    changed,
+                ));
+            }
+        }
+    }
+    Ok(rows)
 }
 
 fn service_leases(read: &UnixIncus, subject: &str) -> Result<Vec<String>, CallError> {
@@ -7795,7 +7857,7 @@ struct ServiceParts<'a> {
 impl ServiceHandler {
     /// The address a new service takes: in a tenant, the lowest free address of the tenant's block; in the node's own
     /// project, the lowest free address of the plan that no tenant's block holds. Every instance, lease and record on
-    /// the node counts as in use.
+    /// the node counts as in use, and so does every address a running instance on the service network holds live.
     fn free_address(
         &self,
         read: &UnixIncus,
@@ -7807,7 +7869,15 @@ impl ServiceHandler {
     ) -> Result<String, CallError> {
         let candidates = crate::service::candidates(cidr).map_err(service_template_error)?;
         let leases = service_leases(read, subject)?;
-        let used = service_used(rows, &leases, entries);
+        // A live address no record holds can only be on the service network: only those instances' state is read.
+        let rows = with_live_state(
+            read,
+            rows,
+            on_service_network,
+            subject,
+            "Nothing was created.",
+        )?;
+        let used = service_used(&rows, &leases, entries);
         if let Some(scope) = tenant {
             return tenants::free_address(scope, &used);
         }
@@ -8501,12 +8571,11 @@ impl ServiceHandler {
         }
         let read = UnixIncus::new(self.cfg.incus.socket.clone());
         let subject = read_subject(self.verb, &args);
-        // Only a create needs an instance's live state: the addresses and the interfaces that are in no record.
-        let picks_an_address = matches!(direction, "service_create" | "function_create");
+        // No call waits for every instance's live state: a create reads that of the instances its address or MAC check
+        // is about, when it makes that check.
         let rows = service_listing(
             &read,
             None,
-            picks_an_address,
             &subject,
             nothing_changed(self.verb, preapproved),
         )?;
@@ -9292,11 +9361,22 @@ impl ServiceHandler {
                         }
                         VmNetwork::Managed => {}
                     }
-                    if let Some(mac) = &mac
-                        && (record_holds_mac(&entries, mac)
-                            || rows.iter().any(|row| instance_holds_mac(row, mac)))
-                    {
-                        return Err(service_refused(mac_held(mac)));
+                    if let Some(mac) = &mac {
+                        // A MAC a guest set on a card of its own is only in its live state: the state of each running
+                        // instance with a card is read for it, and no other.
+                        let held = record_holds_mac(&entries, mac)
+                            || with_live_state(
+                                &read,
+                                &rows,
+                                holds_a_live_card,
+                                &subject,
+                                "Nothing was created.",
+                            )?
+                            .iter()
+                            .any(|row| instance_holds_mac(row, mac));
+                        if held {
+                            return Err(service_refused(mac_held(mac)));
+                        }
                     }
                     if let Some(refusal) = create_room_refusal(
                         &self.cfg,

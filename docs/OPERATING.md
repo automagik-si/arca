@@ -2408,7 +2408,11 @@ Among the service verbs, only these read live state:
   call still answers, with `ipv4` empty and `ipv4Problem` saying why. `service_list` reads no state: such a machine's
   row has `ipv4` empty and `ipv4In: "state"`, which says the address is there to be read and is not "none".
 - `service_create` and `function_create`, and `tenant_create`: a new instance's address, MAC or block must not be one
-  that an instance holds live without a record of it.
+  that an instance holds live without a record of it. They never read the listing with every instance's state. They
+  read the state of each running instance with a card on the service network, since only those can hold one of its
+  addresses, one at a time with a deadline each. A virtual machine on a host bridge that names a `mac` also reads
+  the state of each running instance with any card. A stopped instance, or one only on a host bridge, is never waited
+  for, so a slow machine elsewhere does not fail a create.
 
 Outside the service verbs, the metrics sampler reads each running instance's own state for its CPU and memory, one
 instance at a time with a short deadline, and never the listing with every instance's state (see "Instances" under

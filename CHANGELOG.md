@@ -7,6 +7,14 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 `service_update` checks for instance snapshots before changing the service. If any exist, it names them and leaves the
 service alone. The update takes no snapshot. Rollback rebuilds the root from the old image.
 
+`service_create`, `function_create` and `tenant_create` no longer read every instance on the node with its live state.
+Incus can take seconds to read one virtual machine's state, and the whole listing took as long as the slowest machine,
+so a create in one project could be refused `incus_unavailable` because of an unrelated machine elsewhere. A create now
+lists the instances without state, then reads the state of each running instance with a card on the service network,
+one at a time with a deadline each. Only those instances can hold an address that a create must not hand out. A
+virtual machine on a host bridge that names a `mac` also reads the state of each running instance with a card. Stopped
+instances and instances off the service network are never waited for.
+
 ## 0.39.0 (2026-11-26)
 
 Owners can change a VM's named `createSettings` in place by approving a `service_update` card. The card and

@@ -559,18 +559,34 @@ fn listings_with_state(fake: &FakeIncus) -> usize {
 }
 
 #[test]
-fn a_tenant_create_reads_the_instances_with_their_live_state_and_a_tenant_list_does_not() {
+fn a_tenant_create_reads_the_live_state_of_the_instances_on_the_service_network_and_a_tenant_list_none()
+ {
     let rig = Rig::new(Some(policy()));
-    let before = listings_with_state(rig.fake());
+    rig.template("app", app_template("app"));
     rig.create_tenant(json!({ "id": A })).expect("tenant");
-    let after = listings_with_state(rig.fake());
+    rig.call(
+        "service_create",
+        json!({ "name": "one", "template": "app", "tenant": A }),
+    )
+    .expect("a service in the tenant");
+    let state_of_one = format!("/1.0/instances/one-{A}/state");
+    let states = |fake: &FakeIncus| {
+        fake.requests()
+            .iter()
+            .filter(|request| request.method == "GET" && request.path.starts_with(&state_of_one))
+            .count()
+    };
+    let before = states(rig.fake());
+    rig.create_tenant(json!({ "id": B })).expect("tenant");
+    let after = states(rig.fake());
     assert!(after > before, "the create read no live state");
     rig.call_as("tenant_list", json!({}), Some(&["tenant_list"]))
         .expect("the list");
+    assert_eq!(states(rig.fake()), after, "the list read live state");
     assert_eq!(
         listings_with_state(rig.fake()),
-        after,
-        "the list read live state"
+        0,
+        "a listing with every instance's state"
     );
 }
 

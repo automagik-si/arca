@@ -1131,7 +1131,6 @@ fn tenant_rows(read: &UnixIncus, scope: &TenantScope) -> Result<Vec<Value>, Call
     service_listing(
         read,
         Some(&scope.project),
-        false,
         &format!("tenant {}", scope.id),
         "",
     )
@@ -1582,8 +1581,16 @@ impl TenantHandler {
         }
         // The block: the highest one of the tenant's size that overlaps no tenant's and holds no address in use.
         let subject = format!("tenant {id}");
-        // A new tenant's block holds no address in use, and a live address is in no record: this one reads the state.
-        let rows = service_listing(read, None, true, &subject, "Nothing was created.")?;
+        // A new tenant's block holds no address in use, and a live address is in no record: the state of each running
+        // instance on the service network is read, and no other.
+        let rows = service_listing(read, None, &subject, "Nothing was created.")?;
+        let rows = with_live_state(
+            read,
+            &rows,
+            on_service_network,
+            &subject,
+            "Nothing was created.",
+        )?;
         let leases = service_leases(read, &subject)?;
         let in_use = service_used(&rows, &leases, entries);
         let held = held_blocks(&self.cfg, entries);
