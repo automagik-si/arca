@@ -574,5 +574,40 @@ fn a_tenant_create_reads_the_instances_with_their_live_state_and_a_tenant_list_d
     );
 }
 
+#[test]
+fn a_tenant_create_does_not_wait_for_the_state_of_an_instance_elsewhere() {
+    let rig = two_tenants(policy());
+    // A large machine of another project, on a host bridge, whose state Incus never answers in time; and the listing of
+    // every instance with its state, which waits for that machine, is never answered either.
+    rig.fake().add_instance(json!({
+        "name": "big", "project": "other", "type": "virtual-machine", "status": "Running",
+        "devices": { "eth0": { "type": "nic", "nictype": "bridged", "parent": "br-lan" } }
+    }));
+    let with_state = "/1.0/instances?all-projects=true&recursion=2";
+    rig.fake().unanswered_reads(with_state, 100);
+    rig.fake()
+        .unanswered_reads("/1.0/instances/big/state?project=other", 100);
+    let began = std::time::Instant::now();
+    rig.call(
+        "service_create",
+        json!({ "name": "one", "template": "app", "tenant": A }),
+    )
+    .expect("a create in the tenant");
+    assert!(
+        began.elapsed() < arca_incus::read::TIMEOUT,
+        "the create took {:?}",
+        began.elapsed()
+    );
+    let reads = |prefix: &str| {
+        rig.fake()
+            .requests()
+            .iter()
+            .filter(|request| request.method == "GET" && request.path.starts_with(prefix))
+            .count()
+    };
+    assert_eq!(reads(with_state), 0);
+    assert_eq!(reads("/1.0/instances/big/state"), 0);
+}
+
 #[path = "tenants/token_binding.rs"]
 mod token_binding;

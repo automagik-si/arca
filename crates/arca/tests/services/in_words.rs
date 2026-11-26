@@ -828,6 +828,44 @@ fn a_create_never_hands_out_an_address_or_a_mac_that_only_a_guests_live_state_ho
 }
 
 #[test]
+fn a_create_does_not_wait_for_the_live_state_of_an_instance_off_the_service_network() {
+    // A running machine on a host bridge, and a stopped one by hand: neither can hold an address of the service network,
+    // and Incus is slow to read the state of both, as it is for a large machine on network storage.
+    let rig = machine_and_container();
+    rig.call(
+        "service_create",
+        json!({"name":"p2","template":"pool","bridge":"br0","mac":"02:aa:bb:00:00:07"}),
+    )
+    .expect("a machine on the host bridge");
+    let life = life(&rig, Duration::from_millis(200));
+    start(&life, "p2").expect("start");
+    rig.fake.add_instance(json!({
+        "name": "big", "project": "default", "type": "virtual-machine", "status": "Stopped",
+        "devices": { "eth0": { "type": "nic", "nictype": "bridged", "parent": "br0" } }
+    }));
+    // Neither the listing with every instance's state nor the state of either machine is ever answered.
+    rig.fake.unanswered_reads(LISTING_WITH_STATE, 100);
+    rig.fake
+        .unanswered_reads(&format!("/1.0/instances/p2/state?project={PROJECT}"), 100);
+    rig.fake
+        .unanswered_reads("/1.0/instances/big/state?project=default", 100);
+    let before = [LISTING_WITH_STATE, "/1.0/instances/p2/state", "/1.0/instances/big/state"]
+        .map(|path| reads_of(&rig, path));
+    let began = Instant::now();
+    rig.call("service_create", json!({"name":"p3","template":"pool"}))
+        .expect("a create on the service network");
+    assert!(
+        began.elapsed() < arca_incus::read::TIMEOUT,
+        "the create took {:?}, as long as a read of a state that never answers is given",
+        began.elapsed()
+    );
+    let after = [LISTING_WITH_STATE, "/1.0/instances/p2/state", "/1.0/instances/big/state"]
+        .map(|path| reads_of(&rig, path));
+    assert_eq!(after, before, "the create read a state it does not need");
+    assert!(!address_of(&rig, "p3").is_empty());
+}
+
+#[test]
 fn a_running_machine_on_a_host_bridge_whose_card_is_down_has_no_address_and_no_problem() {
     let rig = machine_and_container();
     let mac = "02:aa:bb:00:00:07";
