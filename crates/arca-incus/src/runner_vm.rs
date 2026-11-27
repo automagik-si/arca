@@ -256,34 +256,47 @@ impl RunnerVms {
                 .join(", ");
             let deleted = self.destroy(&spec.name);
             // The create landed, so this is not a refusal before any write: it says what became of the machine.
-            return Err(IncusError::AppliedUnconfirmed(Box::new(crate::read::Unconfirmed {
-                target: arca_kernel::ownership::ObjectRef {
-                    kind: arca_kernel::ownership::IncusKind::Instance,
-                    project: self.project.clone(),
-                    parent: None,
-                    name: spec.name.clone(),
+            return Err(IncusError::AppliedUnconfirmed(Box::new(
+                crate::read::Unconfirmed {
+                    target: arca_kernel::ownership::ObjectRef {
+                        kind: arca_kernel::ownership::IncusKind::Instance,
+                        project: self.project.clone(),
+                        parent: None,
+                        name: spec.name.clone(),
+                        uuid: None,
+                    },
                     uuid: None,
+                    owner: None,
+                    reason: format!(
+                        "the job machine had a network card other than Arca's ({named}, from a profile or the image machine), so it was {}; give the pool profiles and an image without one",
+                        if deleted.is_ok() {
+                            "deleted"
+                        } else {
+                            "left to be deleted"
+                        }
+                    ),
                 },
-                uuid: None,
-                owner: None,
-                reason: format!(
-                    "the job machine had a network card other than Arca's ({named}, from a profile or the image machine), so it was {}; give the pool profiles and an image without one",
-                    if deleted.is_ok() { "deleted" } else { "left to be deleted" }
-                ),
-            })));
+            )));
         }
         Ok(())
     }
 
     /// The name of the pool's own bridge: `arcarun-<seven hex digits of the pool's hash>`.
     pub fn bridge_name(&self) -> String {
-        format!("{RUNNER_BRIDGE_PREFIX}{:07x}", pool_hash(&self.pool) & 0x0fff_ffff)
+        format!(
+            "{RUNNER_BRIDGE_PREFIX}{:07x}",
+            pool_hash(&self.pool) & 0x0fff_ffff
+        )
     }
 
     /// The `ipv4.address` of the pool's own bridge (`a.b.c.1/24`), or `None` when it is not there. A network of that
     /// name without this pool's mark is refused.
     pub fn own_bridge(&self) -> Result<Option<String>, IncusError> {
-        let path = format!("/1.0/networks/{}?project={}", self.bridge_name(), self.project);
+        let path = format!(
+            "/1.0/networks/{}?project={}",
+            self.bridge_name(),
+            self.project
+        );
         match self.json("GET", &path, None, TIMEOUT) {
             Err(IncusError::Status { code: 404, .. }) => Ok(None),
             Err(error) => Err(error),
@@ -334,7 +347,11 @@ impl RunnerVms {
         if self.own_bridge()?.is_none() {
             return Ok(());
         }
-        let path = format!("/1.0/networks/{}?project={}", self.bridge_name(), self.project);
+        let path = format!(
+            "/1.0/networks/{}?project={}",
+            self.bridge_name(),
+            self.project
+        );
         match self.json("DELETE", &path, None, TIMEOUT) {
             Ok(envelope) => self.wait_for(&envelope),
             Err(IncusError::Status { code: 404, .. }) => Ok(()),
@@ -352,7 +369,10 @@ impl RunnerVms {
     /// this pool's mark is refused and left as it is.
     pub fn ensure_acl(&self, ingress: &[Value], egress: &[Value]) -> Result<AclState, IncusError> {
         let name = self.acl_name();
-        let description = format!("Arca runner pool {} job machines; managed by Arca", self.pool);
+        let description = format!(
+            "Arca runner pool {} job machines; managed by Arca",
+            self.pool
+        );
         let path = format!("/1.0/network-acls/{name}?project={}", self.project);
         match self.json("GET", &path, None, TIMEOUT) {
             Err(IncusError::Status { code: 404, .. }) => {
@@ -406,12 +426,19 @@ impl RunnerVms {
     /// Deletes the pool's ACL, once its pool is gone. One that is already gone is not an error; one without this pool's
     /// mark is refused and left as it is. Incus refuses the delete while a machine's card still names it.
     pub fn remove_acl(&self) -> Result<(), IncusError> {
-        let path = format!("/1.0/network-acls/{}?project={}", self.acl_name(), self.project);
+        let path = format!(
+            "/1.0/network-acls/{}?project={}",
+            self.acl_name(),
+            self.project
+        );
         match self.json("GET", &path, None, TIMEOUT) {
             Err(IncusError::Status { code: 404, .. }) => return Ok(()),
             Err(error) => return Err(error),
             Ok(answer) => {
-                if !answer.get("metadata").is_some_and(|acl| self.acl_marked(acl)) {
+                if !answer
+                    .get("metadata")
+                    .is_some_and(|acl| self.acl_marked(acl))
+                {
                     return Err(refused("the network ACL is not this pool's"));
                 }
             }

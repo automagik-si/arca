@@ -81,7 +81,10 @@ pub fn choose_subnet(pool: &str, taken: &[String]) -> Option<String> {
 /// A CIDR range as its network address and mask; a bare address is its /24.
 fn range_of(text: &str) -> Option<(u32, u32)> {
     let (ip, prefix) = match text.split_once('/') {
-        Some((ip, prefix)) => (ip, prefix.parse::<u32>().ok().filter(|prefix| *prefix <= 32)?),
+        Some((ip, prefix)) => (
+            ip,
+            prefix.parse::<u32>().ok().filter(|prefix| *prefix <= 32)?,
+        ),
         None => (text, 24),
     };
     let ip = u32::from(ip.parse::<Ipv4Addr>().ok()?);
@@ -134,7 +137,9 @@ impl IncusLauncher {
             None => {
                 if vms.own_bridge().map_err(incus)?.is_none() {
                     let address = choose_subnet(pool, &taken(&socket, plan)?).ok_or_else(|| {
-                        LaunchError("no /24 of 172.16.0.0/12 is free for the pool's own bridge".to_string())
+                        LaunchError(
+                            "no /24 of 172.16.0.0/12 is free for the pool's own bridge".to_string(),
+                        )
                     })?;
                     vms.create_bridge(&address).map_err(incus)?;
                 }
@@ -143,7 +148,11 @@ impl IncusLauncher {
         };
         let (gateway, subnet) = bridge_address(&socket, project, &network)?;
         let mut closed = vec![subnet];
-        if let Some(service) = plan.service_cidr.as_ref().filter(|cidr| **cidr != closed[0]) {
+        if let Some(service) = plan
+            .service_cidr
+            .as_ref()
+            .filter(|cidr| **cidr != closed[0])
+        {
             closed.push(service.clone());
         }
         let egress = job_rules(&socket, gateway, &closed)?;
@@ -310,7 +319,11 @@ fn plain(text: &str) -> bool {
 }
 
 /// The gateway and the subnet (`a.b.c.d/n`, at its real prefix) of the bridge `network`, read as `project` sees it.
-fn bridge_address(socket: &Path, project: &str, network: &str) -> Result<(Ipv4Addr, String), LaunchError> {
+fn bridge_address(
+    socket: &Path,
+    project: &str,
+    network: &str,
+) -> Result<(Ipv4Addr, String), LaunchError> {
     if !plain(network) || !plain(project) {
         return Err(LaunchError(
             "the pool's network or project is not a plain name".to_string(),
@@ -340,9 +353,15 @@ fn host_addresses(read: &UnixIncus) -> Result<Value, LaunchError> {
 
 /// The egress rules of the pool's job machines: the rules of a tenant's service with `closed` rejected, from the
 /// bridge's gateway and the host's addresses as they are now.
-fn job_rules(socket: &Path, gateway: Ipv4Addr, closed: &[String]) -> Result<Vec<Value>, LaunchError> {
+fn job_rules(
+    socket: &Path,
+    gateway: Ipv4Addr,
+    closed: &[String],
+) -> Result<Vec<Value>, LaunchError> {
     let hosts = host_addresses(&UnixIncus::new(socket.to_path_buf()))?;
-    Ok(arca_netproject::tenant::job_egress_rules(gateway, closed, &hosts))
+    Ok(arca_netproject::tenant::job_egress_rules(
+        gateway, closed, &hosts,
+    ))
 }
 
 /// Every range the pool's own bridge must keep clear of: the service subnet, the reserved ranges, every Incus network's
@@ -398,11 +417,17 @@ pub fn remove_gone_pools(socket: &Path, pools: &[&str]) -> Vec<String> {
             Err(error) => return lines.push(format!("the {kind}s could not be listed: {error}")),
         };
         for row in rows {
-            let Some(pool) = row.pointer(&format!("/config/{RUNNER_KEY}")).and_then(Value::as_str) else {
+            let Some(pool) = row
+                .pointer(&format!("/config/{RUNNER_KEY}"))
+                .and_then(Value::as_str)
+            else {
                 continue;
             };
             let name = row.get("name").and_then(Value::as_str).unwrap_or_default();
-            let project = row.get("project").and_then(Value::as_str).unwrap_or("default");
+            let project = row
+                .get("project")
+                .and_then(Value::as_str)
+                .unwrap_or("default");
             if pools.contains(&pool) {
                 continue;
             }
@@ -412,15 +437,27 @@ pub fn remove_gone_pools(socket: &Path, pools: &[&str]) -> Vec<String> {
             if name != expected(&vms) {
                 continue;
             }
-            let removed = if kind == "network ACL" { vms.remove_acl() } else { vms.remove_bridge() };
+            let removed = if kind == "network ACL" {
+                vms.remove_acl()
+            } else {
+                vms.remove_bridge()
+            };
             lines.push(match removed {
                 Ok(()) => format!("pool {pool} is gone: its {kind} {name} was deleted"),
                 Err(error) => format!("pool {pool} is gone, and its {kind} {name} stays: {error}"),
             });
         }
     };
-    gone("/1.0/network-acls?all-projects=true&recursion=1", "network ACL", &|vms| vms.acl_name());
-    gone("/1.0/networks?all-projects=true&recursion=1", "bridge", &|vms| vms.bridge_name());
+    gone(
+        "/1.0/network-acls?all-projects=true&recursion=1",
+        "network ACL",
+        &|vms| vms.acl_name(),
+    );
+    gone(
+        "/1.0/networks?all-projects=true&recursion=1",
+        "bridge",
+        &|vms| vms.bridge_name(),
+    );
     lines
 }
 

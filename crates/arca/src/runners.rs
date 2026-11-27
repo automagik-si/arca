@@ -11,8 +11,8 @@ use arca_runners::incus::{IncusLauncher, NetworkPlan};
 use arca_runners::record::Recorder;
 use arca_runners::scaleset::{Http, ScaleSetClient};
 use arca_runners::{
-    Access, AccessError, ActionsConnection, JobRef, Launcher, MintRequest, Minted, Pool, PoolConfig,
-    Secret, SignInBoard, SignInReason,
+    Access, AccessError, ActionsConnection, JobRef, Launcher, MintRequest, Minted, Pool,
+    PoolConfig, Secret, SignInBoard, SignInReason,
 };
 
 use crate::config::NodeConfig;
@@ -179,7 +179,10 @@ pub fn spawn(
         return Ok(None);
     };
     let socket = cfg.incus.socket.clone();
-    let (service_cidr, reserved) = (cfg.kernel.service_cidr.clone(), cfg.kernel.reserved_cidrs.clone());
+    let (service_cidr, reserved) = (
+        cfg.kernel.service_cidr.clone(),
+        cfg.kernel.reserved_cidrs.clone(),
+    );
     start_pools(
         runners.pools.clone(),
         cfg.state_dir.join("runners"),
@@ -248,7 +251,11 @@ where
 }
 
 /// The Incus launcher of one pool: a virtual machine per job, cloned from the pool's `image`.
-fn incus_launcher(pool: &PoolConfig, socket: &Path, plan: &NetworkPlan) -> Result<IncusLauncher, String> {
+fn incus_launcher(
+    pool: &PoolConfig,
+    socket: &Path,
+    plan: &NetworkPlan,
+) -> Result<IncusLauncher, String> {
     IncusLauncher::new(
         socket.to_path_buf(),
         &pool.project,
@@ -320,7 +327,10 @@ mod tests {
     async fn until(what: &str, mut check: impl FnMut() -> bool) {
         let start = Instant::now();
         while !check() {
-            assert!(start.elapsed() < Duration::from_secs(30), "timed out waiting for {what}");
+            assert!(
+                start.elapsed() < Duration::from_secs(30),
+                "timed out waiting for {what}"
+            );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }

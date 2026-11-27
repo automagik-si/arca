@@ -1490,7 +1490,12 @@ mod tests {
     #[test]
     fn a_job_machine_reaches_nothing_of_its_subnet_and_the_internet_past_the_rejects() {
         // The job machines' own bridge, and the node's service subnet routed through the host.
-        let hosts = json!(["192.0.2.1/24", "198.51.100.1/24", "100.99.1.2/32", "fd00::1/64"]);
+        let hosts = json!([
+            "192.0.2.1/24",
+            "198.51.100.1/24",
+            "100.99.1.2/32",
+            "fd00::1/64"
+        ]);
         let gateway = Ipv4Addr::new(192, 0, 2, 1);
         let closed = ["192.0.2.0/24".to_string(), "198.51.100.0/24".to_string()];
         let rules = job_egress_rules(gateway, &closed, &hosts);
@@ -1501,16 +1506,28 @@ mod tests {
         let shape = |rules: &[Value]| {
             rules
                 .iter()
-                .map(|rule| (rule["action"].clone(), rule["protocol"].clone(), rule["destination_port"].clone()))
+                .map(|rule| {
+                    (
+                        rule["action"].clone(),
+                        rule["protocol"].clone(),
+                        rule["destination_port"].clone(),
+                    )
+                })
                 .collect::<Vec<_>>()
         };
         assert_eq!(shape(&rules), shape(&tenant));
         assert_eq!(rules[1..4], tenant[1..4], "DHCP and DNS on the gateway");
-        assert_eq!(rules[5..], tenant[5..], "IPv6, reserved, the host and the internet");
+        assert_eq!(
+            rules[5..],
+            tenant[5..],
+            "IPv6, reserved, the host and the internet"
+        );
         assert_eq!(
             rules[0],
-            rule(json!({"action":"reject", "destination":"192.0.2.0/24,198.51.100.0/24",
-                "description":"the job machines' whole subnet and the node's service subnet: a job machine has no block of its own"}))
+            rule(
+                json!({"action":"reject", "destination":"192.0.2.0/24,198.51.100.0/24",
+                "description":"the job machines' whole subnet and the node's service subnet: a job machine has no block of its own"})
+            )
         );
         assert_eq!(rules.last().unwrap()["description"], "internet");
         // As Incus weighs them: no address of either subnet, the gateways and every neighbour among them, on any
@@ -1518,8 +1535,19 @@ mod tests {
         for subnet in [[192, 0, 2], [198, 51, 100]] {
             for last in 0..=255u8 {
                 let to = Ipv4Addr::new(subnet[0], subnet[1], subnet[2], last);
-                for (protocol, port) in [("tcp", 443), ("tcp", 8443), ("udp", 53), ("tcp", 53), ("udp", 67), ("icmp4", 0), ("gre", 0)] {
-                    assert!(!allowed(&rules, to, protocol, port), "{to} {protocol} {port}");
+                for (protocol, port) in [
+                    ("tcp", 443),
+                    ("tcp", 8443),
+                    ("udp", 53),
+                    ("tcp", 53),
+                    ("udp", 67),
+                    ("icmp4", 0),
+                    ("gre", 0),
+                ] {
+                    assert!(
+                        !allowed(&rules, to, protocol, port),
+                        "{to} {protocol} {port}"
+                    );
                 }
             }
         }
@@ -1547,7 +1575,11 @@ mod tests {
             assert!(allowed(&rules, to, "tcp", 443), "{to}");
             assert!(allowed(&rules, to, "udp", 53), "{to}");
         }
-        assert!(rules.iter().any(|rule| rule["action"] == "reject" && rule["destination"] == "::/0"));
+        assert!(
+            rules
+                .iter()
+                .any(|rule| rule["action"] == "reject" && rule["destination"] == "::/0")
+        );
     }
 
     #[test]
@@ -1567,7 +1599,12 @@ mod tests {
         }
         let private = rules
             .iter()
-            .find(|rule| rule["description"].as_str().unwrap_or("").starts_with("RFC1918"))
+            .find(|rule| {
+                rule["description"]
+                    .as_str()
+                    .unwrap_or("")
+                    .starts_with("RFC1918")
+            })
             .expect("the private ranges");
         assert_eq!(
             private["destination"],
