@@ -7523,7 +7523,11 @@ first real job, and how to read a pool.
    snapshot `image`. The pool's `image` is `arca-runner-image-<tag>` for the first and `arca-runner-image-<tag>/image`
    for the second. Never start or change the kept machine: every job machine is a copy of its snapshot.
 3. **Room in the project.** Each machine counts its class's full CPUs and memory against the Incus project's limits
-   (`incus project info <project>`) and against the pool's `budget`; make the budget fit what the project has free.
+   (`incus project info <project>`) and against the pool's `budget`. Every other instance in the project counts too,
+   stopped ones included, so the kept image machine's own `limits.cpu` and `limits.memory` take their share. Make the
+   budget fit what the project has free: a project with an 8 GiB memory limit that holds a kept image machine of 1 GiB
+   has 7 GiB for job machines, so two machines of 4 GiB do not fit and two of 3 GiB do (the example below). A machine
+   the project has no room for is refused by Incus; the pool records it as a failure and waits before the next try.
 4. **The organisation's App connection and its runner group.** Connect the organisation on `/approve/github` with
    "a GitHub App made for you" (Mode 2 above), pick the repositories that may send jobs, and give one label set per size
    class. The App's runner group, `Arca runners`, holds exactly those repositories. `github_bindings` lists the
@@ -7535,8 +7539,8 @@ first real job, and how to read a pool.
    "runners": { "pools": [ {
      "name": "ci", "binding": "gh-…", "project": "ci",
      "image": "arca-runner-image-ubuntu24-20261111-370/image",
-     "budget": { "cpu": 4, "memory": "8GiB" },
-     "classes": [ { "labels": ["acme-2vcpu-ubuntu-2404"], "cpu": 2, "memory": "4GiB", "max": 2 } ]
+     "budget": { "cpu": 4, "memory": "6GiB" },
+     "classes": [ { "labels": ["acme-2vcpu-ubuntu-2404"], "cpu": 2, "memory": "3GiB", "max": 2 } ]
    } ] }
    ```
 
