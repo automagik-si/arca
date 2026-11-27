@@ -101,8 +101,10 @@ times. GitHub cannot narrow this permission to one runner group; the restraint i
 binding's runner group with the labels the person chose), and the key never leaves the kernel.
 
 **The pool signs in through the signer.** A pool's `binding` is a GitHub App connection the person made on the
-approval page (the one-link GitHub connect). A device-flow or push connection cannot mint runners: the signer refuses
-it, the pool only logs the refusal and tries again, and no runner ever starts. The pool asks the kernel's signer for the Actions service connection and for every
+approval page (the one-link GitHub connect). A device-flow or push connection cannot serve a pool. A device-flow one
+mints nothing. A push one does hand out the configurations its owner pushed (`github_runner_mint` answers them), but it
+has no Actions service connection: the signer answers the pool's sign-in with `Empty`, so the pool gets no scale set,
+logs the refusal, tries again, and never starts a machine. The pool asks the kernel's signer for the Actions service connection and for every
 runner configuration; the signer refuses a scale set outside the connection's runner group and labels outside the
 connection's label sets, and writes every mint to its audit log. The pool holds no key and no token of its own, and
 there is no token file to place.
@@ -120,7 +122,7 @@ The node config's `runners` key (a kernel-mode node only):
         "binding": "gh-acme",
         "budget": { "cpu": 16, "memory": "64GiB" },
         "project": "arcak-runners",
-        "image": "runner-ubuntu-2404",
+        "image": "arca-runner-image-ubuntu24-20261111-370/image",
         "storagePool": "default",
         "classes": [
           { "labels": ["acme-4vcpu-ubuntu-2404"], "cpu": 4, "memory": "16GiB", "diskGiB": 80, "warm": 1, "max": 4 }
@@ -137,29 +139,45 @@ there, and the signer then refuses every runner configuration, since it mints on
 Each class's labels must be one of the connection's label sets. A class whose labels are not boots a machine, is
 refused at the mint and waits; it tries again every five minutes at most, one machine boot each time, and never runs a
 job.
-`name` is at most 52 characters: a machine's name is the pool's name, `-<class>-` and 8 hex digits, and Incus allows 63. `image` is a local image alias or fingerprint, or
-`<instance>/<snapshot>` of a stopped template VM in the same project.
+`name` is at most 52 characters: a machine's name is the pool's name, `-<class>-` and 8 hex digits, and Incus allows 63.
+`image` is the runner image [`images/github-runner/build.sh`](../images/github-runner/README.md) made for a tag:
+`arca-runner-image-<tag>/image` when the build kept the stopped machine `arca-runner-image-<tag>` with its snapshot
+`image` (it must be in the pool's project; never start or change it, every job machine is a copy of that snapshot), or
+`arca-runner-image-<tag>` when the build published it as an image. Any other local image alias or fingerprint, or
+`<instance>/<snapshot>` of a stopped VM in the pool's project, works the same way.
 Records and logs go to `<stateDir>/runners/<pool>/`.
 
 ## The job machine
 
 1. **Clone.** `POST /1.0/instances` with `type: virtual-machine`, the runner image as source, the class's
    `limits.cpu`, `limits.memory` and root disk size, in the pool's own Incus project and network, marked
-   `user.arcakernel.runner=<pool>`. On ZFS and Ceph RBD the root disk is a copy-on-write clone of the image's volume: about a
-   second, and it costs only the blocks the job writes.
+   `user.arcakernel.runner=<pool>`. On btrfs, ZFS and Ceph RBD the root disk is a copy-on-write clone of the image's
+   volume, and it costs only the blocks the job writes. Measured on btrfs (below, "How it is proven"): the copy and the
+   start take one to two and a half seconds, the boot to a ready agent about 25 seconds.
 2. **Boot and wait for the Incus agent.** The launcher never uses a network path into the VM.
 3. **Hand over.** The controller asks the signer for one JIT configuration (`workFolder` `/home/runner/work`) and the
    launcher writes it into the VM through the agent's file API, on `/run` (memory), mode 0600, owned by root (`arca-job`
    reads it as root). It is never in the instance's config, on a command line or in a log.
 4. **Run.** The launcher starts `arca-job` (a short script this repository ships and the launcher writes into the VM)
-   through the agent. It reads the JIT file, deletes it, starts the runner as `runner` in a login session (so
-   `/etc/environment` and limits apply, as on GitHub), and writes the runner's output to `/var/log/arca-job/`. The
-   runner takes exactly one job and exits.
+   through the agent. It stops the image's own `arca-runner.service` (which waits for a configuration handed over
+   another way), reads the JIT file, deletes it, starts the runner as `runner` in a login session (so the limits apply)
+   with `/etc/environment` loaded (as on GitHub), and writes the runner's output to `/var/log/arca-job/`. The runner
+   takes exactly one job and exits. `arca-job` runs the runner program itself (`bin/Runner.Listener run`), not its
+   `run.sh`: `run.sh` starts the runner again for ever after a "retryable" exit, and a configuration the runner cannot
+   use is one, so a refused configuration would keep the machine forever. `arca-job` starts it again after an update
+   exit (3 or 4, as `run.sh` does, at most three times) and once after a retryable exit (2), and then keeps the
+   runner's exit code.
 5. **Collect.** When the runner exits, `arca-job` packs its output and `_diag` into one archive. The launcher reads it
    through the agent and stores it on the host as `<state>/runners/<pool>/logs/<runner>/logs.tar.gz`, directory 0700
    and file 0600, owned by root. Logs older than seven days are deleted.
 6. **Destroy.** Force stop, delete. Nothing is reused. A destroy that fails (Incus refused it or timed out) is tried
    again, waiting longer each time, and the machine keeps its share of the budget until it is gone.
+
+**A runner that refuses its configuration.** A runner that exits with an error before it took a job (its
+configuration was refused, or the image cannot run it) is a failure, as a machine that could not boot is: its record
+carries the runner's exit code, its logs and the note `the runner exited <code> before it took a job`, its runner is
+removed from GitHub, and the class waits before it makes the next machine, longer after each failure in a row (five
+minutes at most).
 
 The pool never ends a runner that has a job: the job runs as long as it runs, and a failed read of the runner (Incus
 restarting or stalled) is not an exit, so the pool reads again five seconds later. A runner without a job whose reads
@@ -185,8 +203,10 @@ service cannot have that class of outage. A VM also runs systemd services, sets 
 **What the guest image must provide** (the contract with the image build):
 
 - user `runner` with passwordless sudo and membership of `docker`; Docker enabled as a systemd service;
-- the runner program in `/home/runner/actions-runner` (the pool setting `runnerDir` changes it);
+- the runner program in `/home/runner/actions-runner` (the pool setting `runnerDir` changes it; Arca's build makes it a
+  link to `/home/runner/runners/<version>`), started as `bin/Runner.Listener run`;
 - the Incus agent (Incus VM images from the image server carry it; a built image adds the `incus-agent` setup);
+- `systemctl`, when the image has its own `arca-runner.service` (Arca's build has; `arca-job` stops it);
 - `bash`, `tar`, `gzip`, `runuser` (util-linux).
 
 ## Size, budget and warm runners
@@ -242,8 +262,26 @@ time.
   config it minted, completes them. It can answer 401, 404 and 403 to drive the alert.
 - **Fake launcher** (tests): an in-memory machine per runner that "runs" a job when told.
 - **Incus launcher** (tests): against the repository's fake Incus, a machine is a marked virtual machine of its
-  class's size, and only the pool's marked machines are listed and destroyed. The runner hand-over (file pushes and
-  the exec) is a next test.
+  class's size, and only the pool's marked machines are listed and destroyed.
+- **Real Incus** (`crates/arca-runners/tests/real_incus_runner.rs`, ignored, run by hand with
+  `ARCA_REAL_RUNNER_PROOF=1`): on a real Incus with the runner image, one machine at a time, with a JIT configuration
+  of GitHub's shape that no runner can use (no GitHub credential and no call to GitHub). One test drives the launcher
+  step by step: clone, agent ready, hand-over, the runner's refusal, the configuration gone from the machine, the logs
+  (`runner.log` and `_diag`), destroy, nothing of the pool left and the image unchanged. The other runs a whole pool
+  (fake GitHub, real launcher) and finds the refusal recorded as above, the logs stored 0600 in a 0700 folder, the
+  runner removed and no machine left. Measured on a btrfs pool (Ubuntu 24.04 image, 2 vCPU, 4 GiB, two runs on
+  2026-11-27):
+
+  | Step | Time |
+  | --- | --- |
+  | Clone (copy-on-write copy of the image's snapshot, and the start) | 1.0 to 2.5 s |
+  | Boot to a ready Incus agent | 24.2 to 24.3 s |
+  | Hand-over (JIT file and `arca-job` written, the exec started) | 0.03 to 0.04 s |
+  | Runner refuses the configuration (exit 2, tried twice, 5 s apart) | 5.9 to 6.2 s |
+  | Destroy (force stop and delete) | 0.5 s |
+  | Pool: from the class asking for a machine to the job record | 31.6 s |
+
+  The runner refuses the made-up configuration at its own key check, before it calls any server.
 - **Dogfood** (our own organisation, one pool): a test workflow and one real CI job. Counted: jobs, pass rate, queue
   time, boot time. And the **state-leak test**: job N writes a marker file in `$HOME`, `/tmp`, `/opt` and the workspace,
   and builds a Docker image; job N+1 on the same class must find none of them.
