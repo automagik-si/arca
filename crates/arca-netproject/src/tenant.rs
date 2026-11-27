@@ -1441,4 +1441,56 @@ mod tests {
         let service = egress_rules(gateway, &hosts, None, &destination);
         assert_eq!(with[..with.len() - 1], service[..service.len() - 1]);
     }
+
+    #[test]
+    fn a_job_machine_reaches_nothing_of_its_subnet_and_the_internet_past_the_rejects() {
+        let hosts = json!(["192.0.2.1/24", "198.51.100.7/24", "100.99.1.2/32", "fd00::1/64"]);
+        let gateway = Ipv4Addr::new(192, 0, 2, 1);
+        let rules = job_egress_rules(gateway, "192.0.2.0/24", &hosts);
+        // The same order and shape as a tenant service's rules: only the first rule differs, and it rejects the whole
+        // subnet instead of the subnet outside a block.
+        let block = blocks("192.0.2.0/24", 29).unwrap()[0];
+        let tenant = egress_rules(gateway, &hosts, Some(block), &[]);
+        assert_eq!(rules.len(), tenant.len());
+        assert_eq!(rules[1..], tenant[1..]);
+        assert_eq!(
+            rules[0],
+            rule(json!({"action":"reject", "destination":"192.0.2.0/24",
+                "description":"the whole service subnet: a job machine has no block of its own"}))
+        );
+        assert_eq!(rules.last().unwrap()["description"], "internet");
+        // As Incus weighs them: no address of the subnet, the gateway and every neighbour among them, on any protocol.
+        for last in 0..=255u8 {
+            let to = Ipv4Addr::new(192, 0, 2, last);
+            for (protocol, port) in [("tcp", 443), ("tcp", 8443), ("udp", 53), ("tcp", 53), ("udp", 67), ("icmp4", 0), ("gre", 0)] {
+                assert!(!allowed(&rules, to, protocol, port), "{to} {protocol} {port}");
+            }
+        }
+        // Nothing private, the tailnet, link-local, loopback, multicast, broadcast or the host's own addresses.
+        for to in [
+            [10, 0, 0, 5],
+            [172, 16, 3, 4],
+            [192, 168, 1, 1],
+            [100, 64, 0, 1],
+            [100, 99, 1, 2],
+            [169, 254, 1, 1],
+            [127, 0, 0, 1],
+            [198, 51, 100, 7],
+            [224, 0, 0, 1],
+            [255, 255, 255, 255],
+            [0, 1, 2, 3],
+            [240, 0, 0, 1],
+        ] {
+            let to = Ipv4Addr::from(to);
+            assert!(!allowed(&rules, to, "tcp", 443), "{to}");
+            assert!(!allowed(&rules, to, "udp", 53), "{to}");
+        }
+        // And the rest of the world.
+        for to in [[203, 0, 113, 9], [198, 51, 100, 200]] {
+            let to = Ipv4Addr::from(to);
+            assert!(allowed(&rules, to, "tcp", 443), "{to}");
+            assert!(allowed(&rules, to, "udp", 53), "{to}");
+        }
+        assert!(rules.iter().any(|rule| rule["action"] == "reject" && rule["destination"] == "::/0"));
+    }
 }
