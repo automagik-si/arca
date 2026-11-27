@@ -181,6 +181,9 @@ pub struct FormulaRun {
     pub version: Option<String>,
 }
 
+/// How long a hung mark stands before `service_logs` may read the journal once more.
+pub const HUNG_PROBE_AFTER: Duration = Duration::from_secs(300);
+
 #[derive(Clone)]
 pub struct ExecTarget {
     pub entry: EntryId,
@@ -194,6 +197,9 @@ pub struct ServiceExec {
     audit_lock: Mutex<()>,
     sequence: AtomicU64,
     hung: Mutex<BTreeMap<String, String>>,
+    /// The node's clock in milliseconds.
+    #[allow(dead_code)]
+    clock: Arc<dyn Fn() -> u64 + Send + Sync>,
     journal_reads: AtomicUsize,
     pub publish_gate: tokio::sync::Mutex<()>,
 }
@@ -212,11 +218,17 @@ impl ServiceExec {
             audit_lock: Mutex::new(()),
             sequence: AtomicU64::new(1),
             hung: Mutex::new(BTreeMap::new()),
+            clock: Arc::new(now),
             journal_reads: AtomicUsize::new(0),
             publish_gate: tokio::sync::Mutex::new(()),
         };
         seam.sweep();
         seam
+    }
+    /// The same seam with the node's clock, in milliseconds.
+    pub fn with_clock(mut self, clock: Arc<dyn Fn() -> u64 + Send + Sync>) -> Self {
+        self.clock = clock;
+        self
     }
     pub fn journal_permit(&self) -> Option<JournalPermit<'_>> {
         self.journal_reads

@@ -6424,7 +6424,8 @@ pub fn service_handlers_with_reach(
 ) -> ServiceHandlersWithReach {
     // One gate for every handler that picks an address or a block: the kernel's own.
     let writes = write_gate(&kernel);
-    let exec = Arc::new(crate::service_exec::ServiceExec::new(cfg.clone()));
+    let exec =
+        Arc::new(crate::service_exec::ServiceExec::new(cfg.clone()).with_clock(clock.clone()));
     let reach = crate::reach::page_reads(kernel.clone(), cfg.clone(), exec.clone());
     let function_verbs: &[&'static str] = if functions.is_some() {
         &FUNCTION_VERBS

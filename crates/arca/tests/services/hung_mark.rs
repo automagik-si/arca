@@ -2,6 +2,9 @@
 //! restart and the update path that stops an instance clear it; an instance nobody stopped keeps it. `service_logs` says
 //! which source its lines came from and, when the journal was not read, why. Every value is synthetic.
 //!
+//! A mark also ages: after [`HUNG_PROBE_AFTER`] the next `service_logs` reads the journal once, one read at a time,
+//! and an answer clears the mark. The node's clock is the test's own, so nothing waits for it.
+//!
 //! A stop and a restart through their handlers take an approved action proposal; `instance_lifecycle.rs` proves that
 //! gate. Here they are run through the lifecycle the handlers call, `InstanceLifecycle::run`, so the test is about the
 //! mark and not the approval. A start runs through its handler, as a doctor calls it.
@@ -9,7 +12,7 @@ use super::*;
 use arca::app_formula::AppUpdate;
 use arca::handlers::{ServiceHandlers, UpdateOptions, service_exec, service_handlers_updating};
 use arca::lifecycle::InstanceLifecycle;
-use arca::service_exec::{DeclaredCommand, ExecTarget, ServiceExec};
+use arca::service_exec::{DeclaredCommand, ExecTarget, HUNG_PROBE_AFTER, ServiceExec};
 use arca_incus::{
     StateAction,
     exec::{ExecCommand, JournalLines},
@@ -44,15 +47,19 @@ fn bounded(test: impl FnOnce() + Send + 'static) {
 /// The node's service handlers and the lifecycle as a served node builds them: one exec handle, whose marks the
 /// lifecycle clears.
 struct Node {
+    /// The node's clock in milliseconds: a test moves it on.
+    clock: Arc<AtomicU64>,
     exec: Arc<ServiceExec>,
     handlers: HashMap<&'static str, Arc<dyn ToolHandler>>,
     lifecycle: Arc<InstanceLifecycle>,
 }
 
 fn node(rig: &Rig) -> Node {
+    let clock = Arc::new(AtomicU64::new(NOW));
+    let now = Arc::clone(&clock);
     let served: ServiceHandlers = service_handlers_updating(
         rig.kernel.clone(),
-        Arc::new(|| NOW),
+        Arc::new(move || now.load(Ordering::SeqCst)),
         rig.cfg.clone(),
         None,
         UpdateOptions {
@@ -87,6 +94,7 @@ fn node(rig: &Rig) -> Node {
         Some(Arc::clone(&lifecycle)),
     ));
     Node {
+        clock,
         exec,
         handlers,
         lifecycle,
@@ -116,6 +124,12 @@ impl Node {
         self.lifecycle
             .run(action, PROJECT, "app", "operator", None, NOW)
             .expect("the lifecycle acts")
+    }
+
+    /// Moves the node's clock on by `by`.
+    fn wait(&self, by: Duration) {
+        self.clock
+            .fetch_add(u64::try_from(by.as_millis()).unwrap(), Ordering::SeqCst);
     }
 
     fn logs(&self) -> Value {
@@ -168,6 +182,42 @@ fn mark_hung(rig: &Rig, node: &Node, target: &ExecTarget) {
         )
         .expect_err("Incus does not answer");
     assert!(node.exec.hung(target));
+}
+
+/// The exec requests the fake was sent.
+fn execs(rig: &Rig) -> usize {
+    rig.fake
+        .service_requests()
+        .iter()
+        .filter(|r| r.path.contains("/exec?") && r.method == "POST")
+        .count()
+}
+
+/// Starts a journal read Incus never answers on a thread of its own, and returns once Incus was sent it. The read
+/// ends past its two-second deadline.
+fn read_in_flight(rig: &Rig, node: &Node, target: &ExecTarget) -> std::thread::JoinHandle<()> {
+    let mut held = ExecScript::new(journal().argv(), 0, "");
+    held.held = true;
+    rig.fake.script_exec(held);
+    let sent = execs(rig);
+    let exec = Arc::clone(&node.exec);
+    let target = target.clone();
+    let read = std::thread::spawn(move || {
+        let _ = exec.run(
+            &target,
+            "viewer",
+            "service_logs",
+            &journal(),
+            &[],
+            Some(Instant::now() + Duration::from_secs(2)),
+        );
+    });
+    let started = Instant::now() + Duration::from_secs(2);
+    while execs(rig) == sent && Instant::now() < started {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(execs(rig) > sent, "the read was sent");
+    read
 }
 
 fn status(rig: &Rig) -> String {
@@ -365,4 +415,129 @@ fn the_update_that_stops_an_instance_clears_its_mark() {
         );
         assert!(!node.exec.hung(&target), "the update stopped it");
     });
+}
+
+#[test]
+fn after_five_minutes_one_journal_read_tries_again_and_its_answer_clears_the_mark() {
+    bounded(|| {
+        let rig = Rig::new();
+        system(&rig);
+        let node = node(&rig);
+        let target = target(&rig);
+        mark_hung(&rig, &node, &target);
+        rig.fake.set_console_log(PROJECT, "app", "console line");
+        // Before its time the mark refuses the read: nothing is sent to the instance.
+        node.wait(HUNG_PROBE_AFTER - Duration::from_secs(1));
+        let sent = execs(&rig);
+        assert_eq!(node.logs()["source"], "console");
+        assert_eq!(execs(&rig), sent, "no read was sent");
+        assert!(node.exec.hung(&target));
+        // Once it has come, one read goes; it answers, so the mark is gone and the journal answers again.
+        node.wait(Duration::from_secs(1));
+        reads_the_journal(&rig, &node, "journal again");
+        assert!(!node.exec.hung(&target), "the answer cleared the mark");
+        reads_the_journal(&rig, &node, "journal still");
+    });
+}
+
+#[test]
+fn a_try_that_fails_keeps_the_mark_for_five_more_minutes() {
+    bounded(|| {
+        let rig = Rig::new();
+        system(&rig);
+        let node = node(&rig);
+        let target = target(&rig);
+        mark_hung(&rig, &node, &target);
+        rig.fake.set_console_log(PROJECT, "app", "console line");
+        node.wait(HUNG_PROBE_AFTER);
+        // The read runs and exits with an error: the answer says so in those words, and the mark stays.
+        rig.fake
+            .script_exec(ExecScript::new(journal().argv(), 1, ""));
+        let sent = execs(&rig);
+        let answer = node.logs();
+        assert_eq!(execs(&rig), sent + 1, "one read was sent");
+        assert_eq!(answer["source"], "console", "{answer}");
+        let why = answer["journalNotRead"].as_str().expect("why");
+        assert!(why.starts_with("the journal read ran and failed"), "{why}");
+        assert!(node.exec.hung(&target));
+        // The mark is renewed: the next call sends nothing, until five more minutes have passed.
+        node.wait(HUNG_PROBE_AFTER - Duration::from_secs(1));
+        let why = node.logs()["journalNotRead"].clone();
+        assert!(why.as_str().unwrap().contains("did not answer"), "{why}");
+        assert_eq!(execs(&rig), sent + 1, "no second read");
+        node.wait(Duration::from_secs(1));
+        reads_the_journal(&rig, &node, "journal after the second try");
+        assert!(!node.exec.hung(&target));
+    });
+}
+
+#[test]
+fn only_one_try_runs_at_a_time() {
+    bounded(|| {
+        let rig = Rig::new();
+        system(&rig);
+        let node = node(&rig);
+        let target = target(&rig);
+        mark_hung(&rig, &node, &target);
+        rig.fake.set_console_log(PROJECT, "app", "console line");
+        node.wait(HUNG_PROBE_AFTER);
+        // The try Incus does not answer either: while it runs, every other read is refused before it is sent.
+        let probe = read_in_flight(&rig, &node, &target);
+        let sent = execs(&rig);
+        for _ in 0..3 {
+            let answer = node.logs();
+            assert_eq!(answer["source"], "console", "{answer}");
+            assert!(
+                answer["journalNotRead"]
+                    .as_str()
+                    .unwrap()
+                    .contains("did not answer")
+            );
+        }
+        assert_eq!(execs(&rig), sent, "no read piled up behind the try");
+        probe.join().expect("the try ends");
+        // It did not answer: the mark is renewed, so the next read waits five more minutes.
+        assert!(node.exec.hung(&target));
+        assert_eq!(node.logs()["source"], "console");
+        assert_eq!(execs(&rig), sent);
+    });
+}
+
+#[test]
+fn a_read_that_was_running_when_the_instance_stopped_does_not_mark_it_again() {
+    bounded(|| {
+        let rig = Rig::new();
+        system(&rig);
+        let node = node(&rig);
+        let target = target(&rig);
+        let read = read_in_flight(&rig, &node, &target);
+        // The stop ends the read's command; its deadline passes after the clear, and it marks nothing.
+        assert_eq!(node.act(StateAction::Restart)["status"], "Running");
+        read.join().expect("the read ends");
+        assert!(
+            !node.exec.hung(&target),
+            "the restart came after the read began"
+        );
+        reads_the_journal(&rig, &node, "journal after restart");
+        // A read that begins after the clear still marks the instance when Incus does not answer it.
+        mark_hung(&rig, &node, &target);
+    });
+}
+
+#[test]
+fn the_cut_answer_keeps_where_its_lines_came_from() {
+    let lines: Vec<String> = (0..205).map(|i| format!("{i}")).collect();
+    let why = "the journal read failed: service exec failed";
+    let cut = arca_api::verbs::cut_service_logs(&json!({
+        "lines": lines, "source": "console", "journalNotRead": why, "note": "a note"
+    }))
+    .expect("the answer is cut");
+    assert_eq!(cut["lines"].as_array().unwrap().len(), 200);
+    assert_eq!(cut["source"], "console");
+    assert_eq!(cut["journalNotRead"], why);
+    assert_eq!(cut["note"], "a note");
+    let journal = arca_api::verbs::cut_service_logs(&json!({"lines": lines, "source": "journal"}))
+        .expect("the answer is cut");
+    assert_eq!(journal["source"], "journal");
+    assert!(journal.get("journalNotRead").is_none());
 }

@@ -677,6 +677,7 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
             Arc::new(cfg.clone()),
             crate::handlers::UpdateOptions::default(),
             crate::handlers::FollowEdges::default(),
+            Arc::new(crate::service_exec::ServiceExec::new(Arc::new(cfg.clone()))),
         ));
         if let Err(error) = crate::handlers::spawn_follower(
             follower,

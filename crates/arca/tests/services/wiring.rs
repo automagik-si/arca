@@ -1496,7 +1496,7 @@ fn g5_system_journal_and_capped_fallback_delete_both_recordings() {
         json!({
             "lines": ["console fallback"],
             "source": "console",
-            "journalNotRead": "the journal read did not finish: service exec output exceeds 64 KiB"
+            "journalNotRead": "the journal read failed: service exec output exceeds 64 KiB"
         })
     );
     assert_eq!(rig.fake.recordings(), 0);

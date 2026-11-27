@@ -161,6 +161,21 @@ fn update_options(up: Arc<AtomicBool>) -> UpdateOptions {
 }
 
 fn follower(rig: &Rig, up: &Arc<AtomicBool>, source: &Source) -> Follower {
+    follower_with(
+        rig,
+        up,
+        source,
+        Arc::new(arca::service_exec::ServiceExec::new(rig.cfg.clone())),
+    )
+}
+
+/// The follower over the exec handle `exec`, whose hung marks its updates clear.
+fn follower_with(
+    rig: &Rig,
+    up: &Arc<AtomicBool>,
+    source: &Source,
+    exec: Arc<arca::service_exec::ServiceExec>,
+) -> Follower {
     // Give successive updates distinct journal IDs.
     static TICKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(NOW);
     Follower::new(
@@ -169,6 +184,7 @@ fn follower(rig: &Rig, up: &Arc<AtomicBool>, source: &Source) -> Follower {
         rig.cfg.clone(),
         update_options(Arc::clone(up)),
         source.edges(),
+        exec,
     )
     .with_health_seconds(1)
     .with_pins(vec![(DIGEST.to_string(), "3.136.4".to_string())])
@@ -752,4 +768,69 @@ fn an_opt_out_survives_a_restart_of_the_follower() {
         alias(&rig, "automagik"),
         format!("automagik-si/automagik-server@{DIGEST}")
     );
+}
+
+/// Issue #307: the follower's update stops the service, and the mark the service verbs obey is cleared by it, since the
+/// follower runs on the node's own exec handle.
+#[test]
+fn the_followers_update_clears_the_hung_mark_the_service_verbs_obey() {
+    use arca::service_exec::{DeclaredCommand, ExecTarget};
+    use arca_incus::fake::ExecScript;
+    use std::time::Instant;
+    let up = Arc::new(AtomicBool::new(true));
+    let mut rig = rig(&up);
+    let served = service_handlers_updating(
+        rig.kernel.clone(),
+        Arc::new(|| NOW),
+        rig.cfg.clone(),
+        None,
+        update_options(Arc::clone(&up)),
+    );
+    let exec = arca::handlers::service_exec(&served);
+    rig.handlers = served.into_iter().collect();
+    let service = rig.service_config("automagik");
+    let target = {
+        let kernel = rig.kernel.lock().unwrap();
+        let entry = EntryId("service-automagik".into());
+        ExecTarget {
+            uuid: kernel.service_uuid(&entry, "automagik"),
+            entry,
+            service,
+            retained: kernel.retained_entries().unwrap(),
+        }
+    };
+    // A declared command Incus never answers marks the container (Rule 82).
+    let formula: arca::app_formula::AppUpdate = serde_json::from_value(json!({
+        "health": { "command": ["/usr/bin/curl", "--fail", "http://localhost/ready"], "seconds": 300 },
+        "version": { "command": ["/usr/bin/cat", "/opt/app/version.txt"] }
+    }))
+    .unwrap();
+    let version = DeclaredCommand::version(&formula, "oci").expect("the version reader");
+    let mut held = ExecScript::new(version.argv(), 0, "");
+    held.held = true;
+    rig.fake.script_exec(held);
+    let _ = exec.run_formula(
+        &target,
+        "doctor",
+        "app_update",
+        &version,
+        Some(Instant::now() + Duration::from_secs(2)),
+    );
+    assert!(exec.hung(&target));
+    let source = Source::new();
+    history(&source);
+    source.set(LANE, &record("3.137.0", D_NEW));
+    let done = follower_with(&rig, &up, &source, Arc::clone(&exec)).tick();
+    assert_eq!(done.len(), 1, "{done:?}");
+    assert_eq!(done[0].outcome, Ok(()));
+    assert!(steps(&rig).contains(&"stop".to_string()));
+    assert_eq!(
+        rig.kernel
+            .lock()
+            .unwrap()
+            .service_uuid(&EntryId("service-automagik".into()), "automagik"),
+        target.uuid,
+        "the same instance: only its stop can have cleared the mark"
+    );
+    assert!(!exec.hung(&target), "the follower's update stopped it");
 }

@@ -358,9 +358,9 @@ impl Follower {
         cfg: Arc<NodeConfig>,
         update: service_update::UpdateOptions,
         edges: FollowEdges,
+        exec: Arc<crate::service_exec::ServiceExec>,
     ) -> Follower {
         let writes = write_gate(&kernel);
-        let exec = Arc::new(crate::service_exec::ServiceExec::new(cfg.clone()));
         Follower {
             handler: ServiceHandler {
                 verb: "service_update",
