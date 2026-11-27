@@ -70,8 +70,10 @@ Scale sets are GitHub's mechanism for runners that come and go with demand.
 **Public repositories and fork pull requests.** A runner group serves a public repository only when its "Allow public
 repositories" setting is on. Then a pull request from a fork can carry its own workflow file naming the pool's label, and
 GitHub runs the pull request's copy of the workflow for `pull_request` events: anyone's code, with passwordless sudo, on
-a machine of the pool. No credential reaches the machine and the machine is destroyed after the job, but until
-per-person network isolation lands it sits on the host's network beside other jobs' machines. So, in GitHub's settings:
+a machine of the pool. No credential reaches the machine, the machine is destroyed after the job, and its network card
+reaches the internet only (see "The job machine's card" below): no service, tenant or other job machine on its bridge,
+no private network and none of the host's addresses. It is still anyone's code using the node's internet connection and
+its CPU. So, in GitHub's settings:
 
 - leave the runner group's "Allow public repositories" off for a pool that serves private repositories only;
 - before a pool serves a public repository, set that repository's (or the organisation's) Actions setting "Approval for
@@ -145,13 +147,16 @@ job.
 `image` (it must be in the pool's project; never start or change it, every job machine is a copy of that snapshot), or
 `arca-runner-image-<tag>` when the build published it as an image. Any other local image alias or fingerprint, or
 `<instance>/<snapshot>` of a stopped VM in the pool's project, works the same way.
+`network` (optional) is the bridge the machines' card is on; absent, the node's service bridge (`arcak-svcbr`). It must
+have an IPv4 address, its gateway: the pool's access rules are built from it. Any `eth0` a profile of `profiles` gives
+is replaced by the card. `name` makes the pool's ACL `arca-runner-<name>`, which Incus allows up to 63 characters.
 Records and logs go to `<stateDir>/runners/<pool>/`.
 
 ## The job machine
 
 1. **Clone.** `POST /1.0/instances` with `type: virtual-machine`, the runner image as source, the class's
-   `limits.cpu`, `limits.memory` and root disk size, in the pool's own Incus project and network, marked
-   `user.arcakernel.runner=<pool>`. On btrfs, ZFS and Ceph RBD the root disk is a copy-on-write clone of the image's
+   `limits.cpu`, `limits.memory` and root disk size, and the card below as `eth0`, in the pool's own Incus project,
+   marked `user.arcakernel.runner=<pool>`. On btrfs, ZFS and Ceph RBD the root disk is a copy-on-write clone of the image's
    volume, and it costs only the blocks the job writes. Measured on btrfs (below, "How it is proven"): the copy and the
    start take one to two and a half seconds, the boot to a ready agent about 25 seconds.
 2. **Boot and wait for the Incus agent.** The launcher never uses a network path into the VM.
@@ -172,6 +177,31 @@ Records and logs go to `<stateDir>/runners/<pool>/`.
    and file 0600, owned by root. Logs older than seven days are deleted.
 6. **Destroy.** Force stop, delete. Nothing is reused. A destroy that fails (Incus refused it or timed out) is tried
    again, waiting longer each time, and the machine keeps its share of the budget until it is gone.
+
+**The job machine's card.** Arca builds it; no profile gives it. `eth0` is on the pool's `network` with
+`security.mac_filtering`, `security.ipv4_filtering` and `security.ipv6_filtering` on (the address is the one Incus's
+DHCP gives it; the service bridge has no IPv6, so every IPv6 frame is dropped), both default actions `reject`, and the
+pool's network ACL `arca-runner-<pool>` in `security.acls`. The ACL is made when the pool starts, from the bridge's
+gateway and subnet and the host's addresses, and found and reused at the next start (its rules replaced only when they
+changed, for example a new host address). It carries `user.arcakernel.runner=<pool>`; an ACL of that name without the
+mark stops the pool from starting and is left alone. A pool that is gone from the config has its ACL deleted at the
+next kernel start (Incus refuses it while a machine's card still names it; the kernel says so and tries at the next
+start). The rules are a tenant service's, in the same order and shape, with the whole subnet rejected instead of the
+subnet outside a block, since a job machine has no block of its own:
+
+- egress: reject the bridge's whole subnet; allow DHCP (udp 67) and DNS (udp and tcp 53) on the gateway; reject the
+  private ranges (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), the tailnet range (`100.64.0.0/10`), link-local
+  and loopback; reject all IPv6; reject multicast, broadcast, `0.0.0.0/8` and `240.0.0.0/4`; reject the host's own
+  addresses, the gateway among them; allow the rest (the internet);
+- ingress: none. The default `reject` refuses every connection into the machine; answers to what it opened pass.
+
+Incus does not keep the rules' order: it puts every `drop`, then every `reject`, then every `allow`, then the card's
+default action (`FirewallACLRules` in `internal/server/network/acl/acl_firewall.go`), so a reject always outweighs an
+allow. The gateway's DNS still answers although the gateway is in a rejected range: Incus's filter for a card that has
+an ACL accepts DNS (udp and tcp 53) to the bridge's own addresses and the DHCP broadcast before it reaches the ACL's
+rules (`nftablesInstanceBridgeFilter` in `internal/server/firewall/drivers/drivers_nftables_templates.go`). The allows
+for DHCP and DNS on the gateway state that intent; they open nothing themselves. A DHCP renewal sent straight to the
+gateway is refused like any packet to it; the client then asks again by broadcast, which passes.
 
 **A runner that refuses its configuration.** A runner that exits with an error before it took a job (its
 configuration was refused, or the image cannot run it) is a failure, as a machine that could not boot is: its record
@@ -262,7 +292,12 @@ time.
   config it minted, completes them. It can answer 401, 404 and 403 to drive the alert.
 - **Fake launcher** (tests): an in-memory machine per runner that "runs" a job when told.
 - **Incus launcher** (tests): against the repository's fake Incus, a machine is a marked virtual machine of its
-  class's size, and only the pool's marked machines are listed and destroyed.
+  class's size with the card above on the pool's bridge (the service bridge by default, `network` otherwise), and only
+  the pool's marked machines are listed and destroyed; the ACL holds no ingress rule and the job rules built from the
+  bridge's gateway and the host's addresses, is reused at the next start without a write, follows a new host address,
+  is never taken over from a hand-made ACL of its name, and is deleted when its pool is gone, and no other. The rules
+  themselves are checked against a model of Incus's weighing (`crates/arca-netproject/src/tenant.rs`): no address of
+  the subnet on any protocol, no private, tailnet, link-local, loopback, multicast or host address, and the internet.
 - **Real Incus** (`crates/arca-runners/tests/real_incus_runner.rs`, ignored, run by hand with
   `ARCA_REAL_RUNNER_PROOF=1`): on a real Incus with the runner image, one machine at a time, with a JIT configuration
   of GitHub's shape that no runner can use (no GitHub credential and no call to GitHub). One test drives the launcher
@@ -280,6 +315,14 @@ time.
   | Runner refuses the configuration (exit 2, tried twice, 5 s apart) | 5.9 to 6.2 s |
   | Destroy (force stop and delete) | 0.5 s |
   | Pool: from the class asking for a machine to the job record | 31.6 s |
+
+  A third test proves the card from inside a job machine on the service bridge, in a project without
+  `features.networks` (the ACL is then in `default`): DNS on the gateway answers over udp and tcp (2.2 s after the
+  agent, the machine's DHCP included) and a public https site answers, while a service on the same bridge, the
+  gateway's port 8443 and a private address outside the bridge do not (each attempt times out: Incus turns a reject in
+  the bridge's forward path into a drop). The gateway's 8443 and the private address answer from the host, which the
+  test checks first; the service is reported, since its own ACL may refuse the host too. The machine and the ACL are
+  deleted on every exit path (run on 2026-11-27, with the two tests above, which pass with the card).
 
   The runner refuses the made-up configuration at its own key check, before it calls any server.
 - **Dogfood** (our own organisation, one pool): a test workflow and one real CI job. Counted: jobs, pass rate, queue

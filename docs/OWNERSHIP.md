@@ -1756,12 +1756,19 @@ and in no other, and only virtual machines whose own config carries `user.arcake
 create sets that key; every later request (a file written into or read from the guest through the Incus agent, the
 one command started through the agent, a forced stop, a delete) reads the instance first and refuses one that is not a
 virtual machine carrying this pool's value. The key is in the kernel's namespace and names no entry, so every other
-writer classes such a machine as foreign and never writes it (Rules 2 and 3). The pool keeps a line per machine in
-`<stateDir>/runners/<pool>/jobs.jsonl`, as a run is a line of the run log. The writer is compiled with `arca-incus`'s
-`write` feature, which `arca-runners` receives through `arca-providers` and never enables itself (Rule 28).
-Source: `RunnerVms` and `RUNNER_KEY` in `crates/arca-incus/src/runner_vm.rs`; test
-`a_job_machine_is_a_marked_vm_of_its_size_and_only_marked_machines_go` in `crates/arca-runners/tests/incus_launcher.rs`;
-`crates/arca-runners/Cargo.toml`.
+writer classes such a machine as foreign and never writes it (Rules 2 and 3). The same writer owns one more object per
+pool: the network ACL `arca-runner-<pool>` that every job machine's card names. It is requested in the pool's project
+(Incus keeps it in the project that serves that project's networks), created with `user.arcakernel.runner` set to the
+pool's name, and afterwards read first: its rules are replaced (one PATCH, the config kept) or it is deleted only while
+it carries this pool's value, and an ACL of that name without it is refused and never written. The kernel deletes the
+ACL of a pool that is gone from the config through that pool's writer, at its start. The pool keeps a line per machine
+in `<stateDir>/runners/<pool>/jobs.jsonl`, as a run is a line of the run log. The writer is compiled with
+`arca-incus`'s `write` feature, which `arca-runners` receives through `arca-providers` and never enables itself
+(Rule 28).
+Source: `RunnerVms`, `RUNNER_KEY` and `RUNNER_ACL_PREFIX` in `crates/arca-incus/src/runner_vm.rs`; tests
+`a_job_machine_is_a_marked_vm_of_its_size_and_only_marked_machines_go`,
+`an_acl_of_the_pools_name_without_its_mark_is_left_alone` and `a_gone_pools_acl_is_deleted_and_no_other` in
+`crates/arca-runners/tests/incus_launcher.rs`; `crates/arca-runners/Cargo.toml`.
 
 ## Approved image imports
 

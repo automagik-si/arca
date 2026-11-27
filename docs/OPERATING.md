@@ -7524,6 +7524,11 @@ first real job, and how to read a pool.
    for the second. Never start or change the kept machine: every job machine is a copy of its snapshot.
 3. **Room in the project.** Each machine counts its class's full CPUs and memory against the Incus project's limits
    (`incus project info <project>`) and against the pool's `budget`; make the budget fit what the project has free.
+   **The network needs nothing from the project or its profiles:** Arca gives every machine its own card on the
+   node's service bridge, or on the bridge the pool's `network` names, and replaces any `eth0` a profile gives. The
+   card reaches DNS on the bridge's gateway and the internet, and nothing else: no service, tenant or other job machine
+   on the bridge, no private range, the tailnet range or the host's own addresses, and nothing reaches into it. The
+   pool's ACL, `arca-runner-<pool>`, is made when the pool starts (RUNNERS.md, "The job machine's card").
 4. **The organisation's App connection and its runner group.** Connect the organisation on `/approve/github` with
    "a GitHub App made for you" (Mode 2 above), pick the repositories that may send jobs, and give one label set per size
    class. The App's runner group, `Arca runners`, holds exactly those repositories. `github_bindings` lists the
@@ -7561,6 +7566,10 @@ first real job, and how to read a pool.
   `sudo tar -xzOf <file> var/log/arca-job/runner.log`.
 - **`github_audit`.** Every runner configuration minted for the connection, with the runner's name and, once known, its
   job.
+- **The pool's network rules:** `incus network acl show arca-runner-<pool> --project <project>`. A pool whose ACL
+  could not be made (its bridge has no IPv4 address, or an ACL of that name was made by hand) does not start, and the
+  kernel's log says why. A pool removed from the config has its ACL deleted at the next kernel start
+  (`arca: runners: pool <name> is gone: …`).
 - **The machines alive now:** `incus list --project <project> user.arcakernel.runner=<pool>`. None stays after its job;
   the pool deletes any marked machine it does not know at start and every five minutes.
 
