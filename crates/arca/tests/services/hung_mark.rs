@@ -663,8 +663,7 @@ fn a_restart_found_running_after_its_separate_start_clears_the_mark() {
             .unwrap()
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
-            .filter(|row: &Value| row["kind"] == "end")
-            .last()
+            .rfind(|row: &Value| row["kind"] == "end")
             .expect("an end row");
         assert_eq!(end["outcome"], "running_after_restart", "{end}");
         assert!(!node.exec.hung(&target), "seen stopped before it ran again");
