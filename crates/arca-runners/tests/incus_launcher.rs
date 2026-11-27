@@ -219,7 +219,10 @@ fn a_pool_gets_its_own_bridge_and_its_machines_arcas_card_on_it() {
     assert_eq!(launcher.acl(), AclState::Created);
     assert_eq!(launcher.acl_name(), "arca-runner-acme");
     let bridge = launcher.bridge().to_string();
-    assert!(bridge.starts_with("arcarun-") && bridge.len() <= 15, "{bridge}");
+    assert!(
+        bridge.starts_with("arcarun-") && bridge.len() <= 15,
+        "{bridge}"
+    );
     // The bridge is Arca's: a /24 with NAT and no IPv6, in private space clear of the service subnet, the reserved
     // ranges and the host's networks, marked with the pool.
     let made = network(&fake, &bridge).expect("the pool's bridge");
@@ -227,14 +230,25 @@ fn a_pool_gets_its_own_bridge_and_its_machines_arcas_card_on_it() {
     assert_eq!(made["config"]["user.arcakernel.runner"], "acme");
     assert_eq!(made["config"]["ipv4.nat"], "true");
     assert_eq!(made["config"]["ipv6.address"], "none");
-    let address = made["config"]["ipv4.address"].as_str().expect("an address").to_string();
+    let address = made["config"]["ipv4.address"]
+        .as_str()
+        .expect("an address")
+        .to_string();
     assert!(address.ends_with(".1/24"), "{address}");
     let subnet = subnet_of(&address);
     assert!(overlaps(&subnet, "172.16.0.0/12"), "{subnet}");
-    for taken in [SERVICE_CIDR, "100.70.0.0/16", "198.51.100.128/25", "203.0.113.0/24"] {
+    for taken in [
+        SERVICE_CIDR,
+        "100.70.0.0/16",
+        "198.51.100.128/25",
+        "203.0.113.0/24",
+    ] {
         assert!(!overlaps(&subnet, taken), "{subnet} overlaps {taken}");
     }
-    assert_eq!(subnet, subnet_of(&choose_subnet("acme", &[]).expect("a subnet")));
+    assert_eq!(
+        subnet,
+        subnet_of(&choose_subnet("acme", &[]).expect("a subnet"))
+    );
 
     let spec = spec("acme-0-11223344");
     launcher.create(&spec).expect("create");
@@ -269,7 +283,10 @@ fn a_pool_gets_its_own_bridge_and_its_machines_arcas_card_on_it() {
         list["egress"].as_array().expect("rules"),
         &wanted
     ));
-    assert_eq!(list["egress"][0]["destination"], format!("{subnet},{SERVICE_CIDR}"));
+    assert_eq!(
+        list["egress"][0]["destination"],
+        format!("{subnet},{SERVICE_CIDR}")
+    );
     let _ = fs::remove_dir_all(dir);
 }
 
@@ -284,9 +301,17 @@ fn the_pools_bridge_is_reused_and_its_subnet_follows_from_the_pool() {
     let again = launcher(&fake, "acme", &own()).expect("launcher");
     assert_eq!(again.bridge(), bridge);
     assert_eq!(again.acl(), AclState::Reused);
-    assert_eq!(writes(&fake, "/1.0/networks").len(), 1, "{:?}", writes(&fake, "/1.0/networks"));
+    assert_eq!(
+        writes(&fake, "/1.0/networks").len(),
+        1,
+        "{:?}",
+        writes(&fake, "/1.0/networks")
+    );
     assert_eq!(writes(&fake, "/1.0/network-acls").len(), 1);
-    assert_eq!(network(&fake, &bridge).unwrap()["config"]["ipv4.address"], address);
+    assert_eq!(
+        network(&fake, &bridge).unwrap()["config"]["ipv4.address"],
+        address
+    );
     // Another pool gets another bridge and another subnet.
     let other = launcher(&fake, "other", &own()).expect("launcher");
     assert_ne!(other.bridge(), bridge);
@@ -301,14 +326,24 @@ fn the_pools_bridge_is_reused_and_its_subnet_follows_from_the_pool() {
 #[test]
 fn a_subnet_is_chosen_clear_of_every_taken_range_and_the_same_each_time() {
     let first = choose_subnet("acme", &[]).expect("a subnet");
-    assert_eq!(choose_subnet("acme", &[]), Some(first.clone()), "the same each time");
+    assert_eq!(
+        choose_subnet("acme", &[]),
+        Some(first.clone()),
+        "the same each time"
+    );
     assert!(first.ends_with(".1/24"));
     let taken = vec![subnet_of(&first), "172.16.0.0/16".to_string()];
     let next = choose_subnet("acme", &taken).expect("another subnet");
     for range in &taken {
-        assert!(!overlaps(&subnet_of(&next), range), "{next} overlaps {range}");
+        assert!(
+            !overlaps(&subnet_of(&next), range),
+            "{next} overlaps {range}"
+        );
     }
-    assert!(choose_subnet("acme", &["172.16.0.0/12".to_string()]).is_none(), "no room");
+    assert!(
+        choose_subnet("acme", &["172.16.0.0/12".to_string()]).is_none(),
+        "no room"
+    );
     // A host address alone, without its length, takes its /24.
     let host = subnet_of(&first).replace(".0/24", ".9");
     assert_ne!(choose_subnet("acme", &[host]), Some(first));
@@ -321,7 +356,10 @@ fn a_taken_subnet_moves_the_pools_bridge_and_a_hand_made_bridge_of_its_name_is_l
     let first = choose_subnet("acme", &[]).expect("a subnet");
     fake.set_host_interfaces(vec![
         (SERVICE_BRIDGE.to_string(), vec![ip([192, 0, 2, 1])]),
-        ("lan9".to_string(), vec![first.split('/').next().unwrap().parse().unwrap()]),
+        (
+            "lan9".to_string(),
+            vec![first.split('/').next().unwrap().parse().unwrap()],
+        ),
     ]);
     let launcher = launcher(&fake, "acme", &own()).expect("launcher");
     let address = network(&fake, launcher.bridge()).unwrap()["config"]["ipv4.address"]
@@ -333,9 +371,10 @@ fn a_taken_subnet_moves_the_pools_bridge_and_a_hand_made_bridge_of_its_name_is_l
 
     // A network of the pool's bridge name without its mark stops the pool and is never written.
     let (fake, dir2) = self::fake();
-    let bridge = arca_incus::runner_vm::RunnerVms::new(fake.socket().to_path_buf(), PROJECT, "acme")
-        .expect("writer")
-        .bridge_name();
+    let bridge =
+        arca_incus::runner_vm::RunnerVms::new(fake.socket().to_path_buf(), PROJECT, "acme")
+            .expect("writer")
+            .bridge_name();
     fake.add_network(
         "default",
         json!({"name": bridge, "type": "bridge", "description": "by hand",
@@ -343,7 +382,11 @@ fn a_taken_subnet_moves_the_pools_bridge_and_a_hand_made_bridge_of_its_name_is_l
     );
     assert!(self::launcher(&fake, "acme", &own()).is_err());
     assert_eq!(network(&fake, &bridge).unwrap()["description"], "by hand");
-    assert!(fake.writes().iter().all(|write| !write.path.contains(&bridge)));
+    assert!(
+        fake.writes()
+            .iter()
+            .all(|write| !write.path.contains(&bridge))
+    );
     let _ = fs::remove_dir_all(dir);
     let _ = fs::remove_dir_all(dir2);
 }
@@ -353,7 +396,10 @@ fn a_pools_network_key_puts_the_card_on_that_bridge_with_its_own_subnet_rejected
     let (fake, dir) = fake();
     let launcher = launcher(&fake, "acme", &named("ci-br0")).expect("launcher");
     assert_eq!(launcher.bridge(), "ci-br0");
-    assert!(writes(&fake, "/1.0/networks").is_empty(), "a named bridge is never made");
+    assert!(
+        writes(&fake, "/1.0/networks").is_empty(),
+        "a named bridge is never made"
+    );
     launcher.create(&spec("acme-0-55667788")).expect("create");
     let made = instance(&fake, "acme-0-55667788").expect("the machine exists");
     assert_eq!(made["devices"]["eth0"]["network"], "ci-br0");
@@ -378,12 +424,16 @@ fn a_machine_with_any_card_but_arcas_is_deleted_and_its_create_fails() {
             "root":{"type":"disk","pool":"pool1","path":"/"},
             "eth1":{"type":"nic","network":"ci-br0"}}}),
     );
-    let launcher = launcher_with(&fake, "acme", vec!["extra".to_string()], &own()).expect("launcher");
+    let launcher =
+        launcher_with(&fake, "acme", vec!["extra".to_string()], &own()).expect("launcher");
     let error = launcher
         .create(&spec("acme-0-99aabbcc"))
         .expect_err("a second card is refused");
     assert!(error.to_string().contains("eth1"), "{error}");
-    assert!(instance(&fake, "acme-0-99aabbcc").is_none(), "the machine is gone");
+    assert!(
+        instance(&fake, "acme-0-99aabbcc").is_none(),
+        "the machine is gone"
+    );
     assert!(launcher.existing().expect("list").is_empty());
     let _ = fs::remove_dir_all(dir);
 }
@@ -399,18 +449,31 @@ fn the_pools_acl_follows_the_hosts_addresses_at_each_create() {
     // The host gained a public address while the pool runs: the next create replaces the rules first.
     fake.set_host_interfaces(vec![
         (SERVICE_BRIDGE.to_string(), vec![ip([192, 0, 2, 1])]),
-        ("uplink0".to_string(), vec![ip([203, 0, 113, 7]), ip([203, 0, 113, 99])]),
+        (
+            "uplink0".to_string(),
+            vec![ip([203, 0, 113, 7]), ip([203, 0, 113, 99])],
+        ),
     ]);
     launcher.create(&spec("acme-0-00000002")).expect("create");
     let acl_writes = writes(&fake, "/1.0/network-acls");
     assert_eq!(acl_writes.len(), 2, "{acl_writes:?}");
-    assert_eq!(acl_writes[1], "PATCH /1.0/network-acls/arca-runner-acme?project=arcak-runners");
+    assert_eq!(
+        acl_writes[1],
+        "PATCH /1.0/network-acls/arca-runner-acme?project=arcak-runners"
+    );
     let list = acl(&fake, "arca-runner-acme").expect("the ACL");
     assert!(list["egress"].to_string().contains("203.0.113.99/32"));
     assert_eq!(list["config"]["user.arcakernel.runner"], "acme");
     // The rules were replaced before the machine was made.
-    let all: Vec<String> = fake.writes().iter().map(|w| format!("{} {}", w.method, w.path)).collect();
-    let patch = all.iter().position(|w| w.starts_with("PATCH /1.0/network-acls")).unwrap();
+    let all: Vec<String> = fake
+        .writes()
+        .iter()
+        .map(|w| format!("{} {}", w.method, w.path))
+        .collect();
+    let patch = all
+        .iter()
+        .position(|w| w.starts_with("PATCH /1.0/network-acls"))
+        .unwrap();
     let second = all
         .iter()
         .rposition(|w| w.starts_with("POST /1.0/instances"))

@@ -142,7 +142,8 @@ struct Sweep {
 impl Sweep {
     fn new(proof: &Proof) -> Self {
         Self {
-            vms: RunnerVms::new(proof.socket.clone(), &proof.project, &proof.pool).expect("the writer"),
+            vms: RunnerVms::new(proof.socket.clone(), &proof.project, &proof.pool)
+                .expect("the writer"),
             own_bridge: proof.plan.bridge.is_none(),
             project: proof.project.clone(),
             throwaway: Vec::new(),
@@ -168,7 +169,10 @@ impl Drop for Sweep {
         if self.own_bridge
             && let Err(error) = self.vms.remove_bridge()
         {
-            eprintln!("could not delete the bridge {}: {error}", self.vms.bridge_name());
+            eprintln!(
+                "could not delete the bridge {}: {error}",
+                self.vms.bridge_name()
+            );
         }
     }
 }
@@ -181,7 +185,8 @@ fn incus_cli(args: &[&str]) -> (bool, String) {
         .args(args)
         .output()
         .expect("the incus command line");
-    let text = String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+    let text =
+        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
     (out.status.success(), text)
 }
 
@@ -245,12 +250,18 @@ fn a_real_machine_takes_its_configuration_runs_the_runner_once_and_goes() {
         .get(&format!("/1.0/instances/{name}?project={}", proof.project))
         .expect("the machine");
     assert_eq!(made["type"], "virtual-machine", "{made}");
-    assert_eq!(made["config"]["user.arcakernel.runner"], proof.pool.as_str());
+    assert_eq!(
+        made["config"]["user.arcakernel.runner"],
+        proof.pool.as_str()
+    );
     assert_eq!(made["config"]["limits.cpu"], proof.cpu.to_string());
 
     let clock = Instant::now();
     while !launcher.ready(&name).expect("the readiness read") {
-        assert!(clock.elapsed() < Duration::from_secs(300), "no agent in 5 minutes");
+        assert!(
+            clock.elapsed() < Duration::from_secs(300),
+            "no agent in 5 minutes"
+        );
         std::thread::sleep(Duration::from_millis(500));
     }
     let booted = clock.elapsed();
@@ -277,7 +288,10 @@ fn a_real_machine_takes_its_configuration_runs_the_runner_once_and_goes() {
         {
             break code;
         }
-        assert!(clock.elapsed() < Duration::from_secs(300), "the runner did not exit in 5 minutes");
+        assert!(
+            clock.elapsed() < Duration::from_secs(300),
+            "the runner did not exit in 5 minutes"
+        );
     };
     let ran = clock.elapsed();
     assert_ne!(code, 0, "a configuration no runner can use is refused");
@@ -296,10 +310,16 @@ fn a_real_machine_takes_its_configuration_runs_the_runner_once_and_goes() {
         .expect("the guest packed its logs");
     let listing = untar(&logs, &["-tzf", "-"]);
     assert!(listing.contains("var/log/arca-job/runner.log"), "{listing}");
-    assert!(listing.contains("actions-runner/_diag/Runner_"), "{listing}");
+    assert!(
+        listing.contains("actions-runner/_diag/Runner_"),
+        "{listing}"
+    );
     let log = untar(&logs, &["-xzOf", "-", "var/log/arca-job/runner.log"]);
     assert!(log.contains(&format!("runner exited {code}")), "{log}");
-    assert!(!log.contains(&jit[..64]), "the configuration is not in the log");
+    assert!(
+        !log.contains(&jit[..64]),
+        "the configuration is not in the log"
+    );
 
     let clock = Instant::now();
     launcher.destroy(&name).expect("the destroy");
@@ -348,11 +368,17 @@ async fn the_pool_records_a_refused_runner_and_destroys_its_machine() {
     let github = FakeGitHub::start(TOKEN).await.expect("fake GitHub");
     let http = Http::new().expect("http");
     let access = Arc::new(
-        RegistrationAccess::new(http.clone(), github.api_url(), "https://github.com/proof", Secret::new(TOKEN))
-            .expect("access"),
+        RegistrationAccess::new(
+            http.clone(),
+            github.api_url(),
+            "https://github.com/proof",
+            Secret::new(TOKEN),
+        )
+        .expect("access"),
     );
     let client = Arc::new(ScaleSetClient::new(http, access, &config.binding));
-    let dir = std::env::temp_dir().join(format!("arca-real-runner-{}-{}", std::process::id(), hex()));
+    let dir =
+        std::env::temp_dir().join(format!("arca-real-runner-{}-{}", std::process::id(), hex()));
     let recorder = Recorder::open(dir.clone(), 7).expect("recorder");
     // One machine only: the class's wait after the failure outlasts the test.
     let timing = Timing {
@@ -381,7 +407,10 @@ async fn the_pool_records_a_refused_runner_and_destroys_its_machine() {
         {
             break serde_json::from_str(&line).expect("a job line");
         }
-        assert!(clock.elapsed() < Duration::from_secs(600), "no record in 10 minutes");
+        assert!(
+            clock.elapsed() < Duration::from_secs(600),
+            "no record in 10 minutes"
+        );
         tokio::time::sleep(Duration::from_millis(500)).await;
     };
     let took = clock.elapsed();
@@ -390,17 +419,33 @@ async fn the_pool_records_a_refused_runner_and_destroys_its_machine() {
 
     let code = line["runnerExit"].as_i64().expect("an exit code");
     assert_ne!(code, 0, "{line}");
-    assert_eq!(line["note"], format!("the runner exited {code} before it took a job"));
+    assert_eq!(
+        line["note"],
+        format!("the runner exited {code} before it took a job")
+    );
     assert_eq!(line["repository"], "");
     let logs = dir.join(line["logs"].as_str().expect("logs kept"));
-    let mode = |path: &std::path::Path| std::fs::metadata(path).expect("there").permissions().mode() & 0o777;
+    let mode = |path: &std::path::Path| {
+        std::fs::metadata(path).expect("there").permissions().mode() & 0o777
+    };
     assert_eq!(mode(&logs), 0o600);
     assert_eq!(mode(logs.parent().expect("its folder")), 0o700);
-    let log = untar(&std::fs::read(&logs).expect("the logs"), &["-xzOf", "-", "var/log/arca-job/runner.log"]);
+    let log = untar(
+        &std::fs::read(&logs).expect("the logs"),
+        &["-xzOf", "-", "var/log/arca-job/runner.log"],
+    );
     assert!(log.contains(&format!("runner exited {code}")), "{log}");
-    assert!(launcher.existing().expect("list").is_empty(), "the machine is gone");
+    assert!(
+        launcher.existing().expect("list").is_empty(),
+        "the machine is gone"
+    );
     let name = line["runner"].as_str().expect("its name");
-    assert!(github.removed_runners().iter().any(|removed| removed == name));
+    assert!(
+        github
+            .removed_runners()
+            .iter()
+            .any(|removed| removed == name)
+    );
     assert_eq!(proof.image_state(), image_before, "the image is unchanged");
     eprintln!(
         "real pool proof: record after {} s (boot {} s, machine {} s), runner exit {code}, note: {}",
@@ -441,7 +486,10 @@ fn guest(vms: &RunnerVms, name: &str, script: &str, limit: Duration) -> i64 {
             ExecState::Gone => return -1,
             ExecState::Running => {}
         }
-        assert!(clock.elapsed() < limit, "{script:?} still runs after {limit:?}");
+        assert!(
+            clock.elapsed() < limit,
+            "{script:?} still runs after {limit:?}"
+        );
     }
 }
 
@@ -454,7 +502,9 @@ fn throwaway(project: &str, name: &str, script: &str) -> bool {
 fn holds(subnet: &str, ip: std::net::Ipv4Addr) -> bool {
     let (base, prefix) = subnet.split_once('/').expect("a CIDR");
     let base = u32::from(base.parse::<std::net::Ipv4Addr>().expect("an address"));
-    let mask = u32::MAX.checked_shl(32 - prefix.parse::<u32>().expect("a prefix")).unwrap_or(0);
+    let mask = u32::MAX
+        .checked_shl(32 - prefix.parse::<u32>().expect("a prefix"))
+        .unwrap_or(0);
     u32::from(ip) & mask == base & mask
 }
 
@@ -462,7 +512,10 @@ fn holds(subnet: &str, ip: std::net::Ipv4Addr) -> bool {
 fn address_in(proof: &Proof, name: &str, subnet: &str, deadline: Instant) -> std::net::Ipv4Addr {
     loop {
         let state = proof
-            .get(&format!("/1.0/instances/{name}/state?project={}", proof.project))
+            .get(&format!(
+                "/1.0/instances/{name}/state?project={}",
+                proof.project
+            ))
             .expect("the machine's state");
         let found = state["network"]
             .as_object()
@@ -475,7 +528,10 @@ fn address_in(proof: &Proof, name: &str, subnet: &str, deadline: Instant) -> std
         if let Some(ip) = found {
             return ip;
         }
-        assert!(Instant::now() < deadline, "{name} has no address in {subnet} in time");
+        assert!(
+            Instant::now() < deadline,
+            "{name} has no address in {subnet} in time"
+        );
         std::thread::sleep(Duration::from_secs(1));
     }
 }
@@ -494,38 +550,92 @@ fn a_real_job_machine_reaches_dns_and_the_internet_and_nothing_else() {
     let _one = ONE_AT_A_TIME.blocking_lock();
     let deadline = Instant::now() + Duration::from_secs(900);
     let private = endpoint("ARCA_PROOF_PRIVATE");
-    let service_bridge = env("ARCA_PROOF_SERVICE_BRIDGE").unwrap_or_else(|| arca_netproject::BRIDGE.into());
-    let service_cidr = proof.plan.service_cidr.clone().expect("ARCA_PROOF_SERVICE_CIDR");
+    let service_bridge =
+        env("ARCA_PROOF_SERVICE_BRIDGE").unwrap_or_else(|| arca_netproject::BRIDGE.into());
+    let service_cidr = proof
+        .plan
+        .service_cidr
+        .clone()
+        .expect("ARCA_PROOF_SERVICE_CIDR");
     let dns_name = env("ARCA_PROOF_DNS_NAME").unwrap_or_else(|| "example.com".into());
     let url = env("ARCA_PROOF_INTERNET_URL").unwrap_or_else(|| "https://example.com".into());
     let mut sweep = Sweep::new(&proof);
     let launcher = proof.launcher();
     assert!(launcher.existing().expect("list").is_empty());
     let bridge = proof
-        .get(&format!("/1.0/networks/{}?project={}", launcher.bridge(), proof.project))
+        .get(&format!(
+            "/1.0/networks/{}?project={}",
+            launcher.bridge(),
+            proof.project
+        ))
         .expect("the pool's bridge");
-    let address = bridge["config"]["ipv4.address"].as_str().expect("its address").to_string();
-    let gateway: std::net::Ipv4Addr = address.split('/').next().unwrap().parse().expect("the gateway");
-    let prefix: u32 = address.split('/').nth(1).unwrap().parse().expect("its prefix");
+    let address = bridge["config"]["ipv4.address"]
+        .as_str()
+        .expect("its address")
+        .to_string();
+    let gateway: std::net::Ipv4Addr = address
+        .split('/')
+        .next()
+        .unwrap()
+        .parse()
+        .expect("the gateway");
+    let prefix: u32 = address
+        .split('/')
+        .nth(1)
+        .unwrap()
+        .parse()
+        .expect("its prefix");
     let mask = u32::MAX.checked_shl(32 - prefix).unwrap_or(0);
-    let subnet = format!("{}/{prefix}", std::net::Ipv4Addr::from(u32::from(gateway) & mask));
+    let subnet = format!(
+        "{}/{prefix}",
+        std::net::Ipv4Addr::from(u32::from(gateway) & mask)
+    );
     let incus_api = std::net::SocketAddr::from((gateway, 8443));
-    assert!(host_reaches(private), "the private address does not answer from the host");
-    assert!(host_reaches(incus_api), "the gateway's 8443 does not answer from the host");
+    assert!(
+        host_reaches(private),
+        "the private address does not answer from the host"
+    );
+    assert!(
+        host_reaches(incus_api),
+        "the gateway's 8443 does not answer from the host"
+    );
 
     // The throwaway machine: no rules of its own, on the pool's bridge and on the service bridge.
-    let (instance, snapshot) = proof.image.split_once('/').expect("the image is <instance>/<snapshot>");
+    let (instance, snapshot) = proof
+        .image
+        .split_once('/')
+        .expect("the image is <instance>/<snapshot>");
     let target = format!("{}-target-{}", proof.pool, hex());
     let project = proof.project.as_str();
     let (made, out) = incus_cli(&[
-        "copy", "--project", project, "--instance-only", &format!("{instance}/{snapshot}"), &target,
-        "-c", "limits.cpu=1", "-c", "limits.memory=1GiB", "-c", "boot.autostart=false",
+        "copy",
+        "--project",
+        project,
+        &format!("{instance}/{snapshot}"),
+        &target,
+        "-c",
+        "limits.cpu=1",
+        "-c",
+        "limits.memory=1GiB",
+        "-c",
+        "boot.autostart=false",
     ]);
     sweep.throwaway.push(target.clone());
     assert!(made, "the throwaway copy: {out}");
-    for (card, network) in [("eth0", launcher.bridge()), ("eth1", service_bridge.as_str())] {
+    for (card, network) in [
+        ("eth0", launcher.bridge()),
+        ("eth1", service_bridge.as_str()),
+    ] {
         let (added, out) = incus_cli(&[
-            "config", "device", "add", "--project", project, &target, card, "nic", &format!("network={network}"),
+            "config",
+            "device",
+            "add",
+            "--project",
+            project,
+            &target,
+            card,
+            "nic",
+            &format!("network={network}"),
         ]);
         assert!(added, "the throwaway's {card}: {out}");
     }
@@ -536,7 +646,12 @@ fn a_real_job_machine_reaches_dns_and_the_internet_and_nothing_else() {
     let job = |n: u32| {
         let name = format!("{}-{n}-{}", proof.pool, hex());
         launcher
-            .create(&MachineSpec { name: name.clone(), cpu: proof.cpu, memory_mib: proof.memory_mib, disk_gib: None })
+            .create(&MachineSpec {
+                name: name.clone(),
+                cpu: proof.cpu,
+                memory_mib: proof.memory_mib,
+                disk_gib: None,
+            })
             .expect("the clone");
         name
     };
@@ -552,12 +667,21 @@ fn a_real_job_machine_reaches_dns_and_the_internet_and_nothing_else() {
         .map(|(name, _)| name)
         .collect();
     assert_eq!(cards, vec!["eth0"], "Arca's card and no other");
-    assert_eq!(made["expanded_devices"]["eth0"]["network"], launcher.bridge());
-    assert_eq!(made["expanded_devices"]["eth0"]["security.acls"], launcher.acl_name());
+    assert_eq!(
+        made["expanded_devices"]["eth0"]["network"],
+        launcher.bridge()
+    );
+    assert_eq!(
+        made["expanded_devices"]["eth0"]["security.acls"],
+        launcher.acl_name()
+    );
 
     // The throwaway: both cards up, a listener the host reaches on both addresses.
     while !throwaway(project, &target, "true") {
-        assert!(Instant::now() < deadline, "the throwaway's agent did not answer in time");
+        assert!(
+            Instant::now() < deadline,
+            "the throwaway's agent did not answer in time"
+        );
         std::thread::sleep(Duration::from_secs(1));
     }
     assert!(throwaway(
@@ -572,7 +696,10 @@ fn a_real_job_machine_reaches_dns_and_the_internet_and_nothing_else() {
         let to = std::net::SocketAddr::from((to, 8080));
         let clock = Instant::now();
         while !host_reaches(to) {
-            assert!(clock.elapsed() < Duration::from_secs(60), "the throwaway's {to} does not answer the host");
+            assert!(
+                clock.elapsed() < Duration::from_secs(60),
+                "the throwaway's {to} does not answer the host"
+            );
             std::thread::sleep(Duration::from_secs(1));
         }
     }
@@ -586,27 +713,49 @@ fn a_real_job_machine_reaches_dns_and_the_internet_and_nothing_else() {
     }
     // 1. DNS on the gateway answers, over udp and tcp, once the machine has its address.
     let dig = |tcp: &str| {
-        format!("timeout 10 dig {tcp} +short +time=3 +tries=2 @{gateway} {dns_name} A | grep -q '^[0-9]'")
+        format!(
+            "timeout 10 dig {tcp} +short +time=3 +tries=2 @{gateway} {dns_name} A | grep -q '^[0-9]'"
+        )
     };
     let clock = Instant::now();
     for name in [&first, &second] {
         while guest(&vms, name, &dig(""), Duration::from_secs(30)) != 0 {
-            assert!(clock.elapsed() < Duration::from_secs(180), "no DNS answer from the gateway in 3 minutes");
+            assert!(
+                clock.elapsed() < Duration::from_secs(180),
+                "no DNS answer from the gateway in 3 minutes"
+            );
             std::thread::sleep(Duration::from_secs(2));
         }
     }
     let dns_after = clock.elapsed();
-    assert_eq!(guest(&vms, &first, &dig("+tcp"), Duration::from_secs(30)), 0, "DNS over tcp");
+    assert_eq!(
+        guest(&vms, &first, &dig("+tcp"), Duration::from_secs(30)),
+        0,
+        "DNS over tcp"
+    );
     // 2. The internet answers.
     let curl = format!("timeout 20 curl -sS -m 10 -o /dev/null {url}");
-    assert_eq!(guest(&vms, &first, &curl, Duration::from_secs(30)), 0, "the internet");
+    assert_eq!(
+        guest(&vms, &first, &curl, Duration::from_secs(30)),
+        0,
+        "the internet"
+    );
 
     // The first job machine listens on 8080; it answers itself on its own address.
     let first_ip = address_in(&proof, &first, &subnet, deadline);
     assert_eq!(guest(&vms, &first, LISTEN, Duration::from_secs(30)), 0);
     let clock = Instant::now();
-    while guest(&vms, &first, &connect(first_ip, 8080), Duration::from_secs(30)) != 0 {
-        assert!(clock.elapsed() < Duration::from_secs(30), "the job's listener does not answer itself");
+    while guest(
+        &vms,
+        &first,
+        &connect(first_ip, 8080),
+        Duration::from_secs(30),
+    ) != 0
+    {
+        assert!(
+            clock.elapsed() < Duration::from_secs(30),
+            "the job's listener does not answer itself"
+        );
         std::thread::sleep(Duration::from_secs(1));
     }
 
@@ -616,26 +765,63 @@ fn a_real_job_machine_reaches_dns_and_the_internet_and_nothing_else() {
         refused.push(format!("{what} (exit {code})"));
     };
     // 3. The throwaway on the same bridge, which answers the host: refused.
-    refuse("the throwaway on the same bridge", guest(&vms, &first, &connect(target_here, 8080), Duration::from_secs(30)));
+    refuse(
+        "the throwaway on the same bridge",
+        guest(
+            &vms,
+            &first,
+            &connect(target_here, 8080),
+            Duration::from_secs(30),
+        ),
+    );
     // 4. The throwaway into the job machine: refused.
     refuse(
         "the throwaway into the job machine",
         i64::from(!throwaway(project, &target, &connect(first_ip, 8080))),
     );
     // 5. The second job machine into the first: refused.
-    refuse("the second job machine into the first", guest(&vms, &second, &connect(first_ip, 8080), Duration::from_secs(30)));
+    refuse(
+        "the second job machine into the first",
+        guest(
+            &vms,
+            &second,
+            &connect(first_ip, 8080),
+            Duration::from_secs(30),
+        ),
+    );
     // 6. A service address on the service bridge, routed through the host, which it answers: refused.
     refuse(
         "the service bridge through the host",
-        guest(&vms, &first, &connect(target_service, 8080), Duration::from_secs(30)),
+        guest(
+            &vms,
+            &first,
+            &connect(target_service, 8080),
+            Duration::from_secs(30),
+        ),
     );
     // And the gateway's 8443 and a private address outside both bridges, which answer the host.
-    refuse("the gateway's 8443", guest(&vms, &first, &connect(gateway, 8443), Duration::from_secs(30)));
+    refuse(
+        "the gateway's 8443",
+        guest(
+            &vms,
+            &first,
+            &connect(gateway, 8443),
+            Duration::from_secs(30),
+        ),
+    );
     let private_ip = match private.ip() {
         std::net::IpAddr::V4(ip) => ip,
         std::net::IpAddr::V6(_) => panic!("ARCA_PROOF_PRIVATE is an IPv4 address"),
     };
-    refuse("the private address", guest(&vms, &first, &connect(private_ip, private.port()), Duration::from_secs(30)));
+    refuse(
+        "the private address",
+        guest(
+            &vms,
+            &first,
+            &connect(private_ip, private.port()),
+            Duration::from_secs(30),
+        ),
+    );
     assert!(Instant::now() < deadline, "the proof outlasted its bound");
     eprintln!(
         "real network proof: DNS on the gateway answered both job machines after {} s (udp and tcp on the first), {url} \
