@@ -192,12 +192,12 @@ pub fn spawn(
         move |pool| {
             // The host's routes as they are at this pool's start: a new bridge keeps clear of them, and an existing one
             // that a route now meets stops the pool.
-            let routes = std::fs::read_to_string(crate::cmd_init::ROUTES)
-                .map(|table| crate::cmd_init::routed_networks(&table))
+            let routes = std::fs::read_to_string(arca_netproject::routes::ROUTES)
+                .map(|table| arca_netproject::routes::routed_networks(&table))
                 .map_err(|error| {
                     format!(
                         "the routing table {} could not be read: {error}",
-                        crate::cmd_init::ROUTES
+                        arca_netproject::routes::ROUTES
                     )
                 })?;
             let plan = NetworkPlan {

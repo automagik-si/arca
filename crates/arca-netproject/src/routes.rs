@@ -10,7 +10,32 @@ pub const ROUTES: &str = "/proc/net/route";
 /// the machine's byte order, each as `(network, prefix length, interface)`. The default route is every address and
 /// says nothing of what is in use, so it is left out.
 pub fn parse(table: &str) -> Vec<(Ipv4Addr, u32, String)> {
-    unimplemented!("{table}")
+    let mut routes = Vec::new();
+    for line in table.lines().skip(1) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let (Some(interface), Some(destination), Some(mask)) =
+            (fields.first(), fields.get(1), fields.get(7))
+        else {
+            continue;
+        };
+        let (Ok(destination), Ok(mask)) = (
+            u32::from_str_radix(destination, 16),
+            u32::from_str_radix(mask, 16),
+        ) else {
+            continue;
+        };
+        // The kernel prints each as the number its four network-order bytes make in the machine's own byte order.
+        let (destination, mask) = (u32::from_be(destination), u32::from_be(mask));
+        if mask == 0 {
+            continue;
+        }
+        routes.push((
+            Ipv4Addr::from(destination),
+            mask.count_ones(),
+            interface.to_string(),
+        ));
+    }
+    routes
 }
 
 /// [`parse`] as `(destination CIDR, interface)`.

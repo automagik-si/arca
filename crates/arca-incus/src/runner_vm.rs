@@ -231,9 +231,10 @@ impl RunnerVms {
                 "the created instance does not carry the pool's mark",
             ));
         }
-        // Arca's card is the machine's only way out, and disks its only other devices: a card, a proxy, a passed-through
-        // device or anything else a profile or the copied image machine gives would carry no rules. Such a machine is
-        // deleted before it ever starts.
+        // Arca's card is the machine's only way out, and its root disk its only other device: a card, a proxy, a
+        // passed-through device, a disk from a host directory, a host block device or a shared volume, or anything else a
+        // profile or the copied image machine gives would bypass the rules or share state between jobs. Such a machine
+        // is deleted before it ever starts.
         let devices = made
             .get("expanded_devices")
             .or_else(|| made.get("devices"))
@@ -248,7 +249,10 @@ impl RunnerVms {
                     && name == "eth0"
                     && device.get("security.acls").and_then(Value::as_str)
                         == Some(self.acl_name().as_str());
-                (kind != "disk" && !arcas).then(|| format!("{name} ({kind})"))
+                let root = kind == "disk"
+                    && device.get("path").and_then(Value::as_str) == Some("/")
+                    && device.get("source").is_none();
+                (!root && !arcas).then(|| format!("{name} ({kind})"))
             })
             .collect();
         if !others.is_empty() {
@@ -267,7 +271,7 @@ impl RunnerVms {
                     uuid: None,
                     owner: None,
                     reason: format!(
-                        "the job machine had a device other than its disks and Arca's card ({named}, from a profile or the image machine), so it was {} before it started; give the pool profiles and an image without one",
+                        "the job machine had a device other than its root disk and Arca's card ({named}, from a profile or the image machine), so it was {} before it started; give the pool profiles and an image without one",
                         if deleted.is_ok() {
                             "deleted"
                         } else {
