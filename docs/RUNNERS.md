@@ -71,8 +71,8 @@ Scale sets are GitHub's mechanism for runners that come and go with demand.
 repositories" setting is on. Then a pull request from a fork can carry its own workflow file naming the pool's label, and
 GitHub runs the pull request's copy of the workflow for `pull_request` events: anyone's code, with passwordless sudo, on
 a machine of the pool. No credential reaches the machine, the machine is destroyed after the job, and its network card
-reaches the internet only (see "The job machine's card" below): no service, tenant or other job machine on its bridge,
-no private network and none of the host's addresses. It is still anyone's code using the node's internet connection and
+reaches the internet only (see "The job machine's network" below): it sits on the pool's own bridge, and reaches no
+service, tenant or other job machine, no private network and none of the host's addresses. It is still anyone's code using the node's internet connection and
 its CPU. So, in GitHub's settings:
 
 - leave the runner group's "Allow public repositories" off for a pool that serves private repositories only;
@@ -147,9 +147,12 @@ job.
 `image` (it must be in the pool's project; never start or change it, every job machine is a copy of that snapshot), or
 `arca-runner-image-<tag>` when the build published it as an image. Any other local image alias or fingerprint, or
 `<instance>/<snapshot>` of a stopped VM in the pool's project, works the same way.
-`network` (optional) is the bridge the machines' card is on; absent, the node's service bridge (`arcak-svcbr`). It must
-have an IPv4 address, its gateway: the pool's access rules are built from it. Any `eth0` a profile of `profiles` gives
-is replaced by the card. `name` makes the pool's ACL `arca-runner-<name>`, which Incus allows up to 63 characters.
+`network` (optional) names an existing bridge for the machines' card; absent, the pool gets its own bridge (see "The
+job machine's network"). A named bridge must be visible from the pool's project (a project with `features.networks`
+sees its own networks only) and have an IPv4 address, its gateway: the pool's access rules are built from it. Any
+`eth0` a profile of `profiles` gives is replaced by the card, and a profile or an image machine that gives any other
+card makes every create fail. `name` makes the pool's ACL `arca-runner-<name>`, which Incus allows up to 63
+characters.
 Records and logs go to `<stateDir>/runners/<pool>/`.
 
 ## The job machine
@@ -178,30 +181,60 @@ Records and logs go to `<stateDir>/runners/<pool>/`.
 6. **Destroy.** Force stop, delete. Nothing is reused. A destroy that fails (Incus refused it or timed out) is tried
    again, waiting longer each time, and the machine keeps its share of the budget until it is gone.
 
-**The job machine's card.** Arca builds it; no profile gives it. `eth0` is on the pool's `network` with
-`security.mac_filtering`, `security.ipv4_filtering` and `security.ipv6_filtering` on (the address is the one Incus's
-DHCP gives it; the service bridge has no IPv6, so every IPv6 frame is dropped), both default actions `reject`, and the
-pool's network ACL `arca-runner-<pool>` in `security.acls`. The ACL is made when the pool starts, from the bridge's
-gateway and subnet and the host's addresses, and found and reused at the next start (its rules replaced only when they
-changed, for example a new host address). It carries `user.arcakernel.runner=<pool>`; an ACL of that name without the
-mark stops the pool from starting and is left alone. A pool that is gone from the config has its ACL deleted at the
-next kernel start (Incus refuses it while a machine's card still names it; the kernel says so and tries at the next
-start). The rules are a tenant service's, in the same order and shape, with the whole subnet rejected instead of the
-subnet outside a block, since a job machine has no block of its own:
+**The job machine's network.** By default each pool has a bridge of its own, `arcarun-` and seven hex digits of the
+pool's name hashed. Arca makes it when the pool starts (or finds it and reuses it), marked
+`user.arcakernel.runner=<pool>`: a /24 with NAT, DHCP and DNS, and no IPv6. Its subnet is the first /24 of
+`172.16.0.0/12`, tried from a point the pool's name fixes, that overlaps none of the node's `kernel.serviceCidr`, its
+`kernel.reservedCidrs`, any Incus network's subnet in any project and any network of the host; so a restart, or a
+rebuilt node with the same networks, gives the pool the same subnet. A pool that is gone from the config has its
+bridge deleted at the next kernel start, after its ACL (Incus refuses either while a machine still uses it; the kernel
+says so and tries again at the next start). A network of the bridge's name without the pool's mark stops the pool and
+is left alone.
 
-- egress: reject the bridge's whole subnet; allow DHCP (udp 67) and DNS (udp and tcp 53) on the gateway; reject the
-  private ranges (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), the tailnet range (`100.64.0.0/10`), link-local
-  and loopback; reject all IPv6; reject multicast, broadcast, `0.0.0.0/8` and `240.0.0.0/4`; reject the host's own
-  addresses, the gateway among them; allow the rest (the internet);
-- ingress: none. The default `reject` refuses every connection into the machine; answers to what it opened pass.
+Its own bridge keeps a job off the node's service bridge: there, a job's DHCP requests could take every free address
+of the service subnet (Incus accepts the DHCP broadcast before any rule, and checks only the frame's own MAC), so no
+new service, tenant or job machine would start until the leases lapse; every job machine would take an address that
+may sit inside a tenant's block; and the bridge's DNS would tell a job every instance name on it. A pool whose
+`network` names a shared bridge accepts all of that, and Incus also lets its machines reach port 53 of any
+`dns.nameservers` that bridge names.
+
+**The job machine's card.** Arca builds it; no profile gives it, and it is the machine's only card. `eth0` is on the
+pool's bridge with `security.mac_filtering`, `security.ipv4_filtering` and `security.ipv6_filtering` on (the address
+is the one Incus's DHCP gives it; a bridge without IPv6 drops every IPv6 frame), both default actions `reject`, and
+the pool's network ACL `arca-runner-<pool>` in `security.acls`. After the create the launcher reads the machine back:
+one with any other card (from a profile, or copied from the image machine) is deleted and the create fails, naming
+the card. The ACL is made when the pool starts and found and reused at the next start; before each machine its rules
+are built again from the host's addresses as they are then and replaced when they changed (a new host address is
+rejected from the next machine on). It carries `user.arcakernel.runner=<pool>`; an ACL of that name without the mark
+stops the pool from starting and is left alone. A pool that is gone from the config has its ACL deleted at the next
+kernel start. The rules are a tenant service's, in the same order and shape, with the job's whole bridge subnet (at its
+real prefix) and the node's service subnet rejected instead of the subnet outside a block, since a job machine has no
+block of its own:
+
+- egress: reject the bridge's whole subnet and the service subnet; allow DHCP (udp 67) and DNS (udp and tcp 53) on the
+  gateway; reject the private ranges whole (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), the tailnet range
+  (`100.64.0.0/10`), link-local and loopback; reject all IPv6; reject multicast, broadcast, `0.0.0.0/8` and
+  `240.0.0.0/4`; reject the host's own addresses, the gateway among them; allow the rest (the internet);
+- ingress: none. The default `reject` refuses every connection into the machine, from the host, a neighbour or another
+  job machine; answers to what it opened pass.
 
 Incus does not keep the rules' order: it puts every `drop`, then every `reject`, then every `allow`, then the card's
 default action (`FirewallACLRules` in `internal/server/network/acl/acl_firewall.go`), so a reject always outweighs an
 allow. The gateway's DNS still answers although the gateway is in a rejected range: Incus's filter for a card that has
-an ACL accepts DNS (udp and tcp 53) to the bridge's own addresses and the DHCP broadcast before it reaches the ACL's
-rules (`nftablesInstanceBridgeFilter` in `internal/server/firewall/drivers/drivers_nftables_templates.go`). The allows
-for DHCP and DNS on the gateway state that intent; they open nothing themselves. A DHCP renewal sent straight to the
-gateway is refused like any packet to it; the client then asks again by broadcast, which passes.
+an ACL accepts DNS (udp and tcp 53) to the bridge's own addresses, and a DHCP request sent from `0.0.0.0` to the
+broadcast address, before it reaches the ACL's rules (`nftablesInstanceBridgeFilter` in
+`internal/server/firewall/drivers/drivers_nftables_templates.go`). The allows for DHCP and DNS on the gateway state
+that intent; they open nothing themselves. Any other DHCP packet a machine sends from its own address to the gateway or
+the broadcast address meets a reject; whether a client's renewal needs one depends on the client, and it was not
+measured. The card's rules sit in the bridge's own filter, per port (`InstanceSetupBridgeFilter` in
+`drivers_nftables.go`, chains `in`, `fwd` and `out`), so they hold between two machines on the same bridge as much as
+towards the host; in the forward path Incus turns a reject into a drop, so a refused neighbour times out.
+
+**An existing pool after this change.** It needs nothing in its config: at its next start it gets its own bridge and
+its machines leave the bridge their project's profile gave them. The pool's project must be allowed to make a network
+(an unrestricted project, as a runner project is; with `features.networks` off the bridge lives in `default`), and
+`172.16.0.0/12` must have a free /24. A pool that should stay on a bridge it was on names it in `network`. A profile in
+`profiles` that gives a card other than `eth0` must lose it, or every create fails.
 
 **A runner that refuses its configuration.** A runner that exits with an error before it took a job (its
 configuration was refused, or the image cannot run it) is a failure, as a machine that could not boot is: its record
@@ -292,12 +325,16 @@ time.
   config it minted, completes them. It can answer 401, 404 and 403 to drive the alert.
 - **Fake launcher** (tests): an in-memory machine per runner that "runs" a job when told.
 - **Incus launcher** (tests): against the repository's fake Incus, a machine is a marked virtual machine of its
-  class's size with the card above on the pool's bridge (the service bridge by default, `network` otherwise), and only
-  the pool's marked machines are listed and destroyed; the ACL holds no ingress rule and the job rules built from the
-  bridge's gateway and the host's addresses, is reused at the next start without a write, follows a new host address,
-  is never taken over from a hand-made ACL of its name, and is deleted when its pool is gone, and no other. The rules
-  themselves are checked against a model of Incus's weighing (`crates/arca-netproject/src/tenant.rs`): no address of
-  the subnet on any protocol, no private, tailnet, link-local, loopback, multicast or host address, and the internet.
+  class's size with the card above, and only the pool's marked machines are listed and destroyed. The pool's own
+  bridge is made marked, with NAT and no IPv6, in a subnet clear of the service subnet, the reserved ranges and the
+  host's networks, the same each time, and reused without a write; a taken first choice moves it; a hand-made network
+  of its name stops the pool untouched; `network` puts the card on that bridge and closes its real prefix. A machine
+  that a profile gives a second card is deleted and its create fails. The ACL holds no ingress rule and the job rules,
+  is reused without a write, and is patched before a machine when the host gained an address. A hand-made ACL of its
+  name is never taken over, and a gone pool's ACL and bridge are deleted, and nothing else. The rules themselves are
+  checked against a model of Incus's weighing (`crates/arca-netproject/src/tenant.rs`): no address of the job's subnet
+  or the service subnet on any protocol, no private, tailnet, link-local, loopback, multicast or host address, the
+  internet, and no /24 assumed for a smaller bridge.
 - **Real Incus** (`crates/arca-runners/tests/real_incus_runner.rs`, ignored, run by hand with
   `ARCA_REAL_RUNNER_PROOF=1`): on a real Incus with the runner image, one machine at a time, with a JIT configuration
   of GitHub's shape that no runner can use (no GitHub credential and no call to GitHub). One test drives the launcher
@@ -316,13 +353,16 @@ time.
   | Destroy (force stop and delete) | 0.5 s |
   | Pool: from the class asking for a machine to the job record | 31.6 s |
 
-  A third test proves the card from inside a job machine on the service bridge, in a project without
-  `features.networks` (the ACL is then in `default`): DNS on the gateway answers over udp and tcp (2.2 s after the
-  agent, the machine's DHCP included) and a public https site answers, while a service on the same bridge, the
-  gateway's port 8443 and a private address outside the bridge do not (each attempt times out: Incus turns a reject in
-  the bridge's forward path into a drop). The gateway's 8443 and the private address answer from the host, which the
-  test checks first; the service is reported, since its own ACL may refuse the host too. The machine and the ACL are
-  deleted on every exit path (run on 2026-11-27, with the two tests above, which pass with the card).
+  A third test proves the network from inside the pool's job machines on the pool's own bridge (made for the test and
+  deleted after it, as the ACL is), in a project without `features.networks`. Besides two job machines it makes one
+  throwaway machine with no rules of its own, a card on the pool's bridge and a card on the service bridge, and a
+  listener the host reaches on both addresses, checked first; the gateway's 8443 and a private address outside both
+  bridges are checked from the host too. So each refusal below is the job's rules and nothing else's. Run on 2026-11-27 (two job
+  machines of 2 vCPU and 2 GiB): DNS on the gateway answered both (udp and tcp) and a public https site answered;
+  refused, each timing out: the throwaway on the same bridge, the throwaway into the job machine, the second job
+  machine into the first, the throwaway's address on the service bridge (routed through the host), the gateway's 8443
+  and the private address. The machines, the bridge and the ACL are deleted on every exit path; the guard that deletes
+  them is made before the first of them. The two tests above pass with the pool on its own bridge.
 
   The runner refuses the made-up configuration at its own key check, before it calls any server.
 - **Dogfood** (our own organisation, one pool): a test workflow and one real CI job. Counted: jobs, pass rate, queue
