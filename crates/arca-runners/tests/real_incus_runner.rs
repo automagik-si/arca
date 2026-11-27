@@ -94,8 +94,11 @@ fn proof() -> Option<Proof> {
             reserved: env("ARCA_PROOF_RESERVED")
                 .map(|ranges| ranges.split(',').map(str::to_string).collect())
                 .unwrap_or_default(),
-            // The kernel passes the host's routing table; the proof's bridge is checked against none.
-            routes: vec![],
+            // The host's routes, as the kernel reads them at a pool's start.
+            routes: arca_netproject::routes::routed_networks(
+                &std::fs::read_to_string(arca_netproject::routes::ROUTES)
+                    .expect("the routing table"),
+            ),
         },
     })
 }

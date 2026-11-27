@@ -479,7 +479,7 @@ fn a_machine_with_any_card_but_arcas_is_deleted_and_its_create_fails() {
 }
 
 #[test]
-fn a_machine_with_any_device_but_disks_and_arcas_card_is_deleted_before_it_starts() {
+fn a_machine_with_any_device_but_its_root_disk_and_arcas_card_is_deleted_before_it_starts() {
     for (name, device) in [
         (
             "hostport",
@@ -490,6 +490,16 @@ fn a_machine_with_any_device_but_disks_and_arcas_card_is_deleted_before_it_start
             json!({"type":"infiniband","nictype":"physical","parent":"ib0"}),
         ),
         ("passed", json!({"type":"pci","address":"0000:03:00.0"})),
+        // Only the root disk passes: a host directory, a host block device or a shared volume is a way in too.
+        (
+            "cache",
+            json!({"type":"disk","source":"/srv/ci-cache","path":"/cache"}),
+        ),
+        ("hostblock", json!({"type":"disk","source":"/dev/sdb"})),
+        (
+            "shared",
+            json!({"type":"disk","pool":"pool1","source":"shared-vol","path":"/shared"}),
+        ),
     ] {
         let (fake, dir) = fake();
         let mut devices = json!({"root":{"type":"disk","pool":"pool1","path":"/"}});
