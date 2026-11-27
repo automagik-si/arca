@@ -7560,8 +7560,9 @@ first real job, and how to read a pool.
    **The network:** each pool gets a bridge of its own, `arcarun-<hash>`, which Arca makes when the pool starts (a /24
    in `172.16.0.0/12` clear of the node's networks, `kernel.serviceCidr` and `kernel.reservedCidrs`) and deletes when
    the pool is removed; the project must be allowed to make a network (an unrestricted runner project is). Every
-   machine gets Arca's card on it, replacing any `eth0` a profile gives, and no other card: a profile (or the image
-   machine) that gives one under another name makes every create fail, so give the pool profiles without one. The card
+   machine gets Arca's card on it, replacing any `eth0` a profile gives, and no other device but its root disk: a
+   profile (or the image machine) that gives another card, a proxy, a passed-through device or another disk (a host
+   directory, a host block device, a shared volume) makes every create fail, so give the pool profiles without one. The card
    reaches DNS on the bridge's gateway and the internet, and nothing else: no service, tenant or other job machine, no
    private range, the tailnet range or the host's own addresses, and nothing reaches into it. The pool's ACL,
    `arca-runner-<pool>`, is made when the pool starts (RUNNERS.md, "The job machine's network"). A pool's `network`

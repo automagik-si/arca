@@ -151,8 +151,9 @@ job.
 job machine's network"). A named bridge must be visible from the pool's project (a project with `features.networks`
 sees its own networks only) and have an IPv4 address, its gateway: the pool's access rules are built from it. A
 `network` Incus does not have (a misspelling) stops the pool, and the kernel's log says so. Any `eth0` a profile of
-`profiles` gives is replaced by the card, and a profile or an image machine that gives any other device but disks (a
-second card, a proxy, a passed-through device) makes every create fail. `name` makes the pool's ACL `arca-runner-<name>`, which Incus allows up to 63
+`profiles` gives is replaced by the card, and a profile or an image machine that gives any other device but the root
+disk (a second card, a proxy, a passed-through device, a disk from a host directory, a host block device or a shared
+volume) makes every create fail. `name` makes the pool's ACL `arca-runner-<name>`, which Incus allows up to 63
 characters.
 Records and logs go to `<stateDir>/runners/<pool>/`.
 
@@ -220,8 +221,9 @@ for about that long.
 pool's bridge with `security.mac_filtering`, `security.ipv4_filtering` and `security.ipv6_filtering` on (the address
 is the one Incus's DHCP gives it; a bridge without IPv6 drops every IPv6 frame), both default actions `reject`, and
 the pool's network ACL `arca-runner-<pool>` in `security.acls`. The machine is made stopped and read back: one with
-any device but its disks and that card (another card, a proxy, an InfiniBand or passed-through device, from a profile
-or copied from the image machine) is deleted before it ever starts, and the create fails naming the device. Only then
+any device but its root disk and that card (another card, a proxy, an InfiniBand or passed-through device, a disk from
+a host directory, a host block device or a shared volume, from a profile or copied from the image machine) is deleted
+before it ever starts, and the create fails naming the device. Only then
 is it started. The ACL is made when the pool starts and found and reused at the next start; before each machine its rules
 are built again from the host's addresses as they are then and replaced when they changed (a new host address is
 rejected from the next machine on). It carries `user.arcakernel.runner=<pool>`; an ACL of that name without the mark
@@ -253,7 +255,7 @@ towards the host; in the forward path Incus turns a reject into a drop, so a ref
 its machines leave the bridge their project's profile gave them. The pool's project must be allowed to make a network
 (an unrestricted project, as a runner project is; with `features.networks` off the bridge lives in `default`), and
 `172.16.0.0/12` must have a free /24. A pool that should stay on a bridge it was on names it in `network`. A profile in
-`profiles` that gives a device other than a disk or `eth0` must lose it, or every create fails.
+`profiles` that gives a device other than the root disk or `eth0` must lose it, or every create fails.
 
 **A runner that refuses its configuration.** A runner that exits with an error before it took a job (its
 configuration was refused, or the image cannot run it) is a failure, as a machine that could not boot is: its record
