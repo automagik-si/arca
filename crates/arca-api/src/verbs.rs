@@ -1035,7 +1035,7 @@ static VERBS: [Verb; 103] = [
     },
     Verb {
         name: "instance_restart",
-        summary: "Restart a running Incus instance that Arca owns or has adopted, gracefully, once the owner has approved it as an action proposal. Inside a tenant it needs no approval, from a token whose tool allowlist names it. A stopped instance is started instead, and the answer says so. An instance that is not Arca's is refused.",
+        summary: "Restart a running Incus instance that Arca owns or has adopted, gracefully, once the owner has approved it as an action proposal. Inside a tenant it needs no approval, from a token whose tool allowlist names it. A stopped instance is started instead, and the answer says so. A restart that fails and leaves the instance stopped is followed by one plain start, and the answer says that too. An instance that is not Arca's is refused.",
         class: VerbClass::L,
         min_scope: Scope::Doctor,
         writes: true,

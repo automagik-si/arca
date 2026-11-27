@@ -3190,11 +3190,24 @@ ask and the owner approves on the approval page; an approved `instance_start` ru
 requests (`owner_approval_request`) have no word for a stop or a restart, so those two run through a proposal only. An
 instance that is not Arca's cannot be proposed either, so the owner is never shown a card for it.
 
-A stop and a restart are graceful: Incus gives the instance 60 seconds to shut down. Arca forces nothing. One call takes
-at most 150 seconds, and the approval page waits 180 seconds for a linked kernel's answer to an approval (30 for any other
-relayed write), so a slow stop on a linked host still answers as done or with its own refusal. An instance
-that does not shut down stays running and the call is refused with `InstanceStopFailed` or `InstanceRestartFailed`, with
-the state the instance is in now. A frozen instance, or one in an error state, is left as it is
+A stop and a restart are graceful: Incus gives the instance 60 seconds to shut down. Arca forces nothing. The state
+change of one call takes at most 280 seconds. A start or a restart of a virtual machine with secrets then waits for its
+agent, up to 120 seconds, and writes the secrets, which that bound leaves out. Every relayed approval on the approval
+page waits 310 seconds for a linked kernel's answer (30 for any other relayed write), so a slow stop on a linked host
+still answers as done or with its own refusal. An instance that does not shut down stays running and the call is refused
+with `InstanceStopFailed` or `InstanceRestartFailed`, with the state the instance is in now.
+
+A restart that Incus fails once it was sent (it failed its start half after its stop half) is followed by a read of the
+instance: one that is stopped then is sent one plain start, never forced, apart from the restart. A restart Incus has not
+finished by Arca's 90-second wait is waited on for 45 seconds more before anything is read, because Incus reports a
+restarting instance stopped until its start half comes up, and a start sent then would join that restart. When it has
+ended, Arca decides as above, and the start gets 45 seconds. When it is still running, Arca sends nothing more and the
+call is refused with `InstanceRestartFailed`, saying the restart is still running and the state is not known until it
+ends. The answer says the restart failed, why, and what Arca did: the instance is running, or the call is refused with
+`InstanceRestartFailed` and the state it is in now. In `instance-actions.jsonl` the start has its own `separate_start`
+line, written before it is sent, and the action's `end` line has the outcome `started_after_restart`, or
+`running_after_restart` when the start was refused but the instance runs anyway. A restart still running when Arca stops
+waiting has a `restart_unfinished` line. A frozen instance, or one in an error state, is left as it is
 (`InstanceStateUnsupported`). An instance recreated between the owner check and the change is refused with
 `InstanceChanged`, and nothing is sent to it.
 
@@ -4536,10 +4549,10 @@ Then:
   (`act-…`) to its `action_approve`, a delete plan's digest to its `approval_submit`. It answers what that kernel said:
   its result with `host` added, or its exact refusal (403 `{refusal, message}`, for example `WrongHost`, `BadSignature`,
   `Expired` or `Replayed`). `POST /approve/decline` with a `host` relays an action's decline to `plan_decline` the same
-  way. The page waits for a relayed approval as long as the action can run: 180 seconds, and for a `service_update`
+  way. The page waits for a relayed approval as long as the action can run: 310 seconds, and for a `service_update`
   longer: one Incus step of its rebuild may take 600 seconds (a registry pull included), its new version has its
   `timeoutSeconds` (120 by default) to answer, and after a rollback the old one has up to 30 more. A `service_update`
-  with `timeoutSeconds` 300 waits 1110 seconds. The wait comes from the card as last listed: a linked host the page
+  with `timeoutSeconds` 300 waits 1240 seconds. The wait comes from the card as last listed: a linked host the page
   could not read keeps the wait it was listed with before.
 - A `host` the page does not list is refused 403 `{ "refusal": "NotLinked", "message": "this machine is not linked for
   approvals yet" }`. A linked kernel that refuses the token answers 502 `LinkToken`, with a message that says what to
@@ -6215,7 +6228,7 @@ answer and marks nothing. No formula command runs in a marked instance, and no c
 cleanups (removing the tailnet key directory, stopping the daemon). The mark stays until Arca sees the instance stopped,
 since a stopped instance runs nothing, or until the instance's uuid changes, since that is another instance. Arca sees it
 stopped when `instance_stop` stops it or finds it stopped, when `instance_start` starts it from stopped, when
-`instance_restart` restarts it, when `service_update` stops or restarts it (an update the Automagik follower makes
+`instance_restart` restarts it or starts it after a restart that left it stopped, when `service_update` stops or restarts it (an update the Automagik follower makes
 included), and when `service_reconfigure` restarts it or stops it for a memory `/run`. A start of a running instance
 clears nothing, and a command that was already running when the instance stopped marks nothing when it fails afterwards.
 A mark also ages: 5 minutes after it was set (or after the marking command's own limit, when that is longer) the next
@@ -7466,8 +7479,9 @@ mint answers `Empty` and the pool waits.
 - **Device-code runners stay offline.** Their files (`.runner`, `.credentials`, `.credentials_rsaparams`) are in the
   store and `Signer::runner_files` reads them, but no host and no pool template reads them yet. The runners are
   registered on GitHub and stay offline until that is wired.
-- **The pool is not wired yet.** The runner pool's template does not call `Signer::mint` yet; until it does, App and
-  push connections mint only through `github_runner_mint`.
+- **The template pool is not wired.** The fixed-slot `github-runner-pool` template does not call `Signer::mint`. The
+  per-job pools of the node config's `runners` key do, for App connections ("Per-job runners: the first real job"
+  below); push connections still mint only through `github_runner_mint`.
 - **Who may mint.** Any `operator` token may call `github_runner_mint` and receive a runner's credential (above). To
   harden: the verb only for a token whose tool list names it, or the in-process call only.
 - **A restart while registering.** A kernel restart while a device-code connection is registering loses the flow
@@ -7517,6 +7531,66 @@ job attachment and disconnect, with the caller and the time. It holds no credent
 | `github_runner_mint` | operator | One just-in-time runner configuration for a connection's labels |
 | `github_mint_job` | operator | Records which job a minted runner took |
 | `github_disconnect` | operator | Ends a connection (above); destructive, so `confirm: false` refuses it |
+
+## Per-job runners: the first real job
+
+The node config's `runners` key runs GitHub Actions jobs one per fresh virtual machine, each cloned from the runner
+image for its job and deleted after it. [`RUNNERS.md`](RUNNERS.md) is the design; this is what one node needs before a
+first real job, and how to read a pool.
+
+**What the node needs**
+
+1. **Kernel mode.** Only a kernel-mode node reads `runners`; it starts the pools when the kernel starts.
+2. **The runner image, in the pool's project.** `images/github-runner/build.sh ubuntu24` builds it
+   ([`images/github-runner/README.md`](../images/github-runner/README.md)) and leaves either the image
+   `arca-runner-image-<tag>` or, when the host is short of room, the stopped machine `arca-runner-image-<tag>` with a
+   snapshot `image`. The pool's `image` is `arca-runner-image-<tag>` for the first and `arca-runner-image-<tag>/image`
+   for the second. Never start or change the kept machine: every job machine is a copy of its snapshot.
+3. **Room in the project.** Each machine counts its class's full CPUs and memory against the Incus project's limits
+   (`incus project info <project>`) and against the pool's `budget`. Every other instance in the project counts too,
+   stopped ones included, so the kept image machine's own `limits.cpu` and `limits.memory` take their share. Make the
+   budget fit what the project has free: a project with an 8 GiB memory limit that holds a kept image machine of 1 GiB
+   has 7 GiB for job machines, so two machines of 4 GiB do not fit and two of 3 GiB do (the example below). A machine
+   the project has no room for is refused by Incus; the pool records it as a failure and waits before the next try.
+4. **The organisation's App connection and its runner group.** Connect the organisation on `/approve/github` with
+   "a GitHub App made for you" (Mode 2 above), pick the repositories that may send jobs, and give one label set per size
+   class. The App's runner group, `Arca runners`, holds exactly those repositories. `github_bindings` lists the
+   connection's id (`gh-…`), its runner group and its label sets. A device-code or push connection cannot serve a pool.
+5. **`runners.pools` in the node config**, then a kernel restart (a restart ends the jobs running then: do it while
+   the queue is quiet):
+
+   ```json
+   "runners": { "pools": [ {
+     "name": "ci", "binding": "gh-…", "project": "ci",
+     "image": "arca-runner-image-ubuntu24-20261111-370/image",
+     "budget": { "cpu": 4, "memory": "6GiB" },
+     "classes": [ { "labels": ["acme-2vcpu-ubuntu-2404"], "cpu": 2, "memory": "3GiB", "max": 2 } ]
+   } ] }
+   ```
+
+   `binding` is the connection's id and the class's `labels` one of its label sets, exactly; leave `runnerGroupId`
+   unset (the connection's own group).
+6. **A workflow** in one of the picked repositories (a private one: see RUNNERS.md on public repositories) with
+   `runs-on:` that label set and `on: workflow_dispatch`, run by hand.
+
+**Reading a pool**
+
+- **The kernel's log.** `arca: runners: pool <name>: …` lines: the pool started (its classes, project and budget), a
+  machine that failed and why, a runner that could not be removed. A pool that could not start says so once.
+- **`alerts_list`.** `runner-signin` fires for a pool whose sign-in fails (bad credentials, App not installed,
+  forbidden, no connection of that id); the reason is in the kernel's log line.
+- **`<stateDir>/runners/<pool>/jobs.jsonl`.** One line per machine: runner, class, repository, run and job, result,
+  queue and assign times, `bootSeconds` (clone to runner start), `machineSeconds`, `runnerExit`, `logs` and `note`. A
+  machine that never ran a job writes a line with the job fields empty. The note `the runner exited <code> before it
+  took a job` means the runner refused its configuration or the image cannot run it: read its logs; the class waits
+  before the next machine.
+- **`<stateDir>/runners/<pool>/logs/<runner>/logs.tar.gz`** (root only, kept 7 days): `var/log/arca-job/runner.log`
+  (what `arca-job` and the runner printed, with each start and exit code) and the runner's `_diag` folder, e.g.
+  `sudo tar -xzOf <file> var/log/arca-job/runner.log`.
+- **`github_audit`.** Every runner configuration minted for the connection, with the runner's name and, once known, its
+  job.
+- **The machines alive now:** `incus list --project <project> user.arcakernel.runner=<pool>`. None stays after its job;
+  the pool deletes any marked machine it does not know at start and every five minutes.
 
 ## A pool of GitLab runners
 

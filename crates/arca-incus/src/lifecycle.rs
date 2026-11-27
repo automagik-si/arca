@@ -26,10 +26,14 @@ use crate::write::ProjectFamily;
 pub const GRACE_SECONDS: u64 = 60;
 /// The longest one state change's operation is waited on: the grace, and time for Incus to fail the operation after it.
 const DEADLINE: Duration = Duration::from_secs(90);
-/// The longest one caller's whole action may take: two reads before the change, the change's own request, the wait on its
-/// operation, the read-back and one more read after a failure, each read and request bounded by the client's timeout. A
-/// relay that waits for the answer must wait longer than this.
-pub const CALL_BUDGET: Duration = Duration::from_secs(150);
+/// The longest one caller's state change may take, a restart's being the longest: two reads before the change, the
+/// change's own request, the wait on its operation, the read-back and one more read after a failure; then, when a failed
+/// restart left the instance stopped, the plain start that follows it with its own read, request, wait and read-back, and
+/// one more read after its failure. A restart whose wait ran out is waited on for half a deadline more, and its start
+/// then gets the other half, so that path fits too. Each read and request is bounded by the client's timeout. What a
+/// caller does after the change is outside it: Arca's own wait for a virtual machine's agent after a start, to write its
+/// secrets, is not counted. A relay that waits for the answer must wait longer than this.
+pub const CALL_BUDGET: Duration = Duration::from_secs(280);
 /// How long one wait request asks Incus to hold.
 const WAIT_SECONDS: u64 = 5;
 /// The pause between two looks at an operation that is still running.
@@ -89,6 +93,70 @@ impl InstanceState {
     pub fn is_stopped(&self) -> bool {
         self.status == "Stopped"
     }
+}
+
+/// A state change that did not end as asked: why, and its operation when the wait on it ran out before it ended.
+#[derive(Debug)]
+pub struct ChangeFailure {
+    pub error: IncusError,
+    /// The change's operation, which Incus may still be running: set only when `error` is [`IncusError::Timeout`] after
+    /// the change was sent.
+    pub unfinished: Option<Unfinished>,
+}
+
+/// An operation a state change was sent as, which the writer stopped waiting on before it ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unfinished {
+    id: String,
+}
+
+/// How an unfinished operation was found when it was waited on again.
+#[derive(Debug)]
+pub enum OperationEnd {
+    /// It ended with success.
+    Succeeded,
+    /// It ended with its own failure.
+    Failed(IncusError),
+    /// Incus no longer holds it: it has ended, and how is not known.
+    Gone,
+    /// It was still running when the wait ran out.
+    Running,
+    /// The wait could not tell.
+    Unknown(IncusError),
+}
+
+/// How one wait on an operation ended.
+enum Waited {
+    Done,
+    Failed(IncusError),
+    Gone,
+    Error(IncusError),
+}
+
+impl Waited {
+    /// The wait as the writer's own state changes read it: an operation Incus no longer holds is not one it can confirm.
+    fn into_result(self) -> Result<(), IncusError> {
+        match self {
+            Self::Done => Ok(()),
+            Self::Failed(error) | Self::Error(error) => Err(error),
+            Self::Gone => Err(decode("the wait answered without the operation's status")),
+        }
+    }
+}
+
+/// The operation an answer names: `None` for a synchronous answer.
+fn operation_of(envelope: &Value) -> Result<Option<String>, IncusError> {
+    if envelope.get("type").and_then(Value::as_str) == Some("sync") {
+        return Ok(None);
+    }
+    envelope
+        .get("operation")
+        .and_then(Value::as_str)
+        .and_then(|operation| operation.strip_prefix("/1.0/operations/"))
+        .map(|id| id.split('?').next().unwrap_or(id))
+        .filter(|id| operation_id(id))
+        .map(|id| Some(id.to_string()))
+        .ok_or_else(|| decode("the answer names no operation"))
 }
 
 /// The writer for one instance's power state.
@@ -202,27 +270,58 @@ impl StateChanger {
         seen: &InstanceState,
         action: StateAction,
     ) -> Result<InstanceState, IncusError> {
-        self.allow(&seen.project)?;
-        let fresh = self.read(&seen.project, &seen.name)?;
+        self.change_tracked(seen, action)
+            .map_err(|failure| failure.error)
+    }
+
+    /// [`StateChanger::change`], keeping the change's operation when the wait on it ran out before it ended, so the
+    /// caller can wait on that operation again ([`StateChanger::wait_unfinished`]) before it decides anything.
+    pub fn change_tracked(
+        &self,
+        seen: &InstanceState,
+        action: StateAction,
+    ) -> Result<InstanceState, ChangeFailure> {
+        let failed = |error| ChangeFailure {
+            error,
+            unfinished: None,
+        };
+        self.allow(&seen.project).map_err(failed)?;
+        let fresh = self.read(&seen.project, &seen.name).map_err(failed)?;
         if fresh.uuid != seen.uuid || fresh.kind != seen.kind {
-            return Err(refused("the instance was recreated since it was read"));
+            return Err(failed(refused(
+                "the instance was recreated since it was read",
+            )));
         }
-        let url = state_url(&seen.project, &seen.name)?;
+        let url = state_url(&seen.project, &seen.name).map_err(failed)?;
         let body = match action {
             StateAction::Start => json!({ "action": "start" }),
             StateAction::Stop | StateAction::Restart => {
                 json!({ "action": action.as_str(), "timeout": GRACE_SECONDS, "force": false })
             }
         };
-        let envelope = checked_envelope(self.send("PUT", &url, Some(&body))?)?;
-        self.wait_for(&envelope)?;
-        let after = self.read(&seen.project, &seen.name)?;
+        let envelope = self
+            .send("PUT", &url, Some(&body))
+            .and_then(checked_envelope)
+            .map_err(failed)?;
+        if let Some(id) = operation_of(&envelope).map_err(failed)? {
+            match self.wait_operation(&id, self.deadline) {
+                Waited::Done => {}
+                Waited::Error(IncusError::Timeout) => {
+                    return Err(ChangeFailure {
+                        error: IncusError::Timeout,
+                        unfinished: Some(Unfinished { id }),
+                    });
+                }
+                other => return Err(failed(other.into_result().unwrap_err())),
+            }
+        }
+        let after = self.read(&seen.project, &seen.name).map_err(failed)?;
         let wanted = match action {
             StateAction::Start | StateAction::Restart => after.is_running(),
             StateAction::Stop => after.is_stopped(),
         };
         if !wanted {
-            return Err(IncusError::AppliedUnconfirmed(Box::new(
+            return Err(failed(IncusError::AppliedUnconfirmed(Box::new(
                 crate::read::Unconfirmed {
                     target: crate::read::Target {
                         kind: arca_kernel::ownership::IncusKind::Instance,
@@ -236,9 +335,25 @@ impl StateChanger {
                     reason: "the read-back does not show the state the change asked for"
                         .to_string(),
                 },
-            )));
+            ))));
         }
         Ok(after)
+    }
+
+    /// Waits at most `within` more on an operation a change left unfinished, and says how it was found.
+    pub fn wait_unfinished(&self, unfinished: &Unfinished, within: Duration) -> OperationEnd {
+        match self.wait_operation(&unfinished.id, within) {
+            Waited::Done => OperationEnd::Succeeded,
+            Waited::Failed(error) => OperationEnd::Failed(error),
+            Waited::Gone => OperationEnd::Gone,
+            Waited::Error(IncusError::Timeout) => OperationEnd::Running,
+            Waited::Error(error) => OperationEnd::Unknown(error),
+        }
+    }
+
+    /// The longest this writer waits on one state change.
+    pub fn deadline(&self) -> Duration {
+        self.deadline
     }
 
     /// Sends one state body for one instance and waits for its operation. It is the crate's own: the one caller outside
@@ -903,53 +1018,57 @@ impl StateChanger {
     /// Waits on the operation an async answer names until it ends or the deadline passes. Only status code 200 with the
     /// status `Success` is done; a 4xx or 5xx in the operation is the operation's own failure.
     fn wait_for(&self, envelope: &Value) -> Result<(), IncusError> {
-        if envelope.get("type").and_then(Value::as_str) == Some("sync") {
-            return Ok(());
+        match operation_of(envelope)? {
+            None => Ok(()),
+            Some(id) => self.wait_operation(&id, self.deadline).into_result(),
         }
-        let id = envelope
-            .get("operation")
-            .and_then(Value::as_str)
-            .and_then(|operation| operation.strip_prefix("/1.0/operations/"))
-            .map(|id| id.split('?').next().unwrap_or(id))
-            .filter(|id| operation_id(id))
-            .ok_or_else(|| decode("the answer names no operation"))?;
+    }
+
+    /// Waits on the operation `id` until it ends or `deadline` passes.
+    fn wait_operation(&self, id: &str, deadline: Duration) -> Waited {
         let started = Instant::now();
         loop {
-            if started.elapsed() >= self.deadline {
-                return Err(IncusError::Timeout);
+            if started.elapsed() >= deadline {
+                return Waited::Error(IncusError::Timeout);
             }
             let path = format!("/1.0/operations/{id}/wait?timeout={WAIT_SECONDS}");
             // One wait never outlasts what is left of the deadline, so the whole wait is bounded by it.
-            let left = self.deadline.saturating_sub(started.elapsed());
-            let framed = self.send_within(
+            let left = deadline.saturating_sub(started.elapsed());
+            let framed = match self.send_within(
                 "GET",
                 &path,
                 None,
                 (Duration::from_secs(WAIT_SECONDS) + self.timeout).min(left),
-            )?;
-            let answer = checked_envelope(framed).map_err(|error| match error {
-                IncusError::Status { .. } => {
-                    decode("the wait answered without the operation's status")
+            ) {
+                Ok(framed) => framed,
+                Err(error) => return Waited::Error(error),
+            };
+            let answer = match checked_envelope(framed) {
+                Ok(answer) => answer,
+                // Incus no longer holds the operation: it ended, and how is not known.
+                Err(IncusError::Status { code: 404, .. }) => return Waited::Gone,
+                Err(IncusError::Status { .. }) => {
+                    return Waited::Error(decode(
+                        "the wait answered without the operation's status",
+                    ));
                 }
-                other => other,
-            })?;
-            let operation = answer
-                .get("metadata")
-                .and_then(Value::as_object)
-                .ok_or_else(|| decode("the wait has no operation"))?;
+                Err(other) => return Waited::Error(other),
+            };
+            let Some(operation) = answer.get("metadata").and_then(Value::as_object) else {
+                return Waited::Error(decode("the wait has no operation"));
+            };
             if operation.get("id").and_then(Value::as_str) != Some(id) {
-                return Err(decode("the wait answered for another operation"));
+                return Waited::Error(decode("the wait answered for another operation"));
             }
-            let code = operation
-                .get("status_code")
-                .and_then(Value::as_u64)
-                .ok_or_else(|| decode("the operation has no status code"))?;
+            let Some(code) = operation.get("status_code").and_then(Value::as_u64) else {
+                return Waited::Error(decode("the operation has no status code"));
+            };
             let status = operation
                 .get("status")
                 .and_then(Value::as_str)
                 .unwrap_or("");
             match code {
-                200 if status == "Success" => return Ok(()),
+                200 if status == "Success" => return Waited::Done,
                 100..=199 => thread::sleep(POLL_PAUSE),
                 400..=599 => {
                     let message = operation
@@ -957,12 +1076,12 @@ impl StateChanger {
                         .and_then(Value::as_str)
                         .filter(|text| !text.is_empty())
                         .unwrap_or(status);
-                    return Err(IncusError::Status {
+                    return Waited::Failed(IncusError::Status {
                         code: u16::try_from(code).unwrap_or(500),
                         message: message.chars().take(256).collect(),
                     });
                 }
-                _ => return Err(decode("the operation ended without success")),
+                _ => return Waited::Error(decode("the operation ended without success")),
             }
         }
     }
@@ -1304,8 +1423,12 @@ mod tests {
 
     #[test]
     fn the_call_budget_covers_every_request_of_one_action() {
-        // Two reads, the PUT, the wait, the read-back and the read after a failure.
-        assert!(TIMEOUT * 5 + DEADLINE <= CALL_BUDGET);
+        // Two reads, the PUT, the wait, the read-back and the read after a failure; after a failed restart, the start's
+        // read, PUT, wait and read-back, and the read after its failure.
+        assert!(TIMEOUT * 10 + DEADLINE * 2 <= CALL_BUDGET);
+        // A restart whose wait ran out has no read-back: half a deadline more on its operation, the read after it, and
+        // the start's four requests with half a deadline of wait, and the read after its failure.
+        assert!(TIMEOUT * 9 + DEADLINE + DEADLINE / 2 + DEADLINE / 2 <= CALL_BUDGET);
         assert!(Duration::from_secs(GRACE_SECONDS) < DEADLINE);
     }
 }

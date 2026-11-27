@@ -585,7 +585,11 @@ impl<A: Access, L: Launcher> Pool<A, L> {
                 ));
             }
         }
+        // A runner that exits with an error before it took a job refused its configuration, or the image cannot run
+        // it: a failure, as one before the runner started is.
+        let refused = matches!(outcome, Ok(Some(code)) if code != 0) && !ran;
         let mut note = match &outcome {
+            Ok(Some(code)) if refused => Some(format!("the runner exited {code} before it took a job")),
             Ok(_) => None,
             Err(why) => Some(why.clone()),
         };
@@ -638,12 +642,16 @@ impl<A: Access, L: Launcher> Pool<A, L> {
             state.cpu_used = state.cpu_used.saturating_sub(config.cpu);
             state.memory_used = state.memory_used.saturating_sub(config.memory);
             let class_state = &mut state.classes[class];
-            // A failure before the runner started is the machine's or the credential's: the class waits before the
-            // next try, longer each time, so a broken image or credential does not spin.
-            if note.is_some() && runner_start_ms.is_none() && !cancel.load(Ordering::SeqCst) {
+            // A failure before the runner started, or a runner that refused its configuration, is the machine's, the
+            // image's or the credential's: the class waits before the next try, longer each time, so a broken image or
+            // credential does not spin.
+            if note.is_some()
+                && (runner_start_ms.is_none() || refused)
+                && !cancel.load(Ordering::SeqCst)
+            {
                 class_state.failures = class_state.failures.saturating_add(1);
                 class_state.retry_at_ms = now_ms() + ms(self.timing.backoff(class_state.failures));
-            } else if runner_start_ms.is_some() {
+            } else if runner_start_ms.is_some() && !refused {
                 class_state.failures = 0;
                 class_state.retry_at_ms = 0;
             }

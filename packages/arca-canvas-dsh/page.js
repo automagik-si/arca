@@ -867,7 +867,7 @@
     return match ? `${match[1] ?? "0000"}:${match[2]}` : "";
   }
   var APPROVAL_TIMEOUT_MS = 3e4;
-  var INSTANCE_APPROVAL_TIMEOUT_MS = 18e4;
+  var INSTANCE_APPROVAL_TIMEOUT_MS = 31e4;
   var NO_SUCH_PLAN = "This proposal is no longer waiting. It may have been approved or declined elsewhere. Check Steps.";
   var MISSING_PROPOSAL = "The proposal is not waiting any more.";
   var NEUTRAL_REFUSAL = "Arca did not accept this approval. Try again from the card.";

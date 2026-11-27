@@ -65,8 +65,9 @@ pub use fake::{
 pub use import::{ImportRead, ImportTarget, ImportWriter, import_allowance};
 #[cfg(feature = "write")]
 pub use lifecycle::{
-    CALL_BUDGET, FetchedImage, GRACE_SECONDS, InstanceSnapshot, InstanceState, NotTaken,
-    PartFailure, SnapshotPart, StateAction, StateChanger, TakenPart,
+    CALL_BUDGET, ChangeFailure, FetchedImage, GRACE_SECONDS, InstanceSnapshot, InstanceState,
+    NotTaken, OperationEnd, PartFailure, SnapshotPart, StateAction, StateChanger, TakenPart,
+    Unfinished,
 };
 #[cfg(feature = "write")]
 pub use migrate::{MoveWriter, OpState, PushTarget, Receive};

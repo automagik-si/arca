@@ -45,7 +45,9 @@ pub struct PoolConfig {
     pub classes: Vec<ClassConfig>,
     /// The Incus project the machines are made in.
     pub project: String,
-    /// The runner image: an image alias or fingerprint, or `<instance>/<snapshot>` of a template instance.
+    /// The runner image: `arca-runner-image-<tag>/image`, the stopped machine `images/github-runner/build.sh` kept and
+    /// its snapshot, or `arca-runner-image-<tag>`, the image it published. Any image alias or fingerprint, or
+    /// `<instance>/<snapshot>` of a stopped instance in the pool's project, works the same way.
     pub image: String,
     /// The profiles of every machine, in order; empty takes the project's `default`.
     #[serde(default)]
@@ -211,7 +213,7 @@ mod tests {
             "runnerGroupId": 3,
             "budget": { "cpu": 16, "memory": "64GiB" },
             "project": "arcak-runners",
-            "image": "runner-ubuntu-2404",
+            "image": "arca-runner-image-ubuntu24-20261111-370/image",
             "classes": [
                 { "labels": ["acme-4vcpu-ubuntu-2404"], "cpu": 4, "memory": "16GiB", "warm": 1, "max": 4 },
                 { "labels": ["acme-2vcpu-ubuntu-2404"], "cpu": 2, "memory": "8GiB", "max": 4 }
