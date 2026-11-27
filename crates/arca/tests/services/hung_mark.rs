@@ -17,6 +17,30 @@ use arca_incus::{
 };
 use std::time::{Duration, Instant};
 
+/// The longest one of these tests may take. A fake that never answers must fail the test, not hold the build.
+const TEST_BOUND: Duration = Duration::from_secs(120);
+
+/// Runs `test` on a thread of its own and fails when it has not ended within [`TEST_BOUND`].
+fn bounded(test: impl FnOnce() + Send + 'static) {
+    let (done, ended) = std::sync::mpsc::channel();
+    let runner = std::thread::spawn(move || {
+        test();
+        let _ = done.send(());
+    });
+    match ended.recv_timeout(TEST_BOUND) {
+        Ok(()) => runner.join().expect("the test"),
+        // The test panicked: its own message is the failure.
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            if let Err(panic) = runner.join() {
+                std::panic::resume_unwind(panic);
+            }
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            panic!("the test did not end within {TEST_BOUND:?}")
+        }
+    }
+}
+
 /// The node's service handlers and the lifecycle as a served node builds them: one exec handle, whose marks the
 /// lifecycle clears.
 struct Node {
@@ -170,85 +194,112 @@ fn reads_the_journal(rig: &Rig, node: &Node, line: &str) {
 
 #[test]
 fn a_hung_instance_reads_the_console_and_says_why_until_it_is_stopped_and_started() {
-    let rig = Rig::new();
-    system(&rig);
-    let node = node(&rig);
-    let target = target(&rig);
-    reads_the_journal(&rig, &node, "journal before");
-    mark_hung(&rig, &node, &target);
-    rig.fake.set_console_log(PROJECT, "app", "console line");
-    // The journal is refused while the mark stays: the console answers, and the answer says so and why.
-    let answer = node.logs();
-    assert_eq!(answer["lines"], json!(["console line"]), "{answer}");
-    assert_eq!(answer["source"], "console", "{answer}");
-    let why = answer["journalNotRead"].as_str().expect("why, in words");
-    assert!(why.contains("did not answer"), "{why}");
-    assert!(why.contains("instance_stop"), "{why}");
-    // A start of a running instance stops nothing: the command that did not answer may still run, so the mark stays.
-    let started = node
-        .call("instance_start", json!({"project":PROJECT,"instance":"app"}))
-        .expect("already running");
-    assert_eq!(started["changed"], false);
-    assert!(node.exec.hung(&target), "nothing stopped it");
-    assert_eq!(node.logs()["source"], "console");
-    // Stopped through the lifecycle, the mark is gone; started again, the journal answers.
-    assert_eq!(node.act(StateAction::Stop)["status"], "Stopped");
-    assert!(!node.exec.hung(&target), "seen stopped");
-    node.call("instance_start", json!({"project":PROJECT,"instance":"app"}))
+    bounded(|| {
+        let rig = Rig::new();
+        system(&rig);
+        let node = node(&rig);
+        let target = target(&rig);
+        reads_the_journal(&rig, &node, "journal before");
+        mark_hung(&rig, &node, &target);
+        rig.fake.set_console_log(PROJECT, "app", "console line");
+        // The journal is refused while the mark stays: the console answers, and the answer says so and why.
+        let answer = node.logs();
+        assert_eq!(answer["lines"], json!(["console line"]), "{answer}");
+        assert_eq!(answer["source"], "console", "{answer}");
+        let why = answer["journalNotRead"].as_str().expect("why, in words");
+        assert!(why.contains("did not answer"), "{why}");
+        assert!(why.contains("instance_stop"), "{why}");
+        // A start of a running instance stops nothing: the command that did not answer may still run, so the mark stays.
+        let started = node
+            .call(
+                "instance_start",
+                json!({"project":PROJECT,"instance":"app"}),
+            )
+            .expect("already running");
+        assert_eq!(started["changed"], false);
+        assert!(node.exec.hung(&target), "nothing stopped it");
+        assert_eq!(node.logs()["source"], "console");
+        // Stopped through the lifecycle, the mark is gone; started again, the journal answers.
+        assert_eq!(node.act(StateAction::Stop)["status"], "Stopped");
+        assert!(!node.exec.hung(&target), "seen stopped");
+        node.call(
+            "instance_start",
+            json!({"project":PROJECT,"instance":"app"}),
+        )
         .expect("the start");
-    assert_eq!(status(&rig), "Running");
-    reads_the_journal(&rig, &node, "journal after");
+        assert_eq!(status(&rig), "Running");
+        reads_the_journal(&rig, &node, "journal after");
+    });
 }
 
 #[test]
 fn a_restart_through_the_lifecycle_clears_the_mark() {
-    let rig = Rig::new();
-    system(&rig);
-    let node = node(&rig);
-    let target = target(&rig);
-    mark_hung(&rig, &node, &target);
-    let restarted = node.act(StateAction::Restart);
-    assert_eq!(restarted["changed"], true);
-    assert_eq!(restarted["status"], "Running");
-    assert!(!node.exec.hung(&target), "a restart stops the instance");
-    reads_the_journal(&rig, &node, "journal after restart");
+    bounded(|| {
+        let rig = Rig::new();
+        system(&rig);
+        let node = node(&rig);
+        let target = target(&rig);
+        mark_hung(&rig, &node, &target);
+        let restarted = node.act(StateAction::Restart);
+        assert_eq!(restarted["changed"], true);
+        assert_eq!(restarted["status"], "Running");
+        assert!(!node.exec.hung(&target), "a restart stops the instance");
+        reads_the_journal(&rig, &node, "journal after restart");
+    });
 }
 
 #[test]
 fn a_stop_found_already_done_and_a_start_of_a_stopped_instance_clear_the_mark() {
-    let rig = Rig::new();
-    system(&rig);
-    let node = node(&rig);
-    let target = target(&rig);
-    // Stopped by someone else: the lifecycle's stop finds it stopped, and that is seeing it stopped.
-    mark_hung(&rig, &node, &target);
-    rig.fake.set_instance_status(PROJECT, "app", "Stopped");
-    assert!(node.exec.hung(&target), "Arca has not looked yet");
-    assert_eq!(node.act(StateAction::Stop)["changed"], false);
-    assert!(!node.exec.hung(&target), "found stopped");
-    // Marked again and stopped by someone else: the start sees it stopped before it starts it.
-    rig.fake.set_instance_status(PROJECT, "app", "Running");
-    mark_hung(&rig, &node, &target);
-    rig.fake.set_instance_status(PROJECT, "app", "Stopped");
-    node.call("instance_start", json!({"project":PROJECT,"instance":"app"}))
+    bounded(|| {
+        let rig = Rig::new();
+        system(&rig);
+        let node = node(&rig);
+        let target = target(&rig);
+        // Stopped by someone else: the lifecycle's stop finds it stopped, and that is seeing it stopped.
+        mark_hung(&rig, &node, &target);
+        rig.fake.set_instance_status(PROJECT, "app", "Stopped");
+        assert!(node.exec.hung(&target), "Arca has not looked yet");
+        assert_eq!(node.act(StateAction::Stop)["changed"], false);
+        assert!(!node.exec.hung(&target), "found stopped");
+        // Marked again and stopped by someone else: the start sees it stopped before it starts it.
+        rig.fake.set_instance_status(PROJECT, "app", "Running");
+        mark_hung(&rig, &node, &target);
+        rig.fake.set_instance_status(PROJECT, "app", "Stopped");
+        node.call(
+            "instance_start",
+            json!({"project":PROJECT,"instance":"app"}),
+        )
         .expect("the start");
-    assert!(!node.exec.hung(&target), "started from stopped");
-    reads_the_journal(&rig, &node, "journal after start");
+        assert!(!node.exec.hung(&target), "started from stopped");
+        reads_the_journal(&rig, &node, "journal after start");
+    });
 }
 
 #[test]
 fn the_mark_of_another_instance_is_not_touched() {
-    let rig = Rig::new();
-    system(&rig);
-    rig.call("service_create", json!({"name":"other","template":"app"}))
-        .expect("a second service");
-    let node = node(&rig);
-    let target = target(&rig);
-    mark_hung(&rig, &node, &target);
-    node.lifecycle
-        .run(StateAction::Restart, PROJECT, "other", "operator", None, NOW)
-        .expect("the other restarts");
-    assert!(node.exec.hung(&target), "only its own instance clears a mark");
+    bounded(|| {
+        let rig = Rig::new();
+        system(&rig);
+        rig.call("service_create", json!({"name":"other","template":"app"}))
+            .expect("a second service");
+        let node = node(&rig);
+        let target = target(&rig);
+        mark_hung(&rig, &node, &target);
+        node.lifecycle
+            .run(
+                StateAction::Restart,
+                PROJECT,
+                "other",
+                "operator",
+                None,
+                NOW,
+            )
+            .expect("the other restarts");
+        assert!(
+            node.exec.hung(&target),
+            "only its own instance clears a mark"
+        );
+    });
 }
 
 fn formula() -> AppUpdate {
@@ -261,55 +312,57 @@ fn formula() -> AppUpdate {
 
 #[test]
 fn the_update_that_stops_an_instance_clears_its_mark() {
-    let rig = Rig::with(
-        FakeState {
-            server: json!({}),
-            projects: vec![],
-            instances: vec![],
-            networks: vec![],
-            pools: vec![("pool1".into(), json!({}))],
-        },
-        vec![PROJECT.to_string()],
-        Some("192.0.2.0/24"),
-    );
-    rig.template(
+    bounded(|| {
+        let rig = Rig::with(
+            FakeState {
+                server: json!({}),
+                projects: vec![],
+                instances: vec![],
+                networks: vec![],
+                pools: vec![("pool1".into(), json!({}))],
+            },
+            vec![PROJECT.to_string()],
+            Some("192.0.2.0/24"),
+        );
+        rig.template(
         "app",
         json!({"name":"app","kind":"oci","image":"registry.example/app","digest":DIGEST,"ports":[8080],"lan":{"port":8080},"env":{}}),
     );
-    rig.call("service_create", json!({"name":"app","template":"app"}))
-        .expect("the service");
-    let node = node(&rig);
-    let target = target(&rig);
-    // A declared command Incus never answers marks an OCI container (Rule 82).
-    let version = DeclaredCommand::version(&formula(), "oci").expect("the version reader");
-    let mut held = ExecScript::new(version.argv(), 0, "");
-    held.held = true;
-    rig.fake.script_exec(held);
-    node.exec
-        .run_formula(
-            &target,
-            "doctor",
-            "app_update",
-            &version,
-            Some(Instant::now() + Duration::from_secs(2)),
-        )
-        .expect_err("Incus does not answer");
-    assert!(node.exec.hung(&target));
-    let uuid = target.uuid.clone();
-    let done = node
+        rig.call("service_create", json!({"name":"app","template":"app"}))
+            .expect("the service");
+        let node = node(&rig);
+        let target = target(&rig);
+        // A declared command Incus never answers marks an OCI container (Rule 82).
+        let version = DeclaredCommand::version(&formula(), "oci").expect("the version reader");
+        let mut held = ExecScript::new(version.argv(), 0, "");
+        held.held = true;
+        rig.fake.script_exec(held);
+        node.exec
+            .run_formula(
+                &target,
+                "doctor",
+                "app_update",
+                &version,
+                Some(Instant::now() + Duration::from_secs(2)),
+            )
+            .expect_err("Incus does not answer");
+        assert!(node.exec.hung(&target));
+        let uuid = target.uuid.clone();
+        let done = node
         .call(
             "service_update",
             json!({"name":"app","digest":"sha256:2222222222222222222222222222222222222222222222222222222222222222"}),
         )
         .expect("the update");
-    assert_eq!(done["updated"], true, "{done}");
-    assert_eq!(
-        rig.kernel
-            .lock()
-            .unwrap()
-            .service_uuid(&EntryId("service-app".into()), "app"),
-        uuid,
-        "the same instance: only a stop can have cleared the mark"
-    );
-    assert!(!node.exec.hung(&target), "the update stopped it");
+        assert_eq!(done["updated"], true, "{done}");
+        assert_eq!(
+            rig.kernel
+                .lock()
+                .unwrap()
+                .service_uuid(&EntryId("service-app".into()), "app"),
+            uuid,
+            "the same instance: only a stop can have cleared the mark"
+        );
+        assert!(!node.exec.hung(&target), "the update stopped it");
+    });
 }

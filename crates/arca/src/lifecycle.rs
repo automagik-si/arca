@@ -259,6 +259,15 @@ impl InstanceLifecycle {
             )
         })?;
         let outcome = self.act(action, project, instance);
+        // Seen stopped, or stopped and started again by Incus: nothing left running in it runs any more.
+        if let (Ok(done), Some(after_stop)) = (&outcome, &self.after_stop)
+            && matches!(
+                done.outcome,
+                "stopped" | "already_stopped" | "started" | "started_from_stopped" | "restarted"
+            )
+        {
+            after_stop(&done.state.name, done.state.uuid.as_deref());
+        }
         let end = match &outcome {
             Ok(done) => json!({
                 "kind": "end",

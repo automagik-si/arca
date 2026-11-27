@@ -1483,7 +1483,7 @@ fn g5_system_journal_and_capped_fallback_delete_both_recordings() {
     assert_eq!(
         rig.call("service_logs", json!({"name":"dash","lines":2}))
             .unwrap(),
-        json!({"lines":["one","two"]})
+        json!({"lines":["one","two"],"source":"journal"})
     );
     rig.fake
         .set_console_log(PROJECT, "dash", "console fallback");
@@ -1493,7 +1493,11 @@ fn g5_system_journal_and_capped_fallback_delete_both_recordings() {
     assert_eq!(
         rig.call("service_logs", json!({"name":"dash","lines":2}))
             .unwrap(),
-        json!({"lines":["console fallback"]})
+        json!({
+            "lines": ["console fallback"],
+            "source": "console",
+            "journalNotRead": "the journal read did not finish: service exec output exceeds 64 KiB"
+        })
     );
     assert_eq!(rig.fake.recordings(), 0);
     let deletes = rig

@@ -6001,8 +6001,10 @@ pub fn cut_service_logs(v: &Value) -> Option<Value> {
     if start > 0 || out.iter().zip(&lines[start..]).any(|(a, b)| a != b) {
         let mut cut = json!({ "lines": out });
         // What the answer says about where its lines came from stays with the lines that are left.
-        if let Some(note) = v.get("note") {
-            cut["note"] = note.clone();
+        for key in ["note", "source", "journalNotRead"] {
+            if let Some(said) = v.get(key) {
+                cut[key] = said.clone();
+            }
         }
         Some(cut)
     } else {
@@ -6082,9 +6084,19 @@ fn service_logs_result() -> Value {
                 "maxItems": 200,
                 "type": "array"
             },
+            "journalNotRead": {
+                "description": "Present when source is console: why the journal was not read, in plain words. For an instance marked hung after a command that did not answer, it says that a stop and a start, or a restart, clears the mark.",
+                "maxLength": 400,
+                "type": "string"
+            },
             "note": {
                 "description": "Present when the lines are not the service's journal: on a node that only looks they are the instance's console log, since the journal is read by running a command inside the instance.",
                 "maxLength": 300,
+                "type": "string"
+            },
+            "source": {
+                "description": "Where the lines came from: journal (read inside the instance) or console (the instance's console log). A node of an earlier release leaves it out.",
+                "enum": ["journal", "console"],
                 "type": "string"
             }
         },

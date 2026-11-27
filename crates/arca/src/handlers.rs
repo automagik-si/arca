@@ -6840,6 +6840,22 @@ pub(crate) fn no_service_project_asked(cfg: &NodeConfig) -> bool {
 }
 
 /// What a log answer of a node that only looks says about its lines.
+/// Why a node that only looks reads no journal, as `service_logs` says it in `journalNotRead`.
+const JOURNAL_WATCH_ONLY: &str =
+    "this node only looks, and the journal is read by running a command inside the instance";
+
+/// Why `service_logs` did not read the journal, in plain words, when the exec seam refused or failed the read.
+fn journal_not_read(error: &crate::service_exec::ExecError) -> String {
+    use crate::service_exec::ExecError;
+    match error {
+        ExecError::Refused("hung") => "an earlier command inside the instance did not answer, so Arca marked it hung and runs nothing more in it until it sees it stopped: instance_stop then instance_start, or instance_restart, clears the mark".into(),
+        ExecError::Refused("stopped") => "the instance is not running".into(),
+        ExecError::Refused(code) => format!("Arca refused to run the journal read ({code})"),
+        ExecError::Failed(text) => format!("the journal read did not finish: {text}"),
+        ExecError::Audit => "the exec audit could not be written, so no command ran inside the instance".into(),
+    }
+}
+
 pub const CONSOLE_LOG_NOTE: &str = "these lines are the instance's console log, not the service's journal: the journal is read by running a command inside the instance, and this node only looks";
 
 /// What marks an instance of the service project that this node holds no record of.
@@ -8941,48 +8957,57 @@ impl ServiceHandler {
                 );
                 // A virtual machine's log is its console: an exec needs a guest agent the image may not run.
                 // A node that only looks runs no command inside an instance, so it reads the console log, and says so.
-                let journal = if !reads_as_it_is
-                    && !config.adopted
-                    && config.vm.is_none()
-                    && config.tenant.is_none()
-                    && config.source["protocol"] != "oci"
-                {
-                    if let Some(_permit) = self.exec.journal_permit() {
-                        let target = self.exec_target(&entry, &config)?;
-                        // A window of the lines asked for can start inside a key: `redact_blocks` hides a text
-                        // from its start to an END line no BEGIN line comes before. Reading more lines than asked
-                        // would push a busy service's journal over the exec cap, and its log to the console's.
-                        let cmd = arca_incus::exec::ExecCommand::Journal(
-                            arca_incus::exec::JournalLines::new(lines).map_err(|_| {
-                                CallError::Invalid("lines: expected 1 to 200".into())
-                            })?,
-                        );
-                        match self.exec.run(
-                            &target,
-                            &caller.token_id,
-                            self.verb,
-                            &cmd,
-                            &service_secret_values(&self.cfg.state_dir.join("secrets")),
-                            None,
-                        ) {
-                            Ok(text) => String::from_utf8(text).ok(),
-                            Err(error) if error.ownership() => return Err(error.call_error()),
-                            Err(_) => None,
-                        }
-                    } else {
-                        None
+                // When the journal is not read, the answer says why in plain words, so an empty answer is never silent.
+                let journal: Result<String, String> = if reads_as_it_is {
+                    Err(JOURNAL_WATCH_ONLY.into())
+                } else if config.adopted {
+                    Err("the service is adopted, and Arca runs no command inside an adopted instance".into())
+                } else if config.vm.is_some() {
+                    Err("a virtual machine's log is its console: reading its journal needs a guest agent its image may not run".into())
+                } else if config.tenant.is_some() {
+                    Err(
+                        "the service is a tenant's, and a tenant's log is read from its console"
+                            .into(),
+                    )
+                } else if config.source["protocol"] == "oci" {
+                    Err("an OCI container's log is its console".into())
+                } else if let Some(_permit) = self.exec.journal_permit() {
+                    let target = self.exec_target(&entry, &config)?;
+                    // A window of the lines asked for can start inside a key: `redact_blocks` hides a text
+                    // from its start to an END line no BEGIN line comes before. Reading more lines than asked
+                    // would push a busy service's journal over the exec cap, and its log to the console's.
+                    let cmd = arca_incus::exec::ExecCommand::Journal(
+                        arca_incus::exec::JournalLines::new(lines)
+                            .map_err(|_| CallError::Invalid("lines: expected 1 to 200".into()))?,
+                    );
+                    match self.exec.run(
+                        &target,
+                        &caller.token_id,
+                        self.verb,
+                        &cmd,
+                        &service_secret_values(&self.cfg.state_dir.join("secrets")),
+                        None,
+                    ) {
+                        Ok(text) => String::from_utf8(text)
+                            .map_err(|_| "the journal's answer was not text".to_string()),
+                        Err(error) if error.ownership() => return Err(error.call_error()),
+                        Err(error) => Err(journal_not_read(&error)),
                     }
                 } else {
-                    None
+                    Err("four journal reads were already running on this node; ask again in a moment".into())
                 };
-                let text = match journal {
-                    Some(text) => text,
-                    None => read.get_text(&path).map_err(|error| match error {
-                        arca_incus::IncusError::Status { code: 404, .. } => {
-                            service_not_found(format!("service {name}: no log"))
-                        }
-                        _ => service_refused(format!("read service {name}'s log")),
-                    })?,
+                let (text, source, not_read) = match journal {
+                    Ok(text) => (text, "journal", None),
+                    Err(why) => (
+                        read.get_text(&path).map_err(|error| match error {
+                            arca_incus::IncusError::Status { code: 404, .. } => {
+                                service_not_found(format!("service {name}: no log"))
+                            }
+                            _ => service_refused(format!("read service {name}'s log")),
+                        })?,
+                        "console",
+                        Some(why),
+                    ),
                 };
                 let mut secrets = service_secret_values(&self.cfg.state_dir.join("secrets"));
                 let envkeys = row["config"][crate::service::ENVKEYS_KEY]
@@ -9028,7 +9053,10 @@ impl ServiceHandler {
                     }
                 }
                 let start = lines_out.len().saturating_sub(lines as usize);
-                let mut answer = json!({ "lines": &lines_out[start..] });
+                let mut answer = json!({ "lines": &lines_out[start..], "source": source });
+                if let Some(why) = not_read {
+                    answer["journalNotRead"] = json!(why);
+                }
                 if reads_as_it_is {
                     answer["note"] = json!(CONSOLE_LOG_NOTE);
                 }
