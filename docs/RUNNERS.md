@@ -370,15 +370,18 @@ time.
   | Pool: from the class asking for a machine to the job record | 31.6 s |
 
   A third test proves the network from inside the pool's job machines on the pool's own bridge (made for the test and
-  deleted after it, as the ACL is), in a project without `features.networks`. Besides two job machines it makes one
-  throwaway machine with no rules of its own, a card on the pool's bridge and a card on the service bridge, and a
-  listener the host reaches on both addresses, checked first; the gateway's 8443 and a private address outside both
-  bridges are checked from the host too. So each refusal below is the job's rules and nothing else's. Run on 2026-11-27 (two job
-  machines of 2 vCPU and 2 GiB): DNS on the gateway answered both (udp and tcp) and a public https site answered;
-  refused, each timing out: the throwaway on the same bridge, the throwaway into the job machine, the second job
-  machine into the first, the throwaway's address on the service bridge (routed through the host), the gateway's 8443
+  deleted after it, as the ACL is), in a project without `features.networks`. Besides two job machines it makes two
+  throwaway machines with no rules of their own: the target, with a card on the pool's bridge and a card on the service
+  bridge and a listener the host reaches on both addresses, and the relay, with one card on the pool's bridge, which
+  must reach the target's service-bridge address through the host (the path a job would take) first. The gateway's
+  8443 and a private address outside both bridges are checked from the host too. So each refusal below is the job's
+  rules and nothing else's, and each must be a connect that timed out (exit 124); any other code fails the test. Run on
+  2026-11-27 (two job machines of 2 vCPU and 2 GiB): DNS on the gateway answered both (udp and tcp) and a public https
+  site answered; refused, each with exit 124: the target on the same bridge, the target into the job machine, the
+  second job machine into the first, the target's service-bridge address (which the relay reached), the gateway's 8443
   and the private address. The machines, the bridge and the ACL are deleted on every exit path; the guard that deletes
-  them is made before the first of them. The two tests above pass with the pool on its own bridge.
+  them is made before the first of them. The two tests above pass with the pool on its own bridge and the machine made
+  stopped, checked, then started.
 
   The runner refuses the made-up configuration at its own key check, before it calls any server.
 - **Dogfood** (our own organisation, one pool): a test workflow and one real CI job. Counted: jobs, pass rate, queue
