@@ -240,12 +240,11 @@ mod tests {
         assert_eq!(pool.classes[0].scale_set_name(), "acme-4vcpu-ubuntu-2404");
         assert_eq!(pool.work_folder, "/home/runner/work");
         assert_eq!(pool.log_days, 7);
-        assert_eq!(pool.network, None);
-        assert_eq!(pool.bridge(), "arcak-svcbr", "the node's service bridge");
+        assert_eq!(pool.network, None, "the pool's own bridge");
         let mut value = example();
         value["network"] = json!("ci-br0");
         let pool: PoolConfig = serde_json::from_value(value).expect("a pool");
-        assert_eq!(pool.bridge(), "ci-br0");
+        assert_eq!(pool.network.as_deref(), Some("ci-br0"));
     }
 
     #[test]
