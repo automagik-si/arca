@@ -55,7 +55,8 @@
 //! `environment.*` value holds a line break or a carriage return, as Incus 7.6 refuses either at start. A graceful stop can be made to
 //! outlast its timeout ([`FakeIncus::hang_stop`]), and then only `force: true` stops it. A test can refuse a start
 //! ([`FakeIncus::refuse_start`], [`FakeIncus::refuse_start_once`]), a restart's start half with it, which leaves the instance
-//! stopped, and hold a stop or a restart past its caller's wait ([`FakeIncus::hold_state`]). A NIC's MAC is its device's `hwaddr`,
+//! stopped, and hold a stop or a restart past its caller's wait ([`FakeIncus::hold_state`]): a held restart's start half
+//! is pending until the operation ends, and a start sent meanwhile joins it ([`FakeIncus::joined_starts`]). A NIC's MAC is its device's `hwaddr`,
 //! else its `volatile.<dev>.hwaddr`, else one the start
 //! generates and keeps there. Its IPv4 is its device's `ipv4.address`, else the lease its MAC holds in the DHCP lease table,
 //! else a fresh one the start leases ([`FakeIncus::set_lease`]; `/1.0/networks/<n>/leases`). A lease a start pins, or one
@@ -280,6 +281,9 @@ struct Store {
     /// State changes a test armed with [`FakeIncus::hold_state`] that have not arrived yet: the operation id each runs as,
     /// by project and instance name.
     held_states: BTreeMap<(String, String), String>,
+    /// The starts that joined a held restart's pending start half, as Incus hands a start the restart's lock: by project
+    /// and instance name, how many.
+    joined: BTreeMap<(String, String), u32>,
     /// The DHCP lease table, one lease per MAC.
     leases: Vec<Lease>,
     /// The instances whose graceful stop outlasts its timeout, by name, and whether a forced stop fails too.
@@ -327,6 +331,8 @@ struct Held {
     lands: Option<Stored>,
     reverts: Option<Place>,
     then: Option<Then>,
+    /// The instance, by project and name, a held restart starts when it succeeds: its start half, still pending.
+    starts: Option<(String, String)>,
 }
 
 /// What else a held operation does when it ends, told whether it succeeded and given the operation to finish.
@@ -477,6 +483,7 @@ impl Shared {
             operations: BTreeMap::new(),
             held: BTreeMap::new(),
             held_states: BTreeMap::new(),
+            joined: BTreeMap::new(),
             armed: Vec::new(),
             leases: Vec::new(),
             hung: BTreeMap::new(),
@@ -882,16 +889,38 @@ impl FakeIncus {
     }
 
     /// Makes the next graceful stop or restart of the instance `name` in `project` run as a held operation with the id
-    /// returned here, as a shutdown slower than the caller's wait. Its stop half is done when it arrives, so the instance
-    /// shows stopped while the operation runs; the operation stays running until the test releases or fails it, and either
-    /// way leaves the instance as it is then: a restart's start half is not modelled. The fake holds no instance lock, so a
-    /// state change sent while it runs is served.
+    /// returned here, as one slower than the caller's wait. Its stop half is done when it arrives. A restart's start half
+    /// is then pending: the instance reads stopped, as Incus reports a restarting container whose start has not come up,
+    /// until the operation ends. Released, the start half runs and the instance is running; failed, it stays stopped. A
+    /// start sent while a restart's start half is pending joins it, as Incus hands it the restart's lock: it is counted
+    /// ([`FakeIncus::joined_starts`]), answered as done and changes nothing by itself.
     pub fn hold_state(&self, project: &str, name: &str) -> OpId {
         let id = self.shared.next_id();
         lock(&self.shared.store)
             .held_states
             .insert((project.to_string(), name.to_string()), id.clone());
         OpId(id)
+    }
+
+    /// How many starts of the instance `name` in `project` joined a held restart's pending start half.
+    pub fn joined_starts(&self, project: &str, name: &str) -> u32 {
+        lock(&self.shared.store)
+            .joined
+            .get(&(project.to_string(), name.to_string()))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Ends the held operation `id` by itself `after` from now, with success, or with failure and `failure` as its `err`,
+    /// as [`FakeIncus::release_operation`] and [`FakeIncus::fail_operation`] end it.
+    pub fn end_operation_after(&self, id: &OpId, after: Duration, failure: Option<&str>) {
+        let shared = Arc::clone(&self.shared);
+        let id = id.clone();
+        let failure = failure.map(str::to_string);
+        thread::spawn(move || {
+            thread::sleep(after);
+            end_held(&shared, &id, failure.as_deref());
+        });
     }
 
     /// Ends a held operation with success. A create held until completion lands now. An id whose create has not arrived yet is
@@ -1176,39 +1205,52 @@ impl FakeIncus {
     }
 
     fn end_operation(&self, id: &OpId, failure: Option<&str>) {
-        let mut guard = lock(&self.shared.store);
-        let store: &mut Store = &mut guard;
-        store.armed.retain(|armed| armed.id != id.0);
-        let Some(held) = store.held.remove(&id.0) else {
-            return;
+        end_held(&self.shared, id, failure);
+    }
+}
+
+/// Ends a held operation, with success or with failure and `failure` as its `err`: a held create lands or goes, a held
+/// restart's start half runs on success, and what else the operation does then runs.
+fn end_held(shared: &Shared, id: &OpId, failure: Option<&str>) {
+    let mut guard = lock(&shared.store);
+    let store: &mut Store = &mut guard;
+    store.armed.retain(|armed| armed.id != id.0);
+    let Some(held) = store.held.remove(&id.0) else {
+        return;
+    };
+    if let Some(operation) = store.operations.get_mut(&id.0) {
+        let (status, code, err) = match failure {
+            None => ("Success", 200, ""),
+            Some(message) => ("Failure", 400, message),
         };
-        if let Some(operation) = store.operations.get_mut(&id.0) {
-            let (status, code, err) = match failure {
-                None => ("Success", 200, ""),
-                Some(message) => ("Failure", 400, message),
-            };
-            operation["status"] = json!(status);
-            operation["status_code"] = json!(code);
-            operation["err"] = json!(err);
-            if let Some(then) = held.then {
-                then(failure.is_none(), operation);
+        operation["status"] = json!(status);
+        operation["status_code"] = json!(code);
+        operation["err"] = json!(err);
+        if let Some(then) = held.then {
+            then(failure.is_none(), operation);
+        }
+    }
+    lock(&shared.migration)
+        .held_pushes
+        .retain(|held| *held != id.0);
+    match failure {
+        None => {
+            if let Some(object) = held.lands {
+                store.objects.push(object);
+            }
+            if let Some((project, name)) = held.starts
+                && let Some(index) = store.objects.iter().position(|object| {
+                    object.kind == "instance" && object.project == project && object.name == name
+                })
+            {
+                store.start(index, shared.counter.fetch_add(1, Ordering::SeqCst));
             }
         }
-        lock(&self.shared.migration)
-            .held_pushes
-            .retain(|held| *held != id.0);
-        match failure {
-            None => {
-                if let Some(object) = held.lands {
-                    store.objects.push(object);
-                }
-            }
-            Some(_) => {
-                if let Some(place) = held.reverts {
-                    store
-                        .objects
-                        .retain(|object| place_of_stored(object) != place);
-                }
+        Some(_) => {
+            if let Some(place) = held.reverts {
+                store
+                    .objects
+                    .retain(|object| place_of_stored(object) != place);
             }
         }
     }
@@ -4315,6 +4357,14 @@ fn change_state(
         .push(text_in(&sent, "action"));
     match text_in(&sent, "action").as_str() {
         "start" if running => bad("The instance is already running"),
+        // A held restart's start half is pending: the start gets the restart's lock and changes nothing by itself.
+        "start" if restart_pending(store, address) => {
+            *store
+                .joined
+                .entry((address.project.clone(), address.name.clone()))
+                .or_default() += 1;
+            answered(shared, store, "instance", "PUT", Ok(()))
+        }
         "start" if start_refused_by_test(shared, address) => answered(
             shared,
             store,
@@ -4381,7 +4431,7 @@ fn change_state(
                 return answered(shared, store, "instance", "PUT", failure);
             }
             stop_half(shared, store, index, address);
-            if let Some(held) = held_state(store, address) {
+            if let Some(held) = held_state(store, address, false) {
                 return held;
             }
             answered(shared, store, "instance", "PUT", Ok(()))
@@ -4400,7 +4450,7 @@ fn change_state(
                 .contains_key(&(address.project.clone(), address.name.clone()))
             {
                 stop_half(shared, store, index, address);
-                if let Some(held) = held_state(store, address) {
+                if let Some(held) = held_state(store, address, true) {
                     return held;
                 }
             }
@@ -4428,6 +4478,15 @@ fn change_state(
         }
         _ => bad("the fake takes only a start, a stop or a restart"),
     }
+}
+
+/// Whether a held restart of the instance at `address` has its start half still pending.
+fn restart_pending(store: &Store, address: &Address) -> bool {
+    store.held.values().any(|held| {
+        held.starts
+            .as_ref()
+            .is_some_and(|(project, name)| *project == address.project && *name == address.name)
+    })
 }
 
 /// Whether a test refused the next start of the instance at `address`: every start ([`FakeIncus::refuse_start`]), or this
@@ -4458,7 +4517,7 @@ fn stop_half(shared: &Shared, store: &mut Store, index: usize, address: &Address
 }
 
 /// The answer of a state change a test armed with [`FakeIncus::hold_state`]: its operation, running until the test ends it.
-fn held_state(store: &mut Store, address: &Address) -> Option<Answer> {
+fn held_state(store: &mut Store, address: &Address, restart: bool) -> Option<Answer> {
     let id = store
         .held_states
         .remove(&(address.project.clone(), address.name.clone()))?;
@@ -4470,7 +4529,11 @@ fn held_state(store: &mut Store, address: &Address) -> Option<Answer> {
     };
     let operation = running_operation(&id, &place);
     store.operations.insert(id.clone(), operation.clone());
-    store.held.insert(id.clone(), Held::default());
+    let held = Held {
+        starts: restart.then(|| (address.project.clone(), address.name.clone())),
+        ..Held::default()
+    };
+    store.held.insert(id.clone(), held);
     Some((202, String::new(), async_envelope(&id, operation)))
 }
 

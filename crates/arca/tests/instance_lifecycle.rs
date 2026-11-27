@@ -708,29 +708,94 @@ fn a_restart_whose_start_half_is_refused_once_ends_running_and_says_the_start_wa
 }
 
 #[test]
-fn a_restart_slower_than_the_deadline_names_the_real_state_and_starts_a_stopped_instance() {
+fn a_restart_still_running_after_the_wait_sends_no_second_start_and_says_its_state_is_unknown() {
     let rig = Rig::with_deadline("life-restart-slow", Duration::from_millis(300));
-    // The restart's operation is still running when Arca stops waiting, and the instance has shut down meanwhile.
+    // The restart's stop half is done and its start half is pending: Incus reports the instance stopped meanwhile, and a
+    // start sent now would join the restart.
     let slow = rig.fake.hold_state(PROJECT, "api");
+    let (code, message) = refusal(rig.approved("instance_restart", at(PROJECT, "api")));
+    assert_eq!(code, "InstanceRestartFailed", "{message}");
+    assert!(message.contains("has not finished restarting"), "{message}");
+    assert!(message.contains("Arca sent nothing more"), "{message}");
+    assert!(message.contains("not known"), "{message}");
+    assert!(!message.contains("one plain start"), "{message}");
+    // One restart and nothing else: no start joined the restart.
+    assert_eq!(rig.fake.state_actions(PROJECT, "api"), ["restart"]);
+    assert_eq!(rig.fake.joined_starts(PROJECT, "api"), 0);
+    let rows = rig.journal();
+    assert!(
+        rows.iter().any(|row| row["kind"] == "restart_unfinished"),
+        "{rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|row| row["kind"] == "separate_start"),
+        "{rows:?}"
+    );
+    let end = rows
+        .iter()
+        .find(|row| row["kind"] == "end")
+        .expect("an end row");
+    assert_eq!(end["code"], json!("InstanceRestartFailed"));
+    // Incus brings it up by itself when its restart ends.
+    rig.fake.release_operation(&slow);
+    assert_eq!(rig.status(PROJECT, "api"), "Running");
+}
+
+#[test]
+fn a_restart_that_fails_its_start_half_after_the_first_wait_is_followed_by_one_start() {
+    let rig = Rig::with_deadline("life-restart-late", Duration::from_secs(2));
+    // The restart outlasts the first wait (2 s) and Incus fails its start half within the half deadline after it (1 s).
+    let slow = rig.fake.hold_state(PROJECT, "api");
+    rig.fake.end_operation_after(
+        &slow,
+        Duration::from_millis(2500),
+        Some("Failed to start the instance"),
+    );
     let answer = rig
         .approved("instance_restart", at(PROJECT, "api"))
         .expect("the stopped instance is started");
-    rig.fake.release_operation(&slow);
     assert_eq!(answer["status"], json!("Running"), "{answer}");
     let message = answer["message"].as_str().expect("a message");
     assert!(
-        message.contains("did not answer by the deadline"),
+        message.contains("took longer than 2 seconds and then failed the restart"),
         "{message}"
     );
-    assert!(message.contains("It was stopped"), "{message}");
     assert!(message.contains("one plain start"), "{message}");
+    assert!(message.contains("it is running now"), "{message}");
     assert_eq!(rig.status(PROJECT, "api"), "Running");
+    // The start was sent once the restart had ended, so it joined nothing.
     assert_eq!(rig.fake.state_actions(PROJECT, "api"), ["restart", "start"]);
+    assert_eq!(rig.fake.joined_starts(PROJECT, "api"), 0);
     let rows = rig.journal();
     assert!(
         rows.iter().any(|row| row["kind"] == "separate_start"),
         "{rows:?}"
     );
+}
+
+#[test]
+fn a_restart_that_finishes_after_the_first_wait_is_a_restart_and_nothing_else() {
+    let rig = Rig::with_deadline("life-restart-done", Duration::from_secs(2));
+    let slow = rig.fake.hold_state(PROJECT, "api");
+    rig.fake
+        .end_operation_after(&slow, Duration::from_millis(2500), None);
+    let answer = rig
+        .approved("instance_restart", at(PROJECT, "api"))
+        .expect("the restart ends");
+    assert_eq!(answer["status"], json!("Running"), "{answer}");
+    let message = answer["message"].as_str().expect("a message");
+    assert!(
+        message.starts_with("restarted the instance api"),
+        "{message}"
+    );
+    assert!(message.contains("took longer than 2 seconds"), "{message}");
+    assert_eq!(rig.fake.state_actions(PROJECT, "api"), ["restart"]);
+    let end = rig
+        .journal()
+        .into_iter()
+        .find(|row| row["kind"] == "end")
+        .expect("an end row");
+    assert_eq!(end["outcome"], json!("restarted"));
 }
 
 #[test]
