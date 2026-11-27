@@ -55,6 +55,10 @@ pub struct NetworkPlan {
     pub service_cidr: Option<String>,
     /// Ranges the pool's own bridge keeps clear of (`kernel.reservedCidrs`).
     pub reserved: Vec<String>,
+    /// The host's routes as `(destination CIDR, interface)`, the default route left out (the kernel reads
+    /// `/proc/net/route`, the main table): the pool's own bridge keeps clear of them, and one that a route now meets
+    /// stops the pool.
+    pub routes: Vec<(String, String)>,
 }
 
 /// The space a pool's own bridge is chosen in: the /24s of `172.16.0.0/12`.
@@ -65,17 +69,25 @@ const OWN_SLOTS: u32 = 4096;
 /// pool's name fixes, that overlaps none of `taken`. Each of `taken` is a CIDR range or a bare address, which counts as
 /// its /24. `None` when every /24 is taken.
 pub fn choose_subnet(pool: &str, taken: &[String]) -> Option<String> {
-    let ranges: Vec<(u32, u32)> = taken.iter().filter_map(|range| range_of(range)).collect();
     let start = pool_hash(pool) % OWN_SLOTS;
     (0..OWN_SLOTS)
         .map(|step| OWN_SPACE | (((start + step) % OWN_SLOTS) << 8))
         .find(|base| {
-            ranges.iter().all(|(other, mask)| {
-                let common = mask & 0xffff_ff00;
-                base & common != other & common
-            })
+            let slot = format!("{}/24", Ipv4Addr::from(*base));
+            !taken.iter().any(|range| overlaps(&slot, range))
         })
         .map(|base| format!("{}/24", Ipv4Addr::from(base | 1)))
+}
+
+/// Whether two ranges share an address; a bare address counts as its /24.
+fn overlaps(left: &str, right: &str) -> bool {
+    match (range_of(left), range_of(right)) {
+        (Some((a, a_mask)), Some((b, b_mask))) => {
+            let common = a_mask & b_mask;
+            a & common == b & common
+        }
+        _ => false,
+    }
 }
 
 /// A CIDR range as its network address and mask; a bare address is its /24.
@@ -135,15 +147,40 @@ impl IncusLauncher {
         let network = match &plan.bridge {
             Some(bridge) => bridge.clone(),
             None => {
-                if vms.own_bridge().map_err(incus)?.is_none() {
-                    let address = choose_subnet(pool, &taken(&socket, plan)?).ok_or_else(|| {
-                        LaunchError(
-                            "no /24 of 172.16.0.0/12 is free for the pool's own bridge".to_string(),
-                        )
-                    })?;
-                    vms.create_bridge(&address).map_err(incus)?;
+                let bridge = vms.bridge_name();
+                match vms.own_bridge().map_err(incus)? {
+                    None => {
+                        let taken: Vec<String> = taken(&socket, plan, None)?
+                            .into_iter()
+                            .map(|(range, _)| range)
+                            .collect();
+                        let address = choose_subnet(pool, &taken).ok_or_else(|| {
+                            LaunchError(
+                                "no /24 of 172.16.0.0/12 is free for the pool's own bridge"
+                                    .to_string(),
+                            )
+                        })?;
+                        vms.create_bridge(&address).map_err(incus)?;
+                    }
+                    // Reused only while nothing that came since meets it: never renumbered behind the owner's back.
+                    Some(address) => {
+                        let (gateway, subnet) = gateway_and_subnet(&address).ok_or_else(|| {
+                            LaunchError(format!("the pool's bridge {bridge} has no IPv4 address"))
+                        })?;
+                        if let Some((range, what)) = taken(&socket, plan, Some((&bridge, gateway)))?
+                            .into_iter()
+                            .find(|(range, _)| overlaps(&subnet, range))
+                        {
+                            return Err(LaunchError(format!(
+                                "the pool's bridge {bridge} ({subnet}) now overlaps {range}, {what}, so the pool does not \
+                                 start: its machines would cut the host off from that range. Arca does not renumber \
+                                 it; remove the route or name the range elsewhere, or delete the bridge once no \
+                                 machine uses it and Arca makes a new one clear of it at the next start"
+                            )));
+                        }
+                    }
                 }
-                vms.bridge_name()
+                bridge
             }
         };
         let (gateway, subnet) = bridge_address(&socket, project, &network)?;
@@ -332,7 +369,12 @@ fn bridge_address(
     let read = UnixIncus::new(socket.to_path_buf());
     let bridge = read
         .get(&format!("/1.0/networks/{network}?project={project}"))
-        .map_err(|error| LaunchError(format!("incus: the bridge {network}: {error}")))?;
+        .map_err(|error| match error {
+            IncusError::Status { code: 404, .. } => LaunchError(format!(
+                "the pool's network {network} is not an Incus network the project {project} sees: check its spelling"
+            )),
+            error => LaunchError(format!("incus: the bridge {network}: {error}")),
+        })?;
     bridge
         .pointer("/config/ipv4.address")
         .and_then(Value::as_str)
@@ -364,12 +406,36 @@ fn job_rules(
     ))
 }
 
-/// Every range the pool's own bridge must keep clear of: the service subnet, the reserved ranges, every Incus network's
-/// IPv4 subnet in any project, and every host network.
-fn taken(socket: &Path, plan: &NetworkPlan) -> Result<Vec<String>, LaunchError> {
+/// Every range the pool's own bridge must keep clear of, each with what holds it: the service subnet, the reserved
+/// ranges, the host's routes, every Incus network's IPv4 subnet in any project, and every host network. `own` is the
+/// pool's existing bridge and its gateway, left out of all of these (its own network, its connected route, its address).
+fn taken(
+    socket: &Path,
+    plan: &NetworkPlan,
+    own: Option<(&str, Ipv4Addr)>,
+) -> Result<Vec<(String, String)>, LaunchError> {
     let read = UnixIncus::new(socket.to_path_buf());
-    let mut taken: Vec<String> = plan.service_cidr.iter().cloned().collect();
-    taken.extend(plan.reserved.iter().cloned());
+    let (own_name, own_gateway) = match own {
+        Some((name, gateway)) => (Some(name), Some(gateway)),
+        None => (None, None),
+    };
+    let mut taken: Vec<(String, String)> = plan
+        .service_cidr
+        .iter()
+        .map(|cidr| (cidr.clone(), "the node's service subnet".to_string()))
+        .collect();
+    taken.extend(plan.reserved.iter().map(|cidr| {
+        (
+            cidr.clone(),
+            "a range kernel.reservedCidrs names".to_string(),
+        )
+    }));
+    taken.extend(
+        plan.routes
+            .iter()
+            .filter(|(_, interface)| Some(interface.as_str()) != own_name)
+            .map(|(cidr, interface)| (cidr.clone(), format!("a route through {interface}"))),
+    );
     let networks = read
         .get("/1.0/networks?all-projects=true&recursion=1")
         .map_err(|error| LaunchError(format!("incus: the networks: {error}")))?;
@@ -378,8 +444,16 @@ fn taken(socket: &Path, plan: &NetworkPlan) -> Result<Vec<String>, LaunchError> 
             .as_array()
             .into_iter()
             .flatten()
-            .filter_map(|network| network.pointer("/config/ipv4.address")?.as_str())
-            .filter_map(|address| Some(gateway_and_subnet(address)?.1)),
+            .filter(|network| network.get("name").and_then(Value::as_str) != own_name)
+            .filter_map(|network| {
+                let subnet =
+                    gateway_and_subnet(network.pointer("/config/ipv4.address")?.as_str()?)?.1;
+                let name = network
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("with no name");
+                Some((subnet, format!("Incus's network {name}")))
+            }),
     );
     taken.extend(
         host_addresses(&read)?
@@ -388,7 +462,14 @@ fn taken(socket: &Path, plan: &NetworkPlan) -> Result<Vec<String>, LaunchError> 
             .flatten()
             .filter_map(Value::as_str)
             .filter(|address| !address.contains(':'))
-            .map(str::to_string),
+            .filter(|address| {
+                let ip = address
+                    .split('/')
+                    .next()
+                    .and_then(|ip| ip.parse::<Ipv4Addr>().ok());
+                ip.is_none() || ip != own_gateway
+            })
+            .map(|address| (address.to_string(), "an address of the host".to_string())),
     );
     Ok(taken)
 }
@@ -405,12 +486,16 @@ fn gateway_and_subnet(address: &str) -> Option<(Ipv4Addr, String)> {
 
 /// Deletes the ACL and the own bridge of every pool that is gone from the config: an ACL named `arca-runner-<pool>`
 /// or a network named that pool's bridge name, in any project, carrying the runner mark with that pool's name, for a
-/// pool not among `pools`. Each delete goes through that pool's own writer, which reads the mark again first; the ACL
+/// pool not among `pools`; and the own bridge of a pool among `pools` but not among `own` (it names a network now).
+/// Incus refuses to delete a bridge a machine still uses. Each delete goes through that pool's own writer, which reads the mark again first; the ACL
 /// goes before the bridge. Returns one line for each object removed or left, and one when a listing failed.
-pub fn remove_gone_pools(socket: &Path, pools: &[&str]) -> Vec<String> {
+pub fn remove_gone_pools(socket: &Path, pools: &[&str], own: &[&str]) -> Vec<String> {
     let read = UnixIncus::new(socket.to_path_buf());
     let mut lines = Vec::new();
-    let mut gone = |listing: &str, kind: &str, expected: &dyn Fn(&RunnerVms) -> String| {
+    let mut gone = |listing: &str,
+                    kind: &str,
+                    kept: &[&str],
+                    expected: &dyn Fn(&RunnerVms) -> String| {
         let rows = match read.get(listing) {
             Ok(Value::Array(rows)) => rows,
             Ok(_) => return lines.push(format!("the {kind} listing is not a list")),
@@ -428,7 +513,7 @@ pub fn remove_gone_pools(socket: &Path, pools: &[&str]) -> Vec<String> {
                 .get("project")
                 .and_then(Value::as_str)
                 .unwrap_or("default");
-            if pools.contains(&pool) {
+            if kept.contains(&pool) {
                 continue;
             }
             let Ok(vms) = RunnerVms::new(socket.to_path_buf(), project, pool) else {
@@ -442,20 +527,27 @@ pub fn remove_gone_pools(socket: &Path, pools: &[&str]) -> Vec<String> {
             } else {
                 vms.remove_bridge()
             };
+            let why = if pools.contains(&pool) {
+                format!("pool {pool} no longer uses its own {kind}")
+            } else {
+                format!("pool {pool} is gone")
+            };
             lines.push(match removed {
-                Ok(()) => format!("pool {pool} is gone: its {kind} {name} was deleted"),
-                Err(error) => format!("pool {pool} is gone, and its {kind} {name} stays: {error}"),
+                Ok(()) => format!("{why}: its {kind} {name} was deleted"),
+                Err(error) => format!("{why}, and its {kind} {name} stays: {error}"),
             });
         }
     };
     gone(
         "/1.0/network-acls?all-projects=true&recursion=1",
         "network ACL",
+        pools,
         &|vms| vms.acl_name(),
     );
     gone(
         "/1.0/networks?all-projects=true&recursion=1",
         "bridge",
+        own,
         &|vms| vms.bridge_name(),
     );
     lines

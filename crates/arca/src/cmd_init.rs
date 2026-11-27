@@ -47,7 +47,7 @@ const UNIT_MARK: &str = "# Automagik Arca: written by scripts/install.sh.";
 /// The installer's unit.
 const UNIT: &str = "arca.service";
 /// The kernel's IPv4 routing table and its table of the machine's own addresses.
-const ROUTES: &str = "/proc/net/route";
+pub(crate) const ROUTES: &str = "/proc/net/route";
 const FIB_TRIE: &str = "/proc/net/fib_trie";
 /// How long a restarted node has to answer with its new mode.
 const RESTART_WAIT: Duration = Duration::from_secs(30);
@@ -1092,6 +1092,49 @@ fn candidates() -> impl Iterator<Item = Cidr> {
     })
 }
 
+/// The kernel's IPv4 routing table: one route a line after the heading, the destination and the mask as eight
+/// hexadecimal digits in the machine's byte order, each with the interface it goes through. The default route is every
+/// address and says nothing of what is in use, so it is left out.
+fn parse_routes(table: &str) -> Vec<(Cidr, String)> {
+    let mut routes = Vec::new();
+    for line in table.lines().skip(1) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let (Some(interface), Some(destination), Some(mask)) =
+            (fields.first(), fields.get(1), fields.get(7))
+        else {
+            continue;
+        };
+        let (Ok(destination), Ok(mask)) = (
+            u32::from_str_radix(destination, 16),
+            u32::from_str_radix(mask, 16),
+        ) else {
+            continue;
+        };
+        // The kernel prints each as the number its four network-order bytes make in the machine's own byte order.
+        let (destination, mask) = (u32::from_be(destination), u32::from_be(mask));
+        if mask == 0 {
+            continue;
+        }
+        routes.push((
+            Cidr {
+                address: destination,
+                prefix: mask.count_ones(),
+            },
+            interface.to_string(),
+        ));
+    }
+    routes
+}
+
+/// The routes of `table` (`/proc/net/route`) as `(destination CIDR, interface)`, the default route left out: what a
+/// runner pool's own bridge keeps clear of, read the way init reads them.
+pub(crate) fn routed_networks(table: &str) -> Vec<(String, String)> {
+    parse_routes(table)
+        .into_iter()
+        .map(|(cidr, interface)| (cidr.to_string(), interface))
+        .collect()
+}
+
 /// What the machine already uses: its routes, its own addresses, Incus's networks and the config's reserved ranges.
 #[derive(Default)]
 struct Used {
@@ -1108,32 +1151,10 @@ impl Used {
     /// hexadecimal digits in the machine's byte order. The default route is every address and says nothing of what is
     /// in use, so it is not counted.
     fn routes(&mut self, table: &str) {
-        for line in table.lines().skip(1) {
-            let fields: Vec<&str> = line.split_whitespace().collect();
-            let (Some(interface), Some(destination), Some(mask)) =
-                (fields.first(), fields.get(1), fields.get(7))
-            else {
-                continue;
-            };
-            let (Ok(destination), Ok(mask)) = (
-                u32::from_str_radix(destination, 16),
-                u32::from_str_radix(mask, 16),
-            ) else {
-                continue;
-            };
-            // The kernel prints each as the number its four network-order bytes make in the machine's own byte order.
-            let (destination, mask) = (u32::from_be(destination), u32::from_be(mask));
-            if mask == 0 {
-                continue;
-            }
+        for (cidr, interface) in parse_routes(table) {
             self.route_count += 1;
-            self.networks.push((
-                Cidr {
-                    address: destination,
-                    prefix: mask.count_ones(),
-                },
-                format!("a route through {interface}"),
-            ));
+            self.networks
+                .push((cidr, format!("a route through {interface}")));
         }
     }
 

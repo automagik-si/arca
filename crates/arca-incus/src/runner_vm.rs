@@ -6,7 +6,7 @@
 //! and refuses one that does not carry this pool's mark, so no other instance of the project, and no instance of
 //! another pool, is ever started, written into or deleted from here.
 //!
-//! What it sends: an instance create (a VM, started by the create), files written into and read from the guest through
+//! What it sends: an instance create (a VM, made stopped and started once its devices are checked), files written into and read from the guest through
 //! the Incus agent, one command started through the agent, a forced stop and a delete. And the pool's one network ACL,
 //! `arca-runner-<pool>` ([`RunnerVms::acl_name`]), which every job machine's card names: created, its rules replaced
 //! (a PATCH) and deleted, requested in the pool's project (Incus keeps it in the project that holds that project's networks), and
@@ -205,7 +205,8 @@ impl RunnerVms {
             "name": spec.name,
             "type": "virtual-machine",
             "source": source,
-            "start": true,
+            // Made stopped: its devices are checked before it runs anything.
+            "start": false,
             "config": {
                 RUNNER_KEY: self.pool,
                 "limits.cpu": spec.cpu.to_string(),
@@ -230,30 +231,28 @@ impl RunnerVms {
                 "the created instance does not carry the pool's mark",
             ));
         }
-        // Arca's card is the machine's only one: a card a profile or the copied image machine gives under another name
-        // would carry no rules. Such a machine is deleted before it runs anything.
+        // Arca's card is the machine's only way out, and disks its only other devices: a card, a proxy, a passed-through
+        // device or anything else a profile or the copied image machine gives would carry no rules. Such a machine is
+        // deleted before it ever starts.
         let devices = made
             .get("expanded_devices")
             .or_else(|| made.get("devices"))
             .and_then(Value::as_object)
             .cloned()
             .unwrap_or_default();
-        let others: Vec<&String> = devices
+        let others: Vec<String> = devices
             .iter()
-            .filter(|(name, device)| {
-                device.get("type").and_then(Value::as_str) == Some("nic")
-                    && (name.as_str() != "eth0"
-                        || device.get("security.acls").and_then(Value::as_str)
-                            != Some(self.acl_name().as_str()))
+            .filter_map(|(name, device)| {
+                let kind = device.get("type").and_then(Value::as_str).unwrap_or("");
+                let arcas = kind == "nic"
+                    && name == "eth0"
+                    && device.get("security.acls").and_then(Value::as_str)
+                        == Some(self.acl_name().as_str());
+                (kind != "disk" && !arcas).then(|| format!("{name} ({kind})"))
             })
-            .map(|(name, _)| name)
             .collect();
         if !others.is_empty() {
-            let named = others
-                .iter()
-                .map(|name| name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
+            let named = others.join(", ");
             let deleted = self.destroy(&spec.name);
             // The create landed, so this is not a refusal before any write: it says what became of the machine.
             return Err(IncusError::AppliedUnconfirmed(Box::new(
@@ -268,7 +267,7 @@ impl RunnerVms {
                     uuid: None,
                     owner: None,
                     reason: format!(
-                        "the job machine had a network card other than Arca's ({named}, from a profile or the image machine), so it was {}; give the pool profiles and an image without one",
+                        "the job machine had a device other than its disks and Arca's card ({named}, from a profile or the image machine), so it was {} before it started; give the pool profiles and an image without one",
                         if deleted.is_ok() {
                             "deleted"
                         } else {
@@ -278,7 +277,13 @@ impl RunnerVms {
                 },
             )));
         }
-        Ok(())
+        let path = format!(
+            "/1.0/instances/{}/state?project={}",
+            spec.name, self.project
+        );
+        let start = json!({ "action": "start", "timeout": 30 });
+        let envelope = self.json("PUT", &path, Some(&start), TIMEOUT)?;
+        self.wait_for(&envelope)
     }
 
     /// The name of the pool's own bridge: `arcarun-<seven hex digits of the pool's hash>`.
@@ -333,6 +338,8 @@ impl RunnerVms {
                 "ipv4.address": address,
                 "ipv4.nat": "true",
                 "ipv6.address": "none",
+                // A job is not told the names in the host's /etc/hosts.
+                "dns.include_hosts": "false",
                 RUNNER_KEY: self.pool,
             },
         });
