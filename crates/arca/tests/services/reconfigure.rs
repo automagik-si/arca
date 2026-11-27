@@ -965,11 +965,56 @@ fn labels_survive_reconfigure_and_hold_changes_no_boot_policy() {
 /// Issue #307: a reconfigure restarts the running service, so the hung mark the service verbs obey goes.
 #[test]
 fn a_reconfigure_that_restarts_the_service_clears_its_hung_mark() {
+    bounded(|| {
+        let key = common::SkKey::from_seed(47);
+        let mut rig = node(&key);
+        let (exec, target) = hung(&mut rig);
+        let mut template = first_template();
+        template["env"]["MODE"] = json!("two");
+        rig.template("app", template);
+        let proposed = propose(&rig, json!({ "name": "app" })).expect("the proposal");
+        approve_and_run(&rig, &key, &proposed).expect("the approved reconfigure runs");
+        assert_eq!(instance(&rig, "app")["config"]["environment.MODE"], "two");
+        assert!(!exec.hung(&target), "the reconfigure restarted it");
+    });
+}
+
+/// Review 2's N3: a reconfigure that gives the service a memory `/run` stops it, empties `/run` and starts it, in place
+/// of the restart, and that stop clears the mark too.
+#[test]
+fn a_reconfigure_that_moves_run_to_memory_clears_its_hung_mark() {
+    bounded(|| {
+        let key = common::SkKey::from_seed(52);
+        let mut rig = node_with_run_on_disk(&key, true);
+        let (exec, target) = hung(&mut rig);
+        let proposed = propose(&rig, json!({ "name": "app" })).expect("the proposal");
+        assert_eq!(
+            proposed["args"]["changes"],
+            json!({ "runTmpfs": { "from": false, "to": true } }),
+            "{proposed}"
+        );
+        let from = rig.fake.service_requests().len();
+        let done = approve_and_run(&rig, &key, &proposed).expect("the approved reconfigure runs");
+        assert_eq!(done["run"], "memory", "{done}");
+        assert_eq!(
+            states_since(&rig, from),
+            vec![json!("stop"), json!("start")]
+        );
+        assert!(!exec.hung(&target), "the reconfigure stopped it");
+    });
+}
+
+/// Puts the node's own service handlers on `rig` and marks `app` hung on their exec handle: a declared command Incus
+/// never answers (Rule 82).
+fn hung(
+    rig: &mut Rig,
+) -> (
+    Arc<arca::service_exec::ServiceExec>,
+    arca::service_exec::ExecTarget,
+) {
     use arca::service_exec::{DeclaredCommand, ExecTarget};
     use arca_incus::fake::ExecScript;
     use std::time::{Duration, Instant};
-    let key = common::SkKey::from_seed(47);
-    let mut rig = node(&key);
     let served =
         arca::handlers::service_handlers(rig.kernel.clone(), Arc::new(|| NOW), rig.cfg.clone());
     let exec = arca::handlers::service_exec(&served);
@@ -1002,11 +1047,5 @@ fn a_reconfigure_that_restarts_the_service_clears_its_hung_mark() {
         Some(Instant::now() + Duration::from_secs(2)),
     );
     assert!(exec.hung(&target));
-    let mut template = first_template();
-    template["env"]["MODE"] = json!("two");
-    rig.template("app", template);
-    let proposed = propose(&rig, json!({ "name": "app" })).expect("the proposal");
-    approve_and_run(&rig, &key, &proposed).expect("the approved reconfigure runs");
-    assert_eq!(instance(&rig, "app")["config"]["environment.MODE"], "two");
-    assert!(!exec.hung(&target), "the reconfigure restarted it");
+    (exec, target)
 }

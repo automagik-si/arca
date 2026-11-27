@@ -6847,10 +6847,25 @@ const JOURNAL_WATCH_ONLY: &str =
     "this node only looks, and the journal is read by running a command inside the instance";
 
 /// Why `service_logs` did not read the journal, in plain words, when the exec seam refused or failed the read.
-fn journal_not_read(error: &crate::service_exec::ExecError) -> String {
+/// `retry` is how long until the journal is tried again in an instance marked hung: zero while a try runs.
+fn journal_not_read(error: &crate::service_exec::ExecError, retry: Option<Duration>) -> String {
     use crate::service_exec::ExecError;
     match error {
-        ExecError::Refused("hung") => "an earlier command inside the instance did not answer, so Arca marked it hung and runs nothing more in it until it sees it stopped, or until five minutes have passed, when service_logs tries the journal once more: instance_stop then instance_start, or instance_restart, clears the mark now".into(),
+        ExecError::Refused("hung") => {
+            let then = match retry {
+                Some(left) if left.is_zero() => {
+                    "; one try of the journal is running now".to_string()
+                }
+                Some(left) => format!(
+                    ", or for {} more, after which service_logs tries the journal once more",
+                    wait_words(left)
+                ),
+                None => String::new(),
+            };
+            format!(
+                "an earlier command inside the instance did not answer, so Arca marked it hung and runs nothing more in it until it sees it stopped{then}: instance_stop then instance_start, or instance_restart, clears the mark now"
+            )
+        }
         ExecError::Refused("stopped") => "the instance is not running".into(),
         ExecError::Refused(code) => format!("Arca refused to run the journal read ({code})"),
         ExecError::Failed(text) if text.contains("marked hung") => format!(
@@ -6860,8 +6875,21 @@ fn journal_not_read(error: &crate::service_exec::ExecError) -> String {
             format!("the journal read ran and failed: {text}")
         }
         ExecError::Failed(text) => format!("the journal read failed: {text}"),
-        ExecError::Audit => "the exec audit could not be written, so no command ran inside the instance".into(),
+        ExecError::Audit => {
+            "the exec audit could not be written, so no command ran inside the instance".into()
+        }
     }
+}
+
+/// A wait in words, rounded up: seconds under a minute, minutes after.
+fn wait_words(wait: Duration) -> String {
+    let seconds = wait.as_secs() + u64::from(wait.subsec_nanos() > 0);
+    let (count, unit) = if seconds < 60 {
+        (seconds, "second")
+    } else {
+        (seconds.div_ceil(60), "minute")
+    };
+    format!("{count} {unit}{}", if count == 1 { "" } else { "s" })
 }
 
 pub const CONSOLE_LOG_NOTE: &str = "these lines are the instance's console log, not the service's journal: the journal is read by running a command inside the instance, and this node only looks";
@@ -8999,7 +9027,9 @@ impl ServiceHandler {
                         Ok(text) => String::from_utf8(text)
                             .map_err(|_| "the journal's answer was not text".to_string()),
                         Err(error) if error.ownership() => return Err(error.call_error()),
-                        Err(error) => Err(journal_not_read(&error)),
+                        Err(error) => {
+                            Err(journal_not_read(&error, self.exec.hung_retry_in(&target)))
+                        }
                     }
                 } else {
                     Err("four journal reads were already running on this node; ask again in a moment".into())

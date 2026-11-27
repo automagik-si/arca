@@ -193,17 +193,48 @@ struct Mark {
     probing: bool,
 }
 
-/// The hung marks by instance name, and how many times each name's mark was cleared because its instance was seen
-/// stopped. A command that began before a clear sets no mark after it.
+/// The hung marks by instance name, and how many times each instance, by name and uuid, was seen stopped. A command
+/// that began before such a clear of its own instance sets no mark after it; a clear of another instance with the same
+/// name (in another project, or one that was recreated) changes nothing for it.
 #[derive(Default)]
 struct Marks {
     marks: BTreeMap<String, Mark>,
-    clears: BTreeMap<String, u64>,
+    clears: BTreeMap<(String, String), u64>,
 }
 
 impl Marks {
-    fn clears(&self, instance: &str) -> u64 {
-        self.clears.get(instance).copied().unwrap_or(0)
+    fn clears(&self, instance: &str, uuid: &str) -> u64 {
+        self.clears
+            .get(&(instance.to_owned(), uuid.to_owned()))
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
+/// A journal read let through an aged mark (Rule 82). Ended with [`Probe::end`]; one dropped without an end (its
+/// thread panicked) ends as a read that did not answer, so the mark is not left with a try that never finishes.
+struct Probe<'a> {
+    exec: &'a ServiceExec,
+    instance: String,
+    uuid: String,
+    hold: Duration,
+    ended: bool,
+}
+
+impl Probe<'_> {
+    fn end(mut self, answered: bool) {
+        self.ended = true;
+        self.exec
+            .end_probe(&self.instance, &self.uuid, self.hold, answered);
+    }
+}
+
+impl Drop for Probe<'_> {
+    fn drop(&mut self) {
+        if !self.ended {
+            self.exec
+                .end_probe(&self.instance, &self.uuid, self.hold, false);
+        }
     }
 }
 
@@ -370,7 +401,6 @@ impl ServiceExec {
         let id = self.sequence.fetch_add(1, Ordering::SeqCst);
         self.append(&json!({"kind":"start","id":id,"at_ms":now(),"token_id":token,"verb":verb,"step":command.step(),"entry":target.entry.0,"project":target.service.project,"instance":target.service.instance,"uuid":target.uuid,"lines":command.lines()}))?;
         let limit = Duration::from_secs(command.seconds() + 3);
-        let watch = self.watch(target, limit);
         let budget = until.map_or(limit, |end| {
             limit.min(end.saturating_duration_since(Instant::now()))
         });
@@ -379,18 +409,20 @@ impl ServiceExec {
         let mut exit = None;
         let mut bytes = 0;
         let mut attempted = false;
-        let mut probing = false;
+        let mut probe = None;
         let mut result = (|| {
             let owned = self.check_command(
                 target,
                 &writer,
                 matches!(command, ExecCommand::ConnectorStatus),
             )?;
-            probing = self.refuse_hung(
+            let (watch, admitted) = self.refuse_hung(
                 target,
                 command.cleanup(),
                 matches!(command, ExecCommand::Journal(_)),
+                limit,
             )?;
+            probe = admitted;
             attempted = true;
             let operation = writer
                 .start_service_exec(&owned, command, budget.min(Duration::from_secs(10)))
@@ -428,8 +460,8 @@ impl ServiceExec {
             }
             Ok(stdout)
         })();
-        if probing {
-            self.end_probe(target, watch, result.is_ok());
+        if let Some(probe) = probe.take() {
+            probe.end(result.is_ok());
         }
         // Failures and over-cap answers must also check identity before callers consider a console fallback.
         if attempted && self.changed(target, until)? {
@@ -460,7 +492,6 @@ impl ServiceExec {
         let id = self.sequence.fetch_add(1, Ordering::SeqCst);
         self.append(&json!({"kind":"start","id":id,"at_ms":now(),"token_id":token,"verb":verb,"step":command.part.step(),"entry":target.entry.0,"project":target.service.project,"instance":target.service.instance,"uuid":target.uuid,"lines":null}))?;
         let limit = Duration::from_secs(command.seconds()) + FORMULA_MARGIN;
-        let watch = self.watch(target, limit);
         let deadline = started
             + until.map_or(limit, |end| {
                 limit.min(end.saturating_duration_since(Instant::now()))
@@ -473,7 +504,7 @@ impl ServiceExec {
             formula_target(target)?;
             let writer = self.writer(target, deadline.saturating_duration_since(Instant::now()))?;
             let (owned, instance) = self.check_formula(target, &writer)?;
-            self.refuse_hung(target, false, false)?;
+            let (watch, _) = self.refuse_hung(target, false, false, limit)?;
             attempted = true;
             let operation = writer
                 .start_formula_exec(
@@ -575,7 +606,10 @@ impl ServiceExec {
             return false;
         };
         if let Some(uuid) = uuid {
-            *hung.clears.entry(instance.to_owned()).or_default() += 1;
+            *hung
+                .clears
+                .entry((instance.to_owned(), uuid.to_owned()))
+                .or_default() += 1;
             if hung
                 .marks
                 .get(instance)
@@ -586,62 +620,93 @@ impl ServiceExec {
         }
         true
     }
-    /// What a command beginning now sees of its instance's mark, for a command that may run `hold` in the instance.
-    fn watch(&self, target: &ExecTarget, hold: Duration) -> Watch {
-        Watch {
-            seen: self
-                .hung
-                .lock()
-                .map_or(0, |hung| hung.clears(&target.service.name)),
-            hold,
-        }
+    /// How long until a journal read may try `target`'s marked instance again: zero when a try is due or running now.
+    /// `None` when it holds no mark.
+    pub fn hung_retry_in(&self, target: &ExecTarget) -> Option<Duration> {
+        let now = (self.clock)();
+        let hung = self.hung.lock().ok()?;
+        let mark = hung.marks.get(&target.service.name)?;
+        (Some(&mark.uuid) == target.uuid.as_ref())
+            .then(|| Duration::from_millis(mark.probe_at_ms.saturating_sub(now)))
     }
     /// Refuses a command in an instance that is marked hung. A mark of another uuid is dropped: that instance is gone.
     /// A cleanup command of the closed list is let through. A journal read (`probe`) is let through once the mark's
-    /// time has come, one at a time: `Ok(true)` then, and [`Self::end_probe`] says how it went.
+    /// time has come, one at a time, with the [`Probe`] that ends it. What the command saw of its instance's clears is
+    /// read under the same lock, for a command that may run `hold` in the instance.
     fn refuse_hung(
         &self,
         target: &ExecTarget,
         cleanup: bool,
         probe: bool,
-    ) -> Result<bool, ExecError> {
+        hold: Duration,
+    ) -> Result<(Watch, Option<Probe<'_>>), ExecError> {
+        self.admit(
+            &target.service.name,
+            target.uuid.as_deref(),
+            cleanup,
+            probe,
+            hold,
+        )
+    }
+    fn admit(
+        &self,
+        instance: &str,
+        uuid: Option<&str>,
+        cleanup: bool,
+        probe: bool,
+        hold: Duration,
+    ) -> Result<(Watch, Option<Probe<'_>>), ExecError> {
         let now = (self.clock)();
         let mut hung = self.hung.lock().map_err(|_| ExecError::Audit)?;
+        let watch = Watch {
+            seen: uuid.map_or(0, |uuid| hung.clears(instance, uuid)),
+            hold,
+        };
         if hung
             .marks
-            .get(&target.service.name)
-            .is_some_and(|mark| Some(&mark.uuid) != target.uuid.as_ref())
+            .get(instance)
+            .is_some_and(|mark| Some(mark.uuid.as_str()) != uuid)
         {
-            hung.marks.remove(&target.service.name);
+            hung.marks.remove(instance);
         }
-        let Some(mark) = hung.marks.get_mut(&target.service.name) else {
-            return Ok(false);
+        let Some(mark) = hung.marks.get_mut(instance) else {
+            return Ok((watch, None));
         };
         if cleanup {
-            return Ok(false);
+            return Ok((watch, None));
         }
         if probe && !mark.probing && now >= mark.probe_at_ms {
             mark.probing = true;
-            return Ok(true);
+            let probe = Probe {
+                exec: self,
+                instance: instance.to_owned(),
+                uuid: mark.uuid.clone(),
+                hold,
+                ended: false,
+            };
+            return Ok((watch, Some(probe)));
         }
         Err(ExecError::Refused("hung"))
     }
     /// The end of a journal read let through a mark: an answer clears the mark, anything else gives it another
     /// [`HUNG_PROBE_AFTER`].
-    fn end_probe(&self, target: &ExecTarget, watch: Watch, answered: bool) {
+    fn end_probe(&self, instance: &str, uuid: &str, hold: Duration, answered: bool) {
         let now = (self.clock)();
-        let (Some(uuid), Ok(mut hung)) = (&target.uuid, self.hung.lock()) else {
+        let Ok(mut hung) = self.hung.lock() else {
             return;
         };
-        let name = &target.service.name;
-        if hung.marks.get(name).is_none_or(|mark| &mark.uuid != uuid) {
+        if hung
+            .marks
+            .get(instance)
+            .is_none_or(|mark| mark.uuid != uuid)
+        {
             return;
         }
         if answered {
-            hung.marks.remove(name);
-        } else if let Some(mark) = hung.marks.get_mut(name) {
+            hung.marks.remove(instance);
+        } else if let Some(mark) = hung.marks.get_mut(instance) {
             mark.probing = false;
-            mark.probe_at_ms = mark.probe_at_ms.max(probe_at(now, watch.hold));
+            mark.probe_at_ms = mark.probe_at_ms.max(probe_at(now, hold));
         }
     }
     /// Whether the instance's uuid changed while a command ran in it.
@@ -736,7 +801,7 @@ impl ServiceExec {
         let now = (self.clock)();
         if let Some(uuid) = &target.uuid
             && let Ok(mut hung) = self.hung.lock()
-            && hung.clears(&target.service.name) == watch.seen
+            && hung.clears(&target.service.name, uuid) == watch.seen
         {
             let mut mark = Mark {
                 uuid: uuid.clone(),
@@ -998,4 +1063,56 @@ fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn exec(clock: Arc<AtomicU64>) -> ServiceExec {
+        let cfg: NodeConfig = serde_json::from_value(json!({
+            "stateDir": "/nonexistent/state",
+            "incus": { "socket": "/nonexistent/incus.sock" },
+            "listen": { "unix": "/nonexistent/arca.sock" },
+            "tokens": { "hashDir": "/nonexistent/tokens" },
+            "kernel": { "droiddProjects": [] }
+        }))
+        .expect("the fixture config parses");
+        ServiceExec::new(Arc::new(cfg)).with_clock(Arc::new(move || clock.load(Ordering::SeqCst)))
+    }
+
+    /// N5 of PR 313's review 2: a try whose thread panics does not stay a try that is running.
+    #[test]
+    fn a_try_whose_thread_panics_ends_as_one_that_did_not_answer() {
+        let clock = Arc::new(AtomicU64::new(1_000));
+        let exec = exec(Arc::clone(&clock));
+        let hold = Duration::from_secs(13);
+        exec.hung.lock().unwrap().marks.insert(
+            "app".into(),
+            Mark {
+                uuid: "u1".into(),
+                probe_at_ms: 1_000,
+                probing: false,
+            },
+        );
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let (_, probe) = exec
+                .admit("app", Some("u1"), false, true, hold)
+                .expect("the try is let through");
+            assert!(probe.is_some());
+            panic!("the thread of the try panics");
+        }));
+        assert!(panicked.is_err());
+        // The mark stays, no try runs, and it waits five minutes more as after a try that failed.
+        let hung = exec.hung.lock().unwrap();
+        let mark = hung.marks.get("app").expect("the mark stays");
+        assert!(!mark.probing, "no try is left running");
+        assert_eq!(mark.probe_at_ms, probe_at(1_000, hold));
+        drop(hung);
+        clock.store(probe_at(1_000, hold), Ordering::SeqCst);
+        let (_, again) = exec
+            .admit("app", Some("u1"), false, true, hold)
+            .expect("a new try is let through in its time");
+        assert!(again.is_some());
+    }
 }

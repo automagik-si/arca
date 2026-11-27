@@ -6240,8 +6240,9 @@ A mark also ages: 5 minutes after it was set (or after the marking command's own
 `service_logs` tries the journal once, and only one such try runs at a time per instance. An answer clears the mark;
 any other outcome keeps it for 5 more minutes. The mark is kept in memory, so a restart of the node clears it too. While
 an instance is marked, `service_logs` answers its console log with `source` set to `console`, and `journalNotRead` says
-the instance is marked hung, that the journal is tried again after five minutes, and that a stop and a start, or a
-restart, clears the mark now. Every answer of `service_logs` names its `source`, `journal` or
+the instance is marked hung, how long is left until the journal is tried again (or that a try is running now), and
+that a stop and a start, or a restart, clears the mark now. The stops that clear a mark count per instance, by name and
+uuid: a stop of another instance with the same name, a tenant's in another project, clears nothing here. Every answer of `service_logs` names its `source`, `journal` or
 `console`, and says in `journalNotRead` why it did not read the journal whenever it did not.
 
 ### What every virtual machine carries

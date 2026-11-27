@@ -4200,6 +4200,30 @@ fn service_remove_deletes_a_running_service_with_owner_approval() {
     );
 }
 
+/// The longest one of the tests that wait on a fake may take. A fake that never answers must fail the test, not hold the build.
+const TEST_BOUND: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Runs `test` on a thread of its own and fails when it has not ended within [`TEST_BOUND`].
+fn bounded(test: impl FnOnce() + Send + 'static) {
+    let (done, ended) = std::sync::mpsc::channel();
+    let runner = std::thread::spawn(move || {
+        test();
+        let _ = done.send(());
+    });
+    match ended.recv_timeout(TEST_BOUND) {
+        Ok(()) => runner.join().expect("the test"),
+        // The test panicked: its own message is the failure.
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            if let Err(panic) = runner.join() {
+                std::panic::resume_unwind(panic);
+            }
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            panic!("the test did not end within {TEST_BOUND:?}")
+        }
+    }
+}
+
 #[path = "services/app_formula.rs"]
 mod app_formula;
 #[path = "services/app_formula_components.rs"]
