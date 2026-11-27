@@ -4218,6 +4218,8 @@ mod follow;
 mod formula_exec;
 #[path = "services/golden.rs"]
 mod golden;
+#[path = "services/hung_mark.rs"]
+mod hung_mark;
 #[path = "services/kernel_access.rs"]
 mod kernel_access;
 #[path = "services/nats.rs"]

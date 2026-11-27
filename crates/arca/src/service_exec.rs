@@ -506,11 +506,26 @@ impl ServiceExec {
         if state["status"] != "Stopped" {
             return Ok(false);
         }
-        let mut hung = self.hung.lock().map_err(|_| ExecError::Audit)?;
-        if hung.get(&target.service.name) == Some(uuid) {
-            hung.remove(&target.service.name);
+        if self.clear_hung_seen_stopped(&target.service.name, Some(uuid)) {
+            Ok(true)
+        } else {
+            Err(ExecError::Audit)
         }
-        Ok(true)
+    }
+    /// Clears the hung mark of the instance named `instance` with this uuid, which the caller has just seen Incus show
+    /// stopped, or stop and start again: a stopped instance runs nothing, so the command that did not answer has ended.
+    /// A mark of another uuid stays, and so does every mark when no uuid is given. `false` only when the marks cannot be
+    /// read. This makes no stop of its own.
+    pub fn clear_hung_seen_stopped(&self, instance: &str, uuid: Option<&str>) -> bool {
+        let Ok(mut hung) = self.hung.lock() else {
+            return false;
+        };
+        if let Some(uuid) = uuid
+            && hung.get(instance).is_some_and(|marked| marked == uuid)
+        {
+            hung.remove(instance);
+        }
+        true
     }
     /// Refuses a command in an instance that is marked hung. A mark of another uuid is dropped: that instance is gone.
     /// A cleanup command of the closed list is let through.

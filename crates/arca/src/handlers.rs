@@ -5489,6 +5489,12 @@ pub fn service_create_handler(handlers: &ServiceHandlers) -> ServiceCreateHandle
     handlers.create.clone()
 }
 
+/// The exec handle these handlers share: its hung marks are the ones `service_logs` and every other verb here obey.
+/// A served node gives it to the instance lifecycle, so an instance seen stopped there loses its mark here (Rule 82).
+pub fn service_exec(handlers: &ServiceHandlers) -> Arc<crate::service_exec::ServiceExec> {
+    handlers.create.0.exec.clone()
+}
+
 // This module's private field prevents even the other handlers from constructing the proof. The only constructor
 // consumes a grant for postgres_create and its exact arguments. There is no Clone, Default or deserialization path.
 mod approved_database {
