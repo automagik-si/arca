@@ -5,11 +5,12 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 ## Unreleased
 
 An approved `instance_restart` no longer leaves the instance stopped. When Incus failed the restart's start half after a
-slow shutdown, or had not finished by Arca's 90-second wait, the call ended refused and the service stayed down until
-someone started it. Now Arca reads the instance after the failure, and one that is stopped is sent one plain start, never
-forced. The answer says the restart failed, why, and that the start was sent, and the instance action journal has a
-`separate_start` line for it. One instance call may now take up to 280 seconds, and the approval page and the canvas
-wait 310 seconds for it.
+slow shutdown, the call ended refused and the service stayed down until someone started it. Now Arca reads the instance
+after the failure, and one that is stopped is sent one plain start, never forced. A restart Incus has not finished by
+Arca's 90-second wait is waited on for 45 seconds more first, and if it is still running Arca sends nothing and says the
+state is not known yet, so it never starts an instance Incus is still restarting. The answer says what happened, and the
+instance action journal has a `separate_start` or `restart_unfinished` line. One instance state change may now take up
+to 280 seconds, and every relayed approval and the canvas instance cards wait 310 seconds.
 
 Repeated read-only tool calls no longer pile up. A caller that times out and asks again used to start one more handler
 beside the one it left running, so a slow read could fill the node's CPUs with reads nobody was waiting for. Now the
