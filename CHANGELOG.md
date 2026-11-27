@@ -8,8 +8,10 @@ A service whose instance was marked hung reads its journal again once the instan
 an instance does not answer, Arca marks the instance and runs nothing more in it. The mark was meant to go when Arca saw
 the instance stopped, but nothing cleared it short of restarting the node, so `service_logs` kept reading the console
 log, which is empty after a restart, and answered no lines without saying why. Now `instance_stop`, `instance_start` of a
-stopped instance, `instance_restart`, and a `service_update` that stops or restarts the service clear the mark. A start
-of a running instance stops nothing, so the mark stays. `service_logs` also says where its lines came from, in a new
+stopped instance, `instance_restart`, a `service_update` that stops or restarts the service (the Automagik follower's
+own updates included) and a `service_reconfigure` that restarts it clear the mark. A start of a running instance stops
+nothing, so the mark stays. A mark also ages: after five minutes the next `service_logs` tries the journal once, one try
+at a time, and an answer clears the mark. `service_logs` also says where its lines came from, in a new
 `source` field (`journal` or `console`), and when it did not read the journal, a new `journalNotRead` field says why.
 
 Repeated read-only tool calls no longer pile up. A caller that times out and asks again used to start one more handler

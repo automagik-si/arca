@@ -886,6 +886,12 @@ impl ServiceHandler {
             )));
         }
         journal.step("restart", true, json!({ "restarted": was_running }));
+        // Restarted, or stopped and started for a memory `/run`, or found stopped: it runs nothing it ran before, so a
+        // hung mark goes (Rule 82).
+        if was_running || seen.is_stopped() {
+            self.exec
+                .clear_hung_seen_stopped(&seen.name, seen.uuid.as_deref());
+        }
         // The config read back, against what was applied: by key, never by value.
         let read = changer.read(&config.project, &config.instance);
         let (running, differs) = match &read {

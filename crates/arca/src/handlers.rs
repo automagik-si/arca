@@ -6424,6 +6424,7 @@ pub fn service_handlers_with_reach(
 ) -> ServiceHandlersWithReach {
     // One gate for every handler that picks an address or a block: the kernel's own.
     let writes = write_gate(&kernel);
+    // The node's clock ages a hung mark: after a while a journal read may try the instance again (Rule 82).
     let exec =
         Arc::new(crate::service_exec::ServiceExec::new(cfg.clone()).with_clock(clock.clone()));
     let reach = crate::reach::page_reads(kernel.clone(), cfg.clone(), exec.clone());
@@ -6849,10 +6850,16 @@ const JOURNAL_WATCH_ONLY: &str =
 fn journal_not_read(error: &crate::service_exec::ExecError) -> String {
     use crate::service_exec::ExecError;
     match error {
-        ExecError::Refused("hung") => "an earlier command inside the instance did not answer, so Arca marked it hung and runs nothing more in it until it sees it stopped: instance_stop then instance_start, or instance_restart, clears the mark".into(),
+        ExecError::Refused("hung") => "an earlier command inside the instance did not answer, so Arca marked it hung and runs nothing more in it until it sees it stopped, or until five minutes have passed, when service_logs tries the journal once more: instance_stop then instance_start, or instance_restart, clears the mark now".into(),
         ExecError::Refused("stopped") => "the instance is not running".into(),
         ExecError::Refused(code) => format!("Arca refused to run the journal read ({code})"),
-        ExecError::Failed(text) => format!("the journal read did not finish: {text}"),
+        ExecError::Failed(text) if text.contains("marked hung") => format!(
+            "the journal read did not answer in time, so Arca marked the instance hung: {text}"
+        ),
+        ExecError::Failed(text) if text.contains(" exited ") => {
+            format!("the journal read ran and failed: {text}")
+        }
+        ExecError::Failed(text) => format!("the journal read failed: {text}"),
         ExecError::Audit => "the exec audit could not be written, so no command ran inside the instance".into(),
     }
 }

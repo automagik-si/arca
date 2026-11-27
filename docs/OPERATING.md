@@ -6215,10 +6215,15 @@ answer and marks nothing. No formula command runs in a marked instance, and no c
 cleanups (removing the tailnet key directory, stopping the daemon). The mark stays until Arca sees the instance stopped,
 since a stopped instance runs nothing, or until the instance's uuid changes, since that is another instance. Arca sees it
 stopped when `instance_stop` stops it or finds it stopped, when `instance_start` starts it from stopped, when
-`instance_restart` restarts it, and when `service_update` stops or restarts it. A start of a running instance clears
-nothing. The mark is kept in memory, so a restart of the node clears it too. While an instance is marked, `service_logs`
-answers its console log with `source` set to `console`, and `journalNotRead` says the instance is marked hung and that a
-stop and a start, or a restart, clears the mark. Every answer of `service_logs` names its `source`, `journal` or
+`instance_restart` restarts it, when `service_update` stops or restarts it (an update the Automagik follower makes
+included), and when `service_reconfigure` restarts it or stops it for a memory `/run`. A start of a running instance
+clears nothing, and a command that was already running when the instance stopped marks nothing when it fails afterwards.
+A mark also ages: 5 minutes after it was set (or after the marking command's own limit, when that is longer) the next
+`service_logs` tries the journal once, and only one such try runs at a time per instance. An answer clears the mark;
+any other outcome keeps it for 5 more minutes. The mark is kept in memory, so a restart of the node clears it too. While
+an instance is marked, `service_logs` answers its console log with `source` set to `console`, and `journalNotRead` says
+the instance is marked hung, that the journal is tried again after five minutes, and that a stop and a start, or a
+restart, clears the mark now. Every answer of `service_logs` names its `source`, `journal` or
 `console`, and says in `journalNotRead` why it did not read the journal whenever it did not.
 
 ### What every virtual machine carries

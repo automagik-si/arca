@@ -668,6 +668,14 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     } else {
         None
     };
+    let action_slot = ActionSlot::default();
+    let (service_handlers, reach_reads) = crate::handlers::service_handlers_with_reach(
+        kernel.clone(),
+        clock.clone(),
+        Arc::new(cfg.clone()),
+        functions,
+        crate::handlers::UpdateOptions::default(),
+    );
     // The services that follow Automagik's releases are looked at on a timer of their own, as the sweep above is. It
     // asks the network for nothing while no service follows. A timer that cannot start is said on the log.
     if kernel_mode && cfg.kernel.service_cidr.is_some() {
@@ -677,7 +685,8 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
             Arc::new(cfg.clone()),
             crate::handlers::UpdateOptions::default(),
             crate::handlers::FollowEdges::default(),
-            Arc::new(crate::service_exec::ServiceExec::new(Arc::new(cfg.clone()))),
+            // The marks the service verbs obey: an update that stops a service clears its mark there (Rule 82).
+            crate::handlers::service_exec(&service_handlers),
         ));
         if let Err(error) = crate::handlers::spawn_follower(
             follower,
@@ -686,14 +695,6 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
             eprintln!("arca: the Automagik follower did not start: {error}");
         }
     }
-    let action_slot = ActionSlot::default();
-    let (service_handlers, reach_reads) = crate::handlers::service_handlers_with_reach(
-        kernel.clone(),
-        clock.clone(),
-        Arc::new(cfg.clone()),
-        functions,
-        crate::handlers::UpdateOptions::default(),
-    );
     // An instance the lifecycle sees stopped loses the hung mark the service verbs obey (Rule 82).
     let lifecycle = lifecycle.map(|lifecycle| {
         let exec = crate::handlers::service_exec(&service_handlers);
