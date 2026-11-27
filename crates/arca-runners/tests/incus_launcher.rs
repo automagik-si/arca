@@ -378,7 +378,7 @@ fn a_taken_subnet_moves_the_pools_bridge_and_a_hand_made_bridge_of_its_name_is_l
     fake.add_network(
         "default",
         json!({"name": bridge, "type": "bridge", "description": "by hand",
-            "config": {"ipv4.address": "10.99.0.1/24"}}),
+            "config": {"ipv4.address": "198.51.100.1/24"}}),
     );
     assert!(self::launcher(&fake, "acme", &own()).is_err());
     assert_eq!(network(&fake, &bridge).unwrap()["description"], "by hand");
