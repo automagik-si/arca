@@ -6,8 +6,12 @@
 //! and refuses one that does not carry this pool's mark, so no other instance of the project, and no instance of
 //! another pool, is ever started, written into or deleted from here.
 //!
-//! What it sends: an instance create (a VM, started by the create), files written into and read from the guest through
-//! the Incus agent, one command started through the agent, a forced stop and a delete. Nothing else.
+//! What it sends: an instance create (a VM, made stopped and started once its devices are checked), files written into and read from the guest through
+//! the Incus agent, one command started through the agent, a forced stop and a delete. And the pool's one network ACL,
+//! `arca-runner-<pool>` ([`RunnerVms::acl_name`]), which every job machine's card names: created, its rules replaced
+//! (a PATCH) and deleted, requested in the pool's project (Incus keeps it in the project that holds that project's networks), and
+//! only while it carries the same mark. And the pool's own bridge, `arcarun-<hash>` ([`RunnerVms::bridge_name`]),
+//! when the pool names none: created (a /24 with NAT and no IPv6), read and deleted the same way. Nothing else.
 
 use std::path::PathBuf;
 use std::thread;
@@ -20,6 +24,18 @@ use crate::read::{IncusError, exchange_capped};
 
 /// The key, in a job machine's own config, that marks it as a runner pool's: its value is the pool's name.
 pub const RUNNER_KEY: &str = "user.arcakernel.runner";
+/// The start of a pool's network ACL's name: `arca-runner-<pool>`.
+pub const RUNNER_ACL_PREFIX: &str = "arca-runner-";
+/// The start of a pool's own bridge's name: `arcarun-` and seven hex digits of [`pool_hash`] (an interface name is at
+/// most 15 characters).
+pub const RUNNER_BRIDGE_PREFIX: &str = "arcarun-";
+
+/// A pool's name, hashed (32-bit FNV-1a): its bridge's name and the first subnet tried for it follow from it.
+pub fn pool_hash(pool: &str) -> u32 {
+    pool.bytes().fold(0x811c_9dc5u32, |hash, byte| {
+        (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193)
+    })
+}
 /// The largest file read back from a guest, in bytes: a job's packed logs.
 pub const PULL_MAX: usize = 64 * 1024 * 1024;
 /// The largest file written into a guest, in bytes.
@@ -51,6 +67,19 @@ pub struct VmSpec {
     pub storage_pool: Option<String>,
     /// The profiles, in order. Empty takes the project's `default`.
     pub profiles: Vec<String>,
+    /// The bridge the machine's card (`eth0`) is on. The card filters MAC, IPv4 and IPv6 addresses, rejects what no
+    /// rule allows both ways, and names the pool's ACL ([`RunnerVms::acl_name`]); it replaces any `eth0` a profile gives.
+    pub network: String,
+}
+
+/// What became of the pool's ACL at [`RunnerVms::ensure_acl`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AclState {
+    Created,
+    /// It was there with these very rules: nothing was written.
+    Reused,
+    /// It was there with other rules, and they were replaced.
+    Updated,
 }
 
 /// What became of a command started in a guest.
@@ -156,11 +185,28 @@ impl RunnerVms {
         if spec.profiles.iter().any(|profile| !plain_name(profile)) {
             return Err(refused("a profile is not a plain name"));
         }
+        if !plain_name(&spec.network) {
+            return Err(refused("the network is not a plain name"));
+        }
+        devices.insert(
+            "eth0".to_string(),
+            json!({
+                "type": "nic",
+                "network": spec.network,
+                "security.mac_filtering": "true",
+                "security.ipv4_filtering": "true",
+                "security.ipv6_filtering": "true",
+                "security.acls": self.acl_name(),
+                "security.acls.default.ingress.action": "reject",
+                "security.acls.default.egress.action": "reject",
+            }),
+        );
         let mut body = json!({
             "name": spec.name,
             "type": "virtual-machine",
             "source": source,
-            "start": true,
+            // Made stopped: its devices are checked before it runs anything.
+            "start": false,
             "config": {
                 RUNNER_KEY: self.pool,
                 "limits.cpu": spec.cpu.to_string(),
@@ -185,7 +231,241 @@ impl RunnerVms {
                 "the created instance does not carry the pool's mark",
             ));
         }
-        Ok(())
+        // Arca's card is the machine's only way out, and its root disk its only other device: a card, a proxy, a
+        // passed-through device, a disk from a host directory, a host block device or a shared volume, or anything else a
+        // profile or the copied image machine gives would bypass the rules or share state between jobs. Such a machine
+        // is deleted before it ever starts.
+        let devices = made
+            .get("expanded_devices")
+            .or_else(|| made.get("devices"))
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let others: Vec<String> = devices
+            .iter()
+            .filter_map(|(name, device)| {
+                let kind = device.get("type").and_then(Value::as_str).unwrap_or("");
+                let arcas = kind == "nic"
+                    && name == "eth0"
+                    && device.get("security.acls").and_then(Value::as_str)
+                        == Some(self.acl_name().as_str());
+                let root = kind == "disk"
+                    && device.get("path").and_then(Value::as_str) == Some("/")
+                    && device.get("source").is_none();
+                (!root && !arcas).then(|| format!("{name} ({kind})"))
+            })
+            .collect();
+        if !others.is_empty() {
+            let named = others.join(", ");
+            let deleted = self.destroy(&spec.name);
+            // The create landed, so this is not a refusal before any write: it says what became of the machine.
+            return Err(IncusError::AppliedUnconfirmed(Box::new(
+                crate::read::Unconfirmed {
+                    target: arca_kernel::ownership::ObjectRef {
+                        kind: arca_kernel::ownership::IncusKind::Instance,
+                        project: self.project.clone(),
+                        parent: None,
+                        name: spec.name.clone(),
+                        uuid: None,
+                    },
+                    uuid: None,
+                    owner: None,
+                    reason: format!(
+                        "the job machine had a device other than its root disk and Arca's card ({named}, from a profile or the image machine), so it was {} before it started; give the pool profiles and an image without one",
+                        if deleted.is_ok() {
+                            "deleted"
+                        } else {
+                            "left to be deleted"
+                        }
+                    ),
+                },
+            )));
+        }
+        let path = format!(
+            "/1.0/instances/{}/state?project={}",
+            spec.name, self.project
+        );
+        let start = json!({ "action": "start", "timeout": 30 });
+        let envelope = self.json("PUT", &path, Some(&start), TIMEOUT)?;
+        self.wait_for(&envelope)
+    }
+
+    /// The name of the pool's own bridge: `arcarun-<seven hex digits of the pool's hash>`.
+    pub fn bridge_name(&self) -> String {
+        format!(
+            "{RUNNER_BRIDGE_PREFIX}{:07x}",
+            pool_hash(&self.pool) & 0x0fff_ffff
+        )
+    }
+
+    /// The `ipv4.address` of the pool's own bridge (`a.b.c.1/24`), or `None` when it is not there. A network of that
+    /// name without this pool's mark is refused.
+    pub fn own_bridge(&self) -> Result<Option<String>, IncusError> {
+        let path = format!(
+            "/1.0/networks/{}?project={}",
+            self.bridge_name(),
+            self.project
+        );
+        match self.json("GET", &path, None, TIMEOUT) {
+            Err(IncusError::Status { code: 404, .. }) => Ok(None),
+            Err(error) => Err(error),
+            Ok(answer) => {
+                let network = answer
+                    .get("metadata")
+                    .ok_or_else(|| decode("the answer has no metadata"))?;
+                if !self.acl_marked(network) {
+                    return Err(refused("the network is not this pool's bridge"));
+                }
+                network
+                    .pointer("/config/ipv4.address")
+                    .and_then(Value::as_str)
+                    .map(|address| Some(address.to_string()))
+                    .ok_or_else(|| decode("the pool's bridge has no IPv4 address"))
+            }
+        }
+    }
+
+    /// Creates the pool's own bridge with the gateway address `address` (`a.b.c.1/24`): NAT on, no IPv6, the pool's
+    /// mark. It is requested in the pool's project; Incus keeps it in the project that serves that project's networks.
+    pub fn create_bridge(&self, address: &str) -> Result<(), IncusError> {
+        let plain = address
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'.' | b'/'));
+        if !plain || address.is_empty() {
+            return Err(refused("the bridge address is not an IPv4 CIDR"));
+        }
+        let body = json!({
+            "name": self.bridge_name(),
+            "type": "bridge",
+            "description": format!("Arca runner pool {} job machines; managed by Arca", self.pool),
+            "config": {
+                "ipv4.address": address,
+                "ipv4.nat": "true",
+                "ipv6.address": "none",
+                // A job is not told the names in the host's /etc/hosts.
+                "dns.include_hosts": "false",
+                RUNNER_KEY: self.pool,
+            },
+        });
+        let path = format!("/1.0/networks?project={}", self.project);
+        let envelope = self.json("POST", &path, Some(&body), TIMEOUT)?;
+        self.wait_for(&envelope)
+    }
+
+    /// Deletes the pool's own bridge, once its pool is gone. One that is already gone is not an error; one without this
+    /// pool's mark is refused and left as it is. Incus refuses the delete while a card is on it.
+    pub fn remove_bridge(&self) -> Result<(), IncusError> {
+        if self.own_bridge()?.is_none() {
+            return Ok(());
+        }
+        let path = format!(
+            "/1.0/networks/{}?project={}",
+            self.bridge_name(),
+            self.project
+        );
+        match self.json("DELETE", &path, None, TIMEOUT) {
+            Ok(envelope) => self.wait_for(&envelope),
+            Err(IncusError::Status { code: 404, .. }) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The name of the pool's network ACL: `arca-runner-<pool>`.
+    pub fn acl_name(&self) -> String {
+        format!("{RUNNER_ACL_PREFIX}{}", self.pool)
+    }
+
+    /// Makes the pool's ACL hold `ingress` and `egress`: creates it, carrying the pool's mark, when it is not there,
+    /// leaves it alone when it holds those rules already, and replaces its rules otherwise. An ACL of that name without
+    /// this pool's mark is refused and left as it is.
+    pub fn ensure_acl(&self, ingress: &[Value], egress: &[Value]) -> Result<AclState, IncusError> {
+        let name = self.acl_name();
+        let description = format!(
+            "Arca runner pool {} job machines; managed by Arca",
+            self.pool
+        );
+        let path = format!("/1.0/network-acls/{name}?project={}", self.project);
+        match self.json("GET", &path, None, TIMEOUT) {
+            Err(IncusError::Status { code: 404, .. }) => {
+                let body = json!({
+                    "name": name,
+                    "description": description,
+                    "config": { RUNNER_KEY: self.pool },
+                    "ingress": ingress,
+                    "egress": egress,
+                });
+                let path = format!("/1.0/network-acls?project={}", self.project);
+                let envelope = self.json("POST", &path, Some(&body), TIMEOUT)?;
+                self.wait_for(&envelope)?;
+                Ok(AclState::Created)
+            }
+            Err(error) => Err(error),
+            Ok(answer) => {
+                let current = answer
+                    .get("metadata")
+                    .ok_or_else(|| decode("the answer has no metadata"))?;
+                if !self.acl_marked(current) {
+                    return Err(refused("the network ACL is not this pool's"));
+                }
+                let rules = |key: &str| {
+                    current
+                        .get(key)
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default()
+                };
+                if crate::acl_rules_match(&rules("ingress"), ingress)
+                    && crate::acl_rules_match(&rules("egress"), egress)
+                {
+                    return Ok(AclState::Reused);
+                }
+                // Incus's ACL PATCH merges the config (the mark stays) and replaces the description and both rule
+                // arrays, as the journal writer's ACL patch relies on.
+                let body = json!({
+                    "description": description,
+                    "config": current.get("config").cloned().unwrap_or_else(|| json!({})),
+                    "ingress": ingress,
+                    "egress": egress,
+                });
+                let envelope = self.json("PATCH", &path, Some(&body), TIMEOUT)?;
+                self.wait_for(&envelope)?;
+                Ok(AclState::Updated)
+            }
+        }
+    }
+
+    /// Deletes the pool's ACL, once its pool is gone. One that is already gone is not an error; one without this pool's
+    /// mark is refused and left as it is. Incus refuses the delete while a machine's card still names it.
+    pub fn remove_acl(&self) -> Result<(), IncusError> {
+        let path = format!(
+            "/1.0/network-acls/{}?project={}",
+            self.acl_name(),
+            self.project
+        );
+        match self.json("GET", &path, None, TIMEOUT) {
+            Err(IncusError::Status { code: 404, .. }) => return Ok(()),
+            Err(error) => return Err(error),
+            Ok(answer) => {
+                if !answer
+                    .get("metadata")
+                    .is_some_and(|acl| self.acl_marked(acl))
+                {
+                    return Err(refused("the network ACL is not this pool's"));
+                }
+            }
+        }
+        match self.json("DELETE", &path, None, TIMEOUT) {
+            Ok(envelope) => self.wait_for(&envelope),
+            Err(IncusError::Status { code: 404, .. }) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn acl_marked(&self, acl: &Value) -> bool {
+        acl.get("config")
+            .and_then(|config| config.get(RUNNER_KEY))
+            .and_then(Value::as_str)
+            == Some(self.pool.as_str())
     }
 
     /// Whether the machine's Incus agent answers: a read of `/` in the guest succeeds.

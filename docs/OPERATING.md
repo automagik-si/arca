@@ -7558,6 +7558,17 @@ first real job, and how to read a pool.
    budget fit what the project has free: a project with an 8 GiB memory limit that holds a kept image machine of 1 GiB
    has 7 GiB for job machines, so two machines of 4 GiB do not fit and two of 3 GiB do (the example below). A machine
    the project has no room for is refused by Incus; the pool records it as a failure and waits before the next try.
+   **The network:** each pool gets a bridge of its own, `arcarun-<hash>`, which Arca makes when the pool starts (a /24
+   in `172.16.0.0/12` clear of the node's networks, `kernel.serviceCidr` and `kernel.reservedCidrs`) and deletes when
+   the pool is removed; the project must be allowed to make a network (an unrestricted runner project is). Every
+   machine gets Arca's card on it, replacing any `eth0` a profile gives, and no other device but its root disk: a
+   profile (or the image machine) that gives another card, a proxy, a passed-through device or another disk (a host
+   directory, a host block device, a shared volume) makes every create fail, so give the pool profiles without one. The card
+   reaches DNS on the bridge's gateway and the internet, and nothing else: no service, tenant or other job machine, no
+   private range, the tailnet range or the host's own addresses, and nothing reaches into it. The pool's ACL,
+   `arca-runner-<pool>`, is made when the pool starts (RUNNERS.md, "The job machine's network"). A pool's `network`
+   can name an existing bridge instead; on the shared service bridge a job could use up its DHCP addresses and stop
+   services and tenants from starting (RUNNERS.md says what else that costs).
 4. **The organisation's App connection and its runner group.** Connect the organisation on `/approve/github` with
    "a GitHub App made for you" (Mode 2 above), pick the repositories that may send jobs, and give one label set per size
    class. The App's runner group, `Arca runners`, holds exactly those repositories. `github_bindings` lists the
@@ -7595,6 +7606,13 @@ first real job, and how to read a pool.
   `sudo tar -xzOf <file> var/log/arca-job/runner.log`.
 - **`github_audit`.** Every runner configuration minted for the connection, with the runner's name and, once known, its
   job.
+- **The pool's network:** `incus network list user.arcakernel.runner=<pool>` shows its own bridge, and
+  `incus network acl show arca-runner-<pool> --project <project>` its rules. A pool whose bridge or ACL could not be
+  made (no free /24, a named bridge that is not there or has no IPv4 address, its own bridge now overlapping a route
+  or a network that came since, or a network or an ACL of that name made by hand) does not
+  start, and the kernel's log says why. A pool removed from the config has its ACL and its bridge deleted at the next
+  kernel start (`arca: runners: pool <name> is gone: …`). An existing pool needs nothing in its config: at its next
+  start it moves to its own bridge.
 - **The machines alive now:** `incus list --project <project> user.arcakernel.runner=<pool>`. None stays after its job;
   the pool deletes any marked machine it does not know at start and every five minutes.
 

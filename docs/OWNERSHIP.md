@@ -1757,11 +1757,26 @@ and in no other, and only virtual machines whose own config carries `user.arcake
 create sets that key; every later request (a file written into or read from the guest through the Incus agent, the
 one command started through the agent, a forced stop, a delete) reads the instance first and refuses one that is not a
 virtual machine carrying this pool's value. The key is in the kernel's namespace and names no entry, so every other
-writer classes such a machine as foreign and never writes it (Rules 2 and 3). The pool keeps a line per machine in
-`<stateDir>/runners/<pool>/jobs.jsonl`, as a run is a line of the run log. The writer is compiled with `arca-incus`'s
-`write` feature, which `arca-runners` receives through `arca-providers` and never enables itself (Rule 28).
-Source: `RunnerVms` and `RUNNER_KEY` in `crates/arca-incus/src/runner_vm.rs`; test
-`a_job_machine_is_a_marked_vm_of_its_size_and_only_marked_machines_go` in `crates/arca-runners/tests/incus_launcher.rs`;
+writer classes such a machine as foreign and never writes it (Rules 2 and 3). A machine is created stopped; one whose
+read-back shows any device but its root disk and the writer's own `eth0` is deleted at once, before it ever starts, and
+only a machine that passes is started. The same writer owns two more objects per pool: the
+network ACL `arca-runner-<pool>` that every job machine's card names, and, when the pool names no bridge, the pool's
+own bridge `arcarun-<hash>` (a managed bridge: NAT, no IPv6, `dns.include_hosts` off). Each is requested in the pool's project (Incus keeps it
+in the project that serves that project's networks), created with `user.arcakernel.runner` set to the pool's name,
+and afterwards read first: the ACL's rules are replaced (one PATCH, the config kept), and either is deleted, only while
+it carries this pool's value; one of that name without it is refused and never written. The kernel deletes the ACL,
+then the bridge, of a pool that is gone from the config through that pool's writer, at its start, and the bridge of
+a configured pool that now names a network. The pool keeps a line per machine
+in `<stateDir>/runners/<pool>/jobs.jsonl`, as a run is a line of the run log. The writer is compiled with
+`arca-incus`'s `write` feature, which `arca-runners` receives through `arca-providers` and never enables itself
+(Rule 28).
+Source: `RunnerVms`, `RUNNER_KEY`, `RUNNER_ACL_PREFIX` and `RUNNER_BRIDGE_PREFIX` in
+`crates/arca-incus/src/runner_vm.rs`; tests `a_job_machine_is_a_marked_vm_of_its_size_and_only_marked_machines_go`,
+`a_machine_with_any_card_but_arcas_is_deleted_and_its_create_fails`,
+`a_machine_with_any_device_but_its_root_disk_and_arcas_card_is_deleted_before_it_starts`,
+`an_acl_of_the_pools_name_without_its_mark_is_left_alone`,
+`a_taken_subnet_moves_the_pools_bridge_and_a_hand_made_bridge_of_its_name_is_left_alone` and
+`a_gone_pools_acl_and_bridge_are_deleted_and_no_other` in `crates/arca-runners/tests/incus_launcher.rs`;
 `crates/arca-runners/Cargo.toml`.
 
 ## Approved image imports

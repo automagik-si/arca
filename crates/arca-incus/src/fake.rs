@@ -387,6 +387,10 @@ enum Route {
     ListImages(String),
     ImageAliases(String, Option<String>),
     ListInstances,
+    /// Every network ACL of every project, each with its `project`: `/1.0/network-acls?all-projects=true&recursion=1`.
+    ListAcls,
+    /// Every managed network of every project, each with its `project`: `/1.0/networks?all-projects=true&recursion=1`.
+    ListNetworks,
     ListInstancesWithState,
     ProjectInstancesWithState(String),
     /// One project's instances without their state: the `recursion=1` listing with a `project`.
@@ -732,6 +736,22 @@ impl FakeIncus {
         });
         store.objects.push(Stored {
             kind: "acl".to_string(),
+            project: project.to_string(),
+            name,
+            parent: String::new(),
+            body,
+        });
+    }
+
+    /// Puts a network in `project`, as a create by hand would. It records no write.
+    pub fn add_network(&self, project: &str, body: Value) {
+        let mut store = lock(&self.shared.store);
+        let name = text_of(&body, "name");
+        store.objects.retain(|object| {
+            !(object.kind == "network" && object.project == project && object.name == name)
+        });
+        store.objects.push(Stored {
+            kind: "network".to_string(),
             project: project.to_string(),
             name,
             parent: String::new(),
@@ -1840,6 +1860,7 @@ fn parse(target: &str) -> Option<Route> {
         ["instances", name, "backups"] => Route::InstanceBackups(address("backup", name, "")),
         ["networks", name, "leases"] => Route::NetworkLeases((*name).to_string()),
         ["networks"] if query == "recursion=1" => Route::HostInterfaces,
+        ["networks"] if query == "all-projects=true&recursion=1" => Route::ListNetworks,
         ["networks"] => Route::Collection(address("network", "", "")),
         ["networks", name, "state"] if query.is_empty() => {
             Route::HostInterfaceState((*name).to_string())
@@ -1847,6 +1868,7 @@ fn parse(target: &str) -> Option<Route> {
         ["networks", name] => Route::Object(address("network", "", name)),
         ["networks", network, "forwards"] => Route::Collection(address("forward", network, "")),
         ["networks", network, "forwards", name] => Route::Object(address("forward", network, name)),
+        ["network-acls"] if query == "all-projects=true&recursion=1" => Route::ListAcls,
         ["network-acls"] => Route::Collection(address("acl", "", "")),
         ["network-acls", name] => Route::Object(address("acl", "", name)),
         ["profiles"] => Route::Collection(address("profile", "", "")),
@@ -1959,6 +1981,30 @@ fn dispatch(shared: &Shared, request: &Request, route: Route) -> (u16, String, V
             ),
         },
         ("GET", Route::ListInstances) => sync(Value::Array(store.bodies("instance"))),
+        ("GET", Route::ListNetworks) => sync(Value::Array(
+            store
+                .objects
+                .iter()
+                .filter(|object| object.kind == "network")
+                .map(|object| {
+                    let mut body = object.body.clone();
+                    body["project"] = json!(object.project);
+                    body
+                })
+                .collect(),
+        )),
+        ("GET", Route::ListAcls) => sync(Value::Array(
+            store
+                .objects
+                .iter()
+                .filter(|object| object.kind == "acl")
+                .map(|object| {
+                    let mut body = object.body.clone();
+                    body["project"] = json!(object.project);
+                    body
+                })
+                .collect(),
+        )),
         ("GET", Route::ListInstancesWithState) => sync(Value::Array(store.instances_with_state())),
         ("GET", Route::ProjectInstancesWithState(project)) => {
             if project != "default"

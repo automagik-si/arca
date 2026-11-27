@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arca_alerts::eval::{RunnerSignInUse, Timed};
-use arca_runners::incus::IncusLauncher;
+use arca_runners::incus::{IncusLauncher, NetworkPlan};
 use arca_runners::record::Recorder;
 use arca_runners::scaleset::{Http, ScaleSetClient};
 use arca_runners::{
@@ -179,13 +179,35 @@ pub fn spawn(
         return Ok(None);
     };
     let socket = cfg.incus.socket.clone();
+    let (service_cidr, reserved) = (
+        cfg.kernel.service_cidr.clone(),
+        cfg.kernel.reserved_cidrs.clone(),
+    );
     start_pools(
         runners.pools.clone(),
         cfg.state_dir.join("runners"),
         Arc::new(SignerAccess::new(signer)),
         board,
         owner,
-        move |pool| incus_launcher(pool, &socket).map(Arc::new),
+        move |pool| {
+            // The host's routes as they are at this pool's start: a new bridge keeps clear of them, and an existing one
+            // that a route now meets stops the pool.
+            let routes = std::fs::read_to_string(arca_netproject::routes::ROUTES)
+                .map(|table| arca_netproject::routes::routed_networks(&table))
+                .map_err(|error| {
+                    format!(
+                        "the routing table {} could not be read: {error}",
+                        arca_netproject::routes::ROUTES
+                    )
+                })?;
+            let plan = NetworkPlan {
+                bridge: pool.network.clone(),
+                service_cidr: service_cidr.clone(),
+                reserved: reserved.clone(),
+                routes,
+            };
+            incus_launcher(pool, &socket, &plan).map(Arc::new)
+        },
     )
     .map(Some)
 }
@@ -240,7 +262,11 @@ where
 }
 
 /// The Incus launcher of one pool: a virtual machine per job, cloned from the pool's `image`.
-fn incus_launcher(pool: &PoolConfig, socket: &Path) -> Result<IncusLauncher, String> {
+fn incus_launcher(
+    pool: &PoolConfig,
+    socket: &Path,
+    plan: &NetworkPlan,
+) -> Result<IncusLauncher, String> {
     IncusLauncher::new(
         socket.to_path_buf(),
         &pool.project,
@@ -248,8 +274,30 @@ fn incus_launcher(pool: &PoolConfig, socket: &Path) -> Result<IncusLauncher, Str
         &pool.image,
         pool.profiles.clone(),
         pool.storage_pool.clone(),
+        plan,
     )
     .map_err(|error| error.to_string())
+}
+
+/// Deletes the network ACL and the own bridge of every pool that is gone from the node's config (a pool's are made at
+/// its start and reused at the next), and the own bridge of a pool that now names a network, logging each one. A node with no pool at all still runs it: its last pool may
+/// just have gone.
+pub fn remove_gone_pools(cfg: &NodeConfig) {
+    let configured: Vec<&PoolConfig> = cfg
+        .runners
+        .iter()
+        .flat_map(|runners| runners.pools.iter())
+        .collect();
+    let pools: Vec<&str> = configured.iter().map(|pool| pool.name.as_str()).collect();
+    // A pool that names a network uses no bridge of its own: one left from before it named it is swept.
+    let own: Vec<&str> = configured
+        .iter()
+        .filter(|pool| pool.network.is_none())
+        .map(|pool| pool.name.as_str())
+        .collect();
+    for line in arca_runners::incus::remove_gone_pools(&cfg.incus.socket, &pools, &own) {
+        eprintln!("arca: runners: {line}");
+    }
 }
 
 fn start_pool<A: Access, L: Launcher>(

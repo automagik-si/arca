@@ -49,9 +49,16 @@ pub struct PoolConfig {
     /// its snapshot, or `arca-runner-image-<tag>`, the image it published. Any image alias or fingerprint, or
     /// `<instance>/<snapshot>` of a stopped instance in the pool's project, works the same way.
     pub image: String,
-    /// The profiles of every machine, in order; empty takes the project's `default`.
+    /// The profiles of every machine, in order; empty takes the project's `default`. A profile's `eth0` is replaced by
+    /// the card Arca gives every machine; a profile that gives any other card makes every create fail.
     #[serde(default)]
     pub profiles: Vec<String>,
+    /// An existing bridge the machines' card is on; absent, the pool's own bridge, which Arca makes at the pool's start
+    /// and deletes with the pool. The card is Arca's, not a profile's: MAC, IPv4 and IPv6 filtering, nothing inbound,
+    /// and the pool's ACL, which rejects the bridge's whole subnet, the node's service subnet, the private ranges, the
+    /// tailnet range and the host's addresses and lets the rest of the internet out.
+    #[serde(default)]
+    pub network: Option<String>,
     /// The storage pool of the machines' root disks, needed for a class with `diskGiB`.
     #[serde(default)]
     pub storage_pool: Option<String>,
@@ -229,6 +236,11 @@ mod tests {
         assert_eq!(pool.classes[0].scale_set_name(), "acme-4vcpu-ubuntu-2404");
         assert_eq!(pool.work_folder, "/home/runner/work");
         assert_eq!(pool.log_days, 7);
+        assert_eq!(pool.network, None, "the pool's own bridge");
+        let mut value = example();
+        value["network"] = json!("ci-br0");
+        let pool: PoolConfig = serde_json::from_value(value).expect("a pool");
+        assert_eq!(pool.network.as_deref(), Some("ci-br0"));
     }
 
     #[test]

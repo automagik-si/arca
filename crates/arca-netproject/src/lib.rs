@@ -3,6 +3,7 @@
 //! A node that later gains the other network keeps the one project, and its owner widens it (Rules 54 and 55 of the
 //! ownership document).
 pub mod destination;
+pub mod routes;
 pub mod tenant;
 
 use arca_kernel::{

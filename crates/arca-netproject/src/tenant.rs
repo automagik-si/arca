@@ -270,11 +270,44 @@ pub fn function_egress_rules(
     rules
 }
 
+/// The egress rules of a CI job machine's NIC on a bridge whose gateway is `gateway`: a tenant service's rules
+/// ([`egress_rules`] with a block), in the same order and shape, except that the first rule rejects every subnet of
+/// `closed` (`a.b.c.d/n` each: the bridge's whole subnet, at its real prefix, and the node's service subnet) and the
+/// private ranges are rejected whole, so nothing assumes a /24. A job machine has no block of its own: it reaches no
+/// service, no tenant and no other job machine, and it never has a destination. DHCP and DNS on the gateway pass as
+/// they do for a tenant's service, through the rules Incus keeps for a bridge's own address.
+pub fn job_egress_rules(gateway: Ipv4Addr, closed: &[String], hosts: &Value) -> Vec<Value> {
+    egress_rules_inside(gateway, hosts, Inside::Nothing(closed), &[], true)
+}
+
+/// What a NIC on the bridge may reach inside the service subnet besides the gateway's DHCP and DNS.
+#[derive(Clone, Copy)]
+enum Inside<'a> {
+    /// Every neighbour: a service of the node's own project.
+    Neighbours,
+    /// Its tenant's block only.
+    Block(Block),
+    /// Nothing: these subnets, each written as `a.b.c.d/n`, are rejected whole, and so are the private ranges (a CI
+    /// job machine).
+    Nothing(&'a [String]),
+}
+
 /// [`egress_rules`], with or without its last rule: the allow that lets everything not rejected out to the internet.
 fn egress_rules_for(
     gateway: Ipv4Addr,
     hosts: &Value,
     tenant_block: Option<Block>,
+    destinations: &[Destination],
+    internet: bool,
+) -> Vec<Value> {
+    let inside = tenant_block.map_or(Inside::Neighbours, Inside::Block);
+    egress_rules_inside(gateway, hosts, inside, destinations, internet)
+}
+
+fn egress_rules_inside(
+    gateway: Ipv4Addr,
+    hosts: &Value,
+    inside: Inside<'_>,
     destinations: &[Destination],
     internet: bool,
 ) -> Vec<Value> {
@@ -287,7 +320,7 @@ fn egress_rules_for(
             .flatten()
             .filter_map(|host| host.as_str()?.split('/').next()?.parse::<Ipv4Addr>().ok()),
     );
-    let open = if tenant_block.is_some() {
+    let open = if !matches!(inside, Inside::Neighbours) {
         BTreeMap::new()
     } else {
         let mut closed = destination::node_own(hosts);
@@ -303,7 +336,7 @@ fn egress_rules_for(
         (0xa9fe0000, 16),
         (0x7f000000, 8),
     ] {
-        if destination::holds(base, prefix, own) {
+        if destination::holds(base, prefix, own) && !matches!(inside, Inside::Nothing(_)) {
             ranges.extend(destination::without(prefix, own, 24));
         } else {
             ranges.push((base, prefix));
@@ -319,13 +352,25 @@ fn egress_rules_for(
         .collect::<Vec<_>>()
         .join(",");
     let mut tenant = Vec::new();
-    if let Some(block) = tenant_block {
-        // Inside the service subnet a tenant's service reaches its own block only. Incus weighs a reject above an
-        // allow, so the gateway stays rejected as it is for every service, and its DHCP and DNS answer through the
-        // rules Incus keeps for a bridge's own address; the allows state that those two are meant to pass.
+    let closed = match inside {
+        Inside::Neighbours => None,
+        Inside::Block(block) => Some((
+            block.outside().join(","),
+            "the service subnet outside this tenant's block",
+        )),
+        Inside::Nothing(closed) => Some((
+            closed.join(","),
+            "the job machines' whole subnet and the node's service subnet: a job machine has no block of its own",
+        )),
+    };
+    if let Some((rejected, description)) = closed {
+        // Inside the service subnet a tenant's service reaches its own block only, and a job machine nothing. Incus
+        // weighs a reject above an allow, so the gateway stays rejected as it is for every service, and its DHCP and
+        // DNS answer through the rules Incus keeps for a bridge's own address; the allows state that those two are
+        // meant to pass.
         tenant.push(rule(json!({"action":"reject",
-            "destination":block.outside().join(","),
-            "description":"the service subnet outside this tenant's block"})));
+            "destination":rejected,
+            "description":description})));
         for (protocol, port, what) in [
             ("udp", "67", "DHCP"),
             ("udp", "53", "DNS"),
@@ -1440,5 +1485,131 @@ mod tests {
         assert!(with.iter().all(|rule| rule["description"] != "internet"));
         let service = egress_rules(gateway, &hosts, None, &destination);
         assert_eq!(with[..with.len() - 1], service[..service.len() - 1]);
+    }
+
+    #[test]
+    fn a_job_machine_reaches_nothing_of_its_subnet_and_the_internet_past_the_rejects() {
+        // The job machines' own bridge, and the node's service subnet routed through the host.
+        let hosts = json!([
+            "192.0.2.1/24",
+            "198.51.100.1/24",
+            "100.99.1.2/32",
+            "fd00::1/64"
+        ]);
+        let gateway = Ipv4Addr::new(192, 0, 2, 1);
+        let closed = ["192.0.2.0/24".to_string(), "198.51.100.0/24".to_string()];
+        let rules = job_egress_rules(gateway, &closed, &hosts);
+        // The same order and shape as a tenant service's rules: the first rule rejects the closed subnets instead of
+        // the subnet outside a block, then the gateway's DHCP and DNS, then the same rejects and the internet.
+        let block = blocks("192.0.2.0/24", 29).unwrap()[0];
+        let tenant = egress_rules(gateway, &hosts, Some(block), &[]);
+        let shape = |rules: &[Value]| {
+            rules
+                .iter()
+                .map(|rule| {
+                    (
+                        rule["action"].clone(),
+                        rule["protocol"].clone(),
+                        rule["destination_port"].clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(shape(&rules), shape(&tenant));
+        assert_eq!(rules[1..4], tenant[1..4], "DHCP and DNS on the gateway");
+        assert_eq!(
+            rules[5..],
+            tenant[5..],
+            "IPv6, reserved, the host and the internet"
+        );
+        assert_eq!(
+            rules[0],
+            rule(
+                json!({"action":"reject", "destination":"192.0.2.0/24,198.51.100.0/24",
+                "description":"the job machines' whole subnet and the node's service subnet: a job machine has no block of its own"})
+            )
+        );
+        assert_eq!(rules.last().unwrap()["description"], "internet");
+        // As Incus weighs them: no address of either subnet, the gateways and every neighbour among them, on any
+        // protocol.
+        for subnet in [[192, 0, 2], [198, 51, 100]] {
+            for last in 0..=255u8 {
+                let to = Ipv4Addr::new(subnet[0], subnet[1], subnet[2], last);
+                for (protocol, port) in [
+                    ("tcp", 443),
+                    ("tcp", 8443),
+                    ("udp", 53),
+                    ("tcp", 53),
+                    ("udp", 67),
+                    ("icmp4", 0),
+                    ("gre", 0),
+                ] {
+                    assert!(
+                        !allowed(&rules, to, protocol, port),
+                        "{to} {protocol} {port}"
+                    );
+                }
+            }
+        }
+        // Nothing private, the tailnet, link-local, loopback, multicast, broadcast or the host's own addresses.
+        for to in [
+            [10, 0, 0, 5],
+            [172, 16, 3, 4],
+            [192, 168, 1, 1],
+            [100, 64, 0, 1],
+            [100, 99, 1, 2],
+            [169, 254, 1, 1],
+            [127, 0, 0, 1],
+            [224, 0, 0, 1],
+            [255, 255, 255, 255],
+            [0, 1, 2, 3],
+            [240, 0, 0, 1],
+        ] {
+            let to = Ipv4Addr::from(to);
+            assert!(!allowed(&rules, to, "tcp", 443), "{to}");
+            assert!(!allowed(&rules, to, "udp", 53), "{to}");
+        }
+        // And the rest of the world.
+        for to in [[203, 0, 113, 9], [8, 8, 4, 4]] {
+            let to = Ipv4Addr::from(to);
+            assert!(allowed(&rules, to, "tcp", 443), "{to}");
+            assert!(allowed(&rules, to, "udp", 53), "{to}");
+        }
+        assert!(
+            rules
+                .iter()
+                .any(|rule| rule["action"] == "reject" && rule["destination"] == "::/0")
+        );
+    }
+
+    #[test]
+    fn a_job_machines_rules_assume_no_slash_24() {
+        // A private bridge smaller than a /24: the other half of its /24 is no part of the bridge, and stays rejected
+        // with every private range, whole.
+        let hosts = json!(["10.20.30.129/25"]);
+        let gateway = Ipv4Addr::new(10, 20, 30, 129);
+        let rules = job_egress_rules(gateway, &["10.20.30.128/25".to_string()], &hosts);
+        assert_eq!(rules[0]["destination"], "10.20.30.128/25");
+        for last in [1u8, 5, 64, 127, 128, 200, 255] {
+            let to = Ipv4Addr::new(10, 20, 30, last);
+            assert!(!allowed(&rules, to, "tcp", 443), "{to}");
+        }
+        for to in [[10, 20, 31, 1], [10, 0, 0, 1], [10, 255, 255, 254]] {
+            assert!(!allowed(&rules, Ipv4Addr::from(to), "tcp", 443), "{to:?}");
+        }
+        let private = rules
+            .iter()
+            .find(|rule| {
+                rule["description"]
+                    .as_str()
+                    .unwrap_or("")
+                    .starts_with("RFC1918")
+            })
+            .expect("the private ranges");
+        assert_eq!(
+            private["destination"],
+            "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,100.64.0.0/10,169.254.0.0/16,127.0.0.0/8"
+        );
+        assert!(allowed(&rules, Ipv4Addr::new(203, 0, 113, 9), "tcp", 443));
     }
 }
