@@ -99,9 +99,12 @@ impl InstanceState {
 #[derive(Debug)]
 pub struct ChangeFailure {
     pub error: IncusError,
-    /// The change's operation, which Incus may still be running: set only when `error` is [`IncusError::Timeout`] after
-    /// the change was sent.
+    /// The change's operation, which Incus may still be running: set when the wait on it ended in anything but the
+    /// operation's own end (it ran out, or broke off with an error).
     pub unfinished: Option<Unfinished>,
+    /// Whether the change's request was sent. A request Incus did not answer in time names no operation, and may still
+    /// have been taken.
+    pub sent: bool,
 }
 
 /// An operation a state change was sent as, which the writer stopped waiting on before it ended.
@@ -284,6 +287,12 @@ impl StateChanger {
         let failed = |error| ChangeFailure {
             error,
             unfinished: None,
+            sent: false,
+        };
+        let sent = |error| ChangeFailure {
+            error,
+            unfinished: None,
+            sent: true,
         };
         self.allow(&seen.project).map_err(failed)?;
         let fresh = self.read(&seen.project, &seen.name).map_err(failed)?;
@@ -302,26 +311,28 @@ impl StateChanger {
         let envelope = self
             .send("PUT", &url, Some(&body))
             .and_then(checked_envelope)
-            .map_err(failed)?;
-        if let Some(id) = operation_of(&envelope).map_err(failed)? {
+            .map_err(sent)?;
+        if let Some(id) = operation_of(&envelope).map_err(sent)? {
             match self.wait_operation(&id, self.deadline) {
                 Waited::Done => {}
-                Waited::Error(IncusError::Timeout) => {
+                // Only the operation's own end says it ended: a wait that ran out or broke off leaves it unknown.
+                Waited::Error(error) => {
                     return Err(ChangeFailure {
-                        error: IncusError::Timeout,
+                        error,
                         unfinished: Some(Unfinished { id }),
+                        sent: true,
                     });
                 }
-                other => return Err(failed(other.into_result().unwrap_err())),
+                other => return Err(sent(other.into_result().unwrap_err())),
             }
         }
-        let after = self.read(&seen.project, &seen.name).map_err(failed)?;
+        let after = self.read(&seen.project, &seen.name).map_err(sent)?;
         let wanted = match action {
             StateAction::Start | StateAction::Restart => after.is_running(),
             StateAction::Stop => after.is_stopped(),
         };
         if !wanted {
-            return Err(failed(IncusError::AppliedUnconfirmed(Box::new(
+            return Err(sent(IncusError::AppliedUnconfirmed(Box::new(
                 crate::read::Unconfirmed {
                     target: crate::read::Target {
                         kind: arca_kernel::ownership::IncusKind::Instance,

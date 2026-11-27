@@ -7,8 +7,9 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 An approved `instance_restart` no longer leaves the instance stopped. When Incus failed the restart's start half after a
 slow shutdown, the call ended refused and the service stayed down until someone started it. Now Arca reads the instance
 after the failure, and one that is stopped is sent one plain start, never forced. A restart Incus has not finished by
-Arca's 90-second wait is waited on for 45 seconds more first, and if it is still running Arca sends nothing and says the
-state is not known yet, so it never starts an instance Incus is still restarting. The answer says what happened, and the
+Arca's 90-second wait is waited on for 45 seconds more first, and if it is still running Arca sends nothing and refuses
+the call with the new code `InstanceRestartUnknown` (outcome `unknown` in the journal), so it never starts an instance
+Incus is still restarting. The answer says what happened, and the
 instance action journal has a `separate_start` or `restart_unfinished` line. One instance state change may now take up
 to 280 seconds, and every relayed approval and the canvas instance cards wait 310 seconds.
 

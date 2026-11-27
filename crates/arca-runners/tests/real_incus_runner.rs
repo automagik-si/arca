@@ -182,7 +182,10 @@ fn secret_parts(jit: &str) -> Vec<String> {
 /// Fails when any secret part of the configuration is in `text`.
 fn assert_no_secret(text: &str, jit: &str, place: &str) {
     for part in secret_parts(jit) {
-        assert!(!text.contains(&part), "a part of the configuration is in {place}");
+        assert!(
+            !text.contains(&part),
+            "a part of the configuration is in {place}"
+        );
     }
 }
 
@@ -219,12 +222,18 @@ fn a_real_machine_takes_its_configuration_runs_the_runner_once_and_goes() {
         .get(&format!("/1.0/instances/{name}?project={}", proof.project))
         .expect("the machine");
     assert_eq!(made["type"], "virtual-machine", "{made}");
-    assert_eq!(made["config"]["user.arcakernel.runner"], proof.pool.as_str());
+    assert_eq!(
+        made["config"]["user.arcakernel.runner"],
+        proof.pool.as_str()
+    );
     assert_eq!(made["config"]["limits.cpu"], proof.cpu.to_string());
 
     let clock = Instant::now();
     while !launcher.ready(&name).expect("the readiness read") {
-        assert!(clock.elapsed() < Duration::from_secs(300), "no agent in 5 minutes");
+        assert!(
+            clock.elapsed() < Duration::from_secs(300),
+            "no agent in 5 minutes"
+        );
         std::thread::sleep(Duration::from_millis(500));
     }
     let booted = clock.elapsed();
@@ -251,7 +260,10 @@ fn a_real_machine_takes_its_configuration_runs_the_runner_once_and_goes() {
         {
             break code;
         }
-        assert!(clock.elapsed() < Duration::from_secs(300), "the runner did not exit in 5 minutes");
+        assert!(
+            clock.elapsed() < Duration::from_secs(300),
+            "the runner did not exit in 5 minutes"
+        );
     };
     let ran = clock.elapsed();
     assert_ne!(code, 0, "a configuration no runner can use is refused");
@@ -270,7 +282,10 @@ fn a_real_machine_takes_its_configuration_runs_the_runner_once_and_goes() {
         .expect("the guest packed its logs");
     let listing = untar(&logs, &["-tzf", "-"]);
     assert!(listing.contains("var/log/arca-job/runner.log"), "{listing}");
-    assert!(listing.contains("actions-runner/_diag/Runner_"), "{listing}");
+    assert!(
+        listing.contains("actions-runner/_diag/Runner_"),
+        "{listing}"
+    );
     let log = untar(&logs, &["-xzOf", "-", "var/log/arca-job/runner.log"]);
     assert!(log.contains(&format!("runner exited {code}")), "{log}");
     // Every file collected (runner.log and the runner's own _diag), whole.
@@ -332,11 +347,17 @@ async fn the_pool_records_a_refused_runner_and_destroys_its_machine() {
     let github = FakeGitHub::start(TOKEN).await.expect("fake GitHub");
     let http = Http::new().expect("http");
     let access = Arc::new(
-        RegistrationAccess::new(http.clone(), github.api_url(), "https://github.com/proof", Secret::new(TOKEN))
-            .expect("access"),
+        RegistrationAccess::new(
+            http.clone(),
+            github.api_url(),
+            "https://github.com/proof",
+            Secret::new(TOKEN),
+        )
+        .expect("access"),
     );
     let client = Arc::new(ScaleSetClient::new(http, access, &config.binding));
-    let dir = std::env::temp_dir().join(format!("arca-real-runner-{}-{}", std::process::id(), hex()));
+    let dir =
+        std::env::temp_dir().join(format!("arca-real-runner-{}-{}", std::process::id(), hex()));
     let recorder = Recorder::open(dir.clone(), 7).expect("recorder");
     // One machine only: the class's wait after the failure outlasts the test.
     let timing = Timing {
@@ -365,7 +386,10 @@ async fn the_pool_records_a_refused_runner_and_destroys_its_machine() {
         {
             break serde_json::from_str(&line).expect("a job line");
         }
-        assert!(clock.elapsed() < Duration::from_secs(600), "no record in 10 minutes");
+        assert!(
+            clock.elapsed() < Duration::from_secs(600),
+            "no record in 10 minutes"
+        );
         tokio::time::sleep(Duration::from_millis(500)).await;
     };
     let took = clock.elapsed();
@@ -374,10 +398,15 @@ async fn the_pool_records_a_refused_runner_and_destroys_its_machine() {
 
     let code = line["runnerExit"].as_i64().expect("an exit code");
     assert_ne!(code, 0, "{line}");
-    assert_eq!(line["note"], format!("the runner exited {code} before it took a job"));
+    assert_eq!(
+        line["note"],
+        format!("the runner exited {code} before it took a job")
+    );
     assert_eq!(line["repository"], "");
     let logs = dir.join(line["logs"].as_str().expect("logs kept"));
-    let mode = |path: &std::path::Path| std::fs::metadata(path).expect("there").permissions().mode() & 0o777;
+    let mode = |path: &std::path::Path| {
+        std::fs::metadata(path).expect("there").permissions().mode() & 0o777
+    };
     assert_eq!(mode(&logs), 0o600);
     assert_eq!(mode(logs.parent().expect("its folder")), 0o700);
     let archive = std::fs::read(&logs).expect("the logs");
@@ -392,8 +421,16 @@ async fn the_pool_records_a_refused_runner_and_destroys_its_machine() {
     let everything = untar(&archive, &["-xzOf", "-"]);
     assert!(everything.len() > log.len(), "the _diag files are kept too");
     assert_no_secret(&everything, jit, "the logs kept on the host");
-    assert!(launcher.existing().expect("list").is_empty(), "the machine is gone");
-    assert!(github.removed_runners().iter().any(|removed| removed == name));
+    assert!(
+        launcher.existing().expect("list").is_empty(),
+        "the machine is gone"
+    );
+    assert!(
+        github
+            .removed_runners()
+            .iter()
+            .any(|removed| removed == name)
+    );
     assert_eq!(proof.image_state(), image_before, "the image is unchanged");
     eprintln!(
         "real pool proof: record after {} s (boot {} s, machine {} s), runner exit {code}, note: {}",

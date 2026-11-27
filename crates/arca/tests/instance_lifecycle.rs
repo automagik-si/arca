@@ -714,7 +714,8 @@ fn a_restart_still_running_after_the_wait_sends_no_second_start_and_says_its_sta
     // start sent now would join the restart.
     let slow = rig.fake.hold_state(PROJECT, "api");
     let (code, message) = refusal(rig.approved("instance_restart", at(PROJECT, "api")));
-    assert_eq!(code, "InstanceRestartFailed", "{message}");
+    // Not a failure: what became of the restart is not known yet.
+    assert_eq!(code, "InstanceRestartUnknown", "{message}");
     assert!(message.contains("has not finished restarting"), "{message}");
     assert!(message.contains("Arca sent nothing more"), "{message}");
     assert!(message.contains("not known"), "{message}");
@@ -735,7 +736,8 @@ fn a_restart_still_running_after_the_wait_sends_no_second_start_and_says_its_sta
         .iter()
         .find(|row| row["kind"] == "end")
         .expect("an end row");
-    assert_eq!(end["code"], json!("InstanceRestartFailed"));
+    assert_eq!(end["outcome"], json!("unknown"));
+    assert_eq!(end["code"], json!("InstanceRestartUnknown"));
     // Incus brings it up by itself when its restart ends.
     rig.fake.release_operation(&slow);
     assert_eq!(rig.status(PROJECT, "api"), "Running");
@@ -745,9 +747,10 @@ fn a_restart_still_running_after_the_wait_sends_no_second_start_and_says_its_sta
 fn a_restart_that_fails_its_start_half_after_the_first_wait_is_followed_by_one_start() {
     let rig = Rig::with_deadline("life-restart-late", Duration::from_secs(2));
     // The restart outlasts the first wait (2 s) and Incus fails its start half within the half deadline after it (1 s).
-    let slow = rig.fake.hold_state(PROJECT, "api");
-    rig.fake.end_operation_after(
-        &slow,
+    // The operation's clock starts when the restart arrives, so the approval's own time does not count.
+    rig.fake.hold_state_ending(
+        PROJECT,
+        "api",
         Duration::from_millis(2500),
         Some("Failed to start the instance"),
     );
@@ -776,9 +779,8 @@ fn a_restart_that_fails_its_start_half_after_the_first_wait_is_followed_by_one_s
 #[test]
 fn a_restart_that_finishes_after_the_first_wait_is_a_restart_and_nothing_else() {
     let rig = Rig::with_deadline("life-restart-done", Duration::from_secs(2));
-    let slow = rig.fake.hold_state(PROJECT, "api");
     rig.fake
-        .end_operation_after(&slow, Duration::from_millis(2500), None);
+        .hold_state_ending(PROJECT, "api", Duration::from_millis(2500), None);
     let answer = rig
         .approved("instance_restart", at(PROJECT, "api"))
         .expect("the restart ends");
@@ -796,6 +798,49 @@ fn a_restart_that_finishes_after_the_first_wait_is_a_restart_and_nothing_else() 
         .find(|row| row["kind"] == "end")
         .expect("an end row");
     assert_eq!(end["outcome"], json!("restarted"));
+}
+
+#[test]
+fn a_first_wait_that_breaks_off_keeps_the_restart_unfinished_and_starts_nothing() {
+    let rig = Rig::with_deadline("life-restart-broken", Duration::from_millis(300));
+    // The restart's start half is pending, and the first wait on its operation is answered with an error, not its end.
+    let slow = rig.fake.hold_state(PROJECT, "api");
+    rig.fake.fail_reads("/1.0/operations/", 1, 500);
+    let (code, message) = refusal(rig.approved("instance_restart", at(PROJECT, "api")));
+    assert_eq!(code, "InstanceRestartUnknown", "{message}");
+    assert!(message.contains("Arca sent nothing more"), "{message}");
+    assert_eq!(rig.fake.state_actions(PROJECT, "api"), ["restart"]);
+    assert_eq!(rig.fake.joined_starts(PROJECT, "api"), 0);
+    rig.fake.release_operation(&slow);
+    assert_eq!(rig.status(PROJECT, "api"), "Running");
+}
+
+#[test]
+fn a_read_that_fails_once_after_a_late_restart_is_read_again_before_the_answer() {
+    let rig = Rig::with_deadline("life-restart-flap", Duration::from_secs(2));
+    rig.fake
+        .hold_state_ending(PROJECT, "api", Duration::from_millis(2500), None);
+    let proposal = rig
+        .call(
+            Scope::Viewer,
+            "action_propose",
+            json!({ "action": "instance_restart", "args": at(PROJECT, "api") }),
+        )
+        .expect("proposed");
+    // The owner check and the writer's own read pass; the read after the restart ended fails once.
+    rig.fake.pass_reads("/1.0/instances/api?", 2);
+    rig.fake.fail_reads("/1.0/instances/api?", 1, 500);
+    let answer = rig
+        .approve_by_card(&proposal)
+        .expect("the restart ends running");
+    assert_eq!(answer["status"], json!("Running"), "{answer}");
+    let message = answer["message"].as_str().expect("a message");
+    assert!(
+        message.starts_with("restarted the instance api"),
+        "{message}"
+    );
+    assert!(!message.contains("did not stay running"), "{message}");
+    assert_eq!(rig.fake.state_actions(PROJECT, "api"), ["restart"]);
 }
 
 #[test]
