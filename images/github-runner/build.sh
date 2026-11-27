@@ -19,10 +19,11 @@
 # 5. Compares our software report with GitHub's for the same release, with GitHub's own comparer
 #    (Calculate-ImagesDifference.ps1), and with our previous build of the line when there is one.
 # 6. vm/finalize.sh: the runner user, the runner program, arca-runner.service, then the clean-up of the build.
-# 7. Stops the machine and publishes it as the Incus image `arca/github-runner/<tag>` (in PROJECT's image store), then
-#    deletes the machine. --no-publish, or too little room under /var/lib/incus, keeps the stopped machine instead,
-#    renamed `arca-runner-image-<tag>` with a snapshot `image`: `incus copy` makes job machines from it (copy-on-write
-#    on btrfs and ZFS). Each tag keeps its own machine, so the previous image stays for a rollback.
+# 7. Stops the machine and publishes it as the Incus image `arca-runner-image-<tag>` (dots made dashes; in PROJECT's
+#    image store), then deletes the machine. --no-publish, or too little room under /var/lib/incus, keeps the stopped
+#    machine instead, renamed `arca-runner-image-<tag>` with a snapshot `image`: `incus copy` makes job machines from it
+#    (copy-on-write on btrfs and ZFS). Each tag keeps its own machine, so the previous image stays for a rollback. A
+#    runner pool's `image` names the one or the other: `arca-runner-image-<tag>` or `arca-runner-image-<tag>/image`.
 # 8. Writes the published difference into docs/runner-image/<tag>/ (README.md, software-report.json, the diffs, the
 #    failed tests) and deletes everything else it made, except a compressed log in WORK/logs.
 #
@@ -71,7 +72,8 @@ done
 slug=${RUNNER_IMAGES_TAG//\//-}
 vm=arca-runner-build-$IMAGE_OS
 image_vm=arca-runner-image-${slug//./-}
-alias=arca/github-runner/$RUNNER_IMAGES_TAG
+# The published image's alias is the kept machine's name: one plain name, which a runner pool's `image` can hold.
+alias=$image_vm
 src=$WORK/$slug
 out=$repo/docs/runner-image/$slug
 log=$WORK/logs/$slug-$(date -u +%Y%m%dT%H%M%SZ).log

@@ -758,11 +758,15 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
         for (verb, handler) in crate::github_handlers::handlers(signer) {
             server = server.handle(verb, handler);
         }
-        if let Some(board) = runner_board {
-            crate::runners::spawn(&cfg, &runner_owner, signer.clone(), board)
-                .map_err(Failure::Runtime)?;
-        }
     }
+    // The runner pools run while the kernel serves: this holds them.
+    let _runner_pools = match (&github_signer, runner_board) {
+        (Some(signer), Some(board)) => {
+            crate::runners::spawn(&cfg, &runner_owner, signer.clone(), board)
+                .map_err(Failure::Runtime)?
+        }
+        _ => None,
+    };
     for (verb, handler) in crate::approval_requests::handlers(
         Arc::clone(&kernel),
         clock.clone(),

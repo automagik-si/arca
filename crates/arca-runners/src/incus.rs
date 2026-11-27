@@ -38,7 +38,8 @@ pub struct IncusLauncher {
 
 impl IncusLauncher {
     /// A launcher for `pool`'s machines in `project` on the Incus socket at `socket`. `image` is an image alias or
-    /// fingerprint, or `<instance>/<snapshot>`.
+    /// fingerprint (`arca-runner-image-<tag>`, as the image build publishes it), or `<instance>/<snapshot>`
+    /// (`arca-runner-image-<tag>/image`, the stopped machine the build keeps).
     pub fn new(
         socket: PathBuf,
         project: &str,

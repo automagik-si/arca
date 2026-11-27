@@ -30,10 +30,12 @@ images/github-runner/build.sh ubuntu24        # or ubuntu26
 What it does is written at the top of `build.sh`. In short: wait for the host to be quiet enough (CPU idle, free
 memory, room on the storage pool), start a capped virtual machine (4 CPUs, 8 GiB, an 80 GiB root throttled to
 150 MB/s read and 80 MB/s write) in the Incus project `ci`, run GitHub's template against it with Packer's `null`
-builder, compare the software reports, add the runner, clean up, publish the image as `arca/github-runner/<tag>`,
-delete the machine, and write `docs/runner-image/<tag>/`. When there is too little room under `/var/lib/incus` to
-publish (or with `--no-publish`), the image is the stopped machine `arca-runner-image-<tag>` (dots made dashes, e.g.
-`arca-runner-image-ubuntu24-20261111-370`) with a snapshot `image`, one machine per tag. A build never deletes one:
+builder, compare the software reports, add the runner, clean up, publish the image as `arca-runner-image-<tag>` (dots
+made dashes, e.g. `arca-runner-image-ubuntu24-20261111-370`), delete the machine, and write `docs/runner-image/<tag>/`.
+When there is too little room under `/var/lib/incus` to publish (or with `--no-publish`), the image is the stopped
+machine of that same name with a snapshot `image`, one machine per tag. A runner pool's `image`
+([`docs/RUNNERS.md`](../../docs/RUNNERS.md)) names the published image as `arca-runner-image-<tag>` and the kept machine
+as `arca-runner-image-<tag>/image`. A build never deletes one:
 when a machine is in its way it stops and says which `incus move` frees the name (an image kept under the build's name
 `arca-runner-build-<line>` by an earlier build is renamed to its tag's name once, by hand). Settings (`PROJECT`, `CPU`,
 `MEMORY`, `DISK`, the gate's limits, `GATE_FLOORS` for other paths whose free room must stay above a floor once the
@@ -63,6 +65,10 @@ same way.
 
 ## A job machine
 
+Arca's runner pools ([`docs/RUNNERS.md`](../../docs/RUNNERS.md)) start the runner their own way: they write the
+configuration and their `arca-job` script into the machine through the Incus agent and run it, and `arca-job` stops
+`arca-runner.service` first. The service is for a machine made by hand, as below.
+
 `arca-runner.service` starts at boot and waits for the machine's one just-in-time runner configuration (GitHub's
 `encoded_jit_config`), from the file `/run/arca-runner/jitconfig` or from the instance setting
 `user.arca-runner.jitconfig` (read through Incus's guest API). It runs that runner once as `runner`, with the work
@@ -70,7 +76,7 @@ folder at `/home/runner/work`, and powers the machine off when the job is over. 
 command line.
 
 ```sh
-incus init arca/github-runner/ubuntu24/20261111.370 job-1 --project ci -c limits.cpu=2 -c limits.memory=8GiB
+incus init arca-runner-image-ubuntu24-20261111-370 job-1 --project ci -c limits.cpu=2 -c limits.memory=8GiB
 incus config set job-1 user.arca-runner.jitconfig="$ENCODED_JIT_CONFIG" --project ci
 incus start job-1 --project ci          # runs one job, then powers off: delete it then
 # When the build kept the stopped machine instead of publishing it (too little room under /var/lib/incus):

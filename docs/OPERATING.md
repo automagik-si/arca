@@ -7455,8 +7455,9 @@ mint answers `Empty` and the pool waits.
 - **Device-code runners stay offline.** Their files (`.runner`, `.credentials`, `.credentials_rsaparams`) are in the
   store and `Signer::runner_files` reads them, but no host and no pool template reads them yet. The runners are
   registered on GitHub and stay offline until that is wired.
-- **The pool is not wired yet.** The runner pool's template does not call `Signer::mint` yet; until it does, App and
-  push connections mint only through `github_runner_mint`.
+- **The template pool is not wired.** The fixed-slot `github-runner-pool` template does not call `Signer::mint`. The
+  per-job pools of the node config's `runners` key do, for App connections ("Per-job runners: the first real job"
+  below); push connections still mint only through `github_runner_mint`.
 - **Who may mint.** Any `operator` token may call `github_runner_mint` and receive a runner's credential (above). To
   harden: the verb only for a token whose tool list names it, or the in-process call only.
 - **A restart while registering.** A kernel restart while a device-code connection is registering loses the flow
@@ -7506,6 +7507,62 @@ job attachment and disconnect, with the caller and the time. It holds no credent
 | `github_runner_mint` | operator | One just-in-time runner configuration for a connection's labels |
 | `github_mint_job` | operator | Records which job a minted runner took |
 | `github_disconnect` | operator | Ends a connection (above); destructive, so `confirm: false` refuses it |
+
+## Per-job runners: the first real job
+
+The node config's `runners` key runs GitHub Actions jobs one per fresh virtual machine, each cloned from the runner
+image for its job and deleted after it. [`RUNNERS.md`](RUNNERS.md) is the design; this is what one node needs before a
+first real job, and how to read a pool.
+
+**What the node needs**
+
+1. **Kernel mode.** Only a kernel-mode node reads `runners`; it starts the pools when the kernel starts.
+2. **The runner image, in the pool's project.** `images/github-runner/build.sh ubuntu24` builds it
+   ([`images/github-runner/README.md`](../images/github-runner/README.md)) and leaves either the image
+   `arca-runner-image-<tag>` or, when the host is short of room, the stopped machine `arca-runner-image-<tag>` with a
+   snapshot `image`. The pool's `image` is `arca-runner-image-<tag>` for the first and `arca-runner-image-<tag>/image`
+   for the second. Never start or change the kept machine: every job machine is a copy of its snapshot.
+3. **Room in the project.** Each machine counts its class's full CPUs and memory against the Incus project's limits
+   (`incus project info <project>`) and against the pool's `budget`; make the budget fit what the project has free.
+4. **The organisation's App connection and its runner group.** Connect the organisation on `/approve/github` with
+   "a GitHub App made for you" (Mode 2 above), pick the repositories that may send jobs, and give one label set per size
+   class. The App's runner group, `Arca runners`, holds exactly those repositories. `github_bindings` lists the
+   connection's id (`gh-…`), its runner group and its label sets. A device-code or push connection cannot serve a pool.
+5. **`runners.pools` in the node config**, then a kernel restart (a restart ends the jobs running then: do it while
+   the queue is quiet):
+
+   ```json
+   "runners": { "pools": [ {
+     "name": "ci", "binding": "gh-…", "project": "ci",
+     "image": "arca-runner-image-ubuntu24-20261111-370/image",
+     "budget": { "cpu": 4, "memory": "8GiB" },
+     "classes": [ { "labels": ["acme-2vcpu-ubuntu-2404"], "cpu": 2, "memory": "4GiB", "max": 2 } ]
+   } ] }
+   ```
+
+   `binding` is the connection's id and the class's `labels` one of its label sets, exactly; leave `runnerGroupId`
+   unset (the connection's own group).
+6. **A workflow** in one of the picked repositories (a private one: see RUNNERS.md on public repositories) with
+   `runs-on:` that label set and `on: workflow_dispatch`, run by hand.
+
+**Reading a pool**
+
+- **The kernel's log.** `arca: runners: pool <name>: …` lines: the pool started (its classes, project and budget), a
+  machine that failed and why, a runner that could not be removed. A pool that could not start says so once.
+- **`alerts_list`.** `runner-signin` fires for a pool whose sign-in fails (bad credentials, App not installed,
+  forbidden, no connection of that id); the reason is in the kernel's log line.
+- **`<stateDir>/runners/<pool>/jobs.jsonl`.** One line per machine: runner, class, repository, run and job, result,
+  queue and assign times, `bootSeconds` (clone to runner start), `machineSeconds`, `runnerExit`, `logs` and `note`. A
+  machine that never ran a job writes a line with the job fields empty. The note `the runner exited <code> before it
+  took a job` means the runner refused its configuration or the image cannot run it: read its logs; the class waits
+  before the next machine.
+- **`<stateDir>/runners/<pool>/logs/<runner>/logs.tar.gz`** (root only, kept 7 days): `var/log/arca-job/runner.log`
+  (what `arca-job` and the runner printed, with each start and exit code) and the runner's `_diag` folder, e.g.
+  `sudo tar -xzOf <file> var/log/arca-job/runner.log`.
+- **`github_audit`.** Every runner configuration minted for the connection, with the runner's name and, once known, its
+  job.
+- **The machines alive now:** `incus list --project <project> user.arcakernel.runner=<pool>`. None stays after its job;
+  the pool deletes any marked machine it does not know at start and every five minutes.
 
 ## A pool of GitLab runners
 
