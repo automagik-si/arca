@@ -2906,12 +2906,14 @@ fn create(
                     lands: None,
                     reverts: Some(place.clone()),
                     then: None,
+                    starts: None,
                 }
             }
             Appears::OnCompletion => Held {
                 lands: Some(stored),
                 reverts: None,
                 then: None,
+                starts: None,
             },
         };
         let operation = running_operation(&armed.id, &place);
