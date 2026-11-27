@@ -3,7 +3,7 @@
 //! launcher, keeps its records under `<stateDir>/runners/<pool>/`, and puts its sign-in state on a board the alerts
 //! read. `docs/RUNNERS.md` has the design.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arca_alerts::eval::{RunnerSignInUse, Timed};
@@ -11,8 +11,8 @@ use arca_runners::incus::IncusLauncher;
 use arca_runners::record::Recorder;
 use arca_runners::scaleset::{Http, ScaleSetClient};
 use arca_runners::{
-    Access, AccessError, ActionsConnection, JobRef, MintRequest, Minted, Pool, PoolConfig, Secret,
-    SignInBoard, SignInReason,
+    Access, AccessError, ActionsConnection, JobRef, Launcher, MintRequest, Minted, Pool, PoolConfig,
+    Secret, SignInBoard, SignInReason,
 };
 
 use crate::config::NodeConfig;
@@ -149,40 +149,81 @@ impl Access for SignerAccess {
     }
 }
 
-/// Starts the node's pools on a thread of their own, with the signer's App as their credential and their sign-in
-/// state on `board`. A node with no pools starts nothing.
+/// The node's running pools. [`RunnerPools::stop`], or dropping it, stops them: the kernel keeps it while it serves.
+pub struct RunnerPools {
+    stop: tokio::sync::watch::Sender<bool>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+impl RunnerPools {
+    /// Stops the pools (each closes its sessions and destroys its machines) and waits for them.
+    pub fn stop(self) {
+        let _ = self.stop.send(true);
+        let _ = self.thread.join();
+    }
+}
+
+/// Starts the node's pools on a thread of their own, with the signer's App as their credential, the Incus launcher for
+/// their machines and their sign-in state on `board`. A node with no pools starts nothing.
 pub fn spawn(
     cfg: &NodeConfig,
     owner: &str,
     signer: Signer,
     board: SignInBoard,
-) -> Result<(), String> {
+) -> Result<Option<RunnerPools>, String> {
     let Some(runners) = cfg
         .runners
         .as_ref()
         .filter(|runners| !runners.pools.is_empty())
     else {
-        return Ok(());
+        return Ok(None);
     };
-    let records = cfg.state_dir.join("runners");
     let socket = cfg.incus.socket.clone();
-    let pools: Vec<PoolConfig> = runners.pools.clone();
+    start_pools(
+        runners.pools.clone(),
+        cfg.state_dir.join("runners"),
+        Arc::new(SignerAccess::new(signer)),
+        board,
+        owner,
+        move |pool| incus_launcher(pool, &socket).map(Arc::new),
+    )
+    .map(Some)
+}
+
+/// Starts `pools` on a thread of their own: each signs in through `access`, makes its machines with the launcher
+/// `launcher` gives it, and keeps its records under `<records>/<pool>/`. A pool that cannot start is logged and the
+/// others run.
+pub fn start_pools<A, L, F>(
+    pools: Vec<PoolConfig>,
+    records: PathBuf,
+    access: Arc<A>,
+    board: SignInBoard,
+    owner: &str,
+    launcher: F,
+) -> Result<RunnerPools, String>
+where
+    A: Access,
+    L: Launcher,
+    F: Fn(&PoolConfig) -> Result<Arc<L>, String> + Send + 'static,
+{
     let owner = owner.to_string();
-    let access = Arc::new(SignerAccess::new(signer));
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .thread_name("arca-runners")
         .enable_all()
         .build()
         .map_err(|error| format!("the runner pools' runtime could not start: {error}"))?;
-    std::thread::Builder::new()
+    let (keep, stop) = tokio::sync::watch::channel(false);
+    let thread = std::thread::Builder::new()
         .name("arca-runners".to_string())
         .spawn(move || {
             runtime.block_on(async move {
-                let (_keep, stop) = tokio::sync::watch::channel(false);
                 let mut tasks = Vec::new();
                 for pool in pools {
-                    match start_pool(&pool, &socket, &access, &records, &board, &owner) {
+                    let started = launcher(&pool).and_then(|launcher| {
+                        start_pool(&pool, launcher, &access, &records, &board, &owner)
+                    });
+                    match started {
                         Ok(pool) => tasks.push(tokio::spawn(pool.run(stop.clone()))),
                         Err(why) => {
                             eprintln!("arca: runners: pool {} does not start: {why}", pool.name)
@@ -195,20 +236,12 @@ pub fn spawn(
             });
         })
         .map_err(|error| format!("the runner pools' thread could not start: {error}"))?;
-    Ok(())
+    Ok(RunnerPools { stop: keep, thread })
 }
 
-fn start_pool(
-    pool: &PoolConfig,
-    socket: &Path,
-    access: &Arc<SignerAccess>,
-    records: &Path,
-    board: &SignInBoard,
-    owner: &str,
-) -> Result<Arc<Pool<SignerAccess, IncusLauncher>>, String> {
-    let http = Http::new()?;
-    let client = Arc::new(ScaleSetClient::new(http, Arc::clone(access), &pool.binding));
-    let launcher = IncusLauncher::new(
+/// The Incus launcher of one pool: a virtual machine per job, cloned from the pool's `image`.
+fn incus_launcher(pool: &PoolConfig, socket: &Path) -> Result<IncusLauncher, String> {
+    IncusLauncher::new(
         socket.to_path_buf(),
         &pool.project,
         &pool.name,
@@ -216,7 +249,19 @@ fn start_pool(
         pool.profiles.clone(),
         pool.storage_pool.clone(),
     )
-    .map_err(|error| error.to_string())?;
+    .map_err(|error| error.to_string())
+}
+
+fn start_pool<A: Access, L: Launcher>(
+    pool: &PoolConfig,
+    launcher: Arc<L>,
+    access: &Arc<A>,
+    records: &Path,
+    board: &SignInBoard,
+    owner: &str,
+) -> Result<Arc<Pool<A, L>>, String> {
+    let http = Http::new()?;
+    let client = Arc::new(ScaleSetClient::new(http, Arc::clone(access), &pool.binding));
     let recorder = Recorder::open(records.join(&pool.name), pool.log_days)
         .map_err(|error| format!("its folder could not be made: {error}"))?;
     eprintln!(
@@ -230,7 +275,7 @@ fn start_pool(
     Ok(Pool::new(
         pool.clone(),
         client,
-        Arc::new(launcher),
+        launcher,
         board.clone(),
         recorder,
         owner,
@@ -240,6 +285,101 @@ fn start_pool(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arca_runners::access::RegistrationAccess;
+    use arca_runners::fake::{FakeGitHub, FakeLauncher, JobSpec};
+    use serde_json::json;
+    use std::time::{Duration, Instant};
+
+    const TOKEN: &str = "fake-installation-token";
+    const LABEL: &str = "acme-4vcpu-ubuntu-2404";
+
+    async fn until(what: &str, mut check: impl FnMut() -> bool) {
+        let start = Instant::now();
+        while !check() {
+            assert!(start.elapsed() < Duration::from_secs(30), "timed out waiting for {what}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_task_runs_each_pool_with_its_launcher_and_records_its_jobs() {
+        let github = FakeGitHub::start(TOKEN).await.expect("fake GitHub");
+        let access = Arc::new(
+            RegistrationAccess::new(
+                Http::new().expect("http"),
+                github.api_url(),
+                "https://github.com/acme",
+                Secret::new(TOKEN),
+            )
+            .expect("access"),
+        );
+        let pool = |name: &str, label: &str| -> PoolConfig {
+            serde_json::from_value(json!({
+                "name": name,
+                "binding": "acme-org",
+                "url": "https://github.com/acme",
+                "runnerGroupId": 3,
+                "budget": { "cpu": 8, "memory": "32GiB" },
+                "project": "arcak-runners",
+                "image": "arca-runner-image-ubuntu24-20261111-370/image",
+                "classes": [{ "labels": [label], "cpu": 4, "memory": "16GiB", "max": 2 }]
+            }))
+            .expect("a pool")
+        };
+        let dir = std::env::temp_dir().join(format!(
+            "arca-runners-task-{}-{}",
+            std::process::id(),
+            arca_runners::time::now_ms()
+        ));
+        let launcher = Arc::new(FakeLauncher::new(github.clone()));
+        let made = Arc::clone(&launcher);
+        let board = SignInBoard::new();
+        let running = start_pools(
+            vec![pool("broken", "acme-other"), pool("acme", LABEL)],
+            dir.join("runners"),
+            access,
+            board.clone(),
+            "node-a",
+            move |pool: &PoolConfig| {
+                if pool.name == "broken" {
+                    Err("no launcher for it".to_string())
+                } else {
+                    Ok(Arc::clone(&made))
+                }
+            },
+        )
+        .expect("the task starts");
+        until("the session", || github.session_open(LABEL)).await;
+        github.queue_job(JobSpec {
+            name: "build".to_string(),
+            repo: "omni".to_string(),
+            labels: vec![LABEL.to_string()],
+            seconds: 0.1,
+            ..JobSpec::default()
+        });
+        until("the job", || github.finished().len() == 1).await;
+        assert_eq!(github.finished()[0].result, "succeeded");
+        let jobs = dir.join("runners/acme/jobs.jsonl");
+        until("the job's record", || {
+            std::fs::read_to_string(&jobs).is_ok_and(|text| text.contains("\"build\""))
+        })
+        .await;
+        assert!(
+            board
+                .read()
+                .get("acme")
+                .is_some_and(|state| state.failing.is_none()),
+            "the pool signed in"
+        );
+        // The pool whose launcher could not be made did not start, and did not stop the other.
+        assert!(!dir.join("runners/broken").exists());
+        tokio::task::spawn_blocking(move || running.stop())
+            .await
+            .expect("stopped");
+        assert!(!github.session_open(LABEL), "its session is closed");
+        assert!(launcher.live().is_empty(), "no machine is left");
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn a_signer_refusal_a_person_must_act_on_is_a_signin_failure() {
