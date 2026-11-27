@@ -479,6 +479,47 @@ fn statistics(world: &World, set: u64) -> Value {
     })
 }
 
+/// A just-in-time runner configuration of GitHub's own shape (base64 of a JSON object whose `.runner`, `.credentials`
+/// and `.credentials_rsaparams` are each base64 of the runner's file) that no runner can use: its key is not an RSA key
+/// and every address in it is under `.invalid`. A real runner given it refuses it before any network call (it cannot
+/// read the key), which is what a job machine does with a configuration GitHub would refuse. `nonce` makes each one
+/// unique.
+pub fn unusable_jit_config(runner_id: u64, runner_name: &str, nonce: &str) -> String {
+    let engine = base64::engine::general_purpose::STANDARD;
+    let encode = |value: &Value| engine.encode(value.to_string());
+    let server = "https://runner.invalid/";
+    let runner = json!({
+        "agentId": runner_id,
+        "agentName": runner_name,
+        "poolId": 1,
+        "poolName": "Default",
+        "serverUrl": server,
+        "serverUrlV2": server,
+        "gitHubUrl": "https://github.invalid/arca",
+        "workFolder": crate::config::work_folder(),
+        "useV2Flow": false,
+    });
+    let credentials = json!({
+        "scheme": "OAuth",
+        "data": {
+            "clientId": format!("arca-fake-{nonce}"),
+            "authorizationUrl": format!("{server}_apis/oauth2/token"),
+            "requireFipsCryptography": "False",
+        },
+    });
+    let not_a_key = engine.encode([1u8; 128]);
+    let half = engine.encode([1u8; 64]);
+    let rsa = json!({
+        "d": not_a_key, "modulus": not_a_key, "exponent": "AQAB",
+        "dp": half, "dq": half, "inverseQ": half, "p": half, "q": half,
+    });
+    encode(&json!({
+        ".runner": encode(&runner),
+        ".credentials": encode(&credentials),
+        ".credentials_rsaparams": encode(&rsa),
+    }))
+}
+
 fn random_hex() -> String {
     let mut bytes = [0u8; 8];
     let _ = getrandom::fill(&mut bytes);
@@ -871,7 +912,7 @@ fn service(
             }
             let id = world.next_id;
             world.next_id += 1;
-            let jit = format!("jit-{id}-{}", random_hex());
+            let jit = unusable_jit_config(id, &name, &random_hex());
             world.runners.insert(
                 id,
                 FakeRunner {
@@ -975,6 +1016,7 @@ struct Machines {
     fail_creates: u32,
     fail_destroys: u32,
     fail_watches: u32,
+    refuse_with: Option<i64>,
     destroyed_while_registered: Vec<String>,
 }
 
@@ -1024,6 +1066,12 @@ impl FakeLauncher {
     /// The next `count` reads of a runner fail, as when Incus restarts or stalls.
     pub fn fail_watches(&self, count: u32) {
         self.lock().fail_watches = count;
+    }
+
+    /// Every runner started from now on refuses its configuration, as a real one does with a configuration GitHub
+    /// would refuse: it never comes online and exits at once with `code`. `None` ends it.
+    pub fn refuse_configurations(&self, code: Option<i64>) {
+        self.lock().refuse_with = code;
     }
 
     /// The machines destroyed while GitHub still listed their runner.
@@ -1129,8 +1177,17 @@ impl Launcher for FakeLauncher {
         jit: &Secret,
         _start: &RunnerStart,
     ) -> Result<(), LaunchError> {
-        if !self.lock().live.contains_key(name) {
-            return Err(LaunchError("no such machine".to_string()));
+        {
+            let mut machines = self.lock();
+            let refuse = machines.refuse_with;
+            let machine = machines
+                .live
+                .get_mut(name)
+                .ok_or_else(|| LaunchError("no such machine".to_string()))?;
+            if let Some(code) = refuse {
+                machine.exit = Some(code);
+                return Ok(());
+            }
         }
         let runner = self
             .github

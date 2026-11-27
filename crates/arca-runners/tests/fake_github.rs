@@ -40,7 +40,7 @@ fn config(warm: u32, max: u32, budget_cpu: u32) -> PoolConfig {
         "runnerGroupId": 3,
         "budget": { "cpu": budget_cpu, "memory": "256GiB" },
         "project": "arcak-runners",
-        "image": "runner-ubuntu-2404",
+        "image": "arca-runner-image-ubuntu24-20261111-370/image",
         "classes": [
             { "labels": [LABEL], "cpu": 4, "memory": "16GiB", "warm": warm, "max": max },
             { "labels": ["acme-2vcpu-ubuntu-2404", "acme-small"], "cpu": 2, "memory": "8GiB", "max": 2 }
@@ -825,5 +825,49 @@ async fn a_runner_github_just_handed_a_job_is_kept_at_the_bound() {
         })
         .count();
     assert!((1..=3).contains(&refused), "refused removals: {refused}");
+    rig.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_runner_that_refuses_its_configuration_is_a_failure_the_class_waits_on() {
+    let timing = Timing {
+        backoff_base: Duration::from_millis(500),
+        ..Timing::default()
+    };
+    let rig = rig_timed(config(1, 1, 32), timing, |_, launcher| {
+        launcher.refuse_configurations(Some(2));
+    })
+    .await;
+    until("the refused runner's line", Duration::from_secs(20), || {
+        !rig.jobs_file().is_empty()
+    })
+    .await;
+    let recorded = Instant::now();
+    let line = rig.jobs_file()[0].clone();
+    let name = line["runner"].as_str().expect("a runner").to_string();
+    assert_eq!(line["runnerExit"], 2, "{line}");
+    assert_eq!(
+        line["note"], "the runner exited 2 before it took a job",
+        "{line}"
+    );
+    assert!(line["logs"].is_string(), "its logs are kept: {line}");
+    assert_eq!(line["repository"], "", "no job: {line}");
+    assert!(rig.launcher.live().is_empty(), "its machine is gone");
+    // It never took a job, so its runner is taken off GitHub.
+    until("the runner removed", Duration::from_secs(5), || {
+        rig.github.removed_runners().contains(&name)
+    })
+    .await;
+    // The class waits before the next machine: one machine during the pause, a second after it.
+    assert_eq!(rig.launcher.created().len(), 1);
+    until("the next try", Duration::from_secs(10), || {
+        rig.launcher.created().len() >= 2
+    })
+    .await;
+    assert!(
+        recorded.elapsed() >= Duration::from_millis(800),
+        "the class waited {:?}",
+        recorded.elapsed()
+    );
     rig.finish().await;
 }
