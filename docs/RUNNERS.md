@@ -151,9 +151,12 @@ Records and logs go to `<stateDir>/runners/<pool>/`.
 
 1. **Clone.** `POST /1.0/instances` with `type: virtual-machine`, the runner image as source, the class's
    `limits.cpu`, `limits.memory` and root disk size, in the pool's own Incus project and network, marked
-   `user.arcakernel.runner=<pool>`. On btrfs, ZFS and Ceph RBD the root disk is a copy-on-write clone of the image's
-   volume, and it costs only the blocks the job writes. Measured on btrfs (below, "How it is proven"): the copy and the
-   start take one to two and a half seconds, the boot to a ready agent about 25 seconds.
+   `user.arcakernel.runner=<pool>`. On a storage pool whose driver clones volumes (btrfs, ZFS, Ceph RBD) the root disk is
+   a copy-on-write clone of the image's volume, and it costs only the blocks the job writes; on another driver
+   (`dir`, LVM without a thin pool) it is a full copy. Only btrfs is measured (below, "How it is proven"): the copy and
+   the start take one to two and a half seconds, the boot to a ready agent about 25 seconds. ZFS and Ceph RBD are
+   expected to clone the same way and are not measured: a Ceph pool clones only with `ceph.rbd.clone_copy` left on
+   (Incus's default), and only when the image or the kept machine is in the same storage pool as the job machines.
 2. **Boot and wait for the Incus agent.** The launcher never uses a network path into the VM.
 3. **Hand over.** The controller asks the signer for one JIT configuration (`workFolder` `/home/runner/work`) and the
    launcher writes it into the VM through the agent's file API, on `/run` (memory), mode 0600, owned by root (`arca-job`
