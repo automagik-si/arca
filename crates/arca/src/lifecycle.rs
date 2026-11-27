@@ -66,6 +66,10 @@ pub type AfterStart = Arc<
         + Sync,
 >;
 
+/// What Arca does when it sees an instance stopped, given its name and uuid: a stop it made or found, a start of a stopped
+/// instance, or a restart. A served node clears the instance's hung mark (Rule 82). It answers nothing and refuses nothing.
+pub type AfterStop = Arc<dyn Fn(&str, Option<&str>) + Send + Sync>;
+
 /// The state writer of a kernel-mode node, the ownership check in front of it, and the journal behind it.
 pub struct InstanceLifecycle {
     changer: StateChanger,
@@ -76,6 +80,7 @@ pub struct InstanceLifecycle {
     /// One action at a time. The number is the last id this process gave a journalled action.
     gate: Mutex<u64>,
     after_start: Option<AfterStart>,
+    after_stop: Option<AfterStop>,
 }
 
 impl std::fmt::Debug for InstanceLifecycle {
@@ -115,6 +120,7 @@ impl InstanceLifecycle {
             journal: state_dir.join(INSTANCE_ACTIONS_FILE),
             gate: Mutex::new(0),
             after_start: None,
+            after_stop: None,
         }
     }
 
@@ -143,6 +149,12 @@ impl InstanceLifecycle {
     /// The same lifecycle with what follows a start or a restart. Without one, nothing follows.
     pub fn with_after_start(mut self, after_start: AfterStart) -> InstanceLifecycle {
         self.after_start = Some(after_start);
+        self
+    }
+
+    /// The same lifecycle with what follows an instance seen stopped. Without one, nothing follows.
+    pub fn with_after_stop(mut self, after_stop: AfterStop) -> InstanceLifecycle {
+        self.after_stop = Some(after_stop);
         self
     }
 
@@ -258,6 +270,23 @@ impl InstanceLifecycle {
             )
         })?;
         let outcome = self.act(action, project, instance, &id);
+        // Seen stopped, or stopped and started again by Incus: nothing left running in it runs any more. A restart that
+        // left it stopped and was followed by a start saw it stopped too; one still running (restart_unfinished) is an
+        // error and clears nothing.
+        if let (Ok(done), Some(after_stop)) = (&outcome, &self.after_stop)
+            && matches!(
+                done.outcome,
+                "stopped"
+                    | "already_stopped"
+                    | "started"
+                    | "started_from_stopped"
+                    | "restarted"
+                    | "started_after_restart"
+                    | "running_after_restart"
+            )
+        {
+            after_stop(&done.state.name, done.state.uuid.as_deref());
+        }
         let end = match &outcome {
             Ok(done) => json!({
                 "kind": "end",

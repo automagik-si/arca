@@ -583,7 +583,7 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
             Arc::clone(repository_secrets.as_ref().ok_or_else(|| {
                 Failure::Runtime("the guest secret writer is unavailable".into())
             })?);
-        Some(Arc::new(
+        Some(
             crate::lifecycle::InstanceLifecycle::new(
                 cfg.incus.socket.clone(),
                 family,
@@ -599,7 +599,7 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
             .with_after_start(Arc::new(move |project, instance| {
                 guest_secrets.deliver(project, instance)
             })),
-        ))
+        )
     } else {
         None
     };
@@ -668,6 +668,14 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     } else {
         None
     };
+    let action_slot = ActionSlot::default();
+    let (service_handlers, reach_reads) = crate::handlers::service_handlers_with_reach(
+        kernel.clone(),
+        clock.clone(),
+        Arc::new(cfg.clone()),
+        functions,
+        crate::handlers::UpdateOptions::default(),
+    );
     // The services that follow Automagik's releases are looked at on a timer of their own, as the sweep above is. It
     // asks the network for nothing while no service follows. A timer that cannot start is said on the log.
     if kernel_mode && cfg.kernel.service_cidr.is_some() {
@@ -677,6 +685,8 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
             Arc::new(cfg.clone()),
             crate::handlers::UpdateOptions::default(),
             crate::handlers::FollowEdges::default(),
+            // The marks the service verbs obey: an update that stops a service clears its mark there (Rule 82).
+            crate::handlers::service_exec(&service_handlers),
         ));
         if let Err(error) = crate::handlers::spawn_follower(
             follower,
@@ -685,14 +695,13 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
             eprintln!("arca: the Automagik follower did not start: {error}");
         }
     }
-    let action_slot = ActionSlot::default();
-    let (service_handlers, reach_reads) = crate::handlers::service_handlers_with_reach(
-        kernel.clone(),
-        clock.clone(),
-        Arc::new(cfg.clone()),
-        functions,
-        crate::handlers::UpdateOptions::default(),
-    );
+    // An instance the lifecycle sees stopped loses the hung mark the service verbs obey (Rule 82).
+    let lifecycle = lifecycle.map(|lifecycle| {
+        let exec = crate::handlers::service_exec(&service_handlers);
+        Arc::new(lifecycle.with_after_stop(Arc::new(move |instance, uuid| {
+            exec.clear_hung_seen_stopped(instance, uuid);
+        })))
+    });
     // A database made from the node's template is created by the service handler itself.
     let service_create = crate::handlers::service_create_handler(&service_handlers);
     // The moves to linked hosts: their plans, their runs and their journal. A move a stopped kernel left unfinished is

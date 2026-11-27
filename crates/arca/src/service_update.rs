@@ -1214,6 +1214,11 @@ impl ServiceHandler {
             )));
         }
         journal.step("restart", true, json!({ "restarted": was_running }));
+        // A restart stops the instance: a command that did not answer in it has ended (Rule 82).
+        if was_running {
+            self.exec
+                .clear_hung_seen_stopped(&seen.name, seen.uuid.as_deref());
+        }
         // The same health check a digest update runs, within the call's timeout: a service that does not come back
         // (an image whose setuid helper breaks under the key, say) gets the old setting back and a restart.
         let reach = Reach::of(config, key.health);
@@ -1642,14 +1647,18 @@ impl Run<'_> {
         Ok(())
     }
 
+    /// Stops the instance, or finds it stopped. Either way it runs nothing now, so its hung mark goes (Rule 82).
     fn stopped(&self, instance: &mut InstanceState) -> Result<(), Failure> {
-        if instance.is_stopped() {
-            return Ok(());
+        if !instance.is_stopped() {
+            self.changer
+                .change(instance, StateAction::Stop)
+                .map(|state| *instance = state)
+                .map_err(|error| Failure::of("stop", &error))?;
         }
-        self.changer
-            .change(instance, StateAction::Stop)
-            .map(|state| *instance = state)
-            .map_err(|error| Failure::of("stop", &error))
+        self.handler
+            .exec
+            .clear_hung_seen_stopped(&instance.name, instance.uuid.as_deref());
+        Ok(())
     }
 
     /// Steps 1 to 5. A failed rebuild can still require putting the old root back.

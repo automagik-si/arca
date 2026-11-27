@@ -1473,3 +1473,144 @@ fn a_token_limited_to_one_service_sees_and_reaches_that_service_only() {
     }
     assert_eq!(serve.terminate().code(), Some(0));
 }
+
+/// One `tools/call` that may take longer than [`WAIT`]: the reply, or nothing when it does not come within 40 seconds.
+fn post_slow(socket: &Path, secret: &str, body: &str) -> Option<String> {
+    let mut stream = UnixStream::connect(socket).expect("connect to the server");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(40)))
+        .expect("set a deadline");
+    let request = format!(
+        "POST /mcp HTTP/1.1\r\nHost: arca\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\nAuthorization: Bearer {secret}\r\n\r\n{body}",
+        body.len()
+    );
+    stream
+        .write_all(request.as_bytes())
+        .expect("send the request");
+    let mut reply = String::new();
+    stream.read_to_string(&mut reply).ok()?;
+    Some(reply)
+}
+
+/// Issue #307, end to end: in the served node, the instance lifecycle and `service_logs` share one set of hung marks.
+/// A journal read Incus never answers marks the instance; `instance_start` of the stopped instance clears the mark; the
+/// journal answers again. Without the served node's wiring the last read would still answer the console.
+#[test]
+fn the_served_node_clears_a_hung_mark_when_the_lifecycle_starts_the_stopped_instance() {
+    // A hard bound of its own: a fake that never answers fails the test and never holds the build.
+    let (done, ended) = std::sync::mpsc::channel();
+    let runner = thread::spawn(move || {
+        served_node_clears_a_hung_mark();
+        let _ = done.send(());
+    });
+    match ended.recv_timeout(Duration::from_secs(180)) {
+        Ok(()) => runner.join().expect("the test"),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            if let Err(panic) = runner.join() {
+                std::panic::resume_unwind(panic);
+            }
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            panic!("the test did not end within 180 s")
+        }
+    }
+}
+
+fn served_node_clears_a_hung_mark() {
+    use arca_incus::exec::{ExecCommand, JournalLines};
+    use arca_incus::fake::ExecScript;
+    let scratch = Scratch::new("hung-mark");
+    let rig = rig(&scratch);
+    rig.fake.add_profile(
+        "default",
+        json!({
+            "name": "default", "config": {},
+            "devices": {"root": {"type": "disk", "pool": "default", "path": "/"}}
+        }),
+    );
+    let (hash_dir, secrets) = mint_tokens(&scratch);
+    let config = write_config(&scratch, rig.fake.socket(), &hash_dir);
+    let mut cfg: Value =
+        serde_json::from_slice(&fs::read(&config).expect("config")).expect("config JSON");
+    cfg["kernel"]["projects"] = json!([arca_netproject::PROJECT]);
+    cfg["kernel"]["serviceCidr"] = json!("192.0.2.0/24");
+    fs::write(&config, cfg.to_string()).expect("write kernel config");
+    let templates = scratch.at("state/templates");
+    fs::create_dir(&templates).expect("templates");
+    fs::write(
+        templates.join("app.json"),
+        json!({"name":"app","kind":"system","image":"images:debian/13","ports":[],"env":{}})
+            .to_string(),
+    )
+    .expect("template");
+    let socket = scratch.at("arca.sock");
+    let mut serve = start_serve(&config);
+    wait_for_server(&mut serve, &socket);
+    let doctor = secret_of(&secrets, "doctor-1");
+    let (status, text) = post(
+        &socket,
+        &[bearer(doctor)],
+        &call(1, "service_create", json!({"name":"app", "template":"app"})),
+    );
+    assert_eq!(status, 200, "{text}");
+    assert_eq!(tool_result(&text)["state"], "running", "{text}");
+    let journal = ExecCommand::Journal(JournalLines::new(50).unwrap());
+    rig.fake
+        .set_console_log(arca_netproject::PROJECT, "app", "console line");
+    // The read Incus does not answer: the node waits its 13 seconds and marks the instance, whatever the door answers.
+    let mut held = ExecScript::new(journal.argv(), 0, "");
+    held.held = true;
+    rig.fake.script_exec(held);
+    let _ = post_slow(
+        &socket,
+        doctor,
+        &call(2, "service_logs", json!({"name":"app"})),
+    );
+    let audit = scratch.at("state/exec-audit.jsonl");
+    let deadline = Instant::now() + Duration::from_secs(40);
+    while !fs::read_to_string(&audit)
+        .unwrap_or_default()
+        .contains(r#""outcome":"failed""#)
+    {
+        assert!(Instant::now() < deadline, "the read ended");
+        thread::sleep(Duration::from_millis(50));
+    }
+    let logs = |id: u64| {
+        let (status, text) = post(
+            &socket,
+            &[bearer(doctor)],
+            &call(id, "service_logs", json!({"name":"app"})),
+        );
+        assert_eq!(status, 200, "{text}");
+        // The door adds its own `untrusted` line to a verb whose content comes from outside Arca.
+        tool_result(&text)
+    };
+    let marked = logs(3);
+    assert_eq!(marked["source"], "console", "{marked}");
+    assert!(
+        marked["journalNotRead"]
+            .as_str()
+            .is_some_and(|why| why.contains("did not answer")),
+        "{marked}"
+    );
+    // Stopped outside Arca; the served lifecycle sees it stopped when it starts it.
+    rig.fake
+        .set_instance_status(arca_netproject::PROJECT, "app", "Stopped");
+    let (status, text) = post(
+        &socket,
+        &[bearer(doctor)],
+        &call(
+            4,
+            "instance_start",
+            json!({"project": arca_netproject::PROJECT, "instance": "app"}),
+        ),
+    );
+    assert_eq!(status, 200, "{text}");
+    assert_eq!(tool_result(&text)["changed"], true, "{text}");
+    rig.fake
+        .script_exec(ExecScript::new(journal.argv(), 0, "journal line\n"));
+    let read = logs(5);
+    assert_eq!(read["source"], "journal", "{read}");
+    assert_eq!(read["lines"], json!(["journal line"]), "{read}");
+    assert_eq!(serve.terminate().code(), Some(0));
+}

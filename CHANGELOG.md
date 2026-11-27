@@ -4,6 +4,16 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 
 ## Unreleased
 
+A service whose instance was marked hung reads its journal again once the instance is stopped. When a command inside
+an instance does not answer, Arca marks the instance and runs nothing more in it. The mark was meant to go when Arca saw
+the instance stopped, but nothing cleared it short of restarting the node, so `service_logs` kept reading the console
+log, which is empty after a restart, and answered no lines without saying why. Now `instance_stop`, `instance_start` of a
+stopped instance, `instance_restart`, a `service_update` that stops or restarts the service (the Automagik follower's
+own updates included) and a `service_reconfigure` that restarts it clear the mark. A start of a running instance stops
+nothing, so the mark stays. A mark also ages: after five minutes the next `service_logs` tries the journal once, one try
+at a time, and an answer clears the mark. `service_logs` also says where its lines came from, in a new
+`source` field (`journal` or `console`), and when it did not read the journal, a new `journalNotRead` field says why.
+
 An approved `instance_restart` no longer leaves the instance stopped. When Incus failed the restart's start half after a
 slow shutdown, the call ended refused and the service stayed down until someone started it. Now Arca reads the instance
 after the failure, and one that is stopped is sent one plain start, never forced. A restart Incus has not finished by

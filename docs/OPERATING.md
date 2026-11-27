@@ -475,7 +475,7 @@ the node's own records and Incus, exactly as on a node that makes changes. What 
   `unknown` and the note `not recorded by this node`; a node that makes changes would have written a record for a
   marked one.
 - `service_logs` reads the instance's console log, and its `note` says so: the journal is read by running a command
-  inside the instance, and a node that only looks runs none. A container's console log holds only what its init system
+  inside the instance, and a node that only looks runs none. Its `source` is `console`, and `journalNotRead` says why. A container's console log holds only what its init system
   wrote to the console, which is often much less than its journal, and may be nearly empty.
 - `omni_status` is refused, with that reason: it answers by running a command inside the service.
 - Every tool that would change an instance, a service, a database, a tenant, storage or a GPU assignment is refused
@@ -6231,7 +6231,18 @@ the operation, an answer that is not the operation), since the command may still
 the start makes just before sending it times out, which errs toward the mark. An operation Incus reports failed is an
 answer and marks nothing. No formula command runs in a marked instance, and no command of Rule 50's closed list but its
 cleanups (removing the tailnet key directory, stopping the daemon). The mark stays until Arca sees the instance stopped,
-since a stopped instance runs nothing, or until the instance's uuid changes, since that is another instance.
+since a stopped instance runs nothing, or until the instance's uuid changes, since that is another instance. Arca sees it
+stopped when `instance_stop` stops it or finds it stopped, when `instance_start` starts it from stopped, when
+`instance_restart` restarts it or starts it after a restart that left it stopped, when `service_update` stops or restarts it (an update the Automagik follower makes
+included), and when `service_reconfigure` restarts it or stops it for a memory `/run`. A start of a running instance
+clears nothing, and a command that was already running when the instance stopped marks nothing when it fails afterwards.
+A mark also ages: 5 minutes after it was set (or after the marking command's own limit, when that is longer) the next
+`service_logs` tries the journal once, and only one such try runs at a time per instance. An answer clears the mark;
+any other outcome keeps it for 5 more minutes. The mark is kept in memory, so a restart of the node clears it too. While
+an instance is marked, `service_logs` answers its console log with `source` set to `console`, and `journalNotRead` says
+the instance is marked hung, that the journal is tried again after five minutes, and that a stop and a start, or a
+restart, clears the mark now. Every answer of `service_logs` names its `source`, `journal` or
+`console`, and says in `journalNotRead` why it did not read the journal whenever it did not.
 
 ### What every virtual machine carries
 

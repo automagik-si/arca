@@ -843,7 +843,8 @@ tests: `own_project_and_network_observe_are_scoped`, `own_project_and_network_ob
 closed enum it refuses adopted, OCI, foreign, retained, retiring, stopped and UUID-mismatched instances. Identity
 comes from the newest live class-B instance effect, and a post-exec UUID check discards output from a changed instance.
 Every step has an in-instance SIGKILL timeout, a client deadline, a 64 KiB recording cap, and a synced private exec audit with
-no argv or output. Client deadlines mark that UUID hung; only key cleanup and daemon stop remain permitted. Recordings are
+no argv or output. Client deadlines mark that UUID hung; only key cleanup, daemon stop and, once the mark has aged (Rule 82), one journal
+read at a time remain permitted. Recordings are
 deleted on every outcome. After acquiring the state lock, startup sweeps at most 256 validated unfinished audit operations,
 newest first, by their exact recording names. A sweep failure does not stop serve.
 
@@ -1833,12 +1834,18 @@ ended is an answer: one that succeeded, or one that failed (a status of 400 to 5
 nor does a start request Arca refused before trying to send it, or that Incus answered with an error status. A timeout
 on the owner re-read the start request makes before it is sent marks the instance as the deadline does; that errs toward
 the mark. Rule 50's own commands are still marked only at the deadline. The mark is kept in memory; no command of this
-type runs in a marked instance, nor any closed command but a cleanup. The mark is cleared when Arca reads the instance,
-with the same uuid, stopped, and otherwise only as Rule 50 drops it, when the uuid changes; clearing it makes no stop.
+type runs in a marked instance, nor any closed command but a cleanup. The mark is cleared when Arca sees the instance,
+with the same uuid, stopped, or stopped and started by Incus: a lifecycle stop, a start of a stopped instance or a
+restart, and a stop or restart that `service_update` (the follower's included) or `service_reconfigure` makes. A command
+that began before such a clear sets no mark when it fails after it. A mark also ages: once 5 minutes have passed, or the
+marking command's own limit when that is longer, one journal read of `service_logs` may run, one at a time per instance;
+its answer clears the mark, and any other outcome renews it for 5 minutes. Otherwise it goes only as Rule 50 drops it,
+when the uuid changes. Clearing it makes no stop.
 No rule here limits which program a formula names.
 Source: `FormulaCommand`, `FormulaState`, `FormulaStart`, `UnixIncusWriter::{start_formula_exec, formula_exec_state,
 formula_output}` in `crates/arca-incus/src/exec.rs` and `exchange_tail` in `crates/arca-incus/src/read.rs`;
-`DeclaredCommand` and `ServiceExec::{run_formula, hung, clear_hung_after_stop}` in `crates/arca/src/service_exec.rs`;
+`DeclaredCommand` and `ServiceExec::{run_formula, hung, clear_hung_after_stop, clear_hung_seen_stopped}` in
+`crates/arca/src/service_exec.rs`;
 tests in `crates/arca/tests/services/formula_exec.rs`.
 
 ## Out of scope
