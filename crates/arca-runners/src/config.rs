@@ -49,9 +49,15 @@ pub struct PoolConfig {
     /// its snapshot, or `arca-runner-image-<tag>`, the image it published. Any image alias or fingerprint, or
     /// `<instance>/<snapshot>` of a stopped instance in the pool's project, works the same way.
     pub image: String,
-    /// The profiles of every machine, in order; empty takes the project's `default`.
+    /// The profiles of every machine, in order; empty takes the project's `default`. A profile's `eth0` is replaced by
+    /// the card Arca gives every machine on [`Self::network`].
     #[serde(default)]
     pub profiles: Vec<String>,
+    /// The bridge the machines' card is on; absent, the node's service bridge. The card is Arca's, not a profile's: MAC,
+    /// IPv4 and IPv6 filtering, nothing inbound, and the pool's ACL, which rejects the bridge's whole subnet, the
+    /// private ranges, the tailnet range and the host's addresses and lets the rest of the internet out.
+    #[serde(default)]
+    pub network: Option<String>,
     /// The storage pool of the machines' root disks, needed for a class with `diskGiB`.
     #[serde(default)]
     pub storage_pool: Option<String>,
@@ -104,6 +110,11 @@ impl ClassConfig {
 }
 
 impl PoolConfig {
+    /// The bridge the machines' card is on: [`Self::network`], or the node's service bridge.
+    pub fn bridge(&self) -> &str {
+        self.network.as_deref().unwrap_or(arca_netproject::BRIDGE)
+    }
+
     /// Every rule a pool's settings must keep, with the first one broken named.
     pub fn check(&self) -> Result<(), String> {
         if !plain(&self.name) || !plain(&self.project) {

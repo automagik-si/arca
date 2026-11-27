@@ -270,11 +270,42 @@ pub fn function_egress_rules(
     rules
 }
 
+/// The egress rules of a CI job machine's NIC on a bridge whose gateway is `gateway` and whose subnet is `subnet`
+/// (`a.b.c.d/n`): a tenant service's rules ([`egress_rules`] with a block), in the same order and shape, except that the
+/// first rule rejects the WHOLE subnet. A job machine has no block of its own: it reaches no service, no tenant and no
+/// other job machine on the bridge, and it never has a destination. DHCP and DNS on the gateway pass as they do for a
+/// tenant's service, through the rules Incus keeps for a bridge's own address.
+pub fn job_egress_rules(gateway: Ipv4Addr, subnet: &str, hosts: &Value) -> Vec<Value> {
+    egress_rules_inside(gateway, hosts, Inside::Nothing(subnet), &[], true)
+}
+
+/// What a NIC on the bridge may reach inside the service subnet besides the gateway's DHCP and DNS.
+#[derive(Clone, Copy)]
+enum Inside<'a> {
+    /// Every neighbour: a service of the node's own project.
+    Neighbours,
+    /// Its tenant's block only.
+    Block(Block),
+    /// Nothing: the whole subnet, written as `a.b.c.d/n`, is rejected (a CI job machine).
+    Nothing(&'a str),
+}
+
 /// [`egress_rules`], with or without its last rule: the allow that lets everything not rejected out to the internet.
 fn egress_rules_for(
     gateway: Ipv4Addr,
     hosts: &Value,
     tenant_block: Option<Block>,
+    destinations: &[Destination],
+    internet: bool,
+) -> Vec<Value> {
+    let inside = tenant_block.map_or(Inside::Neighbours, Inside::Block);
+    egress_rules_inside(gateway, hosts, inside, destinations, internet)
+}
+
+fn egress_rules_inside(
+    gateway: Ipv4Addr,
+    hosts: &Value,
+    inside: Inside<'_>,
     destinations: &[Destination],
     internet: bool,
 ) -> Vec<Value> {
@@ -287,7 +318,7 @@ fn egress_rules_for(
             .flatten()
             .filter_map(|host| host.as_str()?.split('/').next()?.parse::<Ipv4Addr>().ok()),
     );
-    let open = if tenant_block.is_some() {
+    let open = if !matches!(inside, Inside::Neighbours) {
         BTreeMap::new()
     } else {
         let mut closed = destination::node_own(hosts);
@@ -319,13 +350,25 @@ fn egress_rules_for(
         .collect::<Vec<_>>()
         .join(",");
     let mut tenant = Vec::new();
-    if let Some(block) = tenant_block {
-        // Inside the service subnet a tenant's service reaches its own block only. Incus weighs a reject above an
-        // allow, so the gateway stays rejected as it is for every service, and its DHCP and DNS answer through the
-        // rules Incus keeps for a bridge's own address; the allows state that those two are meant to pass.
+    let closed = match inside {
+        Inside::Neighbours => None,
+        Inside::Block(block) => Some((
+            block.outside().join(","),
+            "the service subnet outside this tenant's block",
+        )),
+        Inside::Nothing(subnet) => Some((
+            subnet.to_string(),
+            "the whole service subnet: a job machine has no block of its own",
+        )),
+    };
+    if let Some((rejected, description)) = closed {
+        // Inside the service subnet a tenant's service reaches its own block only, and a job machine nothing. Incus
+        // weighs a reject above an allow, so the gateway stays rejected as it is for every service, and its DHCP and
+        // DNS answer through the rules Incus keeps for a bridge's own address; the allows state that those two are
+        // meant to pass.
         tenant.push(rule(json!({"action":"reject",
-            "destination":block.outside().join(","),
-            "description":"the service subnet outside this tenant's block"})));
+            "destination":rejected,
+            "description":description})));
         for (protocol, port, what) in [
             ("udp", "67", "DHCP"),
             ("udp", "53", "DNS"),

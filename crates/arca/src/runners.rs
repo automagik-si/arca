@@ -248,8 +248,23 @@ fn incus_launcher(pool: &PoolConfig, socket: &Path) -> Result<IncusLauncher, Str
         &pool.image,
         pool.profiles.clone(),
         pool.storage_pool.clone(),
+        pool.bridge(),
     )
     .map_err(|error| error.to_string())
+}
+
+/// Deletes the network ACL of every pool that is gone from the node's config (a pool's ACL is made at its start and
+/// reused at the next), logging each one. A node with no pool at all still runs it: its last pool may just have gone.
+pub fn remove_gone_pool_acls(cfg: &NodeConfig) {
+    let pools: Vec<&str> = cfg
+        .runners
+        .iter()
+        .flat_map(|runners| runners.pools.iter())
+        .map(|pool| pool.name.as_str())
+        .collect();
+    for line in arca_runners::incus::remove_gone_pool_acls(&cfg.incus.socket, &pools) {
+        eprintln!("arca: runners: {line}");
+    }
 }
 
 fn start_pool<A: Access, L: Launcher>(

@@ -12,6 +12,7 @@ arca-incus.workspace = true
 # `arca_incus::runner_vm`, is compiled with it, as the adoption writer is for the kernel.
 arca-providers.workspace = true
 arca-metrics.workspace = true
+arca-netproject.workspace = true
 axum.workspace = true
 base64.workspace = true
 getrandom.workspace = true

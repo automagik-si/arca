@@ -370,6 +370,8 @@ enum Route {
     ListImages(String),
     ImageAliases(String, Option<String>),
     ListInstances,
+    /// Every network ACL of every project, each with its `project`: `/1.0/network-acls?all-projects=true&recursion=1`.
+    ListAcls,
     ListInstancesWithState,
     ProjectInstancesWithState(String),
     /// One project's instances without their state: the `recursion=1` listing with a `project`.
@@ -1764,6 +1766,7 @@ fn parse(target: &str) -> Option<Route> {
         ["networks", name] => Route::Object(address("network", "", name)),
         ["networks", network, "forwards"] => Route::Collection(address("forward", network, "")),
         ["networks", network, "forwards", name] => Route::Object(address("forward", network, name)),
+        ["network-acls"] if query == "all-projects=true&recursion=1" => Route::ListAcls,
         ["network-acls"] => Route::Collection(address("acl", "", "")),
         ["network-acls", name] => Route::Object(address("acl", "", name)),
         ["profiles"] => Route::Collection(address("profile", "", "")),
@@ -1876,6 +1879,18 @@ fn dispatch(shared: &Shared, request: &Request, route: Route) -> (u16, String, V
             ),
         },
         ("GET", Route::ListInstances) => sync(Value::Array(store.bodies("instance"))),
+        ("GET", Route::ListAcls) => sync(Value::Array(
+            store
+                .objects
+                .iter()
+                .filter(|object| object.kind == "acl")
+                .map(|object| {
+                    let mut body = object.body.clone();
+                    body["project"] = json!(object.project);
+                    body
+                })
+                .collect(),
+        )),
         ("GET", Route::ListInstancesWithState) => sync(Value::Array(store.instances_with_state())),
         ("GET", Route::ProjectInstancesWithState(project)) => {
             if project != "default"

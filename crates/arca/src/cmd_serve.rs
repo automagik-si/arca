@@ -759,7 +759,11 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
             server = server.handle(verb, handler);
         }
     }
-    // The runner pools run while the kernel serves: this holds them.
+    // The runner pools run while the kernel serves: this holds them. The network ACL of a pool that is gone from the
+    // config goes first.
+    if kernel_mode {
+        crate::runners::remove_gone_pool_acls(&cfg);
+    }
     let _runner_pools = match (&github_signer, runner_board) {
         (Some(signer), Some(board)) => {
             crate::runners::spawn(&cfg, &runner_owner, signer.clone(), board)

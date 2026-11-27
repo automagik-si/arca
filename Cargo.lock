@@ -311,6 +311,7 @@ version = "0.39.0"
 dependencies = [
  "arca-incus",
  "arca-metrics",
+ "arca-netproject",
  "arca-providers",
  "axum",
  "base64 0.23.1",

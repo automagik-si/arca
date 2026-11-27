@@ -7,7 +7,10 @@
 //! another pool, is ever started, written into or deleted from here.
 //!
 //! What it sends: an instance create (a VM, started by the create), files written into and read from the guest through
-//! the Incus agent, one command started through the agent, a forced stop and a delete. Nothing else.
+//! the Incus agent, one command started through the agent, a forced stop and a delete. And the pool's one network ACL,
+//! `arca-runner-<pool>` ([`RunnerVms::acl_name`]), which every job machine's card names: created, its rules replaced
+//! (a PATCH) and deleted, requested in the pool's project (Incus keeps it in the project that holds that project's networks), and
+//! only while it carries the same mark. Nothing else.
 
 use std::path::PathBuf;
 use std::thread;
@@ -20,6 +23,8 @@ use crate::read::{IncusError, exchange_capped};
 
 /// The key, in a job machine's own config, that marks it as a runner pool's: its value is the pool's name.
 pub const RUNNER_KEY: &str = "user.arcakernel.runner";
+/// The start of a pool's network ACL's name: `arca-runner-<pool>`.
+pub const RUNNER_ACL_PREFIX: &str = "arca-runner-";
 /// The largest file read back from a guest, in bytes: a job's packed logs.
 pub const PULL_MAX: usize = 64 * 1024 * 1024;
 /// The largest file written into a guest, in bytes.
@@ -51,6 +56,19 @@ pub struct VmSpec {
     pub storage_pool: Option<String>,
     /// The profiles, in order. Empty takes the project's `default`.
     pub profiles: Vec<String>,
+    /// The bridge the machine's card (`eth0`) is on. The card filters MAC, IPv4 and IPv6 addresses, rejects what no
+    /// rule allows both ways, and names the pool's ACL ([`RunnerVms::acl_name`]); it replaces any `eth0` a profile gives.
+    pub network: String,
+}
+
+/// What became of the pool's ACL at [`RunnerVms::ensure_acl`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AclState {
+    Created,
+    /// It was there with these very rules: nothing was written.
+    Reused,
+    /// It was there with other rules, and they were replaced.
+    Updated,
 }
 
 /// What became of a command started in a guest.
@@ -156,6 +174,22 @@ impl RunnerVms {
         if spec.profiles.iter().any(|profile| !plain_name(profile)) {
             return Err(refused("a profile is not a plain name"));
         }
+        if !plain_name(&spec.network) {
+            return Err(refused("the network is not a plain name"));
+        }
+        devices.insert(
+            "eth0".to_string(),
+            json!({
+                "type": "nic",
+                "network": spec.network,
+                "security.mac_filtering": "true",
+                "security.ipv4_filtering": "true",
+                "security.ipv6_filtering": "true",
+                "security.acls": self.acl_name(),
+                "security.acls.default.ingress.action": "reject",
+                "security.acls.default.egress.action": "reject",
+            }),
+        );
         let mut body = json!({
             "name": spec.name,
             "type": "virtual-machine",
@@ -186,6 +220,94 @@ impl RunnerVms {
             ));
         }
         Ok(())
+    }
+
+    /// The name of the pool's network ACL: `arca-runner-<pool>`.
+    pub fn acl_name(&self) -> String {
+        format!("{RUNNER_ACL_PREFIX}{}", self.pool)
+    }
+
+    /// Makes the pool's ACL hold `ingress` and `egress`: creates it, carrying the pool's mark, when it is not there,
+    /// leaves it alone when it holds those rules already, and replaces its rules otherwise. An ACL of that name without
+    /// this pool's mark is refused and left as it is.
+    pub fn ensure_acl(&self, ingress: &[Value], egress: &[Value]) -> Result<AclState, IncusError> {
+        let name = self.acl_name();
+        let description = format!("Arca runner pool {} job machines; managed by Arca", self.pool);
+        let path = format!("/1.0/network-acls/{name}?project={}", self.project);
+        match self.json("GET", &path, None, TIMEOUT) {
+            Err(IncusError::Status { code: 404, .. }) => {
+                let body = json!({
+                    "name": name,
+                    "description": description,
+                    "config": { RUNNER_KEY: self.pool },
+                    "ingress": ingress,
+                    "egress": egress,
+                });
+                let path = format!("/1.0/network-acls?project={}", self.project);
+                let envelope = self.json("POST", &path, Some(&body), TIMEOUT)?;
+                self.wait_for(&envelope)?;
+                Ok(AclState::Created)
+            }
+            Err(error) => Err(error),
+            Ok(answer) => {
+                let current = answer
+                    .get("metadata")
+                    .ok_or_else(|| decode("the answer has no metadata"))?;
+                if !self.acl_marked(current) {
+                    return Err(refused("the network ACL is not this pool's"));
+                }
+                let rules = |key: &str| {
+                    current
+                        .get(key)
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default()
+                };
+                if crate::acl_rules_match(&rules("ingress"), ingress)
+                    && crate::acl_rules_match(&rules("egress"), egress)
+                {
+                    return Ok(AclState::Reused);
+                }
+                // Incus's ACL PATCH merges the config (the mark stays) and replaces the description and both rule
+                // arrays, as the journal writer's ACL patch relies on.
+                let body = json!({
+                    "description": description,
+                    "config": current.get("config").cloned().unwrap_or_else(|| json!({})),
+                    "ingress": ingress,
+                    "egress": egress,
+                });
+                let envelope = self.json("PATCH", &path, Some(&body), TIMEOUT)?;
+                self.wait_for(&envelope)?;
+                Ok(AclState::Updated)
+            }
+        }
+    }
+
+    /// Deletes the pool's ACL, once its pool is gone. One that is already gone is not an error; one without this pool's
+    /// mark is refused and left as it is. Incus refuses the delete while a machine's card still names it.
+    pub fn remove_acl(&self) -> Result<(), IncusError> {
+        let path = format!("/1.0/network-acls/{}?project={}", self.acl_name(), self.project);
+        match self.json("GET", &path, None, TIMEOUT) {
+            Err(IncusError::Status { code: 404, .. }) => return Ok(()),
+            Err(error) => return Err(error),
+            Ok(answer) => {
+                if !answer.get("metadata").is_some_and(|acl| self.acl_marked(acl)) {
+                    return Err(refused("the network ACL is not this pool's"));
+                }
+            }
+        }
+        match self.json("DELETE", &path, None, TIMEOUT) {
+            Ok(envelope) => self.wait_for(&envelope),
+            Err(IncusError::Status { code: 404, .. }) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn acl_marked(&self, acl: &Value) -> bool {
+        acl.get("config")
+            .and_then(|config| config.get(RUNNER_KEY))
+            .and_then(Value::as_str)
+            == Some(self.pool.as_str())
     }
 
     /// Whether the machine's Incus agent answers: a read of `/` in the guest succeeds.
