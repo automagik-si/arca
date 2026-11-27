@@ -698,7 +698,10 @@ fn a_restart_whose_start_half_is_refused_once_ends_running_and_says_the_start_wa
         .collect();
     assert_eq!(separate.len(), 1, "{rows:?}");
     assert_eq!(separate[0]["status"], json!("Stopped"));
-    let end = rows.iter().find(|row| row["kind"] == "end").expect("an end row");
+    let end = rows
+        .iter()
+        .find(|row| row["kind"] == "end")
+        .expect("an end row");
     assert_eq!(end["id"], separate[0]["id"]);
     assert_eq!(end["outcome"], json!("started_after_restart"));
     assert_eq!(end["status"], json!("Running"));
@@ -715,13 +718,19 @@ fn a_restart_slower_than_the_deadline_names_the_real_state_and_starts_a_stopped_
     rig.fake.release_operation(&slow);
     assert_eq!(answer["status"], json!("Running"), "{answer}");
     let message = answer["message"].as_str().expect("a message");
-    assert!(message.contains("did not answer by the deadline"), "{message}");
+    assert!(
+        message.contains("did not answer by the deadline"),
+        "{message}"
+    );
     assert!(message.contains("It was stopped"), "{message}");
     assert!(message.contains("one plain start"), "{message}");
     assert_eq!(rig.status(PROJECT, "api"), "Running");
     assert_eq!(rig.fake.state_actions(PROJECT, "api"), ["restart", "start"]);
     let rows = rig.journal();
-    assert!(rows.iter().any(|row| row["kind"] == "separate_start"), "{rows:?}");
+    assert!(
+        rows.iter().any(|row| row["kind"] == "separate_start"),
+        "{rows:?}"
+    );
 }
 
 #[test]
@@ -737,8 +746,14 @@ fn a_restart_whose_separate_start_is_refused_too_says_it_is_stopped_and_sends_on
     assert_eq!(rig.status(PROJECT, "api"), "Stopped");
     assert_eq!(rig.fake.state_actions(PROJECT, "api"), ["restart", "start"]);
     let rows = rig.journal();
-    assert!(rows.iter().any(|row| row["kind"] == "separate_start"), "{rows:?}");
-    let end = rows.iter().find(|row| row["kind"] == "end").expect("an end row");
+    assert!(
+        rows.iter().any(|row| row["kind"] == "separate_start"),
+        "{rows:?}"
+    );
+    let end = rows
+        .iter()
+        .find(|row| row["kind"] == "end")
+        .expect("an end row");
     assert_eq!(end["outcome"], json!("failed"));
     assert_eq!(end["code"], json!("InstanceRestartFailed"));
 }

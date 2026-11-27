@@ -10,13 +10,16 @@
 //! proposal the owner approved, and a direct call without one is refused. All three can be proposed with `action_propose`.
 //!
 //! The verbs are idempotent. A start of a running instance and a stop of a stopped one change nothing, succeed and say
-//! so; a restart of a stopped instance starts it. A stop and a restart are graceful and nothing is ever forced.
+//! so; a restart of a stopped instance starts it. A stop and a restart are graceful and nothing is ever forced. A restart
+//! that fails once it was sent, or is not answered by the writer's deadline, is followed by a read of the instance: one
+//! that is stopped then is sent one plain start, apart from the restart, and the answer says so.
 //!
 //! A power state is not a desired-state entry, so these changes are not effects in the effect journal: an open intent
 //! there is settled at the next start as a create or a patch, which a state change is not. Every call that passes its
 //! gate is journalled in [`INSTANCE_ACTIONS_FILE`] instead, an append-only file of JSON lines in the state directory: a
 //! `begin` line before anything is sent to Incus, and an `end` line with what happened. A `begin` that cannot be made
-//! durable refuses the call before any change.
+//! durable refuses the call before any change. The start sent after a failed restart has its own `separate_start` line,
+//! written before it is sent, and the `end` line's outcome is then `started_after_restart` or the restart's failure.
 
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
@@ -246,7 +249,7 @@ impl InstanceLifecycle {
                 "the instance action journal could not be written, so nothing was changed",
             )
         })?;
-        let outcome = self.act(action, project, instance);
+        let outcome = self.act(action, project, instance, &id);
         let end = match &outcome {
             Ok(done) => json!({
                 "kind": "end",
@@ -337,7 +340,13 @@ impl InstanceLifecycle {
         }))
     }
 
-    fn act(&self, action: StateAction, project: &str, instance: &str) -> Result<Done, Stopped> {
+    fn act(
+        &self,
+        action: StateAction,
+        project: &str,
+        instance: &str,
+        id: &str,
+    ) -> Result<Done, Stopped> {
         let seen = self.target(project, instance).map_err(|refusal| Stopped {
             refusal,
             uuid: None,
@@ -407,9 +416,18 @@ impl InstanceLifecycle {
             }),
             Err(error) => {
                 // What the instance is now is read again, so the refusal says what is true and not what was asked.
-                let now = self
-                    .changer()
-                    .read(project, instance)
+                let now = self.changer().read(project, instance);
+                // A restart sent and failed, or not answered in time, may have left the instance stopped: Incus failed its
+                // start half after its stop half, or was still at it when the writer stopped waiting.
+                if send == StateAction::Restart
+                    && let Ok(now) = &now
+                    && now.is_stopped()
+                    && now.uuid == seen.uuid
+                    && now.kind == seen.kind
+                {
+                    return self.start_after_restart(&seen, &named, &error, id);
+                }
+                let now = now
                     .map(|state| shown_status(&state.status))
                     .unwrap_or_else(|_| "in an unknown state".to_string());
                 let verb = match action {
@@ -431,7 +449,65 @@ impl InstanceLifecycle {
                             StateAction::Stop => "InstanceStopFailed",
                             StateAction::Restart => "InstanceRestartFailed",
                         },
-                        format!("{named} was not {verb}: {error}. It is {now} now.{grace}"),
+                        format!(
+                            "{named} was not {verb}: {error}{}. It is {now} now.{grace}",
+                            if send == StateAction::Restart {
+                                unwaited(&error)
+                            } else {
+                                ""
+                            }
+                        ),
+                    ),
+                    uuid: seen.uuid.clone(),
+                    was: Some(seen.status.clone()),
+                })
+            }
+        }
+    }
+
+    /// Follows a restart that was sent and left the instance stopped with one plain start, never forced. The start is
+    /// journalled before it is sent, and the answer says the restart failed, why, and what the start did.
+    fn start_after_restart(
+        &self,
+        seen: &InstanceState,
+        named: &str,
+        error: &IncusError,
+        id: &str,
+    ) -> Result<Done, Stopped> {
+        let failed = format!(
+            "{named} was not restarted: {error}{}. It was stopped then, so Arca sent it one plain start, apart from the restart",
+            unwaited(error)
+        );
+        let row = json!({
+            "kind": "separate_start",
+            "id": id,
+            "after": "restart",
+            "status": "Stopped",
+        });
+        // The action itself is journalled already, and its end line names the start: an instance is not left stopped
+        // because this line could not be written.
+        if self.append(&row).is_err() {
+            eprintln!("arca: the separate start of instance action {id} was not journalled");
+        }
+        match self.changer().change(seen, StateAction::Start) {
+            Ok(state) => Ok(Done {
+                state,
+                changed: true,
+                outcome: "started_after_restart",
+                message: format!("{failed}, and it is running now"),
+            }),
+            Err(start_error) => {
+                let now = self
+                    .changer()
+                    .read(&seen.project, &seen.name)
+                    .map(|state| shown_status(&state.status))
+                    .unwrap_or_else(|_| "in an unknown state".to_string());
+                Err(Stopped {
+                    refusal: refused(
+                        "InstanceRestartFailed",
+                        format!(
+                            "{failed}, which failed too: {start_error}. It is {now} now. Arca gives it {GRACE_SECONDS} seconds to shut down and forces nothing."
+                        ),
                     ),
                     uuid: seen.uuid.clone(),
                     was: Some(seen.status.clone()),
@@ -466,6 +542,16 @@ impl InstanceLifecycle {
         bytes.push(b'\n');
         file.write_all(&bytes)?;
         file.sync_all()
+    }
+}
+
+/// What a state change the writer stopped waiting for leaves unknown, said after its error; nothing for any other error.
+fn unwaited(error: &IncusError) -> &'static str {
+    match error {
+        IncusError::Timeout => {
+            "; Arca stopped waiting, and Incus may still have been working on it"
+        }
+        _ => "",
     }
 }
 

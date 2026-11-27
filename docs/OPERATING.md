@@ -3191,10 +3191,15 @@ requests (`owner_approval_request`) have no word for a stop or a restart, so tho
 instance that is not Arca's cannot be proposed either, so the owner is never shown a card for it.
 
 A stop and a restart are graceful: Incus gives the instance 60 seconds to shut down. Arca forces nothing. One call takes
-at most 150 seconds, and the approval page waits 180 seconds for a linked kernel's answer to an approval (30 for any other
+at most 280 seconds, and the approval page waits 310 seconds for a linked kernel's answer to an approval (30 for any other
 relayed write), so a slow stop on a linked host still answers as done or with its own refusal. An instance
 that does not shut down stays running and the call is refused with `InstanceStopFailed` or `InstanceRestartFailed`, with
-the state the instance is in now. A frozen instance, or one in an error state, is left as it is
+the state the instance is in now. A restart that fails once it was sent (Incus failed its start half after its stop
+half), or that Incus has not finished by Arca's 90-second wait, is followed by a read of the instance: one that is
+stopped then is sent one plain start, never forced, apart from the restart. The answer says the restart failed, why, and
+that the start was sent: the instance is running, or the call is refused with `InstanceRestartFailed` and the state it is
+in now. In `instance-actions.jsonl` that start has its own `separate_start` line, written before it is sent, and the
+action's `end` line has the outcome `started_after_restart` when it ran. A frozen instance, or one in an error state, is left as it is
 (`InstanceStateUnsupported`). An instance recreated between the owner check and the change is refused with
 `InstanceChanged`, and nothing is sent to it.
 
@@ -4536,10 +4541,10 @@ Then:
   (`act-…`) to its `action_approve`, a delete plan's digest to its `approval_submit`. It answers what that kernel said:
   its result with `host` added, or its exact refusal (403 `{refusal, message}`, for example `WrongHost`, `BadSignature`,
   `Expired` or `Replayed`). `POST /approve/decline` with a `host` relays an action's decline to `plan_decline` the same
-  way. The page waits for a relayed approval as long as the action can run: 180 seconds, and for a `service_update`
+  way. The page waits for a relayed approval as long as the action can run: 310 seconds, and for a `service_update`
   longer: one Incus step of its rebuild may take 600 seconds (a registry pull included), its new version has its
   `timeoutSeconds` (120 by default) to answer, and after a rollback the old one has up to 30 more. A `service_update`
-  with `timeoutSeconds` 300 waits 1110 seconds. The wait comes from the card as last listed: a linked host the page
+  with `timeoutSeconds` 300 waits 1240 seconds. The wait comes from the card as last listed: a linked host the page
   could not read keeps the wait it was listed with before.
 - A `host` the page does not list is refused 403 `{ "refusal": "NotLinked", "message": "this machine is not linked for
   approvals yet" }`. A linked kernel that refuses the token answers 502 `LinkToken`, with a message that says what to

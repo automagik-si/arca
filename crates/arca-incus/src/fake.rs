@@ -4315,18 +4315,16 @@ fn change_state(
         .push(text_in(&sent, "action"));
     match text_in(&sent, "action").as_str() {
         "start" if running => bad("The instance is already running"),
-        "start" if start_refused_by_test(shared, address) => {
-            answered(
-                shared,
-                store,
-                "instance",
-                "PUT",
-                Err((
-                    400,
-                    "Failed to start the instance (refused by the test)".to_string(),
-                )),
-            )
-        }
+        "start" if start_refused_by_test(shared, address) => answered(
+            shared,
+            store,
+            "instance",
+            "PUT",
+            Err((
+                400,
+                "Failed to start the instance (refused by the test)".to_string(),
+            )),
+        ),
         "start" => {
             if let Some(reason) =
                 start_refusal(&store.objects[index].body, *lock(&shared.lxc_split))
@@ -4397,7 +4395,10 @@ fn change_state(
                 return answered(shared, store, "instance", "PUT", failure);
             }
             // A slow one has done its stop half and is still running when the caller looks.
-            if store.held_states.contains_key(&(address.project.clone(), address.name.clone())) {
+            if store
+                .held_states
+                .contains_key(&(address.project.clone(), address.name.clone()))
+            {
                 stop_half(shared, store, index, address);
                 if let Some(held) = held_state(store, address) {
                     return held;
@@ -4408,8 +4409,9 @@ fn change_state(
                 start_refusal(&store.objects[index].body, *lock(&shared.lxc_split))
                     .or_else(|| device_limit_refusal(shared, &store.objects[index].body))
                     .or_else(|| {
-                        start_refused_by_test(shared, address)
-                            .then(|| "Failed to start the instance (refused by the test)".to_string())
+                        start_refused_by_test(shared, address).then(|| {
+                            "Failed to start the instance (refused by the test)".to_string()
+                        })
                     })
             {
                 store.objects[index].body["status"] = json!("Stopped");

@@ -26,10 +26,12 @@ use crate::write::ProjectFamily;
 pub const GRACE_SECONDS: u64 = 60;
 /// The longest one state change's operation is waited on: the grace, and time for Incus to fail the operation after it.
 const DEADLINE: Duration = Duration::from_secs(90);
-/// The longest one caller's whole action may take: two reads before the change, the change's own request, the wait on its
-/// operation, the read-back and one more read after a failure, each read and request bounded by the client's timeout. A
-/// relay that waits for the answer must wait longer than this.
-pub const CALL_BUDGET: Duration = Duration::from_secs(150);
+/// The longest one caller's whole action may take, a restart's being the longest: two reads before the change, the
+/// change's own request, the wait on its operation, the read-back and one more read after a failure; then, when a failed
+/// restart left the instance stopped, the plain start that follows it with its own read, request, wait and read-back, and
+/// one more read after its failure. Each read and request is bounded by the client's timeout. A relay that waits for the
+/// answer must wait longer than this.
+pub const CALL_BUDGET: Duration = Duration::from_secs(280);
 /// How long one wait request asks Incus to hold.
 const WAIT_SECONDS: u64 = 5;
 /// The pause between two looks at an operation that is still running.
@@ -1304,8 +1306,9 @@ mod tests {
 
     #[test]
     fn the_call_budget_covers_every_request_of_one_action() {
-        // Two reads, the PUT, the wait, the read-back and the read after a failure.
-        assert!(TIMEOUT * 5 + DEADLINE <= CALL_BUDGET);
+        // Two reads, the PUT, the wait, the read-back and the read after a failure; after a failed restart, the start's
+        // read, PUT, wait and read-back, and the read after its failure.
+        assert!(TIMEOUT * 10 + DEADLINE * 2 <= CALL_BUDGET);
         assert!(Duration::from_secs(GRACE_SECONDS) < DEADLINE);
     }
 }
