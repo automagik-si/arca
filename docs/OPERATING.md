@@ -3201,9 +3201,12 @@ A restart that Incus fails once it was sent (it failed its start half after its 
 instance: one that is stopped then is sent one plain start, never forced, apart from the restart. A restart Incus has not
 finished by Arca's 90-second wait is waited on for 45 seconds more before anything is read, because Incus reports a
 restarting instance stopped until its start half comes up, and a start sent then would join that restart. When it has
-ended, Arca decides as above, and the start gets 45 seconds. When it is still running, Arca sends nothing more and the
-call is refused with `InstanceRestartFailed`, saying the restart is still running and the state is not known until it
-ends. The answer says the restart failed, why, and what Arca did: the instance is running, or the call is refused with
+ended, Arca decides as above, and the start gets 45 seconds. A first wait that breaks off with an error is treated the
+same way: only the operation's own end says the restart ended. When it is still running, Arca sends nothing more and
+the call is refused with `InstanceRestartUnknown` (not a failure: Incus may still finish it), saying the restart is
+still running and the state is not known until it ends. A restart request Incus did not answer in time names no
+operation, so Arca starts nothing and refuses the call with `InstanceRestartUnknown` too, saying Incus may still be
+working on it. The answer says the restart failed, why, and what Arca did: the instance is running, or the call is refused with
 `InstanceRestartFailed` and the state it is in now. In `instance-actions.jsonl` the start has its own `separate_start`
 line, written before it is sent, and the action's `end` line has the outcome `started_after_restart`, or
 `running_after_restart` when the start was refused but the instance runs anyway. A restart still running when Arca stops
@@ -3222,8 +3225,10 @@ them. Each call that passes its gate is written to `instance-actions.jsonl` in t
 {"kind":"end","id":"ia-<ms>-<n>","outcome":"started","code":null,"uuid":"<volatile uuid>","status":"Running"}
 ```
 
-`outcome` is `started`, `already_running`, `stopped`, `already_stopped`, `restarted`, `started_from_stopped`, `refused` or
-`failed`, and `code` is the refusal's code for the last two: `failed` only when a state change was sent and did not finish.
+`outcome` is `started`, `already_running`, `stopped`, `already_stopped`, `restarted`, `started_from_stopped`,
+`started_after_restart`, `running_after_restart`, `refused`, `failed` or `unknown`, and `code` is the refusal's code for
+the last three: `failed` only when a state change was sent and did not finish, `unknown` (`InstanceRestartUnknown`) when
+a restart was sent and Arca does not know how it ended.
 `proposal` is the approved proposal a stop or a restart ran from; a start carries no grant, so it is `null` there. A
 start or a restart that wrote a virtual machine's secrets into its guest adds a third line,
 `{"kind":"guest_secrets","id":"ia-<ms>-<n>","outcome":"written","secrets":["<name>", ...]}`, or `"outcome":"failed"`

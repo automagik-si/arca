@@ -48,6 +48,8 @@ use crate::kernel::Kernel;
 
 /// The instance action journal's file name in the state directory.
 pub const INSTANCE_ACTIONS_FILE: &str = "instance-actions.jsonl";
+/// The code of a restart whose end Arca does not know: Incus may still be running it, so nothing more was sent.
+const RESTART_UNKNOWN: &str = "InstanceRestartUnknown";
 /// A journal past this size is set aside as `<name>.1`, replacing the one set aside before, and a new one is begun.
 const MAX_JOURNAL_BYTES: u64 = 8 * 1024 * 1024;
 
@@ -269,6 +271,7 @@ impl InstanceLifecycle {
                 "kind": "end",
                 "id": id,
                 "outcome": match &stopped.refusal {
+                    CallError::Refused { code, .. } if code == RESTART_UNKNOWN => "unknown",
                     CallError::Refused { code, .. } if code.ends_with("Failed") => "failed",
                     _ => "refused",
                 },
@@ -487,38 +490,56 @@ impl InstanceLifecycle {
         }
         let first = changer.deadline();
         let mut start_deadline = first;
+        // The instance as read once the restart has ended, when a branch below has read it already.
+        let mut read_after = None;
         let failed = match &failure.unfinished {
             None => format!("{named} was not restarted: {}", failure.error),
             Some(unfinished) => {
                 start_deadline = first / 2;
+                // What the first wait on the restart came to: it ran out, or it broke off with an error.
+                let late = match &failure.error {
+                    IncusError::Timeout => format!("Incus took longer than {}", spoken(first)),
+                    error => format!("Arca's wait on the restart broke off ({error})"),
+                };
                 match changer.wait_unfinished(unfinished, first / 2) {
                     OperationEnd::Succeeded => {
-                        // Incus finished the restart after the first wait: the instance is what the read shows.
-                        if let Ok(state) = changer.read(&seen.project, &seen.name)
-                            && state.is_running()
-                        {
-                            return Ok(Done {
-                                state,
-                                changed: true,
-                                outcome: "restarted",
-                                message: format!(
-                                    "restarted {named}; Incus took longer than {} to finish it",
-                                    spoken(first)
-                                ),
-                            });
+                        // Incus finished the restart after the first wait: the instance is what the read shows. A
+                        // read that fails is tried once more, so one failed read is not taken for a stopped instance.
+                        let now = changer
+                            .read(&seen.project, &seen.name)
+                            .or_else(|_| changer.read(&seen.project, &seen.name));
+                        match now {
+                            Ok(state) if state.is_running() => {
+                                return Ok(Done {
+                                    state,
+                                    changed: true,
+                                    outcome: "restarted",
+                                    message: format!(
+                                        "restarted {named}; {late}, and it finished after that"
+                                    ),
+                                });
+                            }
+                            Ok(_) => {
+                                read_after = Some(now);
+                                format!(
+                                    "{named} was restarted by Incus ({late}), but it did not stay running"
+                                )
+                            }
+                            Err(_) => {
+                                read_after = Some(now);
+                                format!(
+                                    "{named} was restarted by Incus ({late}), but Arca could not read it after that"
+                                )
+                            }
                         }
+                    }
+                    OperationEnd::Failed(error) => {
                         format!(
-                            "{named} was restarted by Incus after {}, but it did not stay running",
-                            spoken(first)
+                            "{named} was not restarted: {late} and then failed the restart: {error}"
                         )
                     }
-                    OperationEnd::Failed(error) => format!(
-                        "{named} was not restarted: Incus took longer than {} and then failed the restart: {error}",
-                        spoken(first)
-                    ),
                     OperationEnd::Gone => format!(
-                        "{named} was not restarted in {}, and Incus has ended the restart since without saying how",
-                        spoken(first)
+                        "{named} was not restarted: {late}, and Incus has ended the restart since without saying how"
                     ),
                     still => {
                         let why = match still {
@@ -534,9 +555,9 @@ impl InstanceLifecycle {
                             );
                         }
                         return Err(stopped(refused(
-                            "InstanceRestartFailed",
+                            RESTART_UNKNOWN,
                             format!(
-                                "{named} has not finished restarting: Incus has been at it for {} and {why}. Arca sent nothing more, so it does not start the instance twice. Its state is not known until Incus ends that restart; read it again then, and run instance_start if it is stopped. Arca forces nothing.",
+                                "{named} has not finished restarting: {late}, and {} after it was sent {why}. Arca sent nothing more, so it does not start the instance twice. Its state is not known until Incus ends that restart; read it again then, and run instance_start if it is stopped. Arca forces nothing.",
                                 spoken(first + first / 2)
                             ),
                         )));
@@ -545,10 +566,12 @@ impl InstanceLifecycle {
             }
         };
         // A request Incus did not answer in time names no operation: the restart may be running, so nothing is started.
-        let ended = failure.unfinished.is_some() || !matches!(failure.error, IncusError::Timeout);
+        let unanswered = failure.unfinished.is_none()
+            && failure.sent
+            && matches!(failure.error, IncusError::Timeout);
         // The restart has ended: what the instance is now is read, so the answer says what is true.
-        let now = changer.read(&seen.project, &seen.name);
-        if ended
+        let now = read_after.unwrap_or_else(|| changer.read(&seen.project, &seen.name));
+        if !unanswered
             && let Ok(now) = &now
             && now.is_stopped()
             && now.uuid == seen.uuid
@@ -559,6 +582,14 @@ impl InstanceLifecycle {
         let now = now
             .map(|state| shown_status(&state.status))
             .unwrap_or_else(|_| "in an unknown state".to_string());
+        if unanswered {
+            return Err(stopped(refused(
+                RESTART_UNKNOWN,
+                format!(
+                    "{failed}; Incus may have taken the restart and still be working on it, so Arca sent nothing more. It is {now} now; read it again in a minute, and run instance_start if it is stopped. Arca forces nothing."
+                ),
+            )));
+        }
         Err(stopped(refused(
             "InstanceRestartFailed",
             format!(
