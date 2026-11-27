@@ -53,7 +53,9 @@
 //! included, is refused when the container's init would get other arguments than its `oci.entrypoint` names, by the chain
 //! Incus 7.6 runs and the split of the node's liblxc ([`lxc_execute_argv`], [`FakeIncus::set_lxc_split`]), and when an
 //! `environment.*` value holds a line break or a carriage return, as Incus 7.6 refuses either at start. A graceful stop can be made to
-//! outlast its timeout ([`FakeIncus::hang_stop`]), and then only `force: true` stops it. A NIC's MAC is its device's `hwaddr`,
+//! outlast its timeout ([`FakeIncus::hang_stop`]), and then only `force: true` stops it. A test can refuse a start
+//! ([`FakeIncus::refuse_start`], [`FakeIncus::refuse_start_once`]), a restart's start half with it, which leaves the instance
+//! stopped, and hold a stop or a restart past its caller's wait ([`FakeIncus::hold_state`]). A NIC's MAC is its device's `hwaddr`,
 //! else its `volatile.<dev>.hwaddr`, else one the start
 //! generates and keeps there. Its IPv4 is its device's `ipv4.address`, else the lease its MAC holds in the DHCP lease table,
 //! else a fresh one the start leases ([`FakeIncus::set_lease`]; `/1.0/networks/<n>/leases`). A lease a start pins, or one
@@ -275,6 +277,9 @@ struct Store {
     held: BTreeMap<String, Held>,
     /// Creates a test armed with [`FakeIncus::hold_create`] that have not arrived yet.
     armed: Vec<Armed>,
+    /// State changes a test armed with [`FakeIncus::hold_state`] that have not arrived yet: the operation id each runs as,
+    /// by project and instance name.
+    held_states: BTreeMap<(String, String), String>,
     /// The DHCP lease table, one lease per MAC.
     leases: Vec<Lease>,
     /// The instances whose graceful stop outlasts its timeout, by name, and whether a forced stop fails too.
@@ -471,6 +476,7 @@ impl Shared {
             objects,
             operations: BTreeMap::new(),
             held: BTreeMap::new(),
+            held_states: BTreeMap::new(),
             armed: Vec::new(),
             leases: Vec::new(),
             hung: BTreeMap::new(),
@@ -872,6 +878,19 @@ impl FakeIncus {
             place: place_of(target),
             appears,
         });
+        OpId(id)
+    }
+
+    /// Makes the next graceful stop or restart of the instance `name` in `project` run as a held operation with the id
+    /// returned here, as a shutdown slower than the caller's wait. Its stop half is done when it arrives, so the instance
+    /// shows stopped while the operation runs; the operation stays running until the test releases or fails it, and either
+    /// way leaves the instance as it is then: a restart's start half is not modelled. The fake holds no instance lock, so a
+    /// state change sent while it runs is served.
+    pub fn hold_state(&self, project: &str, name: &str) -> OpId {
+        let id = self.shared.next_id();
+        lock(&self.shared.store)
+            .held_states
+            .insert((project.to_string(), name.to_string()), id.clone());
         OpId(id)
     }
 
@@ -4296,11 +4315,7 @@ fn change_state(
         .push(text_in(&sent, "action"));
     match text_in(&sent, "action").as_str() {
         "start" if running => bad("The instance is already running"),
-        "start"
-            if lock(&shared.migration)
-                .refuse_start
-                .contains(&(address.project.clone(), address.name.clone())) =>
-        {
+        "start" if start_refused_by_test(shared, address) => {
             answered(
                 shared,
                 store,
@@ -4367,21 +4382,10 @@ fn change_state(
                 let failure = Err((400, "Failed shutting down instance".to_string()));
                 return answered(shared, store, "instance", "PUT", failure);
             }
-            if let Some(body) = store.objects[index].body.as_object_mut() {
-                body.insert("status".to_string(), json!("Stopped"));
+            stop_half(shared, store, index, address);
+            if let Some(held) = held_state(store, address) {
+                return held;
             }
-            store
-                .run_memory
-                .remove(&(address.project.clone(), address.name.clone()));
-            if let Some(config) = store.objects[index]
-                .body
-                .get_mut("config")
-                .and_then(Value::as_object_mut)
-                && config.contains_key("volatile.last_state.power")
-            {
-                config.insert("volatile.last_state.power".to_string(), json!("STOPPED"));
-            }
-            lock(&shared.exits).remove(&(address.project.clone(), address.name.clone()));
             answered(shared, store, "instance", "PUT", Ok(()))
         }
         "restart" if !running => bad("The instance is already stopped"),
@@ -4392,10 +4396,21 @@ fn change_state(
                 let failure = Err((400, "Failed shutting down instance".to_string()));
                 return answered(shared, store, "instance", "PUT", failure);
             }
-            // Its stop half is done when its start half cannot start the entrypoint: it ends stopped.
+            // A slow one has done its stop half and is still running when the caller looks.
+            if store.held_states.contains_key(&(address.project.clone(), address.name.clone())) {
+                stop_half(shared, store, index, address);
+                if let Some(held) = held_state(store, address) {
+                    return held;
+                }
+            }
+            // Its stop half is done when its start half cannot start the entrypoint, or is refused: it ends stopped.
             if let Some(reason) =
                 start_refusal(&store.objects[index].body, *lock(&shared.lxc_split))
                     .or_else(|| device_limit_refusal(shared, &store.objects[index].body))
+                    .or_else(|| {
+                        start_refused_by_test(shared, address)
+                            .then(|| "Failed to start the instance (refused by the test)".to_string())
+                    })
             {
                 store.objects[index].body["status"] = json!("Stopped");
                 lock(&shared.exits).remove(&(address.project.clone(), address.name.clone()));
@@ -4411,6 +4426,50 @@ fn change_state(
         }
         _ => bad("the fake takes only a start, a stop or a restart"),
     }
+}
+
+/// Whether a test refused the next start of the instance at `address`: every start ([`FakeIncus::refuse_start`]), or this
+/// one alone ([`FakeIncus::refuse_start_once`]), which it uses up.
+fn start_refused_by_test(shared: &Shared, address: &Address) -> bool {
+    let key = (address.project.clone(), address.name.clone());
+    let mut migration = lock(&shared.migration);
+    migration.refuse_start.contains(&key) || migration.refuse_start_once.remove(&key)
+}
+
+/// A graceful stop's effect on the instance at `index`: it is stopped, its memory `/run` is gone and a planned exit with it.
+fn stop_half(shared: &Shared, store: &mut Store, index: usize, address: &Address) {
+    if let Some(body) = store.objects[index].body.as_object_mut() {
+        body.insert("status".to_string(), json!("Stopped"));
+    }
+    store
+        .run_memory
+        .remove(&(address.project.clone(), address.name.clone()));
+    if let Some(config) = store.objects[index]
+        .body
+        .get_mut("config")
+        .and_then(Value::as_object_mut)
+        && config.contains_key("volatile.last_state.power")
+    {
+        config.insert("volatile.last_state.power".to_string(), json!("STOPPED"));
+    }
+    lock(&shared.exits).remove(&(address.project.clone(), address.name.clone()));
+}
+
+/// The answer of a state change a test armed with [`FakeIncus::hold_state`]: its operation, running until the test ends it.
+fn held_state(store: &mut Store, address: &Address) -> Option<Answer> {
+    let id = store
+        .held_states
+        .remove(&(address.project.clone(), address.name.clone()))?;
+    let place = Place {
+        kind: "instance".to_string(),
+        project: address.project.clone(),
+        parent: String::new(),
+        name: address.name.clone(),
+    };
+    let operation = running_operation(&id, &place);
+    store.operations.insert(id.clone(), operation.clone());
+    store.held.insert(id.clone(), Held::default());
+    Some((202, String::new(), async_envelope(&id, operation)))
 }
 
 /// Takes a snapshot of one custom volume. Its body is exactly `{"name": <snapshot>}`, kept as sent. A restricted project
@@ -5326,6 +5385,8 @@ struct MigrationFake {
     held_pushes: Vec<String>,
     /// The instances whose start is refused, by project and name.
     refuse_start: BTreeSet<(String, String)>,
+    /// The instances whose next start alone is refused, by project and name.
+    refuse_start_once: BTreeSet<(String, String)>,
     /// The `host:port` addresses this fake, as a target, does not answer a push on.
     unreachable: std::collections::BTreeSet<String>,
     /// Whether this fake's pushes leave the guest files behind (a copy whose files differ from the source's).
@@ -5420,10 +5481,18 @@ impl FakeIncus {
         });
     }
 
-    /// Refuses every start of the instance, as Incus refuses one that cannot start here.
+    /// Refuses every start of the instance, a restart's start half included, as Incus refuses one that cannot start here.
     pub fn refuse_start(&self, project: &str, name: &str) {
         lock(&self.shared.migration)
             .refuse_start
+            .insert((project.to_string(), name.to_string()));
+    }
+
+    /// Refuses the next start of the instance alone, a restart's start half included: a restart then ends stopped, as one
+    /// whose start half Incus failed after its stop half. The start after it is served as usual.
+    pub fn refuse_start_once(&self, project: &str, name: &str) {
+        lock(&self.shared.migration)
+            .refuse_start_once
             .insert((project.to_string(), name.to_string()));
     }
 
