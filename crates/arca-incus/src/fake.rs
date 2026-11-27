@@ -280,7 +280,7 @@ struct Store {
     armed: Vec<Armed>,
     /// State changes a test armed with [`FakeIncus::hold_state`] that have not arrived yet: the operation id each runs as,
     /// by project and instance name.
-    held_states: BTreeMap<(String, String), String>,
+    held_states: BTreeMap<(String, String), ArmedState>,
     /// The starts that joined a held restart's pending start half, as Incus hands a start the restart's lock: by project
     /// and instance name, how many.
     joined: BTreeMap<(String, String), u32>,
@@ -333,7 +333,13 @@ struct Held {
     then: Option<Then>,
     /// The instance, by project and name, a held restart starts when it succeeds: its start half, still pending.
     starts: Option<(String, String)>,
+    /// When the operation ends by itself, and its `err` then (`None` for success).
+    ends: Option<(Instant, Option<String>)>,
 }
+
+/// A state change a test armed with [`FakeIncus::hold_state`]: the operation id it runs as, and when it ends by itself
+/// after it arrives, with what `err`.
+type ArmedState = (String, Option<(Duration, Option<String>)>);
 
 /// What else a held operation does when it ends, told whether it succeeded and given the operation to finish.
 type Then = Box<dyn FnOnce(bool, &mut Value) + Send>;
@@ -898,7 +904,25 @@ impl FakeIncus {
         let id = self.shared.next_id();
         lock(&self.shared.store)
             .held_states
-            .insert((project.to_string(), name.to_string()), id.clone());
+            .insert((project.to_string(), name.to_string()), (id.clone(), None));
+        OpId(id)
+    }
+
+    /// [`FakeIncus::hold_state`], and the operation ends by itself `after` from when the change arrives: with success, or
+    /// with failure and `failure` as its `err`, as [`FakeIncus::release_operation`] and [`FakeIncus::fail_operation`] end
+    /// it. The end is seen by a wait on the operation, which is how a caller learns of it.
+    pub fn hold_state_ending(
+        &self,
+        project: &str,
+        name: &str,
+        after: Duration,
+        failure: Option<&str>,
+    ) -> OpId {
+        let id = self.shared.next_id();
+        lock(&self.shared.store).held_states.insert(
+            (project.to_string(), name.to_string()),
+            (id.clone(), Some((after, failure.map(str::to_string)))),
+        );
         OpId(id)
     }
 
@@ -909,18 +933,6 @@ impl FakeIncus {
             .get(&(project.to_string(), name.to_string()))
             .copied()
             .unwrap_or(0)
-    }
-
-    /// Ends the held operation `id` by itself `after` from now, with success, or with failure and `failure` as its `err`,
-    /// as [`FakeIncus::release_operation`] and [`FakeIncus::fail_operation`] end it.
-    pub fn end_operation_after(&self, id: &OpId, after: Duration, failure: Option<&str>) {
-        let shared = Arc::clone(&self.shared);
-        let id = id.clone();
-        let failure = failure.map(str::to_string);
-        thread::spawn(move || {
-            thread::sleep(after);
-            end_held(&shared, &id, failure.as_deref());
-        });
     }
 
     /// Ends a held operation with success. A create held until completion lands now. An id whose create has not arrived yet is
@@ -1750,6 +1762,16 @@ fn hold_wait(shared: &Shared, id: &str, target: &str) {
         });
     let started = Instant::now();
     loop {
+        // A held operation whose time has come ends now, as it would have by itself.
+        let due = lock(&shared.store)
+            .held
+            .get(id)
+            .and_then(|held| held.ends.as_ref())
+            .filter(|(at, _)| Instant::now() >= *at)
+            .map(|(_, failure)| failure.clone());
+        if let Some(failure) = due {
+            end_held(shared, &OpId(id.to_string()), failure.as_deref());
+        }
         let running = lock(&shared.store)
             .operations
             .get(id)
@@ -2907,6 +2929,7 @@ fn create(
                     reverts: Some(place.clone()),
                     then: None,
                     starts: None,
+                    ends: None,
                 }
             }
             Appears::OnCompletion => Held {
@@ -2914,6 +2937,7 @@ fn create(
                 reverts: None,
                 then: None,
                 starts: None,
+                ends: None,
             },
         };
         let operation = running_operation(&armed.id, &place);
@@ -4520,7 +4544,7 @@ fn stop_half(shared: &Shared, store: &mut Store, index: usize, address: &Address
 
 /// The answer of a state change a test armed with [`FakeIncus::hold_state`]: its operation, running until the test ends it.
 fn held_state(store: &mut Store, address: &Address, restart: bool) -> Option<Answer> {
-    let id = store
+    let (id, ending) = store
         .held_states
         .remove(&(address.project.clone(), address.name.clone()))?;
     let place = Place {
@@ -4533,6 +4557,7 @@ fn held_state(store: &mut Store, address: &Address, restart: bool) -> Option<Ans
     store.operations.insert(id.clone(), operation.clone());
     let held = Held {
         starts: restart.then(|| (address.project.clone(), address.name.clone())),
+        ends: ending.map(|(after, failure)| (Instant::now() + after, failure)),
         ..Held::default()
     };
     store.held.insert(id.clone(), held);

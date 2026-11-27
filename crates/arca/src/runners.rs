@@ -11,8 +11,8 @@ use arca_runners::incus::IncusLauncher;
 use arca_runners::record::Recorder;
 use arca_runners::scaleset::{Http, ScaleSetClient};
 use arca_runners::{
-    Access, AccessError, ActionsConnection, JobRef, Launcher, MintRequest, Minted, Pool, PoolConfig,
-    Secret, SignInBoard, SignInReason,
+    Access, AccessError, ActionsConnection, JobRef, Launcher, MintRequest, Minted, Pool,
+    PoolConfig, Secret, SignInBoard, SignInReason,
 };
 
 use crate::config::NodeConfig;
@@ -296,7 +296,10 @@ mod tests {
     async fn until(what: &str, mut check: impl FnMut() -> bool) {
         let start = Instant::now();
         while !check() {
-            assert!(start.elapsed() < Duration::from_secs(30), "timed out waiting for {what}");
+            assert!(
+                start.elapsed() < Duration::from_secs(30),
+                "timed out waiting for {what}"
+            );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
