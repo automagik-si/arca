@@ -20,30 +20,6 @@ use arca_incus::{
 };
 use std::time::{Duration, Instant};
 
-/// The longest one of these tests may take. A fake that never answers must fail the test, not hold the build.
-const TEST_BOUND: Duration = Duration::from_secs(120);
-
-/// Runs `test` on a thread of its own and fails when it has not ended within [`TEST_BOUND`].
-fn bounded(test: impl FnOnce() + Send + 'static) {
-    let (done, ended) = std::sync::mpsc::channel();
-    let runner = std::thread::spawn(move || {
-        test();
-        let _ = done.send(());
-    });
-    match ended.recv_timeout(TEST_BOUND) {
-        Ok(()) => runner.join().expect("the test"),
-        // The test panicked: its own message is the failure.
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            if let Err(panic) = runner.join() {
-                std::panic::resume_unwind(panic);
-            }
-        }
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            panic!("the test did not end within {TEST_BOUND:?}")
-        }
-    }
-}
-
 /// The node's service handlers and the lifecycle as a served node builds them: one exec handle, whose marks the
 /// lifecycle clears.
 struct Node {
@@ -68,25 +44,7 @@ fn node(rig: &Rig) -> Node {
         },
     );
     let exec = service_exec(&served);
-    let kernel = Arc::clone(&rig.kernel);
-    let marks = Arc::clone(&exec);
-    let lifecycle = Arc::new(
-        InstanceLifecycle::new(
-            rig.fake.socket().to_path_buf(),
-            arca_incus::ProjectFamily::new([PROJECT], ["other"]).expect("the family"),
-            move || {
-                kernel
-                    .lock()
-                    .map_err(|_| "kernel".to_string())?
-                    .retained_entries()
-                    .map_err(|error| error.to_string())
-            },
-            &rig.dir,
-        )
-        .with_after_stop(Arc::new(move |instance, uuid| {
-            marks.clear_hung_seen_stopped(instance, uuid);
-        })),
-    );
+    let lifecycle = lifecycle(rig, &exec, None);
     let mut handlers: HashMap<&'static str, Arc<dyn ToolHandler>> = served.into_iter().collect();
     handlers.extend(arca::lifecycle::handlers(
         Arc::clone(&rig.kernel),
@@ -99,6 +57,39 @@ fn node(rig: &Rig) -> Node {
         handlers,
         lifecycle,
     }
+}
+
+/// The lifecycle over the node's family that clears `exec`'s marks, as the served node wires it. `deadline` shortens how
+/// long a state change is waited on.
+fn lifecycle(
+    rig: &Rig,
+    exec: &Arc<ServiceExec>,
+    deadline: Option<Duration>,
+) -> Arc<InstanceLifecycle> {
+    let kernel = Arc::clone(&rig.kernel);
+    let marks = Arc::clone(exec);
+    let family = arca_incus::ProjectFamily::new([PROJECT], ["other"]).expect("the family");
+    let mut lifecycle = InstanceLifecycle::new(
+        rig.fake.socket().to_path_buf(),
+        family.clone(),
+        move || {
+            kernel
+                .lock()
+                .map_err(|_| "kernel".to_string())?
+                .retained_entries()
+                .map_err(|error| error.to_string())
+        },
+        &rig.dir,
+    );
+    if let Some(deadline) = deadline {
+        lifecycle = lifecycle.with_changer(
+            arca_incus::StateChanger::new(rig.fake.socket().to_path_buf(), family)
+                .with_deadline(deadline),
+        );
+    }
+    Arc::new(lifecycle.with_after_stop(Arc::new(move |instance, uuid| {
+        marks.clear_hung_seen_stopped(instance, uuid);
+    })))
 }
 
 fn doctor() -> Caller {
@@ -563,5 +554,146 @@ fn a_restart_that_left_the_instance_stopped_and_was_followed_by_a_start_clears_t
         );
         assert!(!node.exec.hung(&target), "seen stopped after the restart");
         reads_the_journal(&rig, &node, "journal after the separate start");
+    });
+}
+
+/// Review 2's N1: the clear count is per instance, by name and uuid. Another instance named `app` (a tenant's, in
+/// another project) seen stopped while this one's read is in flight does not keep this one from being marked.
+#[test]
+fn a_clear_of_another_instance_with_the_same_name_does_not_stop_this_one_being_marked() {
+    bounded(|| {
+        let rig = Rig::new();
+        system(&rig);
+        let node = node(&rig);
+        let target = target(&rig);
+        let read = read_in_flight(&rig, &node, &target);
+        assert!(
+            node.exec
+                .clear_hung_seen_stopped("app", Some("a-tenants-own-uuid"))
+        );
+        read.join().expect("the read ends");
+        assert!(
+            node.exec.hung(&target),
+            "its own instance was never stopped"
+        );
+    });
+}
+
+/// Review 2's N2: the answer gives the wait that is left, which is longer than five minutes after a long declared
+/// command, and says so while a try runs.
+#[test]
+fn the_reason_gives_the_wait_that_is_left() {
+    bounded(|| {
+        let rig = Rig::new();
+        system(&rig);
+        let node = node(&rig);
+        let target = target(&rig);
+        rig.fake.set_console_log(PROJECT, "app", "console line");
+        let why = |node: &Node| {
+            node.logs()["journalNotRead"]
+                .as_str()
+                .expect("why")
+                .to_string()
+        };
+        // A journal read's mark: five minutes, then less as the clock moves on.
+        mark_hung(&rig, &node, &target);
+        assert!(why(&node).contains("for 5 minutes more"), "{}", why(&node));
+        node.wait(Duration::from_secs(250));
+        assert!(why(&node).contains("for 50 seconds more"), "{}", why(&node));
+        // While the try runs, the others are told so.
+        node.wait(Duration::from_secs(50));
+        let probe = read_in_flight(&rig, &node, &target);
+        assert!(
+            why(&node).contains("one try of the journal is running now"),
+            "{}",
+            why(&node)
+        );
+        probe.join().expect("the try ends");
+        // A declared update of an hour marks for its own limit and margin: an hour and five seconds, said in minutes.
+        let formula: AppUpdate = serde_json::from_value(json!({
+            "update": { "command": ["/usr/local/sbin/app-update", "--to={version}"], "seconds": 3600 },
+            "health": { "command": ["/usr/bin/curl", "--fail", "http://localhost/ready"], "seconds": 300 },
+            "version": { "command": ["/usr/bin/cat", "/opt/app/version.txt"] }
+        }))
+        .expect("a formula");
+        let update = DeclaredCommand::update(
+            &formula,
+            "system",
+            &arca::app_formula::AppVersion::parse("2.0").unwrap(),
+        )
+        .expect("the update");
+        node.act(StateAction::Restart);
+        let mut held = ExecScript::new(update.argv(), 0, "");
+        held.held = true;
+        rig.fake.script_exec(held);
+        let _ = node.exec.run_formula(
+            &target,
+            "doctor",
+            "app_update",
+            &update,
+            Some(Instant::now() + Duration::from_secs(2)),
+        );
+        assert!(node.exec.hung(&target));
+        assert!(why(&node).contains("for 61 minutes more"), "{}", why(&node));
+    });
+}
+
+/// Review 2's N3: a restart whose start half Incus failed, whose separate start failed too, but that is running anyway
+/// (started from elsewhere) was seen stopped, so its mark goes.
+#[test]
+fn a_restart_found_running_after_its_separate_start_clears_the_mark() {
+    bounded(|| {
+        let rig = Rig::new();
+        system(&rig);
+        let node = node(&rig);
+        let target = target(&rig);
+        mark_hung(&rig, &node, &target);
+        rig.fake.refuse_start(PROJECT, "app");
+        rig.fake
+            .started_after_reads(PROJECT, "app", OUTSIDE_START_READ);
+        let restarted = node.act(StateAction::Restart);
+        assert!(
+            restarted["message"]
+                .as_str()
+                .unwrap()
+                .contains("but it is running now"),
+            "{restarted}"
+        );
+        let end: Value = fs::read_to_string(rig.dir.join(arca::lifecycle::INSTANCE_ACTIONS_FILE))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .rfind(|row: &Value| row["kind"] == "end")
+            .expect("an end row");
+        assert_eq!(end["outcome"], "running_after_restart", "{end}");
+        assert!(!node.exec.hung(&target), "seen stopped before it ran again");
+    });
+}
+
+/// The read of the instance on which the start from elsewhere lands: after the restart's own reads, and after the
+/// read that finds it stopped.
+const OUTSIDE_START_READ: u32 = 3;
+
+/// Review 2's N3: a restart Incus has not finished when Arca stops waiting has an end Arca does not know (`unknown`,
+/// InstanceRestartUnknown). Nothing says the instance stopped, so the mark stays.
+#[test]
+fn a_restart_whose_end_is_not_known_keeps_the_mark() {
+    bounded(|| {
+        let rig = Rig::new();
+        system(&rig);
+        let node = node(&rig);
+        let target = target(&rig);
+        mark_hung(&rig, &node, &target);
+        let short = lifecycle(&rig, &node.exec, Some(Duration::from_millis(300)));
+        let slow = rig.fake.hold_state(PROJECT, "app");
+        let refusal = short
+            .run(StateAction::Restart, PROJECT, "app", "operator", None, NOW)
+            .expect_err("the restart is not finished");
+        assert!(
+            matches!(&refusal, CallError::Refused { code, .. } if code == "InstanceRestartUnknown"),
+            "{refusal:?}"
+        );
+        assert!(node.exec.hung(&target), "nothing showed it stopped");
+        rig.fake.release_operation(&slow);
     });
 }

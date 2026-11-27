@@ -11,7 +11,8 @@ log, which is empty after a restart, and answered no lines without saying why. N
 stopped instance, `instance_restart`, a `service_update` that stops or restarts the service (the Automagik follower's
 own updates included) and a `service_reconfigure` that restarts it clear the mark. A start of a running instance stops
 nothing, so the mark stays. A mark also ages: after five minutes the next `service_logs` tries the journal once, one try
-at a time, and an answer clears the mark. `service_logs` also says where its lines came from, in a new
+at a time, and an answer clears the mark; `journalNotRead` says how long is left until that try, which is longer
+after a long declared command. `service_logs` also says where its lines came from, in a new
 `source` field (`journal` or `console`), and when it did not read the journal, a new `journalNotRead` field says why.
 
 An approved `instance_restart` no longer leaves the instance stopped. When Incus failed the restart's start half after a

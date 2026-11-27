@@ -686,7 +686,7 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
             crate::handlers::UpdateOptions::default(),
             crate::handlers::FollowEdges::default(),
             // The marks the service verbs obey: an update that stops a service clears its mark there (Rule 82).
-            crate::handlers::service_exec(&service_handlers),
+            &service_handlers,
         ));
         if let Err(error) = crate::handlers::spawn_follower(
             follower,

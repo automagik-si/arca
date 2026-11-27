@@ -352,15 +352,23 @@ pub struct Follower {
 }
 
 impl Follower {
+    /// The exec handle whose hung marks the follower's updates clear.
+    pub fn exec(&self) -> Arc<crate::service_exec::ServiceExec> {
+        self.handler.exec.clone()
+    }
+
     pub fn new(
         kernel: Arc<Mutex<Kernel>>,
         clock: Clock,
         cfg: Arc<NodeConfig>,
         update: service_update::UpdateOptions,
         edges: FollowEdges,
-        exec: Arc<crate::service_exec::ServiceExec>,
+        handlers: &crate::handlers::ServiceHandlers,
     ) -> Follower {
         let writes = write_gate(&kernel);
+        // The exec handle of the node's own service handlers, and no other: an update that stops a service clears the
+        // hung mark `service_logs` obeys (Rule 82).
+        let exec = crate::handlers::service_exec(handlers);
         Follower {
             handler: ServiceHandler {
                 verb: "service_update",

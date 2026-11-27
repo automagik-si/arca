@@ -271,8 +271,8 @@ impl InstanceLifecycle {
         })?;
         let outcome = self.act(action, project, instance, &id);
         // Seen stopped, or stopped and started again by Incus: nothing left running in it runs any more. A restart that
-        // left it stopped and was followed by a start saw it stopped too; one still running (restart_unfinished) is an
-        // error and clears nothing.
+        // left it stopped and was followed by a start saw it stopped too. A restart whose end is not known yet (end word
+        // `unknown`, code InstanceRestartUnknown) is an error and clears nothing.
         if let (Ok(done), Some(after_stop)) = (&outcome, &self.after_stop)
             && matches!(
                 done.outcome,

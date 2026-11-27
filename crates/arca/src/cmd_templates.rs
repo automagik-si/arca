@@ -63,6 +63,11 @@ pub const SHIPPED: &[(&str, &str)] = shipped![
 /// v<previous>:templates/<name> | sha256sum`). A test checks the list against the release tags where the checkout has
 /// them. A hash is of a file exactly as a release shipped it, so an owner's edit never matches one.
 pub const EARLIER: &[(&str, &str)] = &[
+    // 0.39.0: before the keeper bounded its server lane checks (#299).
+    (
+        "automagik-workspace.sh",
+        "e28da005790e7a67aee85e0877a23162caca4edd7146ea55e2f629660af64591",
+    ),
     // 0.37.0: before these templates named an image update health port.
     (
         "arca-edge.json",
