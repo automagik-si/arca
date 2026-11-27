@@ -270,13 +270,14 @@ pub fn function_egress_rules(
     rules
 }
 
-/// The egress rules of a CI job machine's NIC on a bridge whose gateway is `gateway` and whose subnet is `subnet`
-/// (`a.b.c.d/n`): a tenant service's rules ([`egress_rules`] with a block), in the same order and shape, except that the
-/// first rule rejects the WHOLE subnet. A job machine has no block of its own: it reaches no service, no tenant and no
-/// other job machine on the bridge, and it never has a destination. DHCP and DNS on the gateway pass as they do for a
-/// tenant's service, through the rules Incus keeps for a bridge's own address.
-pub fn job_egress_rules(gateway: Ipv4Addr, subnet: &str, hosts: &Value) -> Vec<Value> {
-    egress_rules_inside(gateway, hosts, Inside::Nothing(subnet), &[], true)
+/// The egress rules of a CI job machine's NIC on a bridge whose gateway is `gateway`: a tenant service's rules
+/// ([`egress_rules`] with a block), in the same order and shape, except that the first rule rejects every subnet of
+/// `closed` (`a.b.c.d/n` each: the bridge's whole subnet, at its real prefix, and the node's service subnet) and the
+/// private ranges are rejected whole, so nothing assumes a /24. A job machine has no block of its own: it reaches no
+/// service, no tenant and no other job machine, and it never has a destination. DHCP and DNS on the gateway pass as
+/// they do for a tenant's service, through the rules Incus keeps for a bridge's own address.
+pub fn job_egress_rules(gateway: Ipv4Addr, closed: &[String], hosts: &Value) -> Vec<Value> {
+    egress_rules_inside(gateway, hosts, Inside::Nothing(closed), &[], true)
 }
 
 /// What a NIC on the bridge may reach inside the service subnet besides the gateway's DHCP and DNS.
@@ -286,8 +287,9 @@ enum Inside<'a> {
     Neighbours,
     /// Its tenant's block only.
     Block(Block),
-    /// Nothing: the whole subnet, written as `a.b.c.d/n`, is rejected (a CI job machine).
-    Nothing(&'a str),
+    /// Nothing: these subnets, each written as `a.b.c.d/n`, are rejected whole, and so are the private ranges (a CI
+    /// job machine).
+    Nothing(&'a [String]),
 }
 
 /// [`egress_rules`], with or without its last rule: the allow that lets everything not rejected out to the internet.
@@ -334,7 +336,7 @@ fn egress_rules_inside(
         (0xa9fe0000, 16),
         (0x7f000000, 8),
     ] {
-        if destination::holds(base, prefix, own) {
+        if destination::holds(base, prefix, own) && !matches!(inside, Inside::Nothing(_)) {
             ranges.extend(destination::without(prefix, own, 24));
         } else {
             ranges.push((base, prefix));
@@ -356,9 +358,9 @@ fn egress_rules_inside(
             block.outside().join(","),
             "the service subnet outside this tenant's block",
         )),
-        Inside::Nothing(subnet) => Some((
-            subnet.to_string(),
-            "the whole service subnet: a job machine has no block of its own",
+        Inside::Nothing(closed) => Some((
+            closed.join(","),
+            "the job machines' whole subnet and the node's service subnet: a job machine has no block of its own",
         )),
     };
     if let Some((rejected, description)) = closed {

@@ -1,14 +1,22 @@
 //! The Incus launcher: one virtual machine per job, cloned from the runner image, used once, deleted.
 //!
 //! Every write goes through [`arca_incus::runner_vm::RunnerVms`], which touches only instances carrying the pool's
-//! mark in the pool's project, and the pool's one network ACL carrying the same mark.
+//! mark in the pool's project, and the pool's network ACL and own bridge carrying the same mark.
 //!
-//! **The card.** Each machine's `eth0` is on the pool's bridge ([`crate::PoolConfig::bridge`]), with MAC, IPv4 and IPv6
-//! filtering and a default of reject both ways, and names the pool's ACL `arca-runner-<pool>`. The ACL is made (or
-//! found and reused) when the launcher is made, at the pool's start, from the bridge's own gateway and subnet and the
-//! host's addresses: no ingress rule, so nothing reaches a job machine but the answers to what it opened, and the egress
-//! rules of a tenant's service with the whole subnet rejected ([`arca_netproject::tenant::job_egress_rules`]). A pool
-//! that is gone from the config has its ACL deleted at the next start ([`remove_gone_pool_acls`]). The runner configuration reaches the machine as a file on its `/run` (memory) through the
+//! **The network.** By default a pool gets its own bridge, `arcarun-<hash>`, which the launcher makes at the pool's
+//! start (or finds and reuses): a /24 with NAT and no IPv6, in `172.16.0.0/12`, the first one clear of the node's
+//! service subnet, its reserved ranges, every Incus network and every host network, tried from a point the pool's name
+//! fixes ([`choose_subnet`]). So a job cannot use up the service bridge's addresses, take one inside a tenant's block
+//! or learn its neighbours' names from its DNS. A pool's `network` names an existing bridge instead.
+//!
+//! **The card.** Each machine's `eth0`, and its only card, is on that bridge, with MAC, IPv4 and IPv6 filtering and a
+//! default of reject both ways, and names the pool's ACL `arca-runner-<pool>`: no ingress rule, so nothing reaches a job
+//! machine but the answers to what it opened, and the egress rules of a tenant's service with the bridge's whole subnet
+//! and the node's service subnet rejected ([`arca_netproject::tenant::job_egress_rules`]). The ACL is made at the pool's
+//! start and its rules are made right again before each machine, from the host's addresses as they are then. A pool
+//! that is gone from the config has its ACL and its own bridge deleted at the next start ([`remove_gone_pools`]).
+//!
+//! The runner configuration reaches the machine as a file on its `/run` (memory) through the
 //! Incus agent; the guest script `arca-job` (shipped in this crate, written into the machine before each start) reads
 //! and deletes it, runs the runner once and packs its logs.
 
@@ -19,7 +27,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use arca_incus::runner_vm::{
-    AclState, ExecState, RUNNER_ACL_PREFIX, RUNNER_KEY, RunnerVms, VmSource, VmSpec,
+    AclState, ExecState, RUNNER_KEY, RunnerVms, VmSource, VmSpec, pool_hash,
 };
 use arca_incus::{IncusError, IncusRead as _, UnixIncus};
 use serde_json::Value;
@@ -37,13 +45,61 @@ pub const GUEST_JIT_PATH: &str = "/run/arca-job-jit";
 pub const GUEST_LOGS_PATH: &str = "/var/log/arca-job/logs.tar.gz";
 pub const GUEST_EXIT_PATH: &str = "/var/log/arca-job/exit";
 
+/// Where a pool's machines go on the network, from the node's config and the pool's.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NetworkPlan {
+    /// The bridge the pool's `network` names; `None` gives the pool its own bridge.
+    pub bridge: Option<String>,
+    /// The node's service subnet (`kernel.serviceCidr`): closed to every job machine, and kept clear by the pool's own
+    /// bridge.
+    pub service_cidr: Option<String>,
+    /// Ranges the pool's own bridge keeps clear of (`kernel.reservedCidrs`).
+    pub reserved: Vec<String>,
+}
+
+/// The space a pool's own bridge is chosen in: the /24s of `172.16.0.0/12`.
+const OWN_SPACE: u32 = 0xac10_0000;
+const OWN_SLOTS: u32 = 4096;
+
+/// The gateway address (`a.b.c.1/24`) of the pool's own bridge: the first /24 of `172.16.0.0/12`, from a point the
+/// pool's name fixes, that overlaps none of `taken`. Each of `taken` is a CIDR range or a bare address, which counts as
+/// its /24. `None` when every /24 is taken.
+pub fn choose_subnet(pool: &str, taken: &[String]) -> Option<String> {
+    let ranges: Vec<(u32, u32)> = taken.iter().filter_map(|range| range_of(range)).collect();
+    let start = pool_hash(pool) % OWN_SLOTS;
+    (0..OWN_SLOTS)
+        .map(|step| OWN_SPACE | (((start + step) % OWN_SLOTS) << 8))
+        .find(|base| {
+            ranges.iter().all(|(other, mask)| {
+                let common = mask & 0xffff_ff00;
+                base & common != other & common
+            })
+        })
+        .map(|base| format!("{}/24", Ipv4Addr::from(base | 1)))
+}
+
+/// A CIDR range as its network address and mask; a bare address is its /24.
+fn range_of(text: &str) -> Option<(u32, u32)> {
+    let (ip, prefix) = match text.split_once('/') {
+        Some((ip, prefix)) => (ip, prefix.parse::<u32>().ok().filter(|prefix| *prefix <= 32)?),
+        None => (text, 24),
+    };
+    let ip = u32::from(ip.parse::<Ipv4Addr>().ok()?);
+    let mask = u32::MAX.checked_shl(32 - prefix).unwrap_or(0);
+    Some((ip & mask, mask))
+}
+
 /// The Incus launcher of one pool.
 pub struct IncusLauncher {
     vms: RunnerVms,
+    socket: PathBuf,
     source: VmSource,
     profiles: Vec<String>,
     storage_pool: Option<String>,
     network: String,
+    gateway: Ipv4Addr,
+    /// The subnets the rules close: the bridge's, then the service subnet.
+    closed: Vec<String>,
     acl: AclState,
     /// The agent operation of each started runner.
     runs: Mutex<BTreeMap<String, String>>,
@@ -51,11 +107,11 @@ pub struct IncusLauncher {
 
 impl IncusLauncher {
     /// A launcher for `pool`'s machines in `project` on the Incus socket at `socket`, each with its card on the bridge
-    /// `network`. `image` is an image alias or fingerprint (`arca-runner-image-<tag>`, as the image build publishes it),
-    /// or `<instance>/<snapshot>` (`arca-runner-image-<tag>/image`, the stopped machine the build keeps).
+    /// `plan` gives. `image` is an image alias or fingerprint (`arca-runner-image-<tag>`, as the image build publishes
+    /// it), or `<instance>/<snapshot>` (`arca-runner-image-<tag>/image`, the stopped machine the build keeps).
     ///
-    /// It makes the pool's ACL, or finds it and reuses it (its rules replaced when the bridge or the host's addresses
-    /// changed): the bridge must have an IPv4 address, its gateway.
+    /// It makes the pool's own bridge when the plan names none, or finds it and reuses it, and the pool's ACL the same
+    /// way (its rules replaced when they changed). A named bridge must have an IPv4 address, its gateway.
     pub fn new(
         socket: PathBuf,
         project: &str,
@@ -63,7 +119,7 @@ impl IncusLauncher {
         image: &str,
         profiles: Vec<String>,
         storage_pool: Option<String>,
-        network: &str,
+        plan: &NetworkPlan,
     ) -> Result<Self, LaunchError> {
         let source = match image.split_once('/') {
             Some((instance, snapshot)) => VmSource::Snapshot {
@@ -73,18 +129,43 @@ impl IncusLauncher {
             None => VmSource::Image(image.to_string()),
         };
         let vms = RunnerVms::new(socket.clone(), project, pool).map_err(incus)?;
-        let egress = job_rules(&socket, project, network)?;
+        let network = match &plan.bridge {
+            Some(bridge) => bridge.clone(),
+            None => {
+                if vms.own_bridge().map_err(incus)?.is_none() {
+                    let address = choose_subnet(pool, &taken(&socket, plan)?).ok_or_else(|| {
+                        LaunchError("no /24 of 172.16.0.0/12 is free for the pool's own bridge".to_string())
+                    })?;
+                    vms.create_bridge(&address).map_err(incus)?;
+                }
+                vms.bridge_name()
+            }
+        };
+        let (gateway, subnet) = bridge_address(&socket, project, &network)?;
+        let mut closed = vec![subnet];
+        if let Some(service) = plan.service_cidr.as_ref().filter(|cidr| **cidr != closed[0]) {
+            closed.push(service.clone());
+        }
+        let egress = job_rules(&socket, gateway, &closed)?;
         // Nothing inbound: no ingress rule, and the card's default rejects the rest.
         let acl = vms.ensure_acl(&[], &egress).map_err(incus)?;
         Ok(Self {
             vms,
+            socket,
             source,
             profiles,
             storage_pool,
-            network: network.to_string(),
+            network,
+            gateway,
+            closed,
             acl,
             runs: Mutex::new(BTreeMap::new()),
         })
+    }
+
+    /// The bridge the pool's machines are on: the one its `network` names, or its own.
+    pub fn bridge(&self) -> &str {
+        &self.network
     }
 
     /// What became of the pool's ACL when this launcher was made.
@@ -122,6 +203,9 @@ impl IncusLauncher {
 
 impl Launcher for IncusLauncher {
     fn create(&self, spec: &MachineSpec) -> Result<(), LaunchError> {
+        // The host's addresses as they are now: an address it gained since the last machine is rejected from this one.
+        let egress = job_rules(&self.socket, self.gateway, &self.closed)?;
+        self.vms.ensure_acl(&[], &egress).map_err(incus)?;
         self.vms
             .create(&VmSpec {
                 name: spec.name.clone(),
@@ -217,16 +301,16 @@ impl Launcher for IncusLauncher {
     }
 }
 
-/// The egress rules of the pool's job machines on the bridge `network`, read as `project` sees it: the rules of a
-/// tenant's service with the bridge's whole subnet rejected, from the bridge's gateway and the host's addresses.
-fn job_rules(socket: &Path, project: &str, network: &str) -> Result<Vec<Value>, LaunchError> {
-    let plain = |text: &str| {
-        !text.is_empty()
-            && text.len() <= 63
-            && text
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-    };
+fn plain(text: &str) -> bool {
+    !text.is_empty()
+        && text.len() <= 63
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+/// The gateway and the subnet (`a.b.c.d/n`, at its real prefix) of the bridge `network`, read as `project` sees it.
+fn bridge_address(socket: &Path, project: &str, network: &str) -> Result<(Ipv4Addr, String), LaunchError> {
     if !plain(network) || !plain(project) {
         return Err(LaunchError(
             "the pool's network or project is not a plain name".to_string(),
@@ -236,7 +320,7 @@ fn job_rules(socket: &Path, project: &str, network: &str) -> Result<Vec<Value>, 
     let bridge = read
         .get(&format!("/1.0/networks/{network}?project={project}"))
         .map_err(|error| LaunchError(format!("incus: the bridge {network}: {error}")))?;
-    let (gateway, subnet) = bridge
+    bridge
         .pointer("/config/ipv4.address")
         .and_then(Value::as_str)
         .and_then(gateway_and_subnet)
@@ -244,13 +328,50 @@ fn job_rules(socket: &Path, project: &str, network: &str) -> Result<Vec<Value>, 
             LaunchError(format!(
                 "the bridge {network} has no IPv4 address: a job machine's rules are built from its gateway"
             ))
-        })?;
-    let hosts = arca_providers::incus::host_networks(&read)
+        })
+}
+
+/// The host's addresses, as the service plugin reads them.
+fn host_addresses(read: &UnixIncus) -> Result<Value, LaunchError> {
+    arca_providers::incus::host_networks(read)
         .map(|networks| arca_providers::incus::host_addresses_value(&networks))
-        .map_err(|error| LaunchError(format!("incus: the host's addresses: {error:?}")))?;
-    Ok(arca_netproject::tenant::job_egress_rules(
-        gateway, &subnet, &hosts,
-    ))
+        .map_err(|error| LaunchError(format!("incus: the host's addresses: {error:?}")))
+}
+
+/// The egress rules of the pool's job machines: the rules of a tenant's service with `closed` rejected, from the
+/// bridge's gateway and the host's addresses as they are now.
+fn job_rules(socket: &Path, gateway: Ipv4Addr, closed: &[String]) -> Result<Vec<Value>, LaunchError> {
+    let hosts = host_addresses(&UnixIncus::new(socket.to_path_buf()))?;
+    Ok(arca_netproject::tenant::job_egress_rules(gateway, closed, &hosts))
+}
+
+/// Every range the pool's own bridge must keep clear of: the service subnet, the reserved ranges, every Incus network's
+/// IPv4 subnet in any project, and every host network.
+fn taken(socket: &Path, plan: &NetworkPlan) -> Result<Vec<String>, LaunchError> {
+    let read = UnixIncus::new(socket.to_path_buf());
+    let mut taken: Vec<String> = plan.service_cidr.iter().cloned().collect();
+    taken.extend(plan.reserved.iter().cloned());
+    let networks = read
+        .get("/1.0/networks?all-projects=true&recursion=1")
+        .map_err(|error| LaunchError(format!("incus: the networks: {error}")))?;
+    taken.extend(
+        networks
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|network| network.pointer("/config/ipv4.address")?.as_str())
+            .filter_map(|address| Some(gateway_and_subnet(address)?.1)),
+    );
+    taken.extend(
+        host_addresses(&read)?
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .filter(|address| !address.contains(':'))
+            .map(str::to_string),
+    );
+    Ok(taken)
 }
 
 /// The gateway and the subnet (`a.b.c.d/n`, its network address) of a bridge whose `ipv4.address` is `address`.
@@ -263,34 +384,43 @@ fn gateway_and_subnet(address: &str) -> Option<(Ipv4Addr, String)> {
     Some((gateway, format!("{network}/{prefix}")))
 }
 
-/// Deletes the ACL of every pool that is gone from the config: an ACL of any project named `arca-runner-<pool>` and
-/// carrying the runner mark with that pool's name, for a pool not among `pools`. Each delete goes through that pool's
-/// own writer, which reads the mark again first. Returns one line for each ACL removed or left, and one when the
-/// listing failed.
-pub fn remove_gone_pool_acls(socket: &Path, pools: &[&str]) -> Vec<String> {
+/// Deletes the ACL and the own bridge of every pool that is gone from the config: an ACL named `arca-runner-<pool>`
+/// or a network named that pool's bridge name, in any project, carrying the runner mark with that pool's name, for a
+/// pool not among `pools`. Each delete goes through that pool's own writer, which reads the mark again first; the ACL
+/// goes before the bridge. Returns one line for each object removed or left, and one when a listing failed.
+pub fn remove_gone_pools(socket: &Path, pools: &[&str]) -> Vec<String> {
     let read = UnixIncus::new(socket.to_path_buf());
-    let rows = match read.get("/1.0/network-acls?all-projects=true&recursion=1") {
-        Ok(Value::Array(rows)) => rows,
-        Ok(_) => return vec!["the network ACL listing is not a list".to_string()],
-        Err(error) => return vec![format!("the network ACLs could not be listed: {error}")],
-    };
     let mut lines = Vec::new();
-    for row in rows {
-        let Some(pool) = row.pointer(&format!("/config/{RUNNER_KEY}")).and_then(Value::as_str) else {
-            continue;
+    let mut gone = |listing: &str, kind: &str, expected: &dyn Fn(&RunnerVms) -> String| {
+        let rows = match read.get(listing) {
+            Ok(Value::Array(rows)) => rows,
+            Ok(_) => return lines.push(format!("the {kind} listing is not a list")),
+            Err(error) => return lines.push(format!("the {kind}s could not be listed: {error}")),
         };
-        let name = row.get("name").and_then(Value::as_str).unwrap_or_default();
-        let project = row.get("project").and_then(Value::as_str).unwrap_or("default");
-        if pools.contains(&pool) || name != format!("{RUNNER_ACL_PREFIX}{pool}") {
-            continue;
+        for row in rows {
+            let Some(pool) = row.pointer(&format!("/config/{RUNNER_KEY}")).and_then(Value::as_str) else {
+                continue;
+            };
+            let name = row.get("name").and_then(Value::as_str).unwrap_or_default();
+            let project = row.get("project").and_then(Value::as_str).unwrap_or("default");
+            if pools.contains(&pool) {
+                continue;
+            }
+            let Ok(vms) = RunnerVms::new(socket.to_path_buf(), project, pool) else {
+                continue;
+            };
+            if name != expected(&vms) {
+                continue;
+            }
+            let removed = if kind == "network ACL" { vms.remove_acl() } else { vms.remove_bridge() };
+            lines.push(match removed {
+                Ok(()) => format!("pool {pool} is gone: its {kind} {name} was deleted"),
+                Err(error) => format!("pool {pool} is gone, and its {kind} {name} stays: {error}"),
+            });
         }
-        let removed = RunnerVms::new(socket.to_path_buf(), project, pool)
-            .and_then(|vms| vms.remove_acl());
-        lines.push(match removed {
-            Ok(()) => format!("pool {pool} is gone: its network ACL {name} was deleted"),
-            Err(error) => format!("pool {pool} is gone, and its network ACL {name} stays: {error}"),
-        });
-    }
+    };
+    gone("/1.0/network-acls?all-projects=true&recursion=1", "network ACL", &|vms| vms.acl_name());
+    gone("/1.0/networks?all-projects=true&recursion=1", "bridge", &|vms| vms.bridge_name());
     lines
 }
 
