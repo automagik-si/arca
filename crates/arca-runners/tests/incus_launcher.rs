@@ -56,7 +56,7 @@ fn a_job_machine_is_a_marked_vm_of_its_size_and_only_marked_machines_go() {
         fake.socket().to_path_buf(),
         PROJECT,
         "acme",
-        "runner-ubuntu-2404",
+        "arca-runner-image-ubuntu24-20261111-370",
         vec![],
         None,
     )
@@ -85,7 +85,7 @@ fn a_job_machine_is_a_marked_vm_of_its_size_and_only_marked_machines_go() {
         fake.socket().to_path_buf(),
         PROJECT,
         "other",
-        "runner-ubuntu-2404",
+        "arca-runner-image-ubuntu24-20261111-370",
         vec![],
         None,
     )
