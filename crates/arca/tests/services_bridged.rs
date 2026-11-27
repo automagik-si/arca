@@ -597,7 +597,11 @@ fn a_vm_is_created_with_its_type_devices_and_limits_and_no_network_is_created_or
     assert_eq!(
         rig.call("service_logs", json!({"name":"ws1"}))
             .expect("logs"),
-        json!({"lines": ["booted", "login:"]})
+        json!({
+            "lines": ["booted", "login:"],
+            "source": "console",
+            "journalNotRead": "a virtual machine's log is its console: reading its journal needs a guest agent its image may not run"
+        })
     );
     assert_eq!(rig.network_requests(), Vec::<String>::new());
 

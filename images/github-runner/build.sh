@@ -22,7 +22,8 @@
 # 7. Stops the machine and publishes it as the Incus image `arca-runner-image-<tag>` (dots made dashes; in PROJECT's
 #    image store), then deletes the machine. --no-publish, or too little room under /var/lib/incus, keeps the stopped
 #    machine instead, renamed `arca-runner-image-<tag>` with a snapshot `image`: `incus copy` makes job machines from it
-#    (copy-on-write on btrfs and ZFS). Each tag keeps its own machine, so the previous image stays for a rollback. A
+#    (a copy-on-write clone on btrfs, ZFS and Ceph RBD, a full copy elsewhere; only btrfs is measured, see
+#    docs/RUNNERS.md). Each tag keeps its own machine, so the previous image stays for a rollback. A
 #    runner pool's `image` names the one or the other: `arca-runner-image-<tag>` or `arca-runner-image-<tag>/image`.
 # 8. Writes the published difference into docs/runner-image/<tag>/ (README.md, software-report.json, the diffs, the
 #    failed tests) and deletes everything else it made, except a compressed log in WORK/logs.

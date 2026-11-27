@@ -475,7 +475,7 @@ the node's own records and Incus, exactly as on a node that makes changes. What 
   `unknown` and the note `not recorded by this node`; a node that makes changes would have written a record for a
   marked one.
 - `service_logs` reads the instance's console log, and its `note` says so: the journal is read by running a command
-  inside the instance, and a node that only looks runs none. A container's console log holds only what its init system
+  inside the instance, and a node that only looks runs none. Its `source` is `console`, and `journalNotRead` says why. A container's console log holds only what its init system
   wrote to the console, which is often much less than its journal, and may be nearly empty.
 - `omni_status` is refused, with that reason: it answers by running a command inside the service.
 - Every tool that would change an instance, a service, a database, a tenant, storage or a GPU assignment is refused
@@ -3190,11 +3190,27 @@ ask and the owner approves on the approval page; an approved `instance_start` ru
 requests (`owner_approval_request`) have no word for a stop or a restart, so those two run through a proposal only. An
 instance that is not Arca's cannot be proposed either, so the owner is never shown a card for it.
 
-A stop and a restart are graceful: Incus gives the instance 60 seconds to shut down. Arca forces nothing. One call takes
-at most 150 seconds, and the approval page waits 180 seconds for a linked kernel's answer to an approval (30 for any other
-relayed write), so a slow stop on a linked host still answers as done or with its own refusal. An instance
-that does not shut down stays running and the call is refused with `InstanceStopFailed` or `InstanceRestartFailed`, with
-the state the instance is in now. A frozen instance, or one in an error state, is left as it is
+A stop and a restart are graceful: Incus gives the instance 60 seconds to shut down. Arca forces nothing. The state
+change of one call takes at most 280 seconds. A start or a restart of a virtual machine with secrets then waits for its
+agent, up to 120 seconds, and writes the secrets, which that bound leaves out. Every relayed approval on the approval
+page waits 310 seconds for a linked kernel's answer (30 for any other relayed write), so a slow stop on a linked host
+still answers as done or with its own refusal. An instance that does not shut down stays running and the call is refused
+with `InstanceStopFailed` or `InstanceRestartFailed`, with the state the instance is in now.
+
+A restart that Incus fails once it was sent (it failed its start half after its stop half) is followed by a read of the
+instance: one that is stopped then is sent one plain start, never forced, apart from the restart. A restart Incus has not
+finished by Arca's 90-second wait is waited on for 45 seconds more before anything is read, because Incus reports a
+restarting instance stopped until its start half comes up, and a start sent then would join that restart. When it has
+ended, Arca decides as above, and the start gets 45 seconds. A first wait that breaks off with an error is treated the
+same way: only the operation's own end says the restart ended. When it is still running, Arca sends nothing more and
+the call is refused with `InstanceRestartUnknown` (not a failure: Incus may still finish it), saying the restart is
+still running and the state is not known until it ends. A restart request Incus did not answer in time names no
+operation, so Arca starts nothing and refuses the call with `InstanceRestartUnknown` too, saying Incus may still be
+working on it. The answer says the restart failed, why, and what Arca did: the instance is running, or the call is refused with
+`InstanceRestartFailed` and the state it is in now. In `instance-actions.jsonl` the start has its own `separate_start`
+line, written before it is sent, and the action's `end` line has the outcome `started_after_restart`, or
+`running_after_restart` when the start was refused but the instance runs anyway. A restart still running when Arca stops
+waiting has a `restart_unfinished` line. A frozen instance, or one in an error state, is left as it is
 (`InstanceStateUnsupported`). An instance recreated between the owner check and the change is refused with
 `InstanceChanged`, and nothing is sent to it.
 
@@ -3209,8 +3225,10 @@ them. Each call that passes its gate is written to `instance-actions.jsonl` in t
 {"kind":"end","id":"ia-<ms>-<n>","outcome":"started","code":null,"uuid":"<volatile uuid>","status":"Running"}
 ```
 
-`outcome` is `started`, `already_running`, `stopped`, `already_stopped`, `restarted`, `started_from_stopped`, `refused` or
-`failed`, and `code` is the refusal's code for the last two: `failed` only when a state change was sent and did not finish.
+`outcome` is `started`, `already_running`, `stopped`, `already_stopped`, `restarted`, `started_from_stopped`,
+`started_after_restart`, `running_after_restart`, `refused`, `failed` or `unknown`, and `code` is the refusal's code for
+the last three: `failed` only when a state change was sent and did not finish, `unknown` (`InstanceRestartUnknown`) when
+a restart was sent and Arca does not know how it ended.
 `proposal` is the approved proposal a stop or a restart ran from; a start carries no grant, so it is `null` there. A
 start or a restart that wrote a virtual machine's secrets into its guest adds a third line,
 `{"kind":"guest_secrets","id":"ia-<ms>-<n>","outcome":"written","secrets":["<name>", ...]}`, or `"outcome":"failed"`
@@ -4536,10 +4554,10 @@ Then:
   (`act-…`) to its `action_approve`, a delete plan's digest to its `approval_submit`. It answers what that kernel said:
   its result with `host` added, or its exact refusal (403 `{refusal, message}`, for example `WrongHost`, `BadSignature`,
   `Expired` or `Replayed`). `POST /approve/decline` with a `host` relays an action's decline to `plan_decline` the same
-  way. The page waits for a relayed approval as long as the action can run: 180 seconds, and for a `service_update`
+  way. The page waits for a relayed approval as long as the action can run: 310 seconds, and for a `service_update`
   longer: one Incus step of its rebuild may take 600 seconds (a registry pull included), its new version has its
   `timeoutSeconds` (120 by default) to answer, and after a rollback the old one has up to 30 more. A `service_update`
-  with `timeoutSeconds` 300 waits 1110 seconds. The wait comes from the card as last listed: a linked host the page
+  with `timeoutSeconds` 300 waits 1240 seconds. The wait comes from the card as last listed: a linked host the page
   could not read keeps the wait it was listed with before.
 - A `host` the page does not list is refused 403 `{ "refusal": "NotLinked", "message": "this machine is not linked for
   approvals yet" }`. A linked kernel that refuses the token answers 502 `LinkToken`, with a message that says what to
@@ -6213,7 +6231,18 @@ the operation, an answer that is not the operation), since the command may still
 the start makes just before sending it times out, which errs toward the mark. An operation Incus reports failed is an
 answer and marks nothing. No formula command runs in a marked instance, and no command of Rule 50's closed list but its
 cleanups (removing the tailnet key directory, stopping the daemon). The mark stays until Arca sees the instance stopped,
-since a stopped instance runs nothing, or until the instance's uuid changes, since that is another instance.
+since a stopped instance runs nothing, or until the instance's uuid changes, since that is another instance. Arca sees it
+stopped when `instance_stop` stops it or finds it stopped, when `instance_start` starts it from stopped, when
+`instance_restart` restarts it or starts it after a restart that left it stopped, when `service_update` stops or restarts it (an update the Automagik follower makes
+included), and when `service_reconfigure` restarts it or stops it for a memory `/run`. A start of a running instance
+clears nothing, and a command that was already running when the instance stopped marks nothing when it fails afterwards.
+A mark also ages: 5 minutes after it was set (or after the marking command's own limit, when that is longer) the next
+`service_logs` tries the journal once, and only one such try runs at a time per instance. An answer clears the mark;
+any other outcome keeps it for 5 more minutes. The mark is kept in memory, so a restart of the node clears it too. While
+an instance is marked, `service_logs` answers its console log with `source` set to `console`, and `journalNotRead` says
+the instance is marked hung, that the journal is tried again after five minutes, and that a stop and a start, or a
+restart, clears the mark now. Every answer of `service_logs` names its `source`, `journal` or
+`console`, and says in `journalNotRead` why it did not read the journal whenever it did not.
 
 ### What every virtual machine carries
 
@@ -7523,7 +7552,11 @@ first real job, and how to read a pool.
    snapshot `image`. The pool's `image` is `arca-runner-image-<tag>` for the first and `arca-runner-image-<tag>/image`
    for the second. Never start or change the kept machine: every job machine is a copy of its snapshot.
 3. **Room in the project.** Each machine counts its class's full CPUs and memory against the Incus project's limits
-   (`incus project info <project>`) and against the pool's `budget`; make the budget fit what the project has free.
+   (`incus project info <project>`) and against the pool's `budget`. Every other instance in the project counts too,
+   stopped ones included, so the kept image machine's own `limits.cpu` and `limits.memory` take their share. Make the
+   budget fit what the project has free: a project with an 8 GiB memory limit that holds a kept image machine of 1 GiB
+   has 7 GiB for job machines, so two machines of 4 GiB do not fit and two of 3 GiB do (the example below). A machine
+   the project has no room for is refused by Incus; the pool records it as a failure and waits before the next try.
    **The network:** each pool gets a bridge of its own, `arcarun-<hash>`, which Arca makes when the pool starts (a /24
    in `172.16.0.0/12` clear of the node's networks, `kernel.serviceCidr` and `kernel.reservedCidrs`) and deletes when
    the pool is removed; the project must be allowed to make a network (an unrestricted runner project is). Every
@@ -7545,8 +7578,8 @@ first real job, and how to read a pool.
    "runners": { "pools": [ {
      "name": "ci", "binding": "gh-…", "project": "ci",
      "image": "arca-runner-image-ubuntu24-20261111-370/image",
-     "budget": { "cpu": 4, "memory": "8GiB" },
-     "classes": [ { "labels": ["acme-2vcpu-ubuntu-2404"], "cpu": 2, "memory": "4GiB", "max": 2 } ]
+     "budget": { "cpu": 4, "memory": "6GiB" },
+     "classes": [ { "labels": ["acme-2vcpu-ubuntu-2404"], "cpu": 2, "memory": "3GiB", "max": 2 } ]
    } ] }
    ```
 

@@ -589,7 +589,9 @@ impl<A: Access, L: Launcher> Pool<A, L> {
         // it: a failure, as one before the runner started is.
         let refused = matches!(outcome, Ok(Some(code)) if code != 0) && !ran;
         let mut note = match &outcome {
-            Ok(Some(code)) if refused => Some(format!("the runner exited {code} before it took a job")),
+            Ok(Some(code)) if refused => {
+                Some(format!("the runner exited {code} before it took a job"))
+            }
             Ok(_) => None,
             Err(why) => Some(why.clone()),
         };

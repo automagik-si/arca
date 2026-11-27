@@ -330,7 +330,7 @@ database delete cannot be proposed. `service_import` and `service_release` take
 `{name}`: an import takes over, where it stands, a service another manager
 created, and a release gives it back. The three instance actions take
 `{project, instance}` and only for an instance Arca owns or has adopted; a stop
-and a restart are graceful, and their cards wait up to 180 seconds for the
+and a restart are graceful, and their cards wait up to 310 seconds for the
 kernel's answer. `tenant_status` and `tenant_usage` take a tenant's `id`, and
 `function_runs` a function's `name` (with an optional `limit` of at most 100 or
 one `run`); each read sends the kernel only those. `tenant_usage` names the

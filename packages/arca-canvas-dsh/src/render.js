@@ -29,9 +29,10 @@ function normalizePci(value) {
   return match ? `${match[1] ?? '0000'}:${match[2]}` : '';
 }
 const APPROVAL_TIMEOUT_MS = 30_000;
-// A stop or a restart is graceful: the kernel gives the instance 60 seconds and one call takes at most 150,
-// so these cards wait as long as the approval page waits for a linked kernel before they offer a retry.
-const INSTANCE_APPROVAL_TIMEOUT_MS = 180_000;
+// A stop or a restart is graceful: the kernel gives the instance 60 seconds and one call takes at most 280
+// (a failed restart's separate start included), so these cards wait as long as the approval page waits for a
+// linked kernel before they offer a retry.
+const INSTANCE_APPROVAL_TIMEOUT_MS = 310_000;
 const NO_SUCH_PLAN = 'This proposal is no longer waiting. It may have been approved or declined elsewhere. Check Steps.';
 const MISSING_PROPOSAL = 'The proposal is not waiting any more.';
 // An approval refusal names the approval itself, so it gets a plain sentence. A handler refusal after

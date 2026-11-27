@@ -124,6 +124,7 @@ struct World {
     jobs: BTreeMap<i64, FakeJob>,
     runners: BTreeMap<u64, FakeRunner>,
     removed_runners: Vec<String>,
+    minted: Vec<(String, String)>,
     next_id: u64,
     calls: Vec<Call>,
     poll: Duration,
@@ -261,6 +262,11 @@ impl FakeGitHub {
     /// The runners removed through the API, by name.
     pub fn removed_runners(&self) -> Vec<String> {
         self.lock().removed_runners.clone()
+    }
+
+    /// Every JIT configuration minted, with its runner's name, kept after the runner is gone.
+    pub fn minted(&self) -> Vec<(String, String)> {
+        self.lock().minted.clone()
     }
 
     /// The scale sets: name and labels.
@@ -913,6 +919,7 @@ fn service(
             let id = world.next_id;
             world.next_id += 1;
             let jit = unusable_jit_config(id, &name, &random_hex());
+            world.minted.push((name.clone(), jit.clone()));
             world.runners.insert(
                 id,
                 FakeRunner {

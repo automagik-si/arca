@@ -10,23 +10,32 @@
 //! proposal the owner approved, and a direct call without one is refused. All three can be proposed with `action_propose`.
 //!
 //! The verbs are idempotent. A start of a running instance and a stop of a stopped one change nothing, succeed and say
-//! so; a restart of a stopped instance starts it. A stop and a restart are graceful and nothing is ever forced.
+//! so; a restart of a stopped instance starts it. A stop and a restart are graceful and nothing is ever forced. A restart
+//! that fails once it was sent is followed by a read of the instance: one that is stopped then is sent one plain start,
+//! apart from the restart, and the answer says so. A restart Incus has not finished by the writer's deadline is waited on
+//! for half a deadline more before anything is read, since a start sent while it runs would join it; one still running
+//! then is sent nothing more, and the answer says its state is not known yet.
 //!
 //! A power state is not a desired-state entry, so these changes are not effects in the effect journal: an open intent
 //! there is settled at the next start as a create or a patch, which a state change is not. Every call that passes its
 //! gate is journalled in [`INSTANCE_ACTIONS_FILE`] instead, an append-only file of JSON lines in the state directory: a
 //! `begin` line before anything is sent to Incus, and an `end` line with what happened. A `begin` that cannot be made
-//! durable refuses the call before any change.
+//! durable refuses the call before any change. The start sent after a failed restart has its own `separate_start` line,
+//! written before it is sent, and the `end` line's outcome is then `started_after_restart`, `running_after_restart` (the
+//! start was not needed in the end) or the restart's failure. A restart still running when Arca stops waiting has a
+//! `restart_unfinished` line.
 
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use arca_api::Scope;
 use arca_incus::{
-    GRACE_SECONDS, IncusError, InstanceState, ProjectFamily, StateAction, StateChanger,
+    GRACE_SECONDS, IncusError, InstanceState, OperationEnd, ProjectFamily, StateAction,
+    StateChanger,
 };
 use arca_kernel::ownership::{IncusKind, ObjectRef, OwnerClass, classify_object};
 use arca_mcp::{CallError, Caller, ToolHandler};
@@ -39,6 +48,8 @@ use crate::kernel::Kernel;
 
 /// The instance action journal's file name in the state directory.
 pub const INSTANCE_ACTIONS_FILE: &str = "instance-actions.jsonl";
+/// The code of a restart whose end Arca does not know: Incus may still be running it, so nothing more was sent.
+const RESTART_UNKNOWN: &str = "InstanceRestartUnknown";
 /// A journal past this size is set aside as `<name>.1`, replacing the one set aside before, and a new one is begun.
 const MAX_JOURNAL_BYTES: u64 = 8 * 1024 * 1024;
 
@@ -55,6 +66,10 @@ pub type AfterStart = Arc<
         + Sync,
 >;
 
+/// What Arca does when it sees an instance stopped, given its name and uuid: a stop it made or found, a start of a stopped
+/// instance, or a restart. A served node clears the instance's hung mark (Rule 82). It answers nothing and refuses nothing.
+pub type AfterStop = Arc<dyn Fn(&str, Option<&str>) + Send + Sync>;
+
 /// The state writer of a kernel-mode node, the ownership check in front of it, and the journal behind it.
 pub struct InstanceLifecycle {
     changer: StateChanger,
@@ -65,6 +80,7 @@ pub struct InstanceLifecycle {
     /// One action at a time. The number is the last id this process gave a journalled action.
     gate: Mutex<u64>,
     after_start: Option<AfterStart>,
+    after_stop: Option<AfterStop>,
 }
 
 impl std::fmt::Debug for InstanceLifecycle {
@@ -104,6 +120,7 @@ impl InstanceLifecycle {
             journal: state_dir.join(INSTANCE_ACTIONS_FILE),
             gate: Mutex::new(0),
             after_start: None,
+            after_stop: None,
         }
     }
 
@@ -132,6 +149,12 @@ impl InstanceLifecycle {
     /// The same lifecycle with what follows a start or a restart. Without one, nothing follows.
     pub fn with_after_start(mut self, after_start: AfterStart) -> InstanceLifecycle {
         self.after_start = Some(after_start);
+        self
+    }
+
+    /// The same lifecycle with what follows an instance seen stopped. Without one, nothing follows.
+    pub fn with_after_stop(mut self, after_stop: AfterStop) -> InstanceLifecycle {
+        self.after_stop = Some(after_stop);
         self
     }
 
@@ -246,7 +269,24 @@ impl InstanceLifecycle {
                 "the instance action journal could not be written, so nothing was changed",
             )
         })?;
-        let outcome = self.act(action, project, instance);
+        let outcome = self.act(action, project, instance, &id);
+        // Seen stopped, or stopped and started again by Incus: nothing left running in it runs any more. A restart that
+        // left it stopped and was followed by a start saw it stopped too; one still running (restart_unfinished) is an
+        // error and clears nothing.
+        if let (Ok(done), Some(after_stop)) = (&outcome, &self.after_stop)
+            && matches!(
+                done.outcome,
+                "stopped"
+                    | "already_stopped"
+                    | "started"
+                    | "started_from_stopped"
+                    | "restarted"
+                    | "started_after_restart"
+                    | "running_after_restart"
+            )
+        {
+            after_stop(&done.state.name, done.state.uuid.as_deref());
+        }
         let end = match &outcome {
             Ok(done) => json!({
                 "kind": "end",
@@ -260,6 +300,7 @@ impl InstanceLifecycle {
                 "kind": "end",
                 "id": id,
                 "outcome": match &stopped.refusal {
+                    CallError::Refused { code, .. } if code == RESTART_UNKNOWN => "unknown",
                     CallError::Refused { code, .. } if code.ends_with("Failed") => "failed",
                     _ => "refused",
                 },
@@ -337,7 +378,13 @@ impl InstanceLifecycle {
         }))
     }
 
-    fn act(&self, action: StateAction, project: &str, instance: &str) -> Result<Done, Stopped> {
+    fn act(
+        &self,
+        action: StateAction,
+        project: &str,
+        instance: &str,
+        id: &str,
+    ) -> Result<Done, Stopped> {
         let seen = self.target(project, instance).map_err(|refusal| Stopped {
             refusal,
             uuid: None,
@@ -391,6 +438,9 @@ impl InstanceLifecycle {
                 });
             }
         };
+        if send == StateAction::Restart {
+            return self.restart(&seen, &named, id);
+        }
         match self.changer().change(&seen, send) {
             Ok(state) => Ok(Done {
                 state,
@@ -440,6 +490,209 @@ impl InstanceLifecycle {
         }
     }
 
+    /// Restarts a running instance. A restart that fails once it was sent is followed by a read of the instance, and one
+    /// that is stopped then is sent one plain start ([`InstanceLifecycle::start_after_restart`]). A restart Incus has not
+    /// finished by the writer's deadline is waited on for half a deadline more: the instance's state means nothing while
+    /// it runs, since Incus reports a restarting instance stopped until its start half comes up, and a start sent then
+    /// would join that restart. One still running after that is sent nothing more.
+    fn restart(&self, seen: &InstanceState, named: &str, id: &str) -> Result<Done, Stopped> {
+        let changer = self.changer();
+        let failure = match changer.change_tracked(seen, StateAction::Restart) {
+            Ok(state) => {
+                return Ok(Done {
+                    state,
+                    changed: true,
+                    outcome: "restarted",
+                    message: format!("restarted {named}"),
+                });
+            }
+            Err(failure) => failure,
+        };
+        let stopped = |refusal| Stopped {
+            refusal,
+            uuid: seen.uuid.clone(),
+            was: Some(seen.status.clone()),
+        };
+        // The writer refused before it sent the change: nothing was sent, so this is a refusal and not a failed change.
+        if let IncusError::Refused(why) = &failure.error {
+            return Err(stopped(changed_refusal(named, why)));
+        }
+        let first = changer.deadline();
+        let mut start_deadline = first;
+        // The instance as read once the restart has ended, when a branch below has read it already.
+        let mut read_after = None;
+        let failed = match &failure.unfinished {
+            None => format!("{named} was not restarted: {}", failure.error),
+            Some(unfinished) => {
+                start_deadline = first / 2;
+                // What the first wait on the restart came to: it ran out, or it broke off with an error.
+                let late = match &failure.error {
+                    IncusError::Timeout => format!("Incus took longer than {}", spoken(first)),
+                    error => format!("Arca's wait on the restart broke off ({error})"),
+                };
+                match changer.wait_unfinished(unfinished, first / 2) {
+                    OperationEnd::Succeeded => {
+                        // Incus finished the restart after the first wait: the instance is what the read shows. A
+                        // read that fails is tried once more, so one failed read is not taken for a stopped instance.
+                        let now = changer
+                            .read(&seen.project, &seen.name)
+                            .or_else(|_| changer.read(&seen.project, &seen.name));
+                        match now {
+                            Ok(state) if state.is_running() => {
+                                return Ok(Done {
+                                    state,
+                                    changed: true,
+                                    outcome: "restarted",
+                                    message: format!(
+                                        "restarted {named}; {late}, and it finished after that"
+                                    ),
+                                });
+                            }
+                            Ok(_) => {
+                                read_after = Some(now);
+                                format!(
+                                    "{named} was restarted by Incus ({late}), but it did not stay running"
+                                )
+                            }
+                            Err(_) => {
+                                read_after = Some(now);
+                                format!(
+                                    "{named} was restarted by Incus ({late}), but Arca could not read it after that"
+                                )
+                            }
+                        }
+                    }
+                    OperationEnd::Failed(error) => {
+                        format!(
+                            "{named} was not restarted: {late} and then failed the restart: {error}"
+                        )
+                    }
+                    OperationEnd::Gone => format!(
+                        "{named} was not restarted: {late}, and Incus has ended the restart since without saying how"
+                    ),
+                    still => {
+                        let why = match still {
+                            OperationEnd::Unknown(error) => {
+                                format!("Arca could not tell whether it has ended ({error})")
+                            }
+                            _ => "it is still running".to_string(),
+                        };
+                        let row = json!({ "kind": "restart_unfinished", "id": id });
+                        if self.append(&row).is_err() {
+                            eprintln!(
+                                "arca: the unfinished restart of instance action {id} was not journalled"
+                            );
+                        }
+                        return Err(stopped(refused(
+                            RESTART_UNKNOWN,
+                            format!(
+                                "{named} has not finished restarting: {late}, and {} after it was sent {why}. Arca sent nothing more, so it does not start the instance twice. Its state is not known until Incus ends that restart; read it again then, and run instance_start if it is stopped. Arca forces nothing.",
+                                spoken(first + first / 2)
+                            ),
+                        )));
+                    }
+                }
+            }
+        };
+        // A request Incus did not answer in time names no operation: the restart may be running, so nothing is started.
+        let unanswered = failure.unfinished.is_none()
+            && failure.sent
+            && matches!(failure.error, IncusError::Timeout);
+        // The restart has ended: what the instance is now is read, so the answer says what is true.
+        let now = read_after.unwrap_or_else(|| changer.read(&seen.project, &seen.name));
+        if !unanswered
+            && let Ok(now) = &now
+            && now.is_stopped()
+            && now.uuid == seen.uuid
+            && now.kind == seen.kind
+        {
+            return self.start_after_restart(seen, &failed, start_deadline, id);
+        }
+        let now = now
+            .map(|state| shown_status(&state.status))
+            .unwrap_or_else(|_| "in an unknown state".to_string());
+        if unanswered {
+            return Err(stopped(refused(
+                RESTART_UNKNOWN,
+                format!(
+                    "{failed}; Incus may have taken the restart and still be working on it, so Arca sent nothing more. It is {now} now; read it again in a minute, and run instance_start if it is stopped. Arca forces nothing."
+                ),
+            )));
+        }
+        Err(stopped(refused(
+            "InstanceRestartFailed",
+            format!(
+                "{failed}. It is {now} now. Arca gives it {GRACE_SECONDS} seconds to shut down and forces nothing."
+            ),
+        )))
+    }
+
+    /// Follows a restart that ended and left the instance stopped with one plain start, never forced, waited on for at
+    /// most `deadline`. The start is journalled before it is sent, and the answer says the restart failed, why, and what
+    /// the start did. `failed` says what became of the restart.
+    fn start_after_restart(
+        &self,
+        seen: &InstanceState,
+        failed: &str,
+        deadline: Duration,
+        id: &str,
+    ) -> Result<Done, Stopped> {
+        let sent = format!(
+            "{failed}. It was stopped then, so Arca sent it one plain start, apart from the restart"
+        );
+        let row = json!({
+            "kind": "separate_start",
+            "id": id,
+            "after": "restart",
+            "status": "Stopped",
+        });
+        // The action itself is journalled already, and its end line names the start: an instance is not left stopped
+        // because this line could not be written.
+        if self.append(&row).is_err() {
+            eprintln!("arca: the separate start of instance action {id} was not journalled");
+        }
+        let changer = self.changer().with_deadline(deadline);
+        let start_error = match changer.change(seen, StateAction::Start) {
+            Ok(state) => {
+                return Ok(Done {
+                    state,
+                    changed: true,
+                    outcome: "started_after_restart",
+                    message: format!("{sent}, and it is running now"),
+                });
+            }
+            Err(error) => error,
+        };
+        let now = changer.read(&seen.project, &seen.name);
+        // Something else started it meanwhile: it runs, which is what the owner asked for.
+        if let Ok(state) = now.as_ref()
+            && state.is_running()
+            && state.uuid == seen.uuid
+        {
+            return Ok(Done {
+                state: state.clone(),
+                changed: true,
+                outcome: "running_after_restart",
+                message: format!(
+                    "{sent}. The start answered: {start_error}; but it is running now"
+                ),
+            });
+        }
+        let now = now
+            .map(|state| shown_status(&state.status))
+            .unwrap_or_else(|_| "in an unknown state".to_string());
+        Err(Stopped {
+            refusal: refused(
+                "InstanceRestartFailed",
+                format!(
+                    "{sent}, and that start failed too: {start_error}. It is {now} now. Arca sends no other start and forces nothing; run instance_start once what stops it is put right."
+                ),
+            ),
+            uuid: seen.uuid.clone(),
+            was: Some(seen.status.clone()),
+        })
+    }
+
     /// Appends one line and syncs it. A journal that is not a private regular file is refused, never replaced.
     fn append(&self, row: &Value) -> std::io::Result<()> {
         match fs::symlink_metadata(&self.journal) {
@@ -466,6 +719,15 @@ impl InstanceLifecycle {
         bytes.push(b'\n');
         file.write_all(&bytes)?;
         file.sync_all()
+    }
+}
+
+/// A wait as a sentence says it: whole seconds, or milliseconds under one second.
+fn spoken(wait: Duration) -> String {
+    if wait >= Duration::from_secs(1) {
+        format!("{} seconds", wait.as_secs())
+    } else {
+        format!("{} milliseconds", wait.as_millis())
     }
 }
 

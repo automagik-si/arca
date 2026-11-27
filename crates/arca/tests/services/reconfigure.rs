@@ -961,3 +961,52 @@ fn labels_survive_reconfigure_and_hold_changes_no_boot_policy() {
     );
     assert_eq!(instance(&rig, "app")["status"], "Running");
 }
+
+/// Issue #307: a reconfigure restarts the running service, so the hung mark the service verbs obey goes.
+#[test]
+fn a_reconfigure_that_restarts_the_service_clears_its_hung_mark() {
+    use arca::service_exec::{DeclaredCommand, ExecTarget};
+    use arca_incus::fake::ExecScript;
+    use std::time::{Duration, Instant};
+    let key = common::SkKey::from_seed(47);
+    let mut rig = node(&key);
+    let served =
+        arca::handlers::service_handlers(rig.kernel.clone(), Arc::new(|| NOW), rig.cfg.clone());
+    let exec = arca::handlers::service_exec(&served);
+    rig.handlers = served.into_iter().collect();
+    let service = rig.service_config("app");
+    let target = {
+        let kernel = rig.kernel.lock().unwrap();
+        let entry = EntryId("service-app".into());
+        ExecTarget {
+            uuid: kernel.service_uuid(&entry, "app"),
+            entry,
+            service,
+            retained: kernel.retained_entries().unwrap(),
+        }
+    };
+    let formula: arca::app_formula::AppUpdate = serde_json::from_value(json!({
+        "health": { "command": ["/usr/bin/curl", "--fail", "http://localhost/ready"], "seconds": 300 },
+        "version": { "command": ["/usr/bin/cat", "/opt/app/version.txt"] }
+    }))
+    .unwrap();
+    let version = DeclaredCommand::version(&formula, "oci").expect("the version reader");
+    let mut held = ExecScript::new(version.argv(), 0, "");
+    held.held = true;
+    rig.fake.script_exec(held);
+    let _ = exec.run_formula(
+        &target,
+        "doctor",
+        "app_update",
+        &version,
+        Some(Instant::now() + Duration::from_secs(2)),
+    );
+    assert!(exec.hung(&target));
+    let mut template = first_template();
+    template["env"]["MODE"] = json!("two");
+    rig.template("app", template);
+    let proposed = propose(&rig, json!({ "name": "app" })).expect("the proposal");
+    approve_and_run(&rig, &key, &proposed).expect("the approved reconfigure runs");
+    assert_eq!(instance(&rig, "app")["config"]["environment.MODE"], "two");
+    assert!(!exec.hung(&target), "the reconfigure restarted it");
+}

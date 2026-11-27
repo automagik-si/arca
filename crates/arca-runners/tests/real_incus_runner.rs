@@ -31,6 +31,11 @@
 //!
 //! `cargo test -p arca-runners --test real_incus_runner -- --ignored --nocapture --test-threads=1` prints the measured
 //! times.
+//!
+//! Both tests refuse to start when the pool already has machines in the project, so a live pool's name never loses its
+//! machines to a proof. A failed check deletes the machine on its way out, but an interrupted run (Ctrl-C, a killed
+//! process) can leave one behind: list it with `incus list --project <project> user.arcakernel.runner=<pool>` and
+//! delete what that lists with `incus delete --force --project <project> <name>`.
 
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::PathBuf;
@@ -145,10 +150,19 @@ struct Sweep {
 }
 
 impl Sweep {
+    /// Refuses to start when the pool already has machines in the project: a live pool's machines are never swept, and
+    /// no sweep exists yet to drop.
     fn new(proof: &Proof) -> Self {
+        let vms =
+            RunnerVms::new(proof.socket.clone(), &proof.project, &proof.pool).expect("the writer");
+        assert!(
+            vms.list().expect("list").is_empty(),
+            "the pool {} already has machines in {}",
+            proof.pool,
+            proof.project
+        );
         Self {
-            vms: RunnerVms::new(proof.socket.clone(), &proof.project, &proof.pool)
-                .expect("the writer"),
+            vms,
             own_bridge: proof.plan.bridge.is_none(),
             project: proof.project.clone(),
             throwaway: Vec::new(),
@@ -220,6 +234,43 @@ fn untar(archive: &[u8], args: &[&str]) -> String {
     let out = child.wait_with_output().expect("tar ran");
     assert!(out.status.success(), "tar {args:?} failed");
     String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// What of a JIT configuration must never reach a log: the whole configuration, each of its three parts as the runner
+/// reads them, and each decoded value of the RSA key (the runner's secret), so a runner that traced the decoded key
+/// would be caught too.
+fn secret_parts(jit: &str) -> Vec<String> {
+    use base64::Engine as _;
+    let engine = base64::engine::general_purpose::STANDARD;
+    let decode = |text: &str| -> Value {
+        serde_json::from_slice(&engine.decode(text).expect("base64")).expect("json")
+    };
+    let mut parts = vec![jit.to_string()];
+    let outer = decode(jit);
+    for (name, part) in outer.as_object().expect("the three parts") {
+        let part = part.as_str().expect("a part");
+        parts.push(part.to_string());
+        if name == ".credentials_rsaparams" {
+            for value in decode(part).as_object().expect("the key").values() {
+                let value = value.as_str().expect("a key value");
+                // The public exponent is four characters that any text may hold.
+                if value.len() >= 16 {
+                    parts.push(value.to_string());
+                }
+            }
+        }
+    }
+    parts
+}
+
+/// Fails when any secret part of the configuration is in `text`.
+fn assert_no_secret(text: &str, jit: &str, place: &str) {
+    for part in secret_parts(jit) {
+        assert!(
+            !text.contains(&part),
+            "a part of the configuration is in {place}"
+        );
+    }
 }
 
 fn secs(duration: Duration) -> String {
@@ -307,7 +358,7 @@ fn a_real_machine_takes_its_configuration_runs_the_runner_once_and_goes() {
     let config = proof
         .get(&format!("/1.0/instances/{name}?project={}", proof.project))
         .expect("the machine");
-    assert!(!config.to_string().contains(&jit[..64]));
+    assert_no_secret(&config.to_string(), &jit, "the machine's settings");
 
     let logs = launcher
         .collect_logs(&name)
@@ -321,10 +372,10 @@ fn a_real_machine_takes_its_configuration_runs_the_runner_once_and_goes() {
     );
     let log = untar(&logs, &["-xzOf", "-", "var/log/arca-job/runner.log"]);
     assert!(log.contains(&format!("runner exited {code}")), "{log}");
-    assert!(
-        !log.contains(&jit[..64]),
-        "the configuration is not in the log"
-    );
+    // Every file collected (runner.log and the runner's own _diag), whole.
+    let everything = untar(&logs, &["-xzOf", "-"]);
+    assert!(everything.len() > log.len(), "the _diag files are read too");
+    assert_no_secret(&everything, &jit, "the collected logs");
 
     let clock = Instant::now();
     launcher.destroy(&name).expect("the destroy");
@@ -435,16 +486,22 @@ async fn the_pool_records_a_refused_runner_and_destroys_its_machine() {
     };
     assert_eq!(mode(&logs), 0o600);
     assert_eq!(mode(logs.parent().expect("its folder")), 0o700);
-    let log = untar(
-        &std::fs::read(&logs).expect("the logs"),
-        &["-xzOf", "-", "var/log/arca-job/runner.log"],
-    );
+    let archive = std::fs::read(&logs).expect("the logs");
+    let log = untar(&archive, &["-xzOf", "-", "var/log/arca-job/runner.log"]);
     assert!(log.contains(&format!("runner exited {code}")), "{log}");
+    let name = line["runner"].as_str().expect("its name");
+    let minted = github.minted();
+    let (_, jit) = minted
+        .iter()
+        .find(|(runner, _)| runner == name)
+        .expect("its configuration was minted");
+    let everything = untar(&archive, &["-xzOf", "-"]);
+    assert!(everything.len() > log.len(), "the _diag files are kept too");
+    assert_no_secret(&everything, jit, "the logs kept on the host");
     assert!(
         launcher.existing().expect("list").is_empty(),
         "the machine is gone"
     );
-    let name = line["runner"].as_str().expect("its name");
     assert!(
         github
             .removed_runners()
