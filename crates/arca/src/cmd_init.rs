@@ -1287,6 +1287,24 @@ mod tests {
     }
 
     #[test]
+    fn a_runner_pool_reads_the_same_routes_with_the_interface_each_goes_through() {
+        let routes = routed_networks(
+            "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n\
+             eth0\t00000000\t010200C0\t0003\t0\t0\t100\t00000000\t0\t0\t0\n\
+             eth0\t000200C0\t00000000\t0001\t0\t0\t100\t00FFFFFF\t0\t0\t0\n\
+             wg0\t00002F0A\t00000000\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0\n",
+        );
+        assert_eq!(
+            routes,
+            vec![
+                ("192.0.2.0/24".to_string(), "eth0".to_string()),
+                ("10.47.0.0/16".to_string(), "wg0".to_string()),
+            ],
+            "the default route is not a network in use"
+        );
+    }
+
+    #[test]
     fn a_source_that_cannot_be_read_is_asked_about_or_stops_init_and_is_never_guessed_around() {
         let unread = vec![
             "the routing table /proc/net/route".to_string(),

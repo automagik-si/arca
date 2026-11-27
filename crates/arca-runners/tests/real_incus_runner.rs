@@ -17,9 +17,12 @@
 //! - `ARCA_PROOF_RESERVED`: ranges the pool's own bridge must keep clear of, comma separated (as `kernel.reservedCidrs`).
 //!
 //! The network proof (`a_real_job_machine_reaches_dns_and_the_internet_and_nothing_else`) makes, besides the job
-//! machines, one throwaway machine with no rules of its own: a copy of the image with a card on the pool's bridge and a
-//! card on `ARCA_PROOF_SERVICE_BRIDGE` (default `arcak-svcbr`), a listener on tcp 8080 that the host reaches on both
-//! addresses (checked first). So every refusal below is the job machine's rules, and nothing else's. It makes two job
+//! machines, two throwaway machines with no rules of its own, copies of the image: the target, with a card on the
+//! pool's bridge and a card on `ARCA_PROOF_SERVICE_BRIDGE` (default `arcak-svcbr`) and a listener on tcp 8080 that the
+//! host reaches on both addresses (checked first); and the relay, with one card on the pool's bridge only, which must
+//! reach the target's service-bridge address through the host (the path a job would take) before a job is refused it.
+//! So every refusal below is the job machine's rules, and nothing else's; each must be a connect that timed out
+//! (exit 124: Incus drops a rejected packet in the bridge's forward path). It makes two job
 //! machines at once: set `ARCA_PROOF_MEMORY_MIB=2048` when the project's memory limit is 8 GiB. It also needs
 //! `ARCA_PROOF_PRIVATE`, `<address>:<port>` of a private address outside both bridges that answers from the host
 //! (checked first), and takes `ARCA_PROOF_DNS_NAME` (default `example.com`) and `ARCA_PROOF_INTERNET_URL` (default
@@ -86,6 +89,8 @@ fn proof() -> Option<Proof> {
             reserved: env("ARCA_PROOF_RESERVED")
                 .map(|ranges| ranges.split(',').map(str::to_string).collect())
                 .unwrap_or_default(),
+            // The kernel passes the host's routing table; the proof's bridge is checked against none.
+            routes: vec![],
         },
     })
 }
@@ -495,7 +500,27 @@ fn guest(vms: &RunnerVms, name: &str, script: &str, limit: Duration) -> i64 {
 
 /// Runs `script` with `sh -c` in the throwaway machine, and whether it exited 0.
 fn throwaway(project: &str, name: &str, script: &str) -> bool {
-    incus_cli(&["exec", "--project", project, name, "--", "sh", "-c", script]).0
+    throwaway_code(project, name, script) == 0
+}
+
+/// Runs `script` with `sh -c` in the throwaway machine, and its exit code, which `incus exec` passes through. A command
+/// line that hangs is killed after two minutes (exit 137, never 124), and one that ends by a signal is -1.
+fn throwaway_code(project: &str, name: &str, script: &str) -> i64 {
+    let out = std::process::Command::new("timeout")
+        .args([
+            "--signal=KILL",
+            "120",
+            "incus",
+            "exec",
+            "--project",
+            project,
+            name,
+            "--",
+        ])
+        .args(["sh", "-c", script])
+        .output()
+        .expect("the incus command line");
+    out.status.code().map_or(-1, i64::from)
 }
 
 /// Whether the CIDR `subnet` holds `ip`.
@@ -605,42 +630,52 @@ fn a_real_job_machine_reaches_dns_and_the_internet_and_nothing_else() {
         .image
         .split_once('/')
         .expect("the image is <instance>/<snapshot>");
-    let target = format!("{}-target-{}", proof.pool, hex());
     let project = proof.project.as_str();
-    let (made, out) = incus_cli(&[
-        "copy",
-        "--project",
-        project,
-        &format!("{instance}/{snapshot}"),
-        &target,
-        "-c",
-        "limits.cpu=1",
-        "-c",
-        "limits.memory=1GiB",
-        "-c",
-        "boot.autostart=false",
-    ]);
-    sweep.throwaway.push(target.clone());
-    assert!(made, "the throwaway copy: {out}");
-    for (card, network) in [
-        ("eth0", launcher.bridge()),
-        ("eth1", service_bridge.as_str()),
-    ] {
-        let (added, out) = incus_cli(&[
-            "config",
-            "device",
-            "add",
+    let copy = |name: &str, cards: &[(&str, &str)]| {
+        let (made, out) = incus_cli(&[
+            "copy",
             "--project",
             project,
-            &target,
-            card,
-            "nic",
-            &format!("network={network}"),
+            &format!("{instance}/{snapshot}"),
+            name,
+            "-c",
+            "limits.cpu=1",
+            "-c",
+            "limits.memory=1GiB",
+            "-c",
+            "boot.autostart=false",
         ]);
-        assert!(added, "the throwaway's {card}: {out}");
-    }
-    let (started, out) = incus_cli(&["start", "--project", project, &target]);
-    assert!(started, "the throwaway's start: {out}");
+        assert!(made, "the throwaway copy {name}: {out}");
+        for (card, network) in cards {
+            let (added, out) = incus_cli(&[
+                "config",
+                "device",
+                "add",
+                "--project",
+                project,
+                name,
+                card,
+                "nic",
+                &format!("network={network}"),
+            ]);
+            assert!(added, "{name}'s {card}: {out}");
+        }
+        let (started, out) = incus_cli(&["start", "--project", project, name]);
+        assert!(started, "{name}'s start: {out}");
+    };
+    let target = format!("{}-target-{}", proof.pool, hex());
+    sweep.throwaway.push(target.clone());
+    copy(
+        &target,
+        &[
+            ("eth0", launcher.bridge()),
+            ("eth1", service_bridge.as_str()),
+        ],
+    );
+    // The relay: one card, on the pool's bridge, and no rules, like a job machine without its ACL.
+    let relay = format!("{}-relay-{}", proof.pool, hex());
+    sweep.throwaway.push(relay.clone());
+    copy(&relay, &[("eth0", launcher.bridge())]);
 
     // Two job machines of the pool.
     let job = |n: u32| {
@@ -676,19 +711,21 @@ fn a_real_job_machine_reaches_dns_and_the_internet_and_nothing_else() {
         launcher.acl_name()
     );
 
-    // The throwaway: both cards up, a listener the host reaches on both addresses.
-    while !throwaway(project, &target, "true") {
-        assert!(
-            Instant::now() < deadline,
-            "the throwaway's agent did not answer in time"
-        );
-        std::thread::sleep(Duration::from_secs(1));
+    // The throwaways: every card up; the target listens, and the host reaches it on both addresses.
+    for name in [&target, &relay] {
+        while !throwaway(project, name, "true") {
+            assert!(
+                Instant::now() < deadline,
+                "{name}'s agent did not answer in time"
+            );
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        assert!(throwaway(
+            project,
+            name,
+            "printf 'network:\n  version: 2\n  ethernets:\n    all:\n      match: {name: \"en*\"}\n      dhcp4: true\n' > /etc/netplan/99-proof.yaml && chmod 600 /etc/netplan/99-proof.yaml && netplan apply"
+        ));
     }
-    assert!(throwaway(
-        project,
-        &target,
-        "printf 'network:\n  version: 2\n  ethernets:\n    all:\n      match: {name: \"en*\"}\n      dhcp4: true\n' > /etc/netplan/99-proof.yaml && chmod 600 /etc/netplan/99-proof.yaml && netplan apply"
-    ));
     assert!(throwaway(project, &target, LISTEN));
     let target_here = address_in(&proof, &target, &subnet, deadline);
     let target_service = address_in(&proof, &target, &service_cidr, deadline);
@@ -703,6 +740,21 @@ fn a_real_job_machine_reaches_dns_and_the_internet_and_nothing_else() {
             std::thread::sleep(Duration::from_secs(1));
         }
     }
+    // The forwarded path's control: the relay, on the pool's bridge with no rules, reaches the target's service-bridge
+    // address through the host. Without it, a host that drops forwarding between the bridges would pass probe 6.
+    address_in(&proof, &relay, &subnet, deadline);
+    let clock = Instant::now();
+    let relay_code = loop {
+        let code = throwaway_code(project, &relay, &connect(target_service, 8080));
+        if code == 0 || clock.elapsed() > Duration::from_secs(60) {
+            break code;
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    };
+    assert_eq!(
+        relay_code, 0,
+        "the relay on the pool's bridge does not reach the service bridge through the host"
+    );
 
     let vms = RunnerVms::new(proof.socket.clone(), &proof.project, &proof.pool).expect("vms");
     for name in [&first, &second] {
@@ -760,8 +812,9 @@ fn a_real_job_machine_reaches_dns_and_the_internet_and_nothing_else() {
     }
 
     let mut refused = Vec::new();
+    // A refusal is a connect that timed out: 124. Any other code is the probe failing, not the rules.
     let mut refuse = |what: &str, code: i64| {
-        assert_ne!(code, 0, "{what} answered");
+        assert_eq!(code, 124, "{what}: the connect did not time out");
         refused.push(format!("{what} (exit {code})"));
     };
     // 3. The throwaway on the same bridge, which answers the host: refused.
@@ -777,7 +830,7 @@ fn a_real_job_machine_reaches_dns_and_the_internet_and_nothing_else() {
     // 4. The throwaway into the job machine: refused.
     refuse(
         "the throwaway into the job machine",
-        i64::from(!throwaway(project, &target, &connect(first_ip, 8080))),
+        throwaway_code(project, &target, &connect(first_ip, 8080)),
     );
     // 5. The second job machine into the first: refused.
     refuse(
@@ -789,9 +842,9 @@ fn a_real_job_machine_reaches_dns_and_the_internet_and_nothing_else() {
             Duration::from_secs(30),
         ),
     );
-    // 6. A service address on the service bridge, routed through the host, which it answers: refused.
+    // 6. A service address on the service bridge, routed through the host, which the relay reached: refused.
     refuse(
-        "the service bridge through the host",
+        "the service bridge through the host (the relay reached it)",
         guest(
             &vms,
             &first,

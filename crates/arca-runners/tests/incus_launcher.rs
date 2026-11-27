@@ -102,6 +102,18 @@ fn own() -> NetworkPlan {
         bridge: None,
         service_cidr: Some(SERVICE_CIDR.to_string()),
         reserved: vec!["100.70.0.0/16".to_string()],
+        routes: vec![],
+    }
+}
+
+/// `own()` with the host's routing table holding `routes` (destination, interface).
+fn routed(routes: &[(&str, &str)]) -> NetworkPlan {
+    NetworkPlan {
+        routes: routes
+            .iter()
+            .map(|(destination, interface)| (destination.to_string(), interface.to_string()))
+            .collect(),
+        ..own()
     }
 }
 
@@ -230,6 +242,8 @@ fn a_pool_gets_its_own_bridge_and_its_machines_arcas_card_on_it() {
     assert_eq!(made["config"]["user.arcakernel.runner"], "acme");
     assert_eq!(made["config"]["ipv4.nat"], "true");
     assert_eq!(made["config"]["ipv6.address"], "none");
+    // Its DNS does not hand the host's /etc/hosts to a job.
+    assert_eq!(made["config"]["dns.include_hosts"], "false");
     let address = made["config"]["ipv4.address"]
         .as_str()
         .expect("an address")
@@ -253,6 +267,16 @@ fn a_pool_gets_its_own_bridge_and_its_machines_arcas_card_on_it() {
     let spec = spec("acme-0-11223344");
     launcher.create(&spec).expect("create");
     let machine = instance(&fake, &spec.name).expect("the machine exists");
+    // Made stopped, its devices checked, then started: one start after the create.
+    let made_then_started: Vec<String> = writes(&fake, "/1.0/instances");
+    assert_eq!(
+        made_then_started,
+        vec![
+            format!("POST /1.0/instances?project={PROJECT}"),
+            format!("PUT /1.0/instances/{}/state?project={PROJECT}", spec.name),
+        ]
+    );
+    assert_eq!(machine["status"], "Running");
     // The card replaces the profile's eth0: on the pool's bridge, filtered, nothing passes that no rule allows.
     assert_eq!(
         machine["devices"]["eth0"],
@@ -410,7 +434,15 @@ fn a_pools_network_key_puts_the_card_on_that_bridge_with_its_own_subnet_rejected
         format!("198.51.100.128/25,{SERVICE_CIDR}")
     );
     // A bridge Incus does not have gives no gateway to build the rules from: the pool does not start.
-    assert!(self::launcher(&fake, "bare", &named("no-such-bridge")).is_err());
+    let error = self::launcher(&fake, "bare", &named("no-such-bridge"))
+        .err()
+        .expect("the pool does not start");
+    assert_eq!(
+        error,
+        format!(
+            "the pool's network no-such-bridge is not an Incus network the project {PROJECT} sees: check its spelling"
+        )
+    );
     assert!(acl(&fake, "arca-runner-bare").is_none());
     let _ = fs::remove_dir_all(dir);
 }
@@ -435,6 +467,102 @@ fn a_machine_with_any_card_but_arcas_is_deleted_and_its_create_fails() {
         "the machine is gone"
     );
     assert!(launcher.existing().expect("list").is_empty());
+    // It was never started: the create, then the delete, and no state change between.
+    assert_eq!(
+        writes(&fake, "/1.0/instances"),
+        vec![
+            format!("POST /1.0/instances?project={PROJECT}"),
+            format!("DELETE /1.0/instances/acme-0-99aabbcc?project={PROJECT}"),
+        ]
+    );
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn a_machine_with_any_device_but_disks_and_arcas_card_is_deleted_before_it_starts() {
+    for (name, device) in [
+        (
+            "hostport",
+            json!({"type":"proxy","listen":"tcp:0.0.0.0:2222","connect":"tcp:127.0.0.1:22"}),
+        ),
+        (
+            "ib0",
+            json!({"type":"infiniband","nictype":"physical","parent":"ib0"}),
+        ),
+        ("passed", json!({"type":"pci","address":"0000:03:00.0"})),
+    ] {
+        let (fake, dir) = fake();
+        let mut devices = json!({"root":{"type":"disk","pool":"pool1","path":"/"}});
+        devices[name] = device;
+        fake.add_profile(
+            "default",
+            json!({"name":"extra","config":{},"devices":devices}),
+        );
+        let launcher =
+            launcher_with(&fake, "acme", vec!["extra".to_string()], &own()).expect("launcher");
+        let error = launcher
+            .create(&spec("acme-0-0d0d0d0d"))
+            .expect_err("the device is refused");
+        assert!(error.to_string().contains(name), "{error}");
+        assert!(instance(&fake, "acme-0-0d0d0d0d").is_none(), "{name}");
+        assert!(
+            !writes(&fake, "/1.0/instances")
+                .iter()
+                .any(|write| write.contains("/state")),
+            "{name}: never started"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+}
+
+#[test]
+fn a_routed_range_moves_the_pools_bridge_and_one_that_now_meets_it_stops_the_pool() {
+    let (fake, dir) = fake();
+    // A range the host reaches through a route (a VPN, a peering) with no address of its own in it.
+    let first = subnet_of(&choose_subnet("acme", &[]).expect("a subnet"));
+    let wide = format!("{}/16", first.split('/').next().unwrap());
+    let launcher = launcher(&fake, "acme", &routed(&[(&wide, "wg0")])).expect("launcher");
+    let bridge = launcher.bridge().to_string();
+    let address = network(&fake, &bridge).unwrap()["config"]["ipv4.address"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let subnet = subnet_of(&address);
+    assert!(
+        !overlaps(&subnet, &wide),
+        "{subnet} is inside the route {wide}"
+    );
+    drop(launcher);
+    let made = writes(&fake, "/1.0/networks").len();
+
+    // The bridge's own connected route is not a conflict: a restart reuses it.
+    let again = self::launcher(
+        &fake,
+        "acme",
+        &routed(&[(&wide, "wg0"), (&subnet, &bridge)]),
+    )
+    .expect("launcher");
+    assert_eq!(again.bridge(), bridge);
+    drop(again);
+
+    // A route that came since now meets the bridge: the pool stops, says so, and nothing is renumbered.
+    let error = self::launcher(&fake, "acme", &routed(&[(&subnet, "tun7")]))
+        .err()
+        .expect("the pool does not start");
+    assert!(
+        error.contains(&bridge) && error.contains(&subnet),
+        "{error}"
+    );
+    assert!(error.contains("tun7"), "{error}");
+    assert_eq!(
+        writes(&fake, "/1.0/networks").len(),
+        made,
+        "nothing is written"
+    );
+    assert_eq!(
+        network(&fake, &bridge).unwrap()["config"]["ipv4.address"],
+        address.as_str()
+    );
     let _ = fs::remove_dir_all(dir);
 }
 
@@ -500,8 +628,14 @@ fn a_gone_pools_acl_and_bridge_are_deleted_and_no_other() {
     let (fake, dir) = fake();
     let kept = launcher(&fake, "kept", &own()).expect("launcher");
     let gone = launcher(&fake, "gone", &own()).expect("launcher");
-    let (kept_bridge, gone_bridge) = (kept.bridge().to_string(), gone.bridge().to_string());
-    drop((kept, gone));
+    // A pool still configured, moved to a named bridge: its own bridge has no pool left.
+    let moved = launcher(&fake, "moved", &own()).expect("launcher");
+    let (kept_bridge, gone_bridge, moved_bridge) = (
+        kept.bridge().to_string(),
+        gone.bridge().to_string(),
+        moved.bridge().to_string(),
+    );
+    drop((kept, gone, moved));
     // An ACL without the mark, and a marked one whose name is not its pool's: neither is a pool's. The same for
     // networks.
     fake.add_acl(
@@ -514,11 +648,21 @@ fn a_gone_pools_acl_and_bridge_are_deleted_and_no_other() {
     );
     fake.add_network(
         "default",
-        json!({ "name": "arcarun-hand", "type": "bridge", "config": { "ipv4.address": "10.98.0.1/24" } }),
+        json!({ "name": "arcarun-hand", "type": "bridge", "config": { "ipv4.address": "198.51.100.1/24" } }),
     );
-    let lines = remove_gone_pools(fake.socket(), &["kept"]);
-    assert_eq!(lines.len(), 2, "{lines:?}");
-    assert!(lines.iter().all(|line| line.contains("gone")), "{lines:?}");
+    let lines = remove_gone_pools(fake.socket(), &["kept", "moved"], &["kept"]);
+    assert_eq!(lines.len(), 3, "{lines:?}");
+    assert!(
+        lines
+            .iter()
+            .all(|line| line.contains("gone") || line.contains("no longer uses")),
+        "{lines:?}"
+    );
+    assert!(network(&fake, &moved_bridge).is_none());
+    assert!(
+        acl(&fake, "arca-runner-moved").is_some(),
+        "a configured pool keeps its ACL"
+    );
     assert!(acl(&fake, "arca-runner-gone").is_none());
     assert!(network(&fake, &gone_bridge).is_none());
     assert!(acl(&fake, "arca-runner-kept").is_some());
@@ -538,9 +682,10 @@ fn a_gone_pools_acl_and_bridge_are_deleted_and_no_other() {
         vec![
             "/1.0/network-acls/arca-runner-gone?project=default".to_string(),
             format!("/1.0/networks/{gone_bridge}?project=default"),
+            format!("/1.0/networks/{moved_bridge}?project=default"),
         ]
     );
     // Run again, nothing is left to do.
-    assert!(remove_gone_pools(fake.socket(), &["kept"]).is_empty());
+    assert!(remove_gone_pools(fake.socket(), &["kept", "moved"], &["kept"]).is_empty());
     let _ = fs::remove_dir_all(dir);
 }
