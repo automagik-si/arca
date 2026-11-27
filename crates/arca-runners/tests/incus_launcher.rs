@@ -373,7 +373,7 @@ fn a_pools_network_key_puts_the_card_on_that_bridge_with_its_own_subnet_rejected
 fn a_machine_with_any_card_but_arcas_is_deleted_and_its_create_fails() {
     let (fake, dir) = fake();
     fake.add_profile(
-        "extra",
+        "default",
         json!({"name":"extra","config":{},"devices":{
             "root":{"type":"disk","pool":"pool1","path":"/"},
             "eth1":{"type":"nic","network":"ci-br0"}}}),
