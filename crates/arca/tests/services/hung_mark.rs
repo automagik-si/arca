@@ -541,3 +541,27 @@ fn the_cut_answer_keeps_where_its_lines_came_from() {
     assert_eq!(journal["source"], "journal");
     assert!(journal.get("journalNotRead").is_none());
 }
+
+#[test]
+fn a_restart_that_left_the_instance_stopped_and_was_followed_by_a_start_clears_the_mark() {
+    bounded(|| {
+        let rig = Rig::new();
+        system(&rig);
+        let node = node(&rig);
+        let target = target(&rig);
+        mark_hung(&rig, &node, &target);
+        // Incus does the stop half and fails the start half; Arca sees it stopped and sends one plain start (#306).
+        rig.fake.refuse_start_once(PROJECT, "app");
+        let restarted = node.act(StateAction::Restart);
+        assert_eq!(restarted["status"], "Running", "{restarted}");
+        assert!(
+            restarted["message"]
+                .as_str()
+                .unwrap()
+                .contains("one plain start"),
+            "{restarted}"
+        );
+        assert!(!node.exec.hung(&target), "seen stopped after the restart");
+        reads_the_journal(&rig, &node, "journal after the separate start");
+    });
+}
