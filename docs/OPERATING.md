@@ -7573,7 +7573,8 @@ first real job, and how to read a pool.
   job.
 - **The pool's network:** `incus network list user.arcakernel.runner=<pool>` shows its own bridge, and
   `incus network acl show arca-runner-<pool> --project <project>` its rules. A pool whose bridge or ACL could not be
-  made (no free /24, a named bridge without an IPv4 address, or a network or an ACL of that name made by hand) does not
+  made (no free /24, a named bridge that is not there or has no IPv4 address, its own bridge now overlapping a route
+  or a network that came since, or a network or an ACL of that name made by hand) does not
   start, and the kernel's log says why. A pool removed from the config has its ACL and its bridge deleted at the next
   kernel start (`arca: runners: pool <name> is gone: …`). An existing pool needs nothing in its config: at its next
   start it moves to its own bridge.
