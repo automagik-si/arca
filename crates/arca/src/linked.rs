@@ -368,7 +368,7 @@ mod tests {
         // Incus step, 300 s for the new version and 30 s for the old one after a rollback.
         let card = approval_wait("service_update", &json!({ "timeoutSeconds": 300 }));
         assert_eq!(card, APPROVAL_TIMEOUT + step + Duration::from_secs(330));
-        assert_eq!(card, Duration::from_secs(180 + 600 + 330));
+        assert_eq!(card, Duration::from_secs(310 + 600 + 330));
         // Without timeoutSeconds the update checks for its default 120 s.
         assert_eq!(
             approval_wait("service_update", &json!({})),
