@@ -13,7 +13,7 @@ use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
@@ -271,13 +271,15 @@ fn read_token(host: &LinkedHost) -> Result<String, RelayError> {
     Ok(token.to_string())
 }
 
-/// One POST of `body` to the linked kernel's `/mcp`. The reply is read to its end, up to [`REPLY_MAX`].
+/// One POST of `body` to the linked kernel's `/mcp`. The reply is read to its end, up to [`REPLY_MAX`], all within
+/// `timeout`: one deadline for the whole reply, so a node that sends a byte at a time is cut off at it.
 fn post(
     host: &LinkedHost,
     token: &str,
     body: &Value,
     timeout: Duration,
 ) -> Result<(u16, Vec<u8>), RelayError> {
+    let deadline = Instant::now() + timeout;
     let mut stream = UnixStream::connect(&host.socket).map_err(|_| RelayError::Unreachable)?;
     stream
         .set_read_timeout(Some(timeout))
@@ -292,10 +294,23 @@ fn post(
         .write_all(request.as_bytes())
         .map_err(|_| RelayError::Unreachable)?;
     let mut reply = Vec::new();
-    stream
-        .take(REPLY_MAX)
-        .read_to_end(&mut reply)
-        .map_err(|_| RelayError::Unreachable)?;
+    let mut chunk = [0u8; 8192];
+    while (reply.len() as u64) < REPLY_MAX {
+        let left = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|left| !left.is_zero())
+            .ok_or(RelayError::Unreachable)?;
+        stream
+            .set_read_timeout(Some(left))
+            .map_err(|_| RelayError::Unreachable)?;
+        let room = (REPLY_MAX - reply.len() as u64).min(chunk.len() as u64) as usize;
+        match stream.read(&mut chunk[..room]) {
+            Ok(0) => break,
+            Ok(read) => reply.extend_from_slice(&chunk[..read]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return Err(RelayError::Unreachable),
+        }
+    }
     let end = reply
         .windows(4)
         .position(|window| window == b"\r\n\r\n")

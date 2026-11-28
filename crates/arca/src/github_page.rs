@@ -1622,11 +1622,20 @@ async fn installed_later(ctx: &Ctx<'_>, installation: u64, state: Option<&str>) 
         .cloned();
     let stale = index.installations.contains_key(&installation);
     let bound = ctx.links.claim_bound;
+    // One hard deadline for every node asked: a node that keeps sending a byte at a time is cut off at it, and what it
+    // answers later is dropped.
+    let deadline = tokio::time::Instant::now() + bound;
+    let by_deadline = |call: tokio::task::JoinHandle<Result<Value, RelayError>>| async move {
+        match tokio::time::timeout_at(deadline, call).await {
+            Ok(Ok(answer)) => answer,
+            Ok(Err(_)) | Err(_) => Err(RelayError::Unreachable),
+        }
+    };
     let claim = json!({ "step": "claim", "origin": ctx.origin, "installationId": installation });
 
     if let Some(node) = indexed {
-        let answer = ctx.links.start_call(&node, claim, bound).await;
-        return match said(answer.unwrap_or(Err(RelayError::Unreachable))) {
+        let answer = by_deadline(ctx.links.start_call(&node, claim, bound)).await;
+        return match said(answer) {
             Said::Holds(_) => update(ctx, installation, state, Claim::Linked(node), false).await,
             Said::NotHeld => {
                 ctx.links.note_read(installation, ctx.signer.now());
@@ -1655,11 +1664,11 @@ async fn installed_later(ctx: &Ctx<'_>, installation: u64, state: Option<&str>) 
         .map(|node| ctx.links.start_call(node, claim.clone(), bound))
         .collect();
     let (local, answers) = tokio::join!(
-        tokio::time::timeout(bound, ctx.signer.app_owning(installation)),
+        tokio::time::timeout_at(deadline, ctx.signer.app_owning(installation)),
         async {
             let mut answers = Vec::new();
             for call in calls {
-                answers.push(call.await.unwrap_or(Err(RelayError::Unreachable)));
+                answers.push(by_deadline(call).await);
             }
             answers
         }
