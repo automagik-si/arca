@@ -2066,4 +2066,55 @@ mod tests {
         assert_eq!(web_origin("https://github.com"), "https://github.com");
         assert_eq!(web_origin("http://127.0.0.1:9/web"), "http://127.0.0.1:9");
     }
+
+    /// Issue 328: a row says what the runner group is open to, and a connection whose own group is open to no
+    /// repository is not shown as simply connected.
+    #[test]
+    fn a_row_says_what_the_runner_group_is_open_to() {
+        use crate::github_signer::{GroupAccess, InstallationRecord, RunnerGroup};
+        let binding = |access: Option<GroupAccess>, repositories: &[&str]| Binding {
+            id: "gh-0123456789abcdef".to_string(),
+            mode: Mode::App,
+            repository_access: false,
+            account: "acme".to_string(),
+            status: Status::Active,
+            why: None,
+            label_sets: vec![vec!["linux".to_string()]],
+            runner_group: Some(RunnerGroup {
+                id: 20,
+                name: "Arca runners".to_string(),
+                created_by_arca: true,
+                warning: None,
+                access,
+            }),
+            runners: Vec::new(),
+            app: None,
+            installation: Some(InstallationRecord {
+                id: 5,
+                repository_selection: "selected".to_string(),
+                repositories: repositories.iter().map(|name| name.to_string()).collect(),
+            }),
+            created_by: "page".to_string(),
+            created_at: 0,
+            updated_at: 0,
+        };
+
+        let row = connection_rows(&[binding(Some(GroupAccess::AllPrivate), &[])], &Target::Here);
+        assert!(row.contains("<span class=\"ok\">connected</span>"), "{row}");
+        assert!(
+            row.contains(
+                "Every private repository of acme may send jobs here. Narrow it in the runner group on GitHub."
+            ),
+            "{row}"
+        );
+
+        let row = connection_rows(&[binding(Some(GroupAccess::Selected), &["acme/web"])], &Target::Here);
+        assert!(row.contains("<span class=\"ok\">connected</span>"), "{row}");
+        assert!(row.contains("acme/web"), "{row}");
+
+        // A record from before issue 328: Arca's group, an installation listing nothing, no access recorded.
+        let row = connection_rows(&[binding(None, &[])], &Target::Here);
+        assert!(!row.contains("<span class=\"ok\">"), "{row}");
+        assert!(row.contains("open to no repository"), "{row}");
+    }
 }

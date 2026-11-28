@@ -729,6 +729,7 @@ impl Signer {
                 name: group.get("name")?.as_str()?.to_string(),
                 created_by_arca,
                 warning,
+                access: None,
             })
         };
         let Some(name) = wanted else {
@@ -744,6 +745,7 @@ impl Signer {
                     name: "Default".to_string(),
                     created_by_arca: false,
                     warning: Some(default_warning),
+                    access: None,
                 });
             self.step(
                 id,

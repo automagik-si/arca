@@ -81,6 +81,27 @@ pub struct RunnerGroup {
     /// What the person should know about it, in words, such as that it is the organisation's default group.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,
+    /// Which repositories may send jobs to the group, as Arca last set or read it. A record from before Arca kept it
+    /// has none; [`Binding::group_access`] then says what it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<GroupAccess>,
+}
+
+/// Which repositories of the organisation may send jobs to a binding's runner group.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GroupAccess {
+    /// Every private repository of the organisation, public ones off: Arca's group when the installation lists no
+    /// repository (an App with only the organisation permission is given none).
+    AllPrivate,
+    /// Exactly the repositories the installation lists.
+    Selected,
+    /// A group Arca did not make: Arca leaves it as it is and cannot tell what it is open to.
+    Unknown,
+    /// No repository at all, so no job ever reaches the runners: Arca's group as Arca before issue 328 left it for an
+    /// installation that lists none. The next sync opens it.
+    #[serde(rename = "none")]
+    NoRepository,
 }
 
 /// A runner registered for an OAuth binding. Its credential is in the store, never in this record.
@@ -134,6 +155,54 @@ impl Binding {
     /// The organisation's address on GitHub's web host, as a runner's `gitHubUrl` names it.
     pub fn org_url(&self, endpoints: &Endpoints) -> String {
         format!("{}/{}", endpoints.web, self.account)
+    }
+
+    /// Which repositories may send jobs to the runner group: as recorded, or, for a record from before Arca kept it,
+    /// what Arca's code then made (an App's own group open to exactly the installation's repositories, which is to
+    /// none when it lists none; a signed-in connection's own group open to every private repository).
+    pub fn group_access(&self) -> Option<GroupAccess> {
+        let group = self.runner_group.as_ref()?;
+        if let Some(access) = group.access {
+            return Some(access);
+        }
+        Some(match (group.created_by_arca, self.mode) {
+            (false, _) => GroupAccess::Unknown,
+            (true, Mode::Oauth) => GroupAccess::AllPrivate,
+            (true, _) => match &self.installation {
+                Some(installation) if installation.repositories.is_empty() => {
+                    GroupAccess::NoRepository
+                }
+                _ => GroupAccess::Selected,
+            },
+        })
+    }
+
+    /// [`Binding::group_access`] in words for the person.
+    pub fn group_access_words(&self) -> Option<String> {
+        let group = self.runner_group.as_ref()?;
+        let org = &self.account;
+        Some(match self.group_access()? {
+            GroupAccess::AllPrivate => format!(
+                "Every private repository of {org} may send jobs here. Narrow it in the runner group on GitHub."
+            ),
+            GroupAccess::Selected => format!(
+                "Only these repositories of {org} may send jobs here: {}.",
+                self.installation
+                    .as_ref()
+                    .map(|installation| installation.repositories.join(", "))
+                    .unwrap_or_default()
+            ),
+            GroupAccess::Unknown => format!(
+                "Arca did not make the runner group \"{}\", so it cannot tell which repositories of {org} may send \
+                 jobs here. See the group's repository access on GitHub.",
+                group.name
+            ),
+            GroupAccess::NoRepository => format!(
+                "The runner group \"{}\" is open to no repository, so no job reaches these runners. Arca opens it to \
+                 every private repository of {org} at its next sync: when the pool starts or GitHub's page returns.",
+                group.name
+            ),
+        })
     }
 }
 

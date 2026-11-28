@@ -991,6 +991,272 @@ async fn a_plan_without_runner_groups_falls_back_to_the_default_group_and_an_exi
     );
 }
 
+// ---- Issue 328: an installation that lists no repository ----------------------------------------------------------
+
+/// What `github_bindings` answers on `signer`, checked against the verb's schema, which names the group's access.
+async fn listed_bindings(signer: &Signer) -> Value {
+    let handlers: std::collections::HashMap<&str, Arc<dyn arca_mcp::ToolHandler>> =
+        arca::github_handlers::handlers(signer)
+            .into_iter()
+            .collect();
+    let handler = Arc::clone(&handlers["github_bindings"]);
+    let caller = Caller {
+        token_id: "viewer".to_string(),
+        scope: arca_api::verbs::Scope::Viewer,
+        tools: None,
+        limits: Default::default(),
+    };
+    let listed = tokio::task::spawn_blocking(move || handler.call(json!({}), &caller))
+        .await
+        .unwrap()
+        .expect("the bindings");
+    let schema = (arca_api::verb("github_bindings").expect("the verb").result)();
+    let access = schema
+        .pointer("/properties/bindings/items/properties/runnerGroup/properties/access/enum")
+        .expect("the schema names the group's access");
+    assert_eq!(
+        access,
+        &json!(["all-private", "selected", "unknown", "none"]),
+        "{schema}"
+    );
+    arca_api::conforms(&schema, &listed).unwrap_or_else(|why| panic!("{why}: {listed}"));
+    listed
+}
+
+/// The last `sync` line of the audit log.
+fn last_sync(signer: &Signer, id: &str) -> Value {
+    signer
+        .audit_log(Some(id), 1000)
+        .into_iter()
+        .filter(|line| line["kind"] == "sync")
+        .last()
+        .expect("a sync line")
+}
+
+const ALL_PRIVATE: &str = "Every private repository of acme may send jobs here. Narrow it in the runner group on GitHub.";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_installation_listing_no_repository_opens_arcas_group_to_every_private_repository() {
+    use arca::github_signer::GroupAccess;
+    let scratch = Scratch::new();
+    let fake = Fake::start("acme").await;
+    // The App asks only for the organisation permission, so GitHub offers no repository choice and lists none.
+    fake.with(|s| s.repositories.clear());
+    let signer = signer(&scratch, &fake);
+    let id = installed_app(&signer, &fake).await;
+
+    let made = fake.seen("POST", "/api/orgs/acme/actions/runner-groups");
+    assert_eq!(
+        made[0].body,
+        json!({
+            "name": RUNNER_GROUP_NAME,
+            "visibility": "all",
+            "allows_public_repositories": false,
+        })
+    );
+    assert!(
+        fake.seen("PUT", "/api/orgs/acme/actions/runner-groups/20/repositories")
+            .is_empty()
+    );
+    let group = fake.group(20).expect("the group on GitHub");
+    assert_eq!(
+        (&group["visibility"], &group["allows_public_repositories"]),
+        (&json!("all"), &json!(false))
+    );
+    let binding = signer.bindings()[0].clone();
+    assert_eq!(binding.status, Status::Active);
+    assert_eq!(
+        binding.runner_group.as_ref().unwrap().access,
+        Some(GroupAccess::AllPrivate)
+    );
+    assert_eq!(binding.group_access(), Some(GroupAccess::AllPrivate));
+    assert_eq!(binding.group_access_words().as_deref(), Some(ALL_PRIVATE));
+    let sync = last_sync(&signer, &id);
+    assert_eq!(sync["runnerGroupAccess"], "all-private", "{sync}");
+    assert_eq!(sync["words"], ALL_PRIVATE, "{sync}");
+    let listed = listed_bindings(&signer).await;
+    assert_eq!(listed["bindings"][0]["runnerGroup"]["access"], "all-private");
+    assert_eq!(listed["bindings"][0]["runnerGroup"]["accessWords"], ALL_PRIVATE);
+
+    // The installation is later given a repository: the group is narrowed to exactly that one.
+    fake.with(|s| s.repositories = vec![(11, "acme/web".to_string())]);
+    signer
+        .app_installed(INSTALLATION, None)
+        .await
+        .expect("GitHub's later return");
+    let patched = fake.seen("PATCH", "/api/orgs/acme/actions/runner-groups/20");
+    assert_eq!(
+        patched.last().expect("a PATCH").body,
+        json!({
+            "name": RUNNER_GROUP_NAME,
+            "visibility": "selected",
+            "allows_public_repositories": false,
+        })
+    );
+    assert_eq!(fake.group(20).unwrap()["visibility"], "selected");
+    assert_eq!(fake.group_repositories(20), Some(json!([11])));
+    let binding = signer.bindings()[0].clone();
+    assert_eq!(binding.group_access(), Some(GroupAccess::Selected));
+    let words = binding.group_access_words().unwrap();
+    assert!(words.contains("acme/web"), "{words}");
+    assert_eq!(last_sync(&signer, &id)["runnerGroupAccess"], "selected");
+
+    // And it loses it again: open to every private repository again, never to none.
+    fake.with(|s| s.repositories.clear());
+    signer
+        .app_installed(INSTALLATION, None)
+        .await
+        .expect("GitHub's later return");
+    assert_eq!(fake.group(20).unwrap()["visibility"], "all");
+    assert_eq!(
+        signer.bindings()[0].group_access(),
+        Some(GroupAccess::AllPrivate)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_connection_left_open_to_no_repository_is_shown_so_and_repaired_by_the_pools_start_and_by_refresh() {
+    use arca::github_signer::GroupAccess;
+    use arca_runners::Access as _;
+    let scratch = Scratch::new();
+    let fake = Fake::start("acme").await;
+    fake.with(|s| s.repositories.clear());
+    let id = installed_app(&signer(&scratch, &fake), &fake).await;
+    // The state Arca before issue 328 left: its own group open to no repository, and no access in the record.
+    let record = scratch.0.join("github/bindings").join(format!("{id}.json"));
+    let break_it = || {
+        fake.with(|s| {
+            for group in s.groups.iter_mut().filter(|group| group["id"] == 20) {
+                group["visibility"] = json!("selected");
+            }
+            s.group_repositories = vec![(20, json!([]))];
+        });
+        let mut stored: Value =
+            serde_json::from_str(&fs::read_to_string(&record).unwrap()).unwrap();
+        stored["runnerGroup"]
+            .as_object_mut()
+            .unwrap()
+            .remove("access");
+        fs::write(&record, serde_json::to_string_pretty(&stored).unwrap()).unwrap();
+        signer(&scratch, &fake)
+    };
+
+    let signer = break_it();
+    let binding = signer.bindings()[0].clone();
+    assert_eq!(binding.status, Status::Active);
+    assert_eq!(binding.group_access(), Some(GroupAccess::NoRepository));
+    let words = binding.group_access_words().unwrap();
+    assert!(words.contains("open to no repository"), "{words}");
+    let listed = listed_bindings(&signer).await;
+    assert_eq!(listed["bindings"][0]["runnerGroup"]["access"], "none");
+    assert_eq!(listed["bindings"][0]["runnerGroup"]["accessWords"], words);
+    // Never shown as simply active: the answer says why.
+    assert_eq!(listed["bindings"][0]["why"], words);
+
+    // The pool's start (its session's sign-in reads the group) repairs it, with no owner step.
+    let access = arca::runners::SignerAccess::new(signer.clone());
+    assert_eq!(access.runner_group(&id).await.expect("read"), Some(20));
+    assert_eq!(fake.group(20).unwrap()["visibility"], "all");
+    assert_eq!(fake.group(20).unwrap()["allows_public_repositories"], false);
+    assert_eq!(
+        signer.bindings()[0].group_access(),
+        Some(GroupAccess::AllPrivate)
+    );
+    let listed = listed_bindings(&signer).await;
+    assert_eq!(listed["bindings"][0]["runnerGroup"]["access"], "all-private");
+    assert!(listed["bindings"][0].get("why").is_none(), "{listed}");
+
+    // So does GitHub's later return (the `refresh` step).
+    let signer = break_it();
+    assert_eq!(
+        signer.bindings()[0].group_access(),
+        Some(GroupAccess::NoRepository)
+    );
+    signer
+        .app_installed(INSTALLATION, None)
+        .await
+        .expect("GitHub's later return");
+    assert_eq!(fake.group(20).unwrap()["visibility"], "all");
+    assert_eq!(
+        signer.bindings()[0].group_access(),
+        Some(GroupAccess::AllPrivate)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_group_arca_did_not_make_is_left_as_it_is_and_arcas_adopted_group_is_opened() {
+    use arca::github_signer::GroupAccess;
+    use arca_runners::Access as _;
+    // A plan without runner groups: the default group, which Arca did not make, is not changed.
+    let scratch = Scratch::new();
+    let fake = Fake::start("acme").await;
+    fake.with(|s| {
+        s.repositories.clear();
+        s.group_create_refusal = Some(403);
+    });
+    let signer = signer(&scratch, &fake);
+    let id = installed_app(&signer, &fake).await;
+    signer
+        .app_installed(INSTALLATION, None)
+        .await
+        .expect("GitHub's later return");
+    arca::runners::SignerAccess::new(signer.clone())
+        .runner_group(&id)
+        .await
+        .expect("read");
+    assert!(
+        fake.seen("PATCH", "/api/orgs/acme/actions/runner-groups/1")
+            .is_empty()
+    );
+    assert!(
+        fake.seen("PUT", "/api/orgs/acme/actions/runner-groups/1/repositories")
+            .is_empty()
+    );
+    let binding = signer.bindings()[0].clone();
+    assert_eq!(binding.group_access(), Some(GroupAccess::Unknown));
+    assert_eq!(
+        binding.group_access_words().as_deref(),
+        Some(
+            "Arca did not make the runner group \"Default\", so it cannot tell which repositories of acme may send \
+             jobs here. See the group's repository access on GitHub."
+        )
+    );
+    assert_eq!(last_sync(&signer, &id)["runnerGroupAccess"], "unknown");
+    assert_eq!(
+        listed_bindings(&signer).await["bindings"][0]["runnerGroup"]["access"],
+        "unknown"
+    );
+
+    // A group of Arca's name already there is adopted as Arca's, and opened to every private repository.
+    let scratch = Scratch::new();
+    let fake = Fake::start("acme").await;
+    fake.with(|s| {
+        s.repositories.clear();
+        s.groups.push(
+            json!({ "id": 9, "name": RUNNER_GROUP_NAME, "default": false, "visibility": "selected" }),
+        );
+    });
+    let signer = self::signer(&scratch, &fake);
+    installed_app(&signer, &fake).await;
+    assert_eq!(
+        fake.seen("PATCH", "/api/orgs/acme/actions/runner-groups/9")[0].body,
+        json!({
+            "name": RUNNER_GROUP_NAME,
+            "visibility": "all",
+            "allows_public_repositories": false,
+        })
+    );
+    assert!(
+        fake.seen("PUT", "/api/orgs/acme/actions/runner-groups/9/repositories")
+            .is_empty()
+    );
+    assert_eq!(fake.group(9).unwrap()["visibility"], "all");
+    assert_eq!(
+        signer.bindings()[0].group_access(),
+        Some(GroupAccess::AllPrivate)
+    );
+}
+
 // ---- Push mode ----------------------------------------------------------------------------------------------------
 
 /// A configuration shaped like GitHub's `encoded_jit_config`.

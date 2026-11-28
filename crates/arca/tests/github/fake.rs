@@ -177,6 +177,21 @@ impl Fake {
         f(&mut self.state.lock().expect("the fake's lock"))
     }
 
+    /// The organisation's runner group `id`, as GitHub holds it now.
+    pub fn group(&self, id: u64) -> Option<Value> {
+        self.with(|s| s.groups.iter().find(|group| group["id"] == id).cloned())
+    }
+
+    /// The repositories GitHub holds for runner group `id`, when a list was set.
+    pub fn group_repositories(&self, id: u64) -> Option<Value> {
+        self.with(|s| {
+            s.group_repositories
+                .iter()
+                .find(|(group, _)| *group == id)
+                .map(|(_, list)| list.clone())
+        })
+    }
+
     pub fn seen(&self, method: &str, path: &str) -> Vec<Seen> {
         self.with(|s| {
             s.seen
@@ -464,11 +479,28 @@ fn answer(
                 .push((id, body["selected_repository_ids"].clone()));
             (204, Value::Null)
         }
+        // GitHub's "Update a self-hosted runner group": `name` is required; `visibility` and
+        // `allows_public_repositories` change what may send jobs to the group.
         ("PATCH", p) if p.starts_with(&format!("/api/orgs/{org}/actions/runner-groups/")) => {
             if !grant_ok {
                 return (401, message("Bad credentials"));
             }
-            (200, json!({ "ok": true }))
+            if !body["name"].is_string() {
+                return (422, message("name is required"));
+            }
+            let id: u64 = p
+                .trim_start_matches(&format!("/api/orgs/{org}/actions/runner-groups/"))
+                .parse()
+                .unwrap_or(0);
+            let Some(group) = s.groups.iter_mut().find(|group| group["id"] == id) else {
+                return (404, message("Not Found"));
+            };
+            for key in ["name", "visibility", "allows_public_repositories"] {
+                if !body[key].is_null() {
+                    group[key] = body[key].clone();
+                }
+            }
+            (200, group.clone())
         }
         ("POST", p) if p == format!("/api/orgs/{org}/actions/runners/generate-jitconfig") => {
             if !grant_ok || !auth.contains(INSTALL_TOKEN) {
@@ -642,6 +674,10 @@ fn answer(
                 "allows_public_repositories": body["allows_public_repositories"],
             });
             s.groups.push(group.clone());
+            if !body["selected_repository_ids"].is_null() {
+                s.group_repositories
+                    .push((id, body["selected_repository_ids"].clone()));
+            }
             (201, group)
         }
         ("POST", "/api/actions/runner-registration") => {

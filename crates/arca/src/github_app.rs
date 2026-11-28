@@ -804,6 +804,7 @@ impl Signer {
                 name: RUNNER_GROUP_NAME.to_string(),
                 created_by_arca: true,
                 warning: None,
+                access: None,
             });
         }
         if answer.status == 409 || answer.status == 422 {
@@ -849,6 +850,7 @@ impl Signer {
                     name: RUNNER_GROUP_NAME.to_string(),
                     created_by_arca: true,
                     warning: None,
+                    access: None,
                 });
             }
         }
@@ -862,6 +864,7 @@ impl Signer {
                  plan up.",
                 answer.why()
             )),
+            access: None,
         })
     }
 
