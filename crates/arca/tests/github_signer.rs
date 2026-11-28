@@ -1028,8 +1028,8 @@ fn last_sync(signer: &Signer, id: &str) -> Value {
     signer
         .audit_log(Some(id), 1000)
         .into_iter()
-        .filter(|line| line["kind"] == "sync")
-        .last()
+        .rev()
+        .find(|line| line["kind"] == "sync")
         .expect("a sync line")
 }
 

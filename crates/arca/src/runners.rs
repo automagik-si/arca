@@ -145,12 +145,13 @@ impl Access for SignerAccess {
             .signer
             .binding(binding)
             .map_err(|_| AccessError::NoCredential)?;
-        if info.mode == Mode::App && info.status == Status::Active {
-            if let Err(why) = self.signer.sync(binding).await {
-                eprintln!(
-                    "arca: runners: connection {binding}: the runner group was not brought up to date: {why}"
-                );
-            }
+        if info.mode == Mode::App
+            && info.status == Status::Active
+            && let Err(why) = self.signer.sync(binding).await
+        {
+            eprintln!(
+                "arca: runners: connection {binding}: the runner group was not brought up to date: {why}"
+            );
         }
         Ok(self
             .signer
