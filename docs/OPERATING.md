@@ -7494,14 +7494,17 @@ pool's start included): one at a time per connection, for twenty seconds at most
 the group as recorded, and not again for ten minutes after one that succeeded (the classes that start together share
 it). A listing GitHub answers in any shape but a `repositories` array (an empty one only with `total_count: 0`), or does
 not answer, changes nothing: the connection reads `unchecked`, "connected, runner group not checked yet" on the page,
-with the reason (`syncError`) and when Arca checks again. The node retries such a sync by itself, with no sign-in,
-`refresh` or restart: after about a minute, then doubling, up to ten minutes, until one succeeds (`syncRetryInMs`). A
-sync that changes nothing writes no audit line.
+with the reason (`syncError`) and the time Arca checks again (`syncRetryAt`, shown as "HH:MM UTC"). The node retries
+such a sync by itself, with no sign-in or `refresh`: after about a minute, then doubling, up to ten minutes, until one
+succeeds; a restart starts it again at the time the record keeps. The classes that wait while a sync runs take its
+outcome, a failure included. A suspended or disconnected connection is not checked again and promises no check, and a
+disconnected one's record is not written again. A sync that changes nothing writes no audit line.
 
 A connection made by Arca 0.45 or older whose installation lists no repository reads `none` ("connected, open to no
 repository", with a `why`) until its next sync. That sync reads the group first: still `selected` with no repository,
 it opens it; `selected` with repositories you gave it on GitHub, it leaves it and records those
-(`runnerGroup.repositories`); anything else it leaves as it is. Nothing is asked of the owner.
+(`runnerGroup.repositories`); anything else it records as it reads it. Any group it does not open is recorded as not
+Arca's (`createdByArca: false`), so no later sync writes to it. Nothing is asked of the owner.
 
 Every runner is then minted just in time, one per job: `github_runner_mint` (or the signer's in-process call,
 `Signer::mint`) returns one ephemeral runner configuration and writes who asked, when, the labels, the runner group and,
