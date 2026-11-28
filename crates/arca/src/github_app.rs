@@ -536,6 +536,50 @@ impl Signer {
             .ok_or_else(|| "the connection is gone".to_string())
     }
 
+    /// The App connection whose App holds GitHub's installation `installation_id`, asked of GitHub with each App's own
+    /// key. Nothing is written. Only GitHub's 404 means not held; `Err` when GitHub could not be reached or could not
+    /// say (401, 403, 429, 5xx), so nothing is decided on it.
+    pub async fn app_owning(&self, installation_id: u64) -> Result<Option<String>, String> {
+        let candidates: Vec<String> = self
+            .bindings()
+            .into_iter()
+            .filter(|binding| binding.mode == Mode::App && binding.status != Status::Revoked)
+            .map(|binding| binding.id)
+            .collect();
+        for id in candidates {
+            let Ok(jwt) = self.app_jwt(&id) else { continue };
+            let answer = self
+                .inner
+                .http
+                .send(
+                    Method::GET,
+                    &self
+                        .inner
+                        .http
+                        .api(&format!("/app/installations/{installation_id}")),
+                    Auth::Bearer(&jwt),
+                    None,
+                )
+                .await
+                .map_err(|why| {
+                    format!("Arca could not reach GitHub to check the installation: {why}.")
+                })?;
+            match answer.status {
+                _ if answer.ok() => return Ok(Some(id)),
+                // Not this App's installation: not held.
+                404 => continue,
+                // GitHub could not say (its App key refused, as with a clock that is off; an error, a refusal or its
+                // rate limit): nothing is decided on it.
+                status => {
+                    return Err(format!(
+                        "GitHub could not say whether the installation is this node's (it answered {status})."
+                    ));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     /// GitHub's return after the person installed (or changed) the App: checks the installation with the App's own JWT,
     /// records it, and puts the runner group in place. Answers the binding's id; `Err` is in words for the person.
     pub async fn app_installed(

@@ -180,7 +180,30 @@ pub struct Links {
     reconciled: Mutex<HashMap<u64, u64>>,
     /// How long after one state-less return of an installation the next is read.
     reconcile_gap: Duration,
+    /// How long all the nodes asked about a state-less return have to answer, together.
+    claim_bound: Duration,
+    /// The installations whose state-less return is being read now.
+    reading: Mutex<std::collections::HashSet<u64>>,
 }
+
+/// A state-less return of one installation being read; dropping it ends the mark.
+struct Reading<'a> {
+    links: &'a Links,
+    installation: u64,
+}
+
+impl Drop for Reading<'_> {
+    fn drop(&mut self) {
+        self.links
+            .reading
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.installation);
+    }
+}
+
+/// How long all the nodes asked whether they hold an installation have, together.
+pub const CLAIM_BOUND: Duration = Duration::from_secs(30);
 
 /// How often a state-less return of one installation is read: each read costs its node several GitHub calls.
 pub const RECONCILE_GAP: Duration = Duration::from_secs(60);
@@ -205,7 +228,15 @@ impl Links {
             index_file: None,
             reconciled: Mutex::new(HashMap::new()),
             reconcile_gap: RECONCILE_GAP,
+            claim_bound: CLAIM_BOUND,
+            reading: Mutex::new(std::collections::HashSet::new()),
         }
+    }
+
+    /// The same, giving the nodes asked about a state-less return `bound` to answer, together.
+    pub fn with_claim_bound(mut self, bound: Duration) -> Self {
+        self.claim_bound = bound;
+        self
     }
 
     /// The same, reading a state-less return of one installation at most once per `gap`.
@@ -214,21 +245,52 @@ impl Links {
         self
     }
 
-    /// Whether a state-less return of `installation` may be read now; if so, the read is noted.
-    fn may_reconcile(&self, installation: u64, now: u64) -> bool {
+    /// Whether a state-less return of `installation` was read less than the gap ago.
+    fn read_lately(&self, installation: u64, now: u64) -> bool {
         let gap = self.reconcile_gap.as_millis() as u64;
         let mut reconciled = self
             .reconciled
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         reconciled.retain(|_, at| now.saturating_sub(*at) < gap);
-        if reconciled.contains_key(&installation) {
-            return false;
+        reconciled.contains_key(&installation)
+    }
+
+    /// Marks a state-less return of `installation` as being read; `None` when one already is. The mark goes with the
+    /// guard.
+    fn start_reading(&self, installation: u64) -> Option<Reading<'_>> {
+        let fresh = self
+            .reading
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(installation);
+        fresh.then_some(Reading {
+            links: self,
+            installation,
+        })
+    }
+
+    /// One call to `node`, started now and run on its own: several run at the same time.
+    fn start_call(
+        &self,
+        node: &str,
+        args: Value,
+        wait: Duration,
+    ) -> tokio::task::JoinHandle<Result<Value, RelayError>> {
+        let relay = Arc::clone(&self.relay);
+        let node = node.to_string();
+        tokio::task::spawn_blocking(move || relay.call(&node, LINK_VERB, args, wait))
+    }
+
+    /// Notes that a state-less return of `installation` was read: the update was made and answered.
+    fn note_read(&self, installation: u64, now: u64) {
+        if self.reconcile_gap.is_zero() {
+            return;
         }
-        if gap > 0 {
-            reconciled.insert(installation, now);
-        }
-        true
+        self.reconciled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(installation, now);
     }
 
     /// The same, with each relayed `github_link` step waiting up to `wait`.
@@ -1379,7 +1441,14 @@ pub async fn installed(
             if !signed_in {
                 return sign_in_first();
             }
-            if !ctx.links.may_reconcile(installation, ctx.signer.now()) {
+            let Some(_reading) = ctx.links.start_reading(installation) else {
+                return message_page(
+                    StatusCode::ACCEPTED,
+                    "Being read now",
+                    "GitHub's change to this installation is being read now. Reload this page in a moment.",
+                );
+            };
+            if ctx.links.read_lately(installation, ctx.signer.now()) {
                 return message_page(
                     StatusCode::TOO_MANY_REQUESTS,
                     "Read a moment ago",
@@ -1387,6 +1456,7 @@ pub async fn installed(
                      minute to read it again.",
                 );
             }
+            return installed_later(ctx, installation, state).await;
         }
         return installed_later(ctx, installation, state).await;
     };
@@ -1501,82 +1571,224 @@ async fn connection_for(ctx: &Ctx<'_>, flow: &LinkedFlow, installation: u64) -> 
         .map(|_| own.to_string())
 }
 
-/// GitHub's return with no flow this page began: the linked node the index names for the installation reads it again
-/// from GitHub. When it does not recognise it, this node's own Apps are tried, then each other linked node that took an
-/// App from this page; the index is not written for those, as this page never saw that installation made.
+/// Who claims GitHub's installation on a return with no flow: this node, or a linked node.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Claim {
+    Here,
+    Linked(String),
+}
+
+/// What one linked node said when asked whether one of its Apps holds an installation.
+enum Said {
+    /// It does, with this App (its name on GitHub).
+    Holds(Option<String>),
+    /// GitHub told it the installation is not its App's.
+    NotHeld,
+    /// It did not answer in time, or GitHub could not say.
+    Undecided,
+}
+
+fn said(answer: Result<Value, RelayError>) -> Said {
+    match answer {
+        Ok(answer) if answer["binding"].as_str().is_some_and(|id| !id.is_empty()) => Said::Holds(
+            answer
+                .pointer("/app/slug")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        ),
+        Ok(_) => Said::NotHeld,
+        Err(RelayError::Refused { code, .. }) if code == "GitHubUnreachable" => Said::Undecided,
+        Err(RelayError::Refused { .. }) => Said::NotHeld,
+        Err(_) => Said::Undecided,
+    }
+}
+
+/// GitHub's return with no flow this page began (only for the owner's session, one read at a time and a minute apart).
+///
+/// An installation the index names was made for that node's App in a flow this page relayed, and GitHub never moves an
+/// installation to another App: that node alone decides. Otherwise this node and every linked node that holds an App
+/// from this page are asked at the same time, within one bound, whether one of their Apps holds it (`claim`, writing
+/// nothing); a linked node's claim counts only when it names an App this page relayed for that node. Exactly one claim,
+/// and that node brings the installation up to date (`refresh`); two or more, and nothing is done and the owner is told
+/// which nodes claim it. A node that does not answer, or whose GitHub could not say, decides nothing, so nothing is
+/// done until it does. The read counts against the minute only once the update answered, or every node did. The index
+/// is not written here.
 async fn installed_later(ctx: &Ctx<'_>, installation: u64, state: Option<&str>) -> Response {
-    let refresh = |node: String| async move {
-        let args =
-            json!({ "step": "refresh", "origin": ctx.origin, "installationId": installation });
-        (ctx.links.link(&node, args).await, node)
-    };
-    let connected = |node: String, answer: Value| {
-        see_other(&page_for(
-            &Target::Linked(node),
-            &format!("connected={}", answer["binding"].as_str().unwrap_or("")),
-        ))
-    };
     let index = ctx.links.index();
-    // A node no longer linked recognises nothing.
     let indexed = index
         .installations
         .get(&installation)
         .filter(|node| ctx.links.names().contains(node))
         .cloned();
     let stale = index.installations.contains_key(&installation);
-    let mut unreached = None;
-    if let Some(node) = indexed.clone() {
-        match refresh(node).await {
-            (Ok(answer), node) => return connected(node, answer),
-            (Err(error), node) if not_reached(&error) => unreached = Some((node, error)),
-            (Err(_), _) => {}
+    let bound = ctx.links.claim_bound;
+    // One hard deadline for every node asked: a node that keeps sending a byte at a time is cut off at it, and what it
+    // answers later is dropped.
+    let deadline = tokio::time::Instant::now() + bound;
+    let by_deadline = |call: tokio::task::JoinHandle<Result<Value, RelayError>>| async move {
+        match tokio::time::timeout_at(deadline, call).await {
+            Ok(Ok(answer)) => answer,
+            Ok(Err(_)) | Err(_) => Err(RelayError::Unreachable),
         }
-    }
-    let local = match ctx.signer.app_installed(installation, state).await {
-        Ok(id) => {
-            if stale && unreached.is_none() {
-                ctx.links.forget_installation(installation);
-            }
-            return see_other(&format!("{PAGE_PATH}?connected={id}"));
-        }
-        Err(why) => why,
     };
+    let claim = json!({ "step": "claim", "origin": ctx.origin, "installationId": installation });
+
+    if let Some(node) = indexed {
+        let answer = by_deadline(ctx.links.start_call(&node, claim, bound)).await;
+        return match said(answer) {
+            Said::Holds(_) => update(ctx, installation, state, Claim::Linked(node), false).await,
+            Said::NotHeld => {
+                ctx.links.note_read(installation, ctx.signer.now());
+                ctx.links.forget_installation(installation);
+                message_page(
+                    StatusCode::BAD_REQUEST,
+                    "Not connected",
+                    &format!(
+                        "{node}, whose App GitHub made this installation for, says GitHub no longer holds it: the App \
+                         was uninstalled or deleted. Nothing was changed. Connect the organisation again from this page."
+                    ),
+                )
+            }
+            Said::Undecided => not_decided(&[node]),
+        };
+    }
+
     let mut nodes: Vec<String> = Vec::new();
     for (node, _) in &index.apps {
-        if Some(node) != indexed.as_ref() && !nodes.contains(node) {
+        if !nodes.contains(node) && ctx.links.names().contains(node) {
             nodes.push(node.clone());
         }
     }
-    for node in nodes {
-        // A node the index does not name for this installation counts only when it names an App this page relayed for
-        // it: no node takes another node's returns by claiming them.
-        if let (Ok(answer), node) = refresh(node).await
-            && answer
-                .pointer("/app/slug")
-                .and_then(Value::as_str)
-                .is_some_and(|slug| index.apps.contains(&(node.clone(), slug.to_string())))
-        {
-            if stale && unreached.is_none() {
-                ctx.links.forget_installation(installation);
+    let calls: Vec<_> = nodes
+        .iter()
+        .map(|node| ctx.links.start_call(node, claim.clone(), bound))
+        .collect();
+    let (local, answers) = tokio::join!(
+        tokio::time::timeout_at(deadline, ctx.signer.app_owning(installation)),
+        async {
+            let mut answers = Vec::new();
+            for call in calls {
+                answers.push(by_deadline(call).await);
             }
-            return connected(node, answer);
+            answers
+        }
+    );
+    let mut claims = Vec::new();
+    let mut silent = Vec::new();
+    match local {
+        Ok(Ok(Some(_))) => claims.push(Claim::Here),
+        Ok(Ok(None)) => {}
+        Ok(Err(_)) | Err(_) => silent.push(format!("this node ({})", ctx.here)),
+    }
+    for (node, answer) in nodes.into_iter().zip(answers) {
+        match said(answer) {
+            Said::Holds(Some(slug)) if index.apps.contains(&(node.clone(), slug.clone())) => {
+                claims.push(Claim::Linked(node));
+            }
+            Said::Holds(_) | Said::NotHeld => {}
+            Said::Undecided => silent.push(node),
         }
     }
-    match unreached {
-        Some((node, error)) => message_page(
-            relay_status(&error),
-            "Not brought up to date yet",
-            &format!(
-                "{} GitHub changed the installation of {node}'s App; reload this page once {node} answers and it \
-                 reads the change.",
-                relay_words(&node, &error)
-            ),
-        ),
-        None => {
+    if !silent.is_empty() {
+        return not_decided(&silent);
+    }
+    match claims.as_slice() {
+        [] => {
+            ctx.links.note_read(installation, ctx.signer.now());
             if stale {
                 ctx.links.forget_installation(installation);
             }
-            message_page(StatusCode::BAD_REQUEST, "Not connected", &local)
+            message_page(
+                StatusCode::BAD_REQUEST,
+                "Not connected",
+                "No App Arca made answers for that installation. Start again from Arca's GitHub page.",
+            )
+        }
+        [one] => update(ctx, installation, state, one.clone(), stale).await,
+        many => {
+            ctx.links.note_read(installation, ctx.signer.now());
+            let names: Vec<String> = many
+                .iter()
+                .map(|claim| match claim {
+                    Claim::Here => format!("this node ({})", ctx.here),
+                    Claim::Linked(node) => node.clone(),
+                })
+                .collect();
+            message_page(
+                StatusCode::CONFLICT,
+                "Claimed by more than one node",
+                &format!(
+                    "GitHub's installation {installation} is claimed by {}. Arca changed nothing on any of them. \
+                     Disconnect it on the node that should not hold it, then reload this page.",
+                    names.join(" and ")
+                ),
+            )
+        }
+    }
+}
+
+/// Nothing is decided on a return while `nodes` have not said whether they hold its installation.
+fn not_decided(nodes: &[String]) -> Response {
+    message_page(
+        StatusCode::BAD_GATEWAY,
+        "Not brought up to date yet",
+        &format!(
+            "{} did not say whether GitHub's installation is theirs (no answer in time, or GitHub could not say), so \
+             nothing was changed. Reload this page in a moment.",
+            nodes.join(" and ")
+        ),
+    )
+}
+
+/// The one node that claims the installation brings it up to date. The read counts against the minute once that
+/// answered.
+async fn update(
+    ctx: &Ctx<'_>,
+    installation: u64,
+    state: Option<&str>,
+    claim: Claim,
+    stale: bool,
+) -> Response {
+    match claim {
+        Claim::Here => match ctx.signer.app_installed(installation, state).await {
+            Ok(id) => {
+                ctx.links.note_read(installation, ctx.signer.now());
+                if stale {
+                    ctx.links.forget_installation(installation);
+                }
+                see_other(&format!("{PAGE_PATH}?connected={id}"))
+            }
+            Err(why) => message_page(StatusCode::BAD_GATEWAY, "Not brought up to date yet", &why),
+        },
+        Claim::Linked(node) => {
+            let args =
+                json!({ "step": "refresh", "origin": ctx.origin, "installationId": installation });
+            match ctx.links.link(&node, args).await {
+                Ok(answer) => {
+                    ctx.links.note_read(installation, ctx.signer.now());
+                    if stale {
+                        ctx.links.forget_installation(installation);
+                    }
+                    see_other(&page_for(
+                        &Target::Linked(node),
+                        &format!("connected={}", answer["binding"].as_str().unwrap_or("")),
+                    ))
+                }
+                Err(error) => {
+                    if !not_reached(&error) {
+                        ctx.links.note_read(installation, ctx.signer.now());
+                    }
+                    message_page(
+                        relay_status(&error),
+                        "Not brought up to date yet",
+                        &format!(
+                            "{} GitHub changed the installation of {node}'s App; reload this page once {node} answers \
+                             and it reads the change.",
+                            relay_words(&node, &error)
+                        ),
+                    )
+                }
+            }
         }
     }
 }
