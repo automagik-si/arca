@@ -1,7 +1,7 @@
 #![cfg(feature = "write")]
-//! The job machine writer's create against the fake Incus: the create body's config carries the pool's mark, the
-//! machine's limits and the key that has Incus rebuild the machine's UEFI variables from the host it runs on, and no
-//! other key.
+//! The job machine writer's create against the fake Incus: the create body's config carries the pool's mark and the
+//! machine's limits and, for a copy of a kept machine's snapshot only, the key that has Incus rebuild the machine's UEFI
+//! variables from the host it runs on. No other key is sent.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -85,37 +85,9 @@ fn config(rig: &Rig, name: &str) -> Value {
     config
 }
 
-#[test]
-fn a_job_machine_is_made_to_take_fresh_firmware_variables_from_the_host_it_runs_on() {
-    let rig = rig();
-    let vms = RunnerVms::new(rig.fake.socket().to_path_buf(), PROJECT, "acme").expect("writer");
-    let copies = [
-        (
-            "acme-0-0a1b2c3d",
-            VmSource::Snapshot {
-                instance: "runner-image".to_string(),
-                snapshot: "ready".to_string(),
-            },
-        ),
-        ("acme-0-0a1b2c3e", VmSource::Image("arca-runner-image".to_string())),
-    ];
-    for (name, source) in copies {
-        vms.create(&spec(name, source)).expect("create");
-        // The key is sent with the pool's mark and the machine's limits, which keep their values.
-        assert_eq!(
-            config(&rig, name),
-            json!({
-                RUNNER_KEY: "acme",
-                "limits.cpu": "2",
-                "limits.memory": "4096MiB",
-                "volatile.apply_nvram": "true",
-            }),
-            "{name}"
-        );
-    }
-    // Each create's body carried exactly these keys, and no other.
-    let posts: Vec<Vec<String>> = rig
-        .fake
+/// The config keys each instance create sent, in order, each list sorted.
+fn create_keys(rig: &Rig) -> Vec<Vec<String>> {
+    rig.fake
         .writes()
         .into_iter()
         .filter(|write| write.method == "POST" && write.path.starts_with("/1.0/instances?"))
@@ -124,13 +96,57 @@ fn a_job_machine_is_made_to_take_fresh_firmware_variables_from_the_host_it_runs_
             keys.sort();
             keys
         })
-        .collect();
-    let mut expected = vec![
-        RUNNER_KEY.to_string(),
-        "limits.cpu".to_string(),
-        "limits.memory".to_string(),
-        "volatile.apply_nvram".to_string(),
-    ];
-    expected.sort();
-    assert_eq!(posts, vec![expected.clone(), expected]);
+        .collect()
+}
+
+fn keys(names: &[&str]) -> Vec<String> {
+    let mut keys: Vec<String> = names.iter().map(|name| name.to_string()).collect();
+    keys.sort();
+    keys
+}
+
+/// The key is checked in the create request only: real Incus clears it at the machine's first start, which the create
+/// makes, while the fake keeps what was sent. So the config read back is compared without it.
+fn kept_keys(rig: &Rig, name: &str) -> Value {
+    let mut config = config(rig, name);
+    config.as_object_mut().expect("a config").remove("volatile.apply_nvram");
+    config
+}
+
+#[test]
+fn a_copy_of_a_kept_machine_is_made_to_take_fresh_firmware_variables_from_the_host_it_runs_on() {
+    let rig = rig();
+    let vms = RunnerVms::new(rig.fake.socket().to_path_buf(), PROJECT, "acme").expect("writer");
+    let source = VmSource::Snapshot {
+        instance: "runner-image".to_string(),
+        snapshot: "ready".to_string(),
+    };
+    vms.create(&spec("acme-0-0a1b2c3d", source)).expect("create");
+    assert_eq!(
+        create_keys(&rig),
+        vec![keys(&[RUNNER_KEY, "limits.cpu", "limits.memory", "volatile.apply_nvram"])]
+    );
+    // The pool's mark and the machine's limits keep their values.
+    assert_eq!(
+        kept_keys(&rig, "acme-0-0a1b2c3d"),
+        json!({ RUNNER_KEY: "acme", "limits.cpu": "2", "limits.memory": "4096MiB" })
+    );
+}
+
+#[test]
+fn a_machine_made_from_an_image_is_sent_no_firmware_key() {
+    // A machine made from an image has no firmware variables yet, so Incus builds them from the host's template anyway;
+    // and a restricted project refuses the key on an image create.
+    let rig = rig();
+    let vms = RunnerVms::new(rig.fake.socket().to_path_buf(), PROJECT, "acme").expect("writer");
+    let source = VmSource::Image("arca-runner-image".to_string());
+    vms.create(&spec("acme-0-0a1b2c3e", source)).expect("create");
+    assert_eq!(
+        create_keys(&rig),
+        vec![keys(&[RUNNER_KEY, "limits.cpu", "limits.memory"])]
+    );
+    assert_eq!(
+        config(&rig, "acme-0-0a1b2c3e"),
+        json!({ RUNNER_KEY: "acme", "limits.cpu": "2", "limits.memory": "4096MiB" })
+    );
 }
