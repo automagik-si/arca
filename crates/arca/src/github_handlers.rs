@@ -23,7 +23,7 @@ use serde_json::{Value, json};
 use crate::github_api::Secret;
 use crate::github_app::{JobRef, MintRefused, MintRequest};
 use crate::github_oauth::{OauthRequest, StartError};
-use crate::github_signer::{GroupAccess, Signer, SignerError, check_account, check_labels};
+use crate::github_signer::{Signer, SignerError, check_account, check_labels};
 use crate::kernel::Kernel;
 
 /// The verbs, keyed by name.
@@ -515,8 +515,8 @@ fn json_of<T: serde::Serialize>(value: &T) -> Result<Value, CallError> {
 }
 
 /// The connections as the verbs show them: each record with what its runner group is open to (`access`, and the
-/// same in words, `accessWords`). One whose own group is open to no repository carries those words as its `why`, so
-/// it never reads as simply active.
+/// same in words, `accessWords`). One whose own group is open to no repository, or not checked, carries those words as
+/// its `why`, so it never reads as simply active.
 fn bindings_view(signer: &Signer) -> Result<Value, CallError> {
     let mut list = Vec::new();
     for binding in signer.bindings() {
@@ -527,7 +527,7 @@ fn bindings_view(signer: &Signer) -> Result<Value, CallError> {
                 group.insert("access".to_string(), json_of(&access)?);
                 group.insert("accessWords".to_string(), json!(words));
             }
-            if access == GroupAccess::NoRepository && binding.why.is_none() {
+            if binding.group_access_is_news() && binding.why.is_none() {
                 value["why"] = json!(words);
             }
         }

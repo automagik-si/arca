@@ -138,8 +138,9 @@ impl Access for SignerAccess {
     }
 
     /// Each session's sign-in (the pool's start included) brings an App connection's runner group up to date first,
-    /// so a group Arca left open to no repository is opened with no owner step (issue 328). A sync that fails keeps the
-    /// group as recorded, and says so in the log.
+    /// so a group Arca left open to no repository is opened with no owner step (issue 328): once for the classes that
+    /// start together, at most once in ten minutes, within the signer's sign-in deadline. A sync that fails or runs out
+    /// of time keeps the group as recorded, and says so in the log.
     async fn runner_group(&self, binding: &str) -> Result<Option<u64>, AccessError> {
         let info = self
             .signer
@@ -147,7 +148,7 @@ impl Access for SignerAccess {
             .map_err(|_| AccessError::NoCredential)?;
         if info.mode == Mode::App
             && info.status == Status::Active
-            && let Err(why) = self.signer.sync(binding).await
+            && let Err(why) = self.signer.sync_for_sign_in(binding).await
         {
             eprintln!(
                 "arca: runners: connection {binding}: the runner group was not brought up to date: {why}"

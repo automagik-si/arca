@@ -169,6 +169,9 @@ impl Binding {
     /// none when it lists none; a signed-in connection's own group open to every private repository).
     pub fn group_access(&self) -> Option<GroupAccess> {
         let group = self.runner_group.as_ref()?;
+        if self.sync_error.is_some() {
+            return Some(GroupAccess::Unchecked);
+        }
         if let Some(access) = group.access {
             return Some(access);
         }
@@ -184,13 +187,38 @@ impl Binding {
         })
     }
 
+    /// Whether the runner group is open to no repository, so no job reaches the runners: Arca's group as Arca before
+    /// issue 328 left it, or a `selected` group whose installation now lists none.
+    pub fn open_to_none(&self) -> bool {
+        match self.group_access() {
+            Some(GroupAccess::NoRepository) => true,
+            Some(GroupAccess::Selected) => self
+                .installation
+                .as_ref()
+                .is_some_and(|installation| installation.repositories.is_empty()),
+            _ => false,
+        }
+    }
+
+    /// Whether the page and `github_bindings` should say the group's access as the connection's `why`: when no job can
+    /// reach it, or Arca could not check it.
+    pub fn group_access_is_news(&self) -> bool {
+        self.open_to_none() || self.group_access() == Some(GroupAccess::Unchecked)
+    }
+
     /// [`Binding::group_access`] in words for the person.
     pub fn group_access_words(&self) -> Option<String> {
         let group = self.runner_group.as_ref()?;
         let org = &self.account;
         Some(match self.group_access()? {
             GroupAccess::AllPrivate => format!(
-                "Every private repository of {org} may send jobs here. Narrow it in the runner group on GitHub."
+                "Every private and internal repository of {org} may send jobs here. Narrow it in the runner group on \
+                 GitHub."
+            ),
+            GroupAccess::Selected if self.open_to_none() => format!(
+                "The runner group \"{}\" is open to no repository: the App's installation on GitHub lists none, so no \
+                 job reaches these runners. Give the installation the repositories of {org} that should send jobs here.",
+                group.name
             ),
             GroupAccess::Selected => format!(
                 "Only these repositories of {org} may send jobs here: {}.",
@@ -214,7 +242,7 @@ impl Binding {
             ),
             GroupAccess::NoRepository => format!(
                 "The runner group \"{}\" is open to no repository, so no job reaches these runners. Arca opens it to \
-                 every private repository of {org} at its next sync: when the pool starts or GitHub's page returns.",
+                 every private and internal repository of {org} at its next sync: when the pool starts or GitHub's page returns.",
                 group.name
             ),
         })
@@ -338,6 +366,8 @@ pub(crate) struct State {
     pub(crate) installation_tokens: HashMap<String, (Secret, u64)>,
     /// Actions service connections, by binding.
     pub(crate) actions: HashMap<String, crate::github_app::ActionsConnection>,
+    /// When a pool's sign-in last synced each binding's runner group (ms), behind a lock that lets one run at a time.
+    pub(crate) sign_in_syncs: HashMap<String, Arc<tokio::sync::Mutex<Option<u64>>>>,
 }
 
 impl Signer {

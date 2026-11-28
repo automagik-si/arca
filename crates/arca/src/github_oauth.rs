@@ -799,7 +799,7 @@ impl Signer {
                 &answer,
             ));
         }
-        let warning = "Arca made this group open to every private repository of the organisation, public ones off. \
+        let warning = "Arca made this group open to every private and internal repository of the organisation, public ones off. \
             To narrow it, choose selected repositories in the group's settings on GitHub."
             .to_string();
         let group = group_of(&answer.json(), true, Some(warning.clone()))

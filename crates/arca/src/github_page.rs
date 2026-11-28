@@ -650,8 +650,9 @@ fn field<'a>(form: &'a HashMap<String, String>, key: &str) -> &'a str {
 
 fn status_words(binding: &Binding) -> (&'static str, &'static str) {
     match binding.status {
-        Status::Active if binding.group_access() == Some(GroupAccess::NoRepository) => {
-            ("bad", "connected, open to no repository")
+        Status::Active if binding.open_to_none() => ("bad", "connected, open to no repository"),
+        Status::Active if binding.group_access() == Some(GroupAccess::Unchecked) => {
+            ("bad", "connected, runner group not checked yet")
         }
         Status::Active => ("ok", "connected"),
         Status::AwaitingInstall => ("bad", "made, not installed yet"),
@@ -705,8 +706,14 @@ fn connection_rows(bindings: &[Binding], target: &Target) -> String {
             body.push_str(&format!("<p class=\"bad\">{}</p>", escape(warning)));
         }
         let words = binding.group_access_words();
-        if let Some(words) = &words {
-            let tone = if binding.group_access() == Some(GroupAccess::NoRepository) {
+        // A group's own warning already says what it is open to, unless no job can reach it or it is not checked.
+        let warned = binding
+            .runner_group
+            .as_ref()
+            .is_some_and(|group| group.warning.is_some())
+            && !binding.group_access_is_news();
+        if let Some(words) = words.as_ref().filter(|_| !warned) {
+            let tone = if binding.group_access_is_news() {
                 " class=\"bad\""
             } else {
                 ""
@@ -2142,5 +2149,23 @@ mod tests {
         let row = connection_rows(&[binding(None, &[])], &Target::Here);
         assert!(!row.contains("<span class=\"ok\">"), "{row}");
         assert!(row.contains("open to no repository"), "{row}");
+
+        // A group whose own warning says what it is open to (a signed-in connection's) says it once.
+        let mut warned = binding(Some(GroupAccess::AllPrivate), &[]);
+        warned.runner_group.as_mut().unwrap().warning =
+            Some("Arca made this group open.".to_string());
+        let row = connection_rows(&[warned], &Target::Here);
+        assert!(row.contains("Arca made this group open."), "{row}");
+        assert!(!row.contains("Every private and internal"), "{row}");
+
+        // A failed check: not checked yet, with the reason.
+        let mut failed = binding(Some(GroupAccess::Selected), &["acme/web"]);
+        failed.sync_error = Some("GitHub answered 502".to_string());
+        let row = connection_rows(&[failed], &Target::Here);
+        assert!(
+            row.contains("<span class=\"bad\">connected, runner group not checked yet</span>"),
+            "{row}"
+        );
+        assert!(row.contains("GitHub answered 502"), "{row}");
     }
 }

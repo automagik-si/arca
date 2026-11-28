@@ -1455,7 +1455,7 @@ static VERBS: [Verb; 104] = [
     },
     Verb {
         name: "github_bindings",
-        summary: "The GitHub organisations connected to this node: each one's id, mode (oauth, app or push), organisation, status, runner group (with what it is open to: `access` all-private, every private repository of the organisation; selected, the installation's repositories; unknown, a group Arca did not make; none, no repository, which the next sync opens; and `accessWords`, the same in words), label sets and registered runners, and the device flows of the last day. Never a key, a grant, a token or a runner's credential.",
+        summary: "The GitHub organisations connected to this node: each one's id, mode (oauth, app or push), organisation, status, runner group (with what it is open to: `access` all-private, every private and internal repository of the organisation; selected, the installation's repositories; unknown, a group Arca did not make; none, no repository, which the next sync opens; unchecked, the last sync failed, `syncError` says why; and `accessWords`, the same in words), label sets and registered runners, and the device flows of the last day. Never a key, a grant, a token or a runner's credential.",
         class: VerbClass::L,
         min_scope: Scope::Viewer,
         writes: false,
@@ -2582,6 +2582,7 @@ fn github_binding_record() -> Value {
         ),
         ("why", false, string()),
         ("labelSets", true, array(array(string()))),
+        ("syncError", false, string()),
         (
             "runnerGroup",
             false,
@@ -2593,7 +2594,7 @@ fn github_binding_record() -> Value {
                 (
                     "access",
                     false,
-                    one_of(&["all-private", "selected", "unknown", "none"]),
+                    one_of(&["all-private", "selected", "unknown", "none", "unchecked"]),
                 ),
                 ("accessWords", false, string()),
             ]),
