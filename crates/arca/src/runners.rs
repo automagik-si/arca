@@ -17,7 +17,7 @@ use arca_runners::{
 
 use crate::config::NodeConfig;
 use crate::github_app::{JobRef as SignerJobRef, MintRefused, MintRequest as SignerMintRequest};
-use crate::github_signer::Signer;
+use crate::github_signer::{Mode, Signer, Status};
 
 /// The alert input of a tick: one row per pool, with why it cannot sign in. No board, no rows.
 pub fn alert_input(board: Option<&SignInBoard>, now_ms: u64) -> Timed<Vec<RunnerSignInUse>> {
@@ -137,11 +137,25 @@ impl Access for SignerAccess {
         );
     }
 
+    /// Each session's sign-in (the pool's start included) brings an App connection's runner group up to date first,
+    /// so a group Arca left open to no repository is opened with no owner step (issue 328). A sync that fails keeps the
+    /// group as recorded, and says so in the log.
     async fn runner_group(&self, binding: &str) -> Result<Option<u64>, AccessError> {
-        match self.signer.binding(binding) {
-            Ok(info) => Ok(info.runner_group_id),
-            Err(_) => Err(AccessError::NoCredential),
+        let info = self
+            .signer
+            .binding(binding)
+            .map_err(|_| AccessError::NoCredential)?;
+        if info.mode == Mode::App && info.status == Status::Active {
+            if let Err(why) = self.signer.sync(binding).await {
+                eprintln!(
+                    "arca: runners: connection {binding}: the runner group was not brought up to date: {why}"
+                );
+            }
         }
+        Ok(self
+            .signer
+            .binding(binding)
+            .map_or(info.runner_group_id, |now| now.runner_group_id))
     }
 
     fn forget_connection(&self, binding: &str) {

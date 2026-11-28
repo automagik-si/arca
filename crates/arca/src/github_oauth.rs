@@ -27,8 +27,8 @@ use serde_json::{Value, json};
 
 use crate::github_api::{ACTIONS_API_VERSION, Answer, Auth, RunnerKey, Secret};
 use crate::github_signer::{
-    Binding, Mode, RegisteredRunner, RunnerGroup, Signer, SignerError, Status, check_account,
-    check_labels, fresh_id, write_private,
+    Binding, GroupAccess, Mode, RegisteredRunner, RunnerGroup, Signer, SignerError, Status,
+    check_account, check_labels, fresh_id, write_private,
 };
 
 /// The scope the grant asks for. GitHub has no narrower scope that can make a runner registration token for an
@@ -729,7 +729,12 @@ impl Signer {
                 name: group.get("name")?.as_str()?.to_string(),
                 created_by_arca,
                 warning,
-                access: None,
+                // Arca makes a signed-in connection's group open to every private repository; another it cannot tell.
+                access: Some(if created_by_arca {
+                    GroupAccess::AllPrivate
+                } else {
+                    GroupAccess::Unknown
+                }),
             })
         };
         let Some(name) = wanted else {
@@ -745,7 +750,7 @@ impl Signer {
                     name: "Default".to_string(),
                     created_by_arca: false,
                     warning: Some(default_warning),
-                    access: None,
+                    access: Some(GroupAccess::Unknown),
                 });
             self.step(
                 id,

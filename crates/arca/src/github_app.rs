@@ -33,8 +33,8 @@ use sha2::{Digest as _, Sha256};
 
 use crate::github_api::{ACTIONS_API_VERSION, Answer, AppKey, Auth, Secret};
 use crate::github_signer::{
-    AppRecord, Binding, InstallationRecord, Mode, RunnerGroup, Signer, SignerError, Status,
-    check_account, check_labels, fresh_id, same_labels, write_private,
+    AppRecord, Binding, GroupAccess, InstallationRecord, Mode, RunnerGroup, Signer, SignerError,
+    Status, check_account, check_labels, fresh_id, same_labels, write_private,
 };
 
 /// The name of the runner group Arca makes for an App binding.
@@ -733,23 +733,17 @@ impl Signer {
         let org = binding.account.clone();
         let group = match binding.runner_group.clone() {
             Some(group) if group.created_by_arca => {
-                let answer = http
-                    .send(
-                        Method::PUT,
-                        &http.api(&format!(
-                            "/orgs/{org}/actions/runner-groups/{}/repositories",
-                            group.id
-                        )),
-                        Auth::Bearer(&token),
-                        Some(&json!({ "selected_repository_ids": ids })),
-                    )
-                    .await?;
-                if !answer.ok() {
-                    return Err(answer.why());
+                let access = self.open_group(&org, &group, &ids, &token).await?;
+                RunnerGroup {
+                    access: Some(access),
+                    ..group
                 }
-                group
             }
-            Some(group) => group,
+            // A group Arca did not make is left as it is.
+            Some(group) => RunnerGroup {
+                access: Some(GroupAccess::Unknown),
+                ..group
+            },
             None => self.make_group(&org, &ids, &token).await?,
         };
         let mut binding = self
@@ -763,15 +757,63 @@ impl Signer {
         }
         binding.runner_group = Some(group.clone());
         binding.updated_at = self.now();
+        let words = binding.group_access_words();
         self.save(binding).map_err(|error| error.message())?;
         self.audit(json!({
             "kind": "sync",
             "binding": id,
             "account": org,
             "runnerGroupId": group.id,
+            "runnerGroupAccess": group.access,
+            "words": words,
             "repositories": names,
         }));
         Ok(())
+    }
+
+    /// Opens Arca's own runner group to exactly the repositories `ids`, or, when the installation lists none (an App
+    /// with only the organisation permission is given none), to every private repository of the organisation; public
+    /// repositories stay off either way. A group open to no repository would receive no job (issue 328). The group's
+    /// visibility is set only when what it is open to changes (as recorded), so a group the owner narrowed on GitHub
+    /// after Arca opened it to every private repository stays as they left it.
+    async fn open_group(
+        &self,
+        org: &str,
+        group: &RunnerGroup,
+        ids: &[u64],
+        token: &Secret,
+    ) -> Result<GroupAccess, String> {
+        let http = &self.inner.http;
+        let id = group.id;
+        let (visibility, access) = if ids.is_empty() {
+            ("all", GroupAccess::AllPrivate)
+        } else {
+            ("selected", GroupAccess::Selected)
+        };
+        let mut calls = Vec::new();
+        if group.access != Some(access) {
+            calls.push((
+                Method::PATCH,
+                format!("/orgs/{org}/actions/runner-groups/{id}"),
+                json!({ "name": group.name, "visibility": visibility, "allows_public_repositories": false }),
+            ));
+        }
+        if !ids.is_empty() {
+            calls.push((
+                Method::PUT,
+                format!("/orgs/{org}/actions/runner-groups/{id}/repositories"),
+                json!({ "selected_repository_ids": ids }),
+            ));
+        }
+        for (method, path, body) in calls {
+            let answer = http
+                .send(method, &http.api(&path), Auth::Bearer(token), Some(&body))
+                .await?;
+            if !answer.ok() {
+                return Err(answer.why());
+            }
+        }
+        Ok(access)
     }
 
     async fn make_group(
@@ -781,17 +823,33 @@ impl Signer {
         token: &Secret,
     ) -> Result<RunnerGroup, String> {
         let http = &self.inner.http;
+        // Open to exactly the installation's repositories, or to every private one when it lists none.
+        let (body, access) = if ids.is_empty() {
+            (
+                json!({
+                    "name": RUNNER_GROUP_NAME,
+                    "visibility": "all",
+                    "allows_public_repositories": false,
+                }),
+                GroupAccess::AllPrivate,
+            )
+        } else {
+            (
+                json!({
+                    "name": RUNNER_GROUP_NAME,
+                    "visibility": "selected",
+                    "selected_repository_ids": ids,
+                    "allows_public_repositories": false,
+                }),
+                GroupAccess::Selected,
+            )
+        };
         let answer = http
             .send(
                 Method::POST,
                 &http.api(&format!("/orgs/{org}/actions/runner-groups")),
                 Auth::Bearer(token),
-                Some(&json!({
-                    "name": RUNNER_GROUP_NAME,
-                    "visibility": "selected",
-                    "selected_repository_ids": ids,
-                    "allows_public_repositories": false,
-                })),
+                Some(&body),
             )
             .await?;
         if answer.ok() {
@@ -804,11 +862,11 @@ impl Signer {
                 name: RUNNER_GROUP_NAME.to_string(),
                 created_by_arca: true,
                 warning: None,
-                access: None,
+                access: Some(access),
             });
         }
         if answer.status == 409 || answer.status == 422 {
-            // A group of that name is there: take it, and give it exactly these repositories.
+            // A group of that name is there: take it, and open it as Arca opens its own.
             let listed = http
                 .send(
                     Method::GET,
@@ -826,32 +884,15 @@ impl Signer {
                 .find(|group| group.get("name").and_then(Value::as_str) == Some(RUNNER_GROUP_NAME))
                 .and_then(|group| group.get("id").and_then(Value::as_u64));
             if let Some(group_id) = found {
-                for (method, path, body) in [
-                    (
-                        Method::PATCH,
-                        format!("/orgs/{org}/actions/runner-groups/{group_id}"),
-                        json!({ "visibility": "selected", "allows_public_repositories": false }),
-                    ),
-                    (
-                        Method::PUT,
-                        format!("/orgs/{org}/actions/runner-groups/{group_id}/repositories"),
-                        json!({ "selected_repository_ids": ids }),
-                    ),
-                ] {
-                    let answer = http
-                        .send(method, &http.api(&path), Auth::Bearer(token), Some(&body))
-                        .await?;
-                    if !answer.ok() {
-                        return Err(answer.why());
-                    }
-                }
-                return Ok(RunnerGroup {
+                let mut group = RunnerGroup {
                     id: group_id,
                     name: RUNNER_GROUP_NAME.to_string(),
                     created_by_arca: true,
                     warning: None,
                     access: None,
-                });
+                };
+                group.access = Some(self.open_group(org, &group, ids, token).await?);
+                return Ok(group);
             }
         }
         Ok(RunnerGroup {
@@ -864,7 +905,7 @@ impl Signer {
                  plan up.",
                 answer.why()
             )),
-            access: None,
+            access: Some(GroupAccess::Unknown),
         })
     }
 

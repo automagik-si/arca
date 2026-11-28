@@ -23,7 +23,7 @@ use serde_json::{Value, json};
 use crate::github_api::Secret;
 use crate::github_app::{JobRef, MintRefused, MintRequest};
 use crate::github_oauth::{OauthRequest, StartError};
-use crate::github_signer::{Signer, SignerError, check_account, check_labels};
+use crate::github_signer::{GroupAccess, Signer, SignerError, check_account, check_labels};
 use crate::kernel::Kernel;
 
 /// The verbs, keyed by name.
@@ -384,7 +384,7 @@ impl ToolHandler for LinkHandler {
                 Ok(state) => Ok(self.flow_words(state)),
                 Err(_) => Ok(json!({ "known": false })),
             },
-            "bindings" => Ok(json!({ "bindings": json_of(&self.signer.bindings())? })),
+            "bindings" => Ok(json!({ "bindings": bindings_view(&self.signer)? })),
             _ => Err(CallError::Invalid(
                 "step: begin, created, installed, refresh, claim, flow, bindings or disconnect"
                     .to_string(),
@@ -514,6 +514,28 @@ fn json_of<T: serde::Serialize>(value: &T) -> Result<Value, CallError> {
     })
 }
 
+/// The connections as the verbs show them: each record with what its runner group is open to (`access`, and the
+/// same in words, `accessWords`). One whose own group is open to no repository carries those words as its `why`, so
+/// it never reads as simply active.
+fn bindings_view(signer: &Signer) -> Result<Value, CallError> {
+    let mut list = Vec::new();
+    for binding in signer.bindings() {
+        let mut value = json_of(&binding)?;
+        if let (Some(access), Some(words)) = (binding.group_access(), binding.group_access_words())
+        {
+            if let Some(group) = value.get_mut("runnerGroup").and_then(Value::as_object_mut) {
+                group.insert("access".to_string(), json_of(&access)?);
+                group.insert("accessWords".to_string(), json!(words));
+            }
+            if access == GroupAccess::NoRepository && binding.why.is_none() {
+                value["why"] = json!(words);
+            }
+        }
+        list.push(value);
+    }
+    Ok(Value::Array(list))
+}
+
 impl ToolHandler for GithubHandler {
     fn call(&self, args: Value, caller: &Caller) -> Result<Value, CallError> {
         match self.verb {
@@ -571,7 +593,7 @@ impl ToolHandler for GithubHandler {
                 json_of(&flow)
             }
             "github_bindings" => Ok(json!({
-                "bindings": json_of(&self.signer.bindings())?,
+                "bindings": bindings_view(&self.signer)?,
                 "flows": json_of(&self.signer.oauth_flows())?,
             })),
             "github_audit" => {

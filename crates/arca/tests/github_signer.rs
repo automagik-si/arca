@@ -1033,7 +1033,8 @@ fn last_sync(signer: &Signer, id: &str) -> Value {
         .expect("a sync line")
 }
 
-const ALL_PRIVATE: &str = "Every private repository of acme may send jobs here. Narrow it in the runner group on GitHub.";
+const ALL_PRIVATE: &str =
+    "Every private repository of acme may send jobs here. Narrow it in the runner group on GitHub.";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_installation_listing_no_repository_opens_arcas_group_to_every_private_repository() {
@@ -1055,8 +1056,11 @@ async fn an_installation_listing_no_repository_opens_arcas_group_to_every_privat
         })
     );
     assert!(
-        fake.seen("PUT", "/api/orgs/acme/actions/runner-groups/20/repositories")
-            .is_empty()
+        fake.seen(
+            "PUT",
+            "/api/orgs/acme/actions/runner-groups/20/repositories"
+        )
+        .is_empty()
     );
     let group = fake.group(20).expect("the group on GitHub");
     assert_eq!(
@@ -1075,8 +1079,14 @@ async fn an_installation_listing_no_repository_opens_arcas_group_to_every_privat
     assert_eq!(sync["runnerGroupAccess"], "all-private", "{sync}");
     assert_eq!(sync["words"], ALL_PRIVATE, "{sync}");
     let listed = listed_bindings(&signer).await;
-    assert_eq!(listed["bindings"][0]["runnerGroup"]["access"], "all-private");
-    assert_eq!(listed["bindings"][0]["runnerGroup"]["accessWords"], ALL_PRIVATE);
+    assert_eq!(
+        listed["bindings"][0]["runnerGroup"]["access"],
+        "all-private"
+    );
+    assert_eq!(
+        listed["bindings"][0]["runnerGroup"]["accessWords"],
+        ALL_PRIVATE
+    );
 
     // The installation is later given a repository: the group is narrowed to exactly that one.
     fake.with(|s| s.repositories = vec![(11, "acme/web".to_string())]);
@@ -1112,10 +1122,40 @@ async fn an_installation_listing_no_repository_opens_arcas_group_to_every_privat
         signer.bindings()[0].group_access(),
         Some(GroupAccess::AllPrivate)
     );
+
+    // The owner narrows the group on GitHub, as the words ask: later syncs (GitHub's return, a pool's sign-in) leave it.
+    let patches = fake
+        .seen("PATCH", "/api/orgs/acme/actions/runner-groups/20")
+        .len();
+    fake.with(|s| {
+        for group in s.groups.iter_mut().filter(|group| group["id"] == 20) {
+            group["visibility"] = json!("selected");
+        }
+        s.group_repositories = vec![(20, json!([11]))];
+    });
+    signer
+        .app_installed(INSTALLATION, None)
+        .await
+        .expect("GitHub's later return");
+    {
+        use arca_runners::Access as _;
+        arca::runners::SignerAccess::new(signer.clone())
+            .runner_group(&id)
+            .await
+            .expect("read");
+    }
+    assert_eq!(
+        fake.seen("PATCH", "/api/orgs/acme/actions/runner-groups/20")
+            .len(),
+        patches
+    );
+    assert_eq!(fake.group(20).unwrap()["visibility"], "selected");
+    assert_eq!(fake.group_repositories(20), Some(json!([11])));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_connection_left_open_to_no_repository_is_shown_so_and_repaired_by_the_pools_start_and_by_refresh() {
+async fn a_connection_left_open_to_no_repository_is_shown_so_and_repaired_by_the_pools_start_and_by_refresh()
+ {
     use arca::github_signer::GroupAccess;
     use arca_runners::Access as _;
     let scratch = Scratch::new();
@@ -1163,7 +1203,10 @@ async fn a_connection_left_open_to_no_repository_is_shown_so_and_repaired_by_the
         Some(GroupAccess::AllPrivate)
     );
     let listed = listed_bindings(&signer).await;
-    assert_eq!(listed["bindings"][0]["runnerGroup"]["access"], "all-private");
+    assert_eq!(
+        listed["bindings"][0]["runnerGroup"]["access"],
+        "all-private"
+    );
     assert!(listed["bindings"][0].get("why").is_none(), "{listed}");
 
     // So does GitHub's later return (the `refresh` step).

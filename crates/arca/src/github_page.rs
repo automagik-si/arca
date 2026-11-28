@@ -48,7 +48,9 @@ use serde_json::{Value, json};
 use crate::config::LinkedHost;
 use crate::github_handlers::LINK_VERB;
 use crate::github_oauth::{FlowState, OauthRequest, StartError};
-use crate::github_signer::{Binding, Mode, Signer, Status, check_account, check_labels};
+use crate::github_signer::{
+    Binding, GroupAccess, Mode, Signer, Status, check_account, check_labels,
+};
 use crate::linked::RelayError;
 
 /// The page's own path, and its forms and returns.
@@ -648,6 +650,9 @@ fn field<'a>(form: &'a HashMap<String, String>, key: &str) -> &'a str {
 
 fn status_words(binding: &Binding) -> (&'static str, &'static str) {
     match binding.status {
+        Status::Active if binding.group_access() == Some(GroupAccess::NoRepository) => {
+            ("bad", "connected, open to no repository")
+        }
         Status::Active => ("ok", "connected"),
         Status::AwaitingInstall => ("bad", "made, not installed yet"),
         Status::Suspended => ("bad", "suspended on GitHub"),
@@ -699,7 +704,20 @@ fn connection_rows(bindings: &[Binding], target: &Target) -> String {
         {
             body.push_str(&format!("<p class=\"bad\">{}</p>", escape(warning)));
         }
-        if let Some(why) = &binding.why {
+        let words = binding.group_access_words();
+        if let Some(words) = &words {
+            let tone = if binding.group_access() == Some(GroupAccess::NoRepository) {
+                " class=\"bad\""
+            } else {
+                ""
+            };
+            body.push_str(&format!("<p{tone}>{}</p>", escape(words)));
+        }
+        if let Some(why) = binding
+            .why
+            .as_ref()
+            .filter(|why| Some(*why) != words.as_ref())
+        {
             body.push_str(&format!("<p>{}</p>", escape(why)));
         }
         if binding.status != Status::Revoked {
@@ -2099,7 +2117,10 @@ mod tests {
             updated_at: 0,
         };
 
-        let row = connection_rows(&[binding(Some(GroupAccess::AllPrivate), &[])], &Target::Here);
+        let row = connection_rows(
+            &[binding(Some(GroupAccess::AllPrivate), &[])],
+            &Target::Here,
+        );
         assert!(row.contains("<span class=\"ok\">connected</span>"), "{row}");
         assert!(
             row.contains(
@@ -2108,7 +2129,10 @@ mod tests {
             "{row}"
         );
 
-        let row = connection_rows(&[binding(Some(GroupAccess::Selected), &["acme/web"])], &Target::Here);
+        let row = connection_rows(
+            &[binding(Some(GroupAccess::Selected), &["acme/web"])],
+            &Target::Here,
+        );
         assert!(row.contains("<span class=\"ok\">connected</span>"), "{row}");
         assert!(row.contains("acme/web"), "{row}");
 

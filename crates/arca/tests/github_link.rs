@@ -840,7 +840,9 @@ async fn a_linked_node_is_connected_from_this_page_with_one_passkey_tap_and_hold
         assert!(body.contains("data-approve"), "{body}");
         // Issue 328: what the runner group is open to, read from beta.
         assert!(
-            body.contains("Only these repositories of acme may send jobs here: acme/web, acme/api."),
+            body.contains(
+                "Only these repositories of acme may send jobs here: acme/web, acme/api."
+            ),
             "{body}"
         );
         assert_no_secret("the page", &body);
