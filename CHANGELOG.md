@@ -4,6 +4,10 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 
 ## Unreleased
 
+## 0.41.0 (2026-11-28)
+
+- Merge PR 321: GitHub is connected by one prepared link, and a linked node from the owner's own page with the owner's passkey checked on that node
+
 ## 0.40.0 (2026-11-28)
 
 A service whose instance was marked hung reads its journal again once the instance is stopped. When a command inside
