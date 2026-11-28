@@ -1856,8 +1856,8 @@ async fn a_failed_sync_is_retried_after_a_restart_and_the_words_give_its_time() 
     assert!(signer.bindings()[0].sync_retry_at.is_none());
 }
 
-/// P3, P5: a disconnected connection promises no next check, runs no retry, and its record is not written again, not
-/// after a restart either.
+/// P3, P5: a disconnected connection promises no next check, runs no retry, and its record is not written again (a
+/// failure that lands after the disconnect included), not after a restart either.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_disconnected_connection_promises_no_check_and_is_not_written_again() {
     use arca_runners::Access as _;
@@ -1872,12 +1872,24 @@ async fn a_disconnected_connection_promises_no_check_and_is_not_written_again() 
         .runner_group(&id)
         .await
         .expect("read");
+    // A sync in flight when the owner disconnects: its failure lands after the disconnect.
+    fake.with(|s| {
+        s.listing = Some((500, json!({ "message": "Server Error" })));
+        s.listing_delay_ms = 300;
+    });
+    let in_flight = tokio::spawn({
+        let signer = signer.clone();
+        let id = id.clone();
+        async move { signer.sync_for_sign_in(&id).await }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
     signer
         .revoke(&id, "page:passkey-1")
         .await
         .expect("disconnected");
     let record = scratch.0.join("github/bindings").join(format!("{id}.json"));
     let written = fs::read_to_string(&record).unwrap();
+    assert!(in_flight.await.unwrap().is_err());
     let words = signer.bindings()[0].group_access_words().unwrap();
     assert!(!words.contains("checks again"), "{words}");
     let before = listings(&fake);
