@@ -4,6 +4,10 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 
 ## Unreleased
 
+## 0.48.0 (2026-11-28)
+
+- Merge PR 336: job machines carry the agent drive, so their agent starts on a host whose QEMU has no 9p
+
 ## 0.47.0 (2026-11-28)
 
 - style(runner): cargo fmt the firmware key tests (#332)
