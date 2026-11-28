@@ -4,6 +4,10 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 
 ## Unreleased
 
+## 0.43.0 (2026-11-28)
+
+- Merge PR 324: a state-less GitHub return acts only when exactly one node holds the installation, within one hard deadline, and only GitHub's 404 means not held
+
 ## 0.42.0 (2026-11-28)
 
 - Merge PR 323: GitHub's return address acts only for the owner's signed-in session, and a connection is matched by its own App
