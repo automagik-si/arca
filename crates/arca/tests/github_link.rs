@@ -1817,3 +1817,279 @@ async fn the_return_address_signs_in_first_through_the_router_and_goes_on_after(
     .await
     .expect("the test ends in time");
 }
+
+/// A linked node that takes `delay` to answer every `github_link` step with `answer`, and counts the calls.
+struct Hung {
+    delay: Duration,
+    answer: Value,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl ToolHandler for Hung {
+    fn call(&self, _args: Value, _caller: &Caller) -> Result<Value, CallError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        std::thread::sleep(self.delay);
+        Ok(self.answer.clone())
+    }
+}
+
+impl Rig {
+    /// Starts a linked node named `name` behind its own door that answers with `handler`.
+    async fn node_with(&self, name: &str, handler: Arc<dyn ToolHandler>) -> LinkedHost {
+        let tokens = TokenStore::load(&self.scratch.path("beta-tokens")).expect("the token store");
+        let router = Server::new(arca_api::verbs(), tokens)
+            .handle(LINK_VERB, handler)
+            .router();
+        let socket = self.scratch.path(&format!("{name}.sock"));
+        let path = socket.clone();
+        tokio::spawn(async move {
+            let _ = serve_unix(router, &path).await;
+        });
+        let until = Instant::now() + Duration::from_secs(5);
+        while !socket.exists() {
+            assert!(Instant::now() < until, "the door started");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        LinkedHost {
+            name: name.to_string(),
+            socket,
+            token_file: self.scratch.path("relay-to-beta.secret"),
+            incus_socket: None,
+            ceph: None,
+        }
+    }
+
+    /// Writes alpha's index of the linked nodes' Apps and installations.
+    fn write_index(&self, apps: Value, installations: Value) -> PathBuf {
+        let file = self.scratch.path("alpha/github-linked-apps.json");
+        fs::write(
+            &file,
+            json!({ "apps": apps, "installations": installations }).to_string(),
+        )
+        .expect("the index is written");
+        file
+    }
+}
+
+fn index_of(file: &Path) -> Value {
+    serde_json::from_str(&fs::read_to_string(file).expect("the index file")).expect("JSON")
+}
+
+fn update_query() -> HashMap<String, String> {
+    query(&format!(
+        "installation_id={INSTALLATION}&setup_action=update"
+    ))
+}
+
+/// Review 1 of PR 324, M1: GitHub answering 500, 403 or 429 to the holder's read decides nothing: no "Not connected",
+/// no index entry removed, and no other node's claim wins in its place.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_github_error_on_the_holders_read_decides_nothing() {
+    tokio::time::timeout(BOUND, async {
+        let rig = Rig::new(&[ORIGIN], &RELAY_TOOLS).await;
+        let binding = connect_beta(&rig).await;
+        let file = rig.scratch.path("alpha/github-linked-apps.json");
+        let indexed = index_of(&file);
+        assert_eq!(indexed["installations"][INSTALLATION.to_string()], json!(NODE));
+        for code in [500, 403, 429] {
+            rig.fake.with(|s| s.installation_refusal = Some(code));
+            let (status, location, body) = installed_later(&rig, "update").await;
+            assert_eq!(status, 502, "{code}: {body}");
+            assert_eq!(location, None);
+            assert!(body.contains("Not brought up to date yet"), "{code}: {body}");
+            assert!(!body.contains("Not connected"), "{code}: {body}");
+            assert_eq!(index_of(&file), indexed, "{code}: the index entry stays");
+        }
+        assert!(!rig.steps().iter().any(|step| step == "refresh"));
+
+        // Not indexed, with a node that claims it with an App this page relayed for it: the holder's GitHub error
+        // still decides nothing, and the other claim does not win.
+        let liar = rig
+            .node_with(
+                "liar",
+                Arc::new(Liar(json!({ "binding": "gh-0123456789abcdef", "app": { "id": 7, "slug": "liar-app" } }))),
+            )
+            .await;
+        let file = rig.write_index(json!([["liar", "liar-app"], [NODE, APP_SLUG]]), json!({}));
+        let links = Links::over(vec![liar, rig.as_token("relay")])
+            .kept_in(file)
+            .with_reconcile_gap(Duration::ZERO);
+        let ctx = Ctx {
+            links: &links,
+            ..rig.ctx()
+        };
+        let (status, location, body) =
+            read(github_page::installed(&ctx, &update_query(), true).await).await;
+        assert_eq!(status, 502, "{body}");
+        assert_eq!(location, None, "{body}");
+        assert!(!body.contains("gh-0123456789abcdef"), "{body}");
+        assert_eq!(rig.beta.bindings()[0].id, binding.id);
+        assert_eq!(rig.beta.bindings()[0].status, Status::Active);
+    })
+    .await
+    .expect("the test ends in time");
+}
+
+/// Review 1 of PR 324, M1 (probe K2): an installation this page saw made for one node's App belongs to that App for
+/// good, as GitHub never moves an installation. When that node says GitHub no longer holds it, nobody gets the update,
+/// whatever another node claims.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_installation_its_indexed_node_no_longer_holds_goes_to_nobody() {
+    tokio::time::timeout(BOUND, async {
+        let rig = Rig::new(&[ORIGIN], &RELAY_TOOLS).await;
+        connect_beta(&rig).await;
+        rig.fake.with(|s| s.installed = false);
+        let liar = rig
+            .node_with(
+                "liar",
+                Arc::new(Liar(json!({ "binding": "gh-0123456789abcdef", "app": { "id": 7, "slug": "liar-app" } }))),
+            )
+            .await;
+        let file = rig.write_index(
+            json!([["liar", "liar-app"], [NODE, APP_SLUG]]),
+            json!({ INSTALLATION.to_string(): NODE }),
+        );
+        let links = Links::over(vec![liar, rig.as_token("relay")])
+            .kept_in(file)
+            .with_reconcile_gap(Duration::ZERO);
+        let ctx = Ctx {
+            links: &links,
+            ..rig.ctx()
+        };
+        let (status, location, body) =
+            read(github_page::installed(&ctx, &update_query(), true).await).await;
+        assert_eq!(status, 400, "{body}");
+        assert_eq!(location, None, "{body}");
+        assert!(body.contains("Not connected"), "{body}");
+        assert!(!body.contains("gh-0123456789abcdef"), "{body}");
+    })
+    .await
+    .expect("the test ends in time");
+}
+
+/// Review 1 of PR 324, M2 (probe L): the update itself got no answer in time, so the read is not counted, and the reload
+/// the page asks for is read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_reload_after_an_update_without_an_answer_is_read() {
+    tokio::time::timeout(BOUND, async {
+        let mut setup = Setup::new(&[ORIGIN], &RELAY_TOOLS);
+        setup.throttle = true;
+        setup.wait = Some(Duration::from_secs(1));
+        setup.late = vec![("refresh", Duration::from_secs(3))];
+        let rig = Rig::with(setup).await;
+        let binding = connect_beta(&rig).await;
+        let (status, _, body) = installed_later(&rig, "update").await;
+        assert_eq!(status, 502, "{body}");
+        assert!(body.contains("Not brought up to date yet"), "{body}");
+        let (status, location, body) = installed_later(&rig, "update").await;
+        assert_eq!(status, 303, "{body}");
+        assert!(
+            location
+                .unwrap()
+                .contains(&format!("connected={}", binding.id))
+        );
+    })
+    .await
+    .expect("the test ends in time");
+}
+
+/// Review 1 of PR 324, M3: the linked nodes are asked at the same time, within one bound for all of them; the ones that
+/// do not answer in it decide nothing, and are named.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_linked_nodes_are_asked_at_once_within_one_bound() {
+    tokio::time::timeout(BOUND, async {
+        let rig = Rig::new(&[ORIGIN], &RELAY_TOOLS).await;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut hosts = Vec::new();
+        for name in ["slow1", "slow2", "slow3"] {
+            let hung = Hung {
+                delay: Duration::from_secs(4),
+                answer: json!({}),
+                calls: Arc::clone(&calls),
+            };
+            hosts.push(rig.node_with(name, Arc::new(hung)).await);
+        }
+        hosts.push(rig.as_token("relay"));
+        let file = rig.write_index(
+            json!([
+                ["slow1", "a1"],
+                ["slow2", "a2"],
+                ["slow3", "a3"],
+                [NODE, APP_SLUG]
+            ]),
+            json!({}),
+        );
+        let links = Links::over(hosts)
+            .kept_in(file)
+            .with_reconcile_gap(Duration::ZERO)
+            .with_claim_bound(Duration::from_secs(2));
+        let ctx = Ctx {
+            links: &links,
+            ..rig.ctx()
+        };
+        let started = Instant::now();
+        let (status, location, body) =
+            read(github_page::installed(&ctx, &update_query(), true).await).await;
+        let took = started.elapsed();
+        assert!(
+            took < Duration::from_secs(4),
+            "one bound for all, not one each: {took:?}"
+        );
+        assert_eq!(status, 502, "{body}");
+        assert_eq!(location, None);
+        assert!(
+            body.contains("slow1") && body.contains("slow2") && body.contains("slow3"),
+            "{body}"
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert!(!rig.steps().iter().any(|step| step == "refresh"));
+    })
+    .await
+    .expect("the test ends in time");
+}
+
+/// Review 1 of PR 324, M3: a reload while a read of the same installation runs starts no calls of its own; it is told
+/// the read is running.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reload_while_a_read_runs_is_told_it_is_running() {
+    tokio::time::timeout(BOUND, async {
+        let rig = Rig::new(&[ORIGIN], &RELAY_TOOLS).await;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hung = Hung {
+            delay: Duration::from_secs(3),
+            answer: json!({}),
+            calls: Arc::clone(&calls),
+        };
+        let slow = rig.node_with("slow", Arc::new(hung)).await;
+        let file = rig.write_index(json!([["slow", "a1"]]), json!({}));
+        let links = Links::over(vec![slow])
+            .kept_in(file)
+            .with_reconcile_gap(Duration::ZERO)
+            .with_claim_bound(Duration::from_secs(10));
+        let ctx = Ctx {
+            links: &links,
+            ..rig.ctx()
+        };
+        let q = update_query();
+        let first = async { read(github_page::installed(&ctx, &q, true).await).await };
+        let second = async {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let started = Instant::now();
+            let answer = read(github_page::installed(&ctx, &q, true).await).await;
+            (answer, started.elapsed())
+        };
+        let (first, ((status, location, body), took)) = tokio::join!(first, second);
+        assert_eq!(status, 202, "{body}");
+        assert_eq!(location, None);
+        assert!(body.contains("being read"), "{body}");
+        assert!(took < Duration::from_secs(1), "{took:?}");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "one read"
+        );
+        assert_ne!(first.0, 202, "{}", first.2);
+    })
+    .await
+    .expect("the test ends in time");
+}

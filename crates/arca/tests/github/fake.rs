@@ -96,6 +96,8 @@ pub struct FakeState {
     /// What the token poll answers before its usual answer, one entry a poll: `503` (an empty 503), `html` (a page
     /// that is not JSON) or `slow_down` (GitHub's slow_down with a one-second interval).
     pub poll_script: Vec<&'static str>,
+    /// What reading the App's installation answers instead, if anything: a GitHub error such as 500, 403 or 429.
+    pub installation_refusal: Option<u16>,
 }
 
 pub struct Fake {
@@ -155,6 +157,7 @@ impl Fake {
             group_repositories: Vec::new(),
             scale_sets: Vec::new(),
             poll_script: Vec::new(),
+            installation_refusal: None,
         }));
         let router = Router::new().fallback(serve).with_state(Arc::clone(&state));
         tokio::spawn(async move {
@@ -386,6 +389,9 @@ fn answer(
             )
         }
         ("GET", p) if p == installation_path => {
+            if let Some(code) = s.installation_refusal {
+                return (code, message("GitHub could not answer"));
+            }
             if s.app_deleted || !app_jwt_ok(s, auth) {
                 return (401, message("A JSON web token could not be decoded"));
             }
