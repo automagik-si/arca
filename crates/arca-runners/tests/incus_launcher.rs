@@ -500,6 +500,12 @@ fn a_machine_with_any_device_but_its_root_disk_and_arcas_card_is_deleted_before_
             "shared",
             json!({"type":"disk","pool":"pool1","source":"shared-vol","path":"/shared"}),
         ),
+        // The agent drive passes under its own name alone; a second one, or the cloud-init drive, is an extra device.
+        ("agent2", json!({"type":"disk","source":"agent:config"})),
+        (
+            "cidata",
+            json!({"type":"disk","source":"cloud-init:config"}),
+        ),
     ] {
         let (fake, dir) = fake();
         let mut devices = json!({"root":{"type":"disk","pool":"pool1","path":"/"}});
