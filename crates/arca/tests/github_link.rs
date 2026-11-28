@@ -17,11 +17,14 @@ mod webauthn;
 
 use std::collections::HashMap;
 use std::fs;
+use std::io::{Read as _, Write as _};
 use std::os::unix::fs::PermissionsExt as _;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use arca::approve_page::{Page, SetupCodeDisplay};
 use arca::config::LinkedHost;
 use arca::github_api::Secret;
 use arca::github_handlers::{LINK_VERB, handlers, link_handler};
@@ -1502,6 +1505,314 @@ async fn a_linked_node_that_claims_another_nodes_app_does_not_swallow_its_return
         );
         assert!(!location.contains("gh-0123456789abcdef"), "{location}");
         assert_eq!(rig.beta.bindings()[0].status, Status::Active);
+    })
+    .await
+    .expect("the test ends in time");
+}
+
+/// Review 1 of PR 323, L1: a state-less return is acted on only when exactly one node claims the installation. Two
+/// claims (here a linked node naming an App this page did relay for it) change nothing, and the owner is told which
+/// nodes claim it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_return_two_nodes_claim_is_acted_on_by_neither() {
+    tokio::time::timeout(BOUND, async {
+        let rig = Rig::new(&[ORIGIN], &RELAY_TOOLS).await;
+        let binding = connect_beta(&rig).await;
+        let liar = rig
+            .liar(
+                "liar",
+                json!({ "binding": "gh-0123456789abcdef", "app": { "id": 7, "slug": "liar-app" } }),
+            )
+            .await;
+        let file = rig.scratch.path("alpha/github-linked-apps.json");
+        fs::write(
+            &file,
+            json!({ "apps": [["liar", "liar-app"], [NODE, APP_SLUG]], "installations": {} })
+                .to_string(),
+        )
+        .expect("the index is written");
+        let links = Links::over(vec![liar, rig.as_token("relay")])
+            .kept_in(file.clone())
+            .with_reconcile_gap(Duration::ZERO);
+        let ctx = Ctx {
+            links: &links,
+            ..rig.ctx()
+        };
+        let github = rig.fake.with(|s| s.seen.len());
+        let q = query(&format!(
+            "installation_id={INSTALLATION}&setup_action=update"
+        ));
+        let (status, location, body) = read(github_page::installed(&ctx, &q, true).await).await;
+        assert_eq!(status, 409, "{body}");
+        assert_eq!(location, None);
+        assert!(body.contains("liar") && body.contains(NODE), "{body}");
+        // Beta was asked whether it holds the installation, and nothing more: no runner group was written.
+        let steps = rig.steps();
+        assert!(steps.iter().any(|step| step == "claim"), "{steps:?}");
+        assert!(!steps.iter().any(|step| step == "refresh"), "{steps:?}");
+        let written = rig.fake.with(|s| {
+            s.seen[github..]
+                .iter()
+                .filter(|seen| seen.method != "GET" && !seen.path.ends_with("/access_tokens"))
+                .count()
+        });
+        assert_eq!(written, 0, "nothing was written on GitHub");
+        assert_eq!(rig.beta.bindings()[0].id, binding.id);
+        assert_eq!(rig.beta.bindings()[0].status, Status::Active);
+    })
+    .await
+    .expect("the test ends in time");
+}
+
+/// Review 1 of PR 323, L2: a read that reached no node does not count against the minute: the reload the page asks for
+/// once the node answers reads it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_return_whose_node_did_not_answer_is_read_on_the_next_reload() {
+    tokio::time::timeout(BOUND, async {
+        let mut setup = Setup::new(&[ORIGIN], &RELAY_TOOLS);
+        setup.throttle = true;
+        let rig = Rig::with(setup).await;
+        let binding = connect_beta(&rig).await;
+        rig.beta_down();
+        let (status, _, body) = installed_later(&rig, "update").await;
+        assert_eq!(status, 502, "{body}");
+        assert!(body.contains("Not brought up to date yet"), "{body}");
+        rig.beta_up().await;
+        let (status, location, body) = installed_later(&rig, "update").await;
+        assert_eq!(status, 303, "{body}");
+        assert!(
+            location
+                .unwrap()
+                .contains(&format!("connected={}", binding.id))
+        );
+        // Now it was read: the next one within the minute is not.
+        let (status, _, body) = installed_later(&rig, "update").await;
+        assert_eq!(status, 429, "{body}");
+    })
+    .await
+    .expect("the test ends in time");
+}
+
+struct NoDisplay;
+
+impl SetupCodeDisplay for NoDisplay {
+    fn show(&self, _code: &str) -> Result<(), String> {
+        Err("No screen to show the code on".to_string())
+    }
+}
+
+/// One HTTP/1.1 request to the page on its unix socket: the status, the head and the body.
+fn http(
+    socket: &Path,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> (u16, String, Vec<u8>) {
+    let mut stream = UnixStream::connect(socket).expect("the page answers");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .expect("a read timeout");
+    let mut request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: box1.example.com\r\nConnection: close\r\nContent-Length: {}\r\n",
+        body.len()
+    );
+    for (name, value) in headers {
+        request.push_str(&format!("{name}: {value}\r\n"));
+    }
+    request.push_str("\r\n");
+    stream.write_all(request.as_bytes()).expect("the request");
+    stream.write_all(body).expect("the body");
+    let mut answer = Vec::new();
+    stream.read_to_end(&mut answer).expect("the answer");
+    let split = answer
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("a head");
+    let head = String::from_utf8_lossy(&answer[..split]).to_string();
+    let mut rest = answer[split + 4..].to_vec();
+    if head
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked")
+    {
+        let mut decoded = Vec::new();
+        loop {
+            let line = rest
+                .windows(2)
+                .position(|w| w == b"\r\n")
+                .expect("a chunk size");
+            let size = usize::from_str_radix(String::from_utf8_lossy(&rest[..line]).trim(), 16)
+                .expect("a hex size");
+            if size == 0 {
+                break;
+            }
+            decoded.extend_from_slice(&rest[line + 2..line + 2 + size]);
+            rest = rest[line + 2 + size + 2..].to_vec();
+        }
+        rest = decoded;
+    }
+    let status = head
+        .split(' ')
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .expect("a status");
+    (status, head, rest)
+}
+
+fn head_value(head: &str, name: &str) -> Option<String> {
+    head.lines().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        key.eq_ignore_ascii_case(name)
+            .then(|| value.trim().to_string())
+    })
+}
+
+/// Review 1 of PR 323, L3: GitHub's return address through the page's own router. Without a session it serves the
+/// GitHub page's passkey sign-in, the same for any installation, and asks nobody anything; the sign-in POST on the
+/// same address takes only the page's own origin; after it, the same address reads the return once, then not again
+/// within the minute.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_return_address_signs_in_first_through_the_router_and_goes_on_after() {
+    tokio::time::timeout(BOUND, async {
+        let rig = Rig::new(&[ORIGIN], &RELAY_TOOLS).await;
+        let binding = connect_beta(&rig).await;
+
+        // Alpha's page as the node serves it, with alpha's kernel trusting the owner's passkey.
+        let kernel_scratch = Scratch::new("ghlink-alpha-kernel");
+        let passkeys = PasskeyVerifier::new(
+            arca_approval::parse_passkeys(format!("{}\n", rig.owner.line(NAMESPACE)).as_bytes()).expect("the owner passkey"),
+            FileSignCounts::open(&kernel_scratch.path("alpha-counts.jsonl")).expect("counts"),
+        );
+        let verifier = ApprovalVerifier::new(
+            "alpha.example".to_string(),
+            OwnerKeys::new(SshSigVerifier::new(Vec::new()), passkeys),
+            FileNonces::open(&kernel_scratch.path("alpha-nonces.jsonl")).expect("nonces"),
+        );
+        let incus = start_fake(&kernel_scratch);
+        let kernel = Arc::new(Mutex::new(
+            kernel_on_host(&kernel_scratch, &incus, verifier, now_ms(), None, "alpha.example")
+                .expect("alpha's kernel opens"),
+        ));
+        let page = Page::new(
+            ORIGIN.to_string(),
+            kernel,
+            clock(),
+            rig.scratch.path("alpha"),
+            Arc::new(NoDisplay),
+        )
+        .with_github(rig.alpha.clone())
+        .with_linked_hosts(vec![rig.as_token("relay")]);
+        let router = page.router(false);
+        let socket = rig.scratch.path("alpha-page.sock");
+        let served = socket.clone();
+        tokio::spawn(async move {
+            let _ = serve_unix(router, &served).await;
+        });
+        let until = Instant::now() + Duration::from_secs(5);
+        while !socket.exists() {
+            assert!(Instant::now() < until, "alpha's page started");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let call = |method: &'static str, path: String, headers: Vec<(&'static str, String)>, body: Vec<u8>| {
+            let socket = socket.clone();
+            tokio::task::spawn_blocking(move || {
+                let headers: Vec<(&str, &str)> =
+                    headers.iter().map(|(name, value)| (*name, value.as_str())).collect();
+                http(&socket, method, &path, &headers, &body)
+            })
+        };
+        let path = github_page::INSTALLED_PATH;
+        let github = rig.fake.with(|s| s.seen.len());
+        let steps = rig.steps().len();
+
+        // No session: the sign-in page, byte for byte the same whatever the address names.
+        let mut bodies = Vec::new();
+        for q in [
+            format!("installation_id={INSTALLATION}&setup_action=update"),
+            "installation_id=999999&setup_action=update".to_string(),
+            format!("installation_id={INSTALLATION}&setup_action=install&state=0123456789abcdef0123456789abcdef"),
+        ] {
+            let (status, head, body) = call("GET", format!("{path}?{q}"), Vec::new(), Vec::new())
+                .await
+                .unwrap();
+            assert_eq!(status, 200, "{head}");
+            let text = String::from_utf8_lossy(&body).to_string();
+            assert!(text.contains("<h1>GitHub runners</h1>"), "{text}");
+            assert!(!text.contains(&binding.id) && !text.contains("node=beta"), "{text}");
+            bodies.push(body);
+        }
+        assert!(bodies.iter().all(|body| *body == bodies[0]));
+        assert_eq!(rig.fake.with(|s| s.seen.len()), github, "GitHub was asked nothing");
+        assert_eq!(rig.steps().len(), steps, "beta was asked nothing");
+
+        // The sign-in POST on the return address: only from the page's own origin.
+        let json_type = ("Content-Type", "application/json".to_string());
+        let (status, _, _) = call("POST", path.to_string(), vec![json_type.clone()], b"{}".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(status, 403, "no Origin");
+        let (status, _, _) = call(
+            "POST",
+            path.to_string(),
+            vec![json_type.clone(), ("Origin", "https://other.example.com".to_string())],
+            b"{}".to_vec(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, 403, "another origin");
+        let own = ("Origin", ORIGIN.to_string());
+        let (status, _, body) = call(
+            "POST",
+            path.to_string(),
+            vec![json_type.clone(), own.clone()],
+            b"{}".to_vec(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, 200);
+        let statement = serde_json::from_slice::<Value>(&body).expect("JSON")["statement"]
+            .as_str()
+            .expect("a statement")
+            .to_string();
+        let forged = json!({ "statement": "x", "proof": {} }).to_string().into_bytes();
+        let (status, _, _) = call("POST", path.to_string(), vec![json_type.clone(), own.clone()], forged)
+            .await
+            .unwrap();
+        assert_eq!(status, 403, "a forged statement");
+        let signed = json!({
+            "statement": statement,
+            "proof": rig.owner.proof_value(&Assert::over(NAMESPACE, statement.as_bytes())),
+        })
+        .to_string()
+        .into_bytes();
+        let (status, head, body) = call("POST", path.to_string(), vec![json_type, own], signed)
+            .await
+            .unwrap();
+        assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+        let cookie = head_value(&head, "set-cookie")
+            .expect("a session cookie")
+            .split(';')
+            .next()
+            .expect("its pair")
+            .to_string();
+        assert_eq!(rig.steps().len(), steps, "signing in asked beta nothing");
+
+        // The reload, now with the session: the return is read once.
+        let reload = format!("{path}?installation_id={INSTALLATION}&setup_action=update");
+        let (status, head, _) = call("GET", reload.clone(), vec![("Cookie", cookie.clone())], Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(status, 303, "{head}");
+        assert_eq!(
+            head_value(&head, "location"),
+            Some(format!("{}?node={NODE}&connected={}", github_page::PAGE_PATH, binding.id))
+        );
+        assert_eq!(rig.steps().iter().filter(|step| *step == "refresh").count(), 1);
+        let (status, head, _) = call("GET", reload, vec![("Cookie", cookie)], Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(status, 429, "{head}");
+        assert_eq!(rig.steps().iter().filter(|step| *step == "refresh").count(), 1);
     })
     .await
     .expect("the test ends in time");
