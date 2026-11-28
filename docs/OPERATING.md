@@ -7490,13 +7490,18 @@ GitHub ("Settings", "Actions", "Runner groups") stays; Arca's words then still s
 read the group back.
 
 The sync runs on GitHub's install return, on its later returns (`refresh`), and when a pool session signs in (the
-pool's start included): once for the classes that start together, at most once in ten minutes per connection, and for
-twenty seconds at most, after which the sign-in goes on with the group as recorded. A listing GitHub answers in any
-shape but a `repositories` array (an empty one only with `total_count: 0`), or does not answer, changes nothing: the
-connection reads `unchecked`, "connected, runner group not checked yet" on the page, with the reason (`syncError`),
-until a sync succeeds. A sync that changes nothing writes no audit line. A connection made by Arca 0.45 or older whose
-installation lists no repository reads `none` ("connected, open to no repository", with a `why`) until its next sync
-opens it; nothing is asked of the owner.
+pool's start included): one at a time per connection, for twenty seconds at most, after which the sign-in goes on with
+the group as recorded, and not again for ten minutes after one that succeeded (the classes that start together share
+it). A listing GitHub answers in any shape but a `repositories` array (an empty one only with `total_count: 0`), or does
+not answer, changes nothing: the connection reads `unchecked`, "connected, runner group not checked yet" on the page,
+with the reason (`syncError`) and when Arca checks again. The node retries such a sync by itself, with no sign-in,
+`refresh` or restart: after about a minute, then doubling, up to ten minutes, until one succeeds (`syncRetryInMs`). A
+sync that changes nothing writes no audit line.
+
+A connection made by Arca 0.45 or older whose installation lists no repository reads `none` ("connected, open to no
+repository", with a `why`) until its next sync. That sync reads the group first: still `selected` with no repository,
+it opens it; `selected` with repositories you gave it on GitHub, it leaves it and records those
+(`runnerGroup.repositories`); anything else it leaves as it is. Nothing is asked of the owner.
 
 Every runner is then minted just in time, one per job: `github_runner_mint` (or the signer's in-process call,
 `Signer::mint`) returns one ephemeral runner configuration and writes who asked, when, the labels, the runner group and,

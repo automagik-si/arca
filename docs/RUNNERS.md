@@ -143,11 +143,12 @@ The node config's `runners` key (a kernel-mode node only):
 ```
 
 `binding` is the signer connection's id. The scale sets go into the runner group the connection made (above). A
-session's sign-in, the pool's start included, first brings that group up to date (the signer's `sync`, at most once in
-ten minutes per connection and for twenty seconds at most); a sync that fails keeps the group as recorded and logs
-why. Leave `runnerGroupId` unset: a pool that names it does not run that sync, and a pool that names any other group
-makes its scale sets there, and the signer then refuses every runner configuration, since it mints only into the
-connection's own group.
+session's sign-in, the pool's start included, first brings that group up to date (the signer's `sync`, for twenty
+seconds at most, not again for ten minutes after one that succeeded); a sync that fails keeps the group as recorded,
+logs why, and is retried by the node itself after about a minute, doubling up to ten minutes. Leave
+`runnerGroupId` unset: a pool that names it does not run that sync, and a pool that names any other group makes its
+scale sets there, and the signer then refuses every runner configuration, since it mints only into the connection's
+own group.
 Each class's labels must be one of the connection's label sets. A class whose labels are not boots a machine, is
 refused at the mint and waits; it tries again every five minutes at most, one machine boot each time, and never runs a
 job.
