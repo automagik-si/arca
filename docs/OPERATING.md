@@ -2391,8 +2391,8 @@ arca token mint --scope doctor --id relay-alpha \
   --out /etc/arca/alpha/beta-relay.secret --config /etc/arca/beta.json
 ```
 
-To connect GitHub on the linked kernel from this kernel's GitHub page, add `github_link` to that list ("One prepared
-link, for this node or a linked node").
+To connect GitHub on the linked kernel from this kernel's GitHub page, the list needs `github_link`, `action_propose`,
+`plan_list` and `action_approve` ("One prepared link, for this node or a linked node").
 
 For a linked kernel on another machine, add `peer_keys_sync` (see [Approving on another machine](#approving-on-another-machine)).
 `token_list` takes `node` too, but it is an `operator` verb and a `doctor` token cannot list it, so through this token it is
@@ -4028,8 +4028,9 @@ service, database, GPU, storage, snapshot, instance, function or tenant verbs: `
 `function_create` and `function_remove` (see [Functions](#functions)), and `tenant_create`, `tenant_remove` and
 `deploy_remove` (see [Tenants](#tenants)), and `route_add` and `route_remove` (see
 [Routes](#routes-names-for-your-instances-served-by-the-nodes-edge)), and `instance_move` and `instance_move_finish`
-(see [Moving containers and stopped virtual machines to a linked host](#moving-containers-and-stopped-virtual-machines-to-a-linked-host-instance_move)), are proposed the same
-way. The canvas Doctor proposes twenty-two of them (not `service_update`, `service_reconfigure`, `host_network_restore`,
+(see [Moving containers and stopped virtual machines to a linked host](#moving-containers-and-stopped-virtual-machines-to-a-linked-host-instance_move)), and `github_link`
+(see [One prepared link, for this node or a linked node](#one-prepared-link-for-this-node-or-a-linked-node), which the
+approval host's GitHub page proposes), are proposed the same way. The canvas Doctor proposes twenty-two of them (not `service_update`, `service_reconfigure`, `host_network_restore`,
 `route_add`, `route_remove`, `instance_move` or `instance_move_finish`); it reads `tenant_list`, `tenant_status`, `tenant_usage` (which names the deploy each instance
 came from), `function_list` and `function_runs` to know what to propose, and a removal of a tenant, a deploy or a
 function is drawn in the alert colour on its card. `action_propose` takes `{action, args}`; `args` is checked against
@@ -7494,34 +7495,65 @@ skips the passkey sign-in or the click. Opening the link begins nothing.
 https://arca.example.com/approve/github?mode=app&node=beta&org=acme&labels=self-hosted,linux,x64
 ```
 
-The page says which node it connects ("You are connecting the linked node beta"), lists that node's connections with
-their Disconnect buttons, and connects it with `app` or `repositories`. GitHub sends the browser back to this page's own
-address; each step goes to the linked node's `github_link` over the link. The linked node converts GitHub's code into
-the App and its key itself, so the key is written on the linked node alone, and `github_bindings` there shows the
-connection. What passes through this node is GitHub's one-hour code, in one relayed call's body: never logged,
-journaled or shown. This node keeps, in memory for an hour, which node each flow belongs to and the App's name.
+The page says which node it connects ("You are connecting the linked node beta") and connects it with `app` or
+`repositories`. Opening the page asks the linked node nothing: the form comes from the link and the list of linked
+nodes. Its connections are read when the owner presses **Show the connections on beta**, each with its Disconnect.
+
+The owner proves themself to the linked node, not to this page. The form's one button is their approval, one passkey
+tap:
+
+1. The page asks the linked node whether it takes GitHub connections from this page (`github_link`, step `flow`), then
+   has it record a `github_link` action proposal for exactly what the form says: `begin`, the organisation, the kind of
+   App (`runners` or `repositories`), the label sets, and this page's origin, which GitHub sends the browser back to.
+2. The owner's passkey signs that card's statement, which names the linked node's own host, the proposal's id and
+   argument digest, and a fresh nonce.
+3. The page relays the approval to the linked node's `action_approve`. The linked node checks the passkey's assertion
+   itself, against the owner keys it trusts for approvals (`approval.peerKeys`, or `trustOwnerKeysFrom` with
+   `approval.origins`), and spends the nonce, as for every approved action: an assertion is taken once, for that card
+   only. Only then does it begin the manifest flow, with the one-shot grant the approval arms.
+
+GitHub's two returns go to the linked node with the proposal's id, and are taken only for the flow that approved begin
+made: the same proposal, page, organisation and kind, within the hour. The owner taps once. A disconnect is approved
+the same way (`github_link` with `disconnect` and the connection), and a disconnect card always needs the passkey.
+Without a valid owner assertion `github_link` begins and disconnects nothing for any token, the relay token included.
+
+The linked node converts GitHub's code into the App and its key itself, so the key is written on the linked node alone,
+and `github_bindings` there shows the connection. What passes through this node is GitHub's one-hour code, in one
+relayed call's body: never logged, journaled or shown. This node keeps, in memory for an hour, which node each flow
+belongs to, its proposal and the App's name, and in `github-linked-apps.json` in its state directory (no secret in it)
+which linked node holds which App and installation. GitHub's later returns carry no `state` (the owner changed the
+repositories, or finished an install after the hour); this node sends each to the linked node whose App it is
+(`github_link` step `refresh`), which reads the installation again from GitHub with its own App's key and brings its
+runner group to the repositories GitHub names, so a repository the owner removes leaves the pool's group. This node
+sends the browser only to addresses on GitHub's own web host.
 
 What the linked node needs, once:
 
-- **Its relay token names `github_link`.** Add `github_link` to the `--tools` of the token this node holds for it in
-  `approval.linkedHosts[].tokenFile` (see [Asking a linked node: `node`](#asking-a-linked-node-node)). `github_link` is for the
-  linked node's operators and for a token whose list names it; a doctor token without a list is refused `LinkToken`.
-- **It trusts this page.** The linked node takes a step only when the page's origin is one whose owner passkeys it
-  trusts: `approval.origins` (with `trustOwnerKeysFrom`) or an `approval.peerKeys` source's `origins`. A page it does
-  not trust is refused `NotApprovalHost` and nothing is begun. `created` and `installed` are taken only for a flow the
-  linked node began for that same origin, within the hour.
+- **Its relay token names `github_link`, `action_propose`, `plan_list` and `action_approve`.** Add them to the
+  `--tools` of the token this node holds for it in `approval.linkedHosts[].tokenFile` (see
+  [Asking a linked node: `node`](#asking-a-linked-node-node)). `github_link` is offered only to the linked node's
+  operators and to a token whose list names it; a doctor token without a list is not offered it and is refused.
+- **It trusts the owner's passkeys for this page.** `approval.peerKeys` (this page's host as a source, with this page's
+  origin) or `approval.trustOwnerKeysFrom` with `approval.origins`. A page whose passkeys it does not trust is told so
+  before any card is made (`NotApprovalHost`), and nothing is begun.
 - **It reaches GitHub's API**, as every node that mints runners does.
 
 When something goes wrong, the page says so in plain words:
 
 - A `node` that is not linked: "Not a linked node", naming the linked nodes. Nothing is begun.
+- A linked node on an older Arca, without `github_link`: it says the node runs an older Arca and to update it first.
 - The linked node does not answer before GitHub is opened: "Nothing was made on GitHub."
-- It does not answer when GitHub sends the browser back after **Create**: GitHub holds the new App (the page names it,
-  `Arca runners xxxxxx`), and nothing of it is stored anywhere. Reload the page within the hour once the node answers
-  and the connection goes on, or delete the App at `https://github.com/organizations/<org>/settings/apps`.
-- It does not answer after **Install**: GitHub holds the App and its installation, and the linked node holds its key
-  with the connection waiting for the install. Reload the page once the node answers to finish, or uninstall and
-  delete the App at the settings page the page links.
+- An approval that is replayed, made for another card, or made with a passkey the linked node does not trust: the
+  linked node refuses it in its own words, and nothing is begun.
+- Its answer does not come back when GitHub sends the browser back after **Create**: the page says the outcome is not
+  known yet and asks the linked node what it holds of the flow (step `flow`). If the node took the App, the page goes on
+  to GitHub's install screen; if it says it has not taken it yet, reload within the hour; if it cannot be asked, the
+  page says it does not know yet. GitHub holds the new App (the page names it, `Arca runners xxxxxx`); delete it at
+  `https://github.com/organizations/<org>/settings/apps` if you do not go on. The page never says nothing is stored
+  unless the linked node said so.
+- It does not answer after **Install**: GitHub holds the App and its installation, and the linked node holds its key;
+  whether it recorded the installation is not known yet. Reload the page once the node answers to finish, or uninstall
+  and delete the App at the settings page the page links.
 - A linked node that took GitHub's code but could not store the App keeps nothing of it (no key without its
   connection) and names the App to delete.
 
@@ -7599,7 +7631,7 @@ job attachment and disconnect, with the caller and the time. It holds no credent
 | `github_runner_mint` | operator | One just-in-time runner configuration for a connection's labels |
 | `github_mint_job` | operator | Records which job a minted runner took |
 | `github_disconnect` | operator | Ends a connection (above); destructive, so `confirm: false` refuses it |
-| `github_link` | operator, or a token whose `--tools` names it | The approval host's page connecting this node over the link ("One prepared link" above): `begin`, `created`, `installed`, `bindings`, `disconnect`, each from a page origin this node trusts |
+| `github_link` | operator, or a token whose `--tools` names it | The approval host's page connecting this node over the link ("One prepared link" above). `begin` and `disconnect` run only from a `github_link` proposal the owner approved with a passkey this node trusts; `created` and `installed` only for the flow that approval made; `refresh` reads an installation of an App this node holds again from GitHub; `flow` and `bindings` read. Destructive, so `confirm: false` refuses it |
 
 ## Per-job runners: the first real job
 

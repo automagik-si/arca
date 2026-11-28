@@ -28,7 +28,7 @@ const API_VERSION: &str = "2022-11-28";
 /// The Actions service's API version, as GitHub's own scale-set client sends it.
 pub const ACTIONS_API_VERSION: &str = "6.0-preview";
 /// The time one request may take, connect included.
-const REQUEST_BUDGET: Duration = Duration::from_secs(30);
+pub const REQUEST_BUDGET: Duration = Duration::from_secs(30);
 /// The most of an answer's body that is read. GitHub's answers to the signer's requests are a few KiB.
 const ANSWER_MAX: usize = 4 * 1024 * 1024;
 

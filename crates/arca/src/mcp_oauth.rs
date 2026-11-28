@@ -2924,9 +2924,19 @@ stay open for it instead of lapsing after 15 minutes.</p></div>"
             let grants = if named.is_empty() {
                 String::new()
             } else {
+                // What each such tool does, once: the support feed's two verbs share their words.
+                let mut what: Vec<&str> = named
+                    .iter()
+                    .map(|tool| match *tool {
+                        "github_link" => "it relays the steps of a GitHub connection, whose start and disconnect still need your passkey",
+                        _ => "it reads or marks the support reports of everyone on this node",
+                    })
+                    .collect();
+                what.dedup();
                 format!(
-                    ". <span class=\"named\">Naming <code>{}</code> gives the app that at any level: it reads or marks the support reports of everyone on this node.</span>",
-                    escape_html(&named.join(", "))
+                    ". <span class=\"named\">Naming <code>{}</code> gives the app that at any level: {}.</span>",
+                    escape_html(&named.join(", ")),
+                    what.join("; ")
                 )
             };
             format!(

@@ -411,7 +411,10 @@ impl Page {
 
     /// The linked kernels whose waiting cards the page lists and to which it relays passkey answers and declines.
     pub fn with_linked_hosts(mut self, hosts: Vec<LinkedHost>) -> Self {
-        self.state.github_links = Arc::new(crate::github_page::Links::over(hosts.clone()));
+        self.state.github_links = Arc::new(
+            crate::github_page::Links::over(hosts.clone())
+                .kept_in(self.state.state_dir.join(GITHUB_LINKED_INDEX)),
+        );
         self.state.linked = Arc::new(hosts);
         self
     }
@@ -522,6 +525,8 @@ impl Page {
                 (gh::APP_PATH, post(github_app)),
                 (gh::PUSH_PATH, post(github_push)),
                 (gh::DISCONNECT_PATH, post(github_disconnect)),
+                (gh::PREPARE_PATH, post(github_prepare)),
+                (gh::CONNECTIONS_PATH, post(github_connections)),
                 (gh::CREATED_PATH, get(github_created)),
                 (gh::INSTALLED_PATH, get(github_installed)),
             ] {
@@ -667,11 +672,16 @@ fn github_caller(credential: &str) -> String {
     format!("page:{}", credential.chars().take(24).collect::<String>())
 }
 
+/// The file in the state directory where the GitHub page keeps which linked node holds which App and installation. No
+/// secret is in it.
+const GITHUB_LINKED_INDEX: &str = "github-linked-apps.json";
+
 fn github_ctx<'a>(
     state: &'a PageState,
     signer: &'a crate::github_signer::Signer,
     caller: &'a str,
     here: &'a str,
+    credentials: &'a [String],
 ) -> crate::github_page::Ctx<'a> {
     crate::github_page::Ctx {
         signer,
@@ -679,6 +689,7 @@ fn github_ctx<'a>(
         caller,
         here,
         links: &state.github_links,
+        credentials,
     }
 }
 
@@ -715,7 +726,8 @@ async fn github_view(
     let caller = github_caller(&credential);
     let query = crate::github_page::parse_form(uri.query().unwrap_or(""));
     let here = github_here(&state);
-    crate::github_page::view(&github_ctx(&state, signer, &caller, &here), &query).await
+    let ids = trusted_credential_ids(&state);
+    crate::github_page::view(&github_ctx(&state, signer, &caller, &here, &ids), &query).await
 }
 
 /// The signed-in caller and the form of a GitHub page POST; `None` when no passkey session came with it.
@@ -752,7 +764,9 @@ async fn github_device(
     match github_form(&state, &headers, &body) {
         Some((caller, form)) => {
             let here = github_here(&state);
-            crate::github_page::device(&github_ctx(&state, signer, &caller, &here), &form).await
+            let ids = trusted_credential_ids(&state);
+            crate::github_page::device(&github_ctx(&state, signer, &caller, &here, &ids), &form)
+                .await
         }
         None => github_signed_out(),
     }
@@ -769,7 +783,9 @@ async fn github_app(
     match github_form(&state, &headers, &body) {
         Some((caller, form)) => {
             let here = github_here(&state);
-            crate::github_page::app_start(&github_ctx(&state, signer, &caller, &here), &form).await
+            let ids = trusted_credential_ids(&state);
+            crate::github_page::app_start(&github_ctx(&state, signer, &caller, &here, &ids), &form)
+                .await
         }
         None => github_signed_out(),
     }
@@ -786,7 +802,8 @@ async fn github_push(
     match github_form(&state, &headers, &body) {
         Some((caller, form)) => {
             let here = github_here(&state);
-            crate::github_page::push(&github_ctx(&state, signer, &caller, &here), &form)
+            let ids = trusted_credential_ids(&state);
+            crate::github_page::push(&github_ctx(&state, signer, &caller, &here, &ids), &form)
         }
         None => github_signed_out(),
     }
@@ -803,7 +820,50 @@ async fn github_disconnect(
     match github_form(&state, &headers, &body) {
         Some((caller, form)) => {
             let here = github_here(&state);
-            crate::github_page::disconnect(&github_ctx(&state, signer, &caller, &here), &form).await
+            let ids = trusted_credential_ids(&state);
+            crate::github_page::disconnect(&github_ctx(&state, signer, &caller, &here, &ids), &form)
+                .await
+        }
+        None => github_signed_out(),
+    }
+}
+
+async fn github_prepare(
+    State(state): State<Arc<PageState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Some(signer) = &state.github else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match github_form(&state, &headers, &body) {
+        Some((caller, form)) => {
+            let here = github_here(&state);
+            let ids = trusted_credential_ids(&state);
+            crate::github_page::prepare(&github_ctx(&state, signer, &caller, &here, &ids), &form)
+                .await
+        }
+        None => github_signed_out(),
+    }
+}
+
+async fn github_connections(
+    State(state): State<Arc<PageState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Some(signer) = &state.github else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match github_form(&state, &headers, &body) {
+        Some((caller, form)) => {
+            let here = github_here(&state);
+            let ids = trusted_credential_ids(&state);
+            crate::github_page::connections(
+                &github_ctx(&state, signer, &caller, &here, &ids),
+                &form,
+            )
+            .await
         }
         None => github_signed_out(),
     }
@@ -815,7 +875,8 @@ async fn github_created(State(state): State<Arc<PageState>>, uri: axum::http::Ur
     };
     let query = crate::github_page::parse_form(uri.query().unwrap_or(""));
     let here = github_here(&state);
-    crate::github_page::created(&github_ctx(&state, signer, "github", &here), &query).await
+    let ids = trusted_credential_ids(&state);
+    crate::github_page::created(&github_ctx(&state, signer, "github", &here, &ids), &query).await
 }
 
 async fn github_installed(State(state): State<Arc<PageState>>, uri: axum::http::Uri) -> Response {
@@ -824,7 +885,8 @@ async fn github_installed(State(state): State<Arc<PageState>>, uri: axum::http::
     };
     let query = crate::github_page::parse_form(uri.query().unwrap_or(""));
     let here = github_here(&state);
-    crate::github_page::installed(&github_ctx(&state, signer, "github", &here), &query).await
+    let ids = trusted_credential_ids(&state);
+    crate::github_page::installed(&github_ctx(&state, signer, "github", &here, &ids), &query).await
 }
 
 async fn canvas_page(State(state): State<Arc<PageState>>, headers: HeaderMap) -> Response {

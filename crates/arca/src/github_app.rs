@@ -67,6 +67,9 @@ pub struct AppFlow {
     pub origin: String,
     /// The binding the flow made once GitHub handed over the App.
     pub binding: Option<String>,
+    /// The approved `github_link` proposal whose begin made the flow, when the approval host's page began it over the
+    /// link. Only that flow's later steps are taken over the link.
+    pub approved: Option<String>,
 }
 
 /// Where the person's browser goes to create the App: a form posted to `action_url` with one field, `manifest`.
@@ -272,7 +275,28 @@ impl Signer {
         origin: &str,
         caller: &str,
     ) -> Result<AppStart, SignerError> {
-        self.app_begin_for(account, label_sets, origin, caller, false)
+        self.app_begin_for(account, label_sets, origin, caller, false, None)
+    }
+
+    /// Starts a manifest flow from the approved `github_link` proposal `approved`: for `account`'s runners, or for its
+    /// workspace repositories when `repository_access`.
+    pub fn app_begin_approved(
+        &self,
+        account: &str,
+        label_sets: &[Vec<String>],
+        origin: &str,
+        caller: &str,
+        repository_access: bool,
+        approved: &str,
+    ) -> Result<AppStart, SignerError> {
+        self.app_begin_for(
+            account,
+            label_sets,
+            origin,
+            caller,
+            repository_access,
+            Some(approved),
+        )
     }
 
     pub(crate) fn app_begin_for(
@@ -282,6 +306,7 @@ impl Signer {
         origin: &str,
         caller: &str,
         repository_access: bool,
+        approved: Option<&str>,
     ) -> Result<AppStart, SignerError> {
         check_account(account)?;
         if !repository_access && (label_sets.is_empty() || label_sets.len() > 10) {
@@ -329,6 +354,7 @@ impl Signer {
                     created_at: now,
                     origin: origin.to_string(),
                     binding: None,
+                    approved: approved.map(str::to_string),
                 },
             );
         }
@@ -357,6 +383,12 @@ impl Signer {
         self.app_flow(state).and_then(|flow| flow.binding)
     }
 
+    /// The install screen of the App the manifest flow `state` made, once GitHub handed it over.
+    pub fn app_flow_install(&self, state: &str) -> Option<String> {
+        let binding = self.app_flow_binding(state)?;
+        self.install_address(&binding, state)
+    }
+
     /// The address of the install screen of the App `binding` holds, for the manifest flow `state`.
     fn install_address(&self, binding: &str, state: &str) -> Option<String> {
         let app = self.lock().bindings.get(binding)?.app.clone()?;
@@ -372,7 +404,8 @@ impl Signer {
         )
     }
 
-    fn app_flow(&self, state: &str) -> Option<AppFlow> {
+    /// The manifest flow `state`, while it lives (an hour).
+    pub fn app_flow(&self, state: &str) -> Option<AppFlow> {
         let now = self.now();
         self.lock()
             .app_flows

@@ -31,6 +31,10 @@ const APPROVAL_MARGIN: Duration = Duration::from_secs(30);
 /// not be reached" while it goes on. An action with its own longer wait gets that too ([`approval_wait`]).
 pub const APPROVAL_TIMEOUT: Duration =
     Duration::from_secs(arca_incus::CALL_BUDGET.as_secs() + APPROVAL_MARGIN.as_secs());
+/// The longest a relayed `github_link` step may take: four of GitHub's own request limits, so a slow GitHub answers through
+/// the relay rather than as "could not be reached" while the node goes on.
+pub const LINK_TIMEOUT: Duration =
+    Duration::from_secs(crate::github_api::REQUEST_BUDGET.as_secs() * 4);
 /// The longest a listing or a status read may take. The canvas polls the list, so a linked kernel that hangs must not hold
 /// the page's own list.
 const LIST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -218,6 +222,9 @@ pub fn timeout_for(verb: &str) -> Duration {
     match verb {
         "plan_list" | "arca_status" | "owner_approval_list" => LIST_TIMEOUT,
         "action_approve" | "approval_submit" => APPROVAL_TIMEOUT,
+        // GitHub's returns: the node converts GitHub's code, or reads the installation and puts its runner group in
+        // place, several GitHub requests of their own limit each, before it answers.
+        "github_link" => LINK_TIMEOUT,
         _ => TIMEOUT,
     }
 }

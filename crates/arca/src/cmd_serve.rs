@@ -741,6 +741,18 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
             Arc::new(cfg.clone()),
         ))
         .chain(crate::instance_move::handlers(moves))
+        // Its approval host's GitHub page connects this node over the link: begin and disconnect from a github_link
+        // proposal the owner approved (so it runs from here too), the returns for the flow that approval made.
+        .chain(github_signer.as_ref().map(|signer| {
+            (
+                crate::github_handlers::LINK_VERB,
+                crate::github_handlers::link_handler(
+                    signer,
+                    Arc::clone(&kernel),
+                    github_link_origins(&cfg),
+                ),
+            )
+        }))
         .collect();
     // The owner approval requests: the three verbs and the approval page share one store in the state directory.
     let dashboard = cfg
@@ -767,11 +779,6 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
         for (verb, handler) in crate::github_handlers::handlers(signer) {
             server = server.handle(verb, handler);
         }
-        // Its approval host's GitHub page connects this node over the link, from the page origins it trusts alone.
-        server = server.handle(
-            crate::github_handlers::LINK_VERB,
-            crate::github_handlers::link_handler(signer, github_link_origins(&cfg)),
-        );
     }
     // The runner pools run while the kernel serves: this holds them. The network ACL and the own bridge of a pool that
     // is gone from the config go first.
@@ -1448,7 +1455,7 @@ fn peer_passkeys(cfg: &NodeConfig) -> Vec<PeerPasskeys> {
         .collect()
 }
 
-/// The page origins `github_link` takes steps from: the origins whose owner passkeys this kernel trusts, which are
+/// The page origins `github_link` takes steps from: the origins whose owner passkeys this kernel trusts for approvals, which are
 /// `approval.origins` when `approval.trustOwnerKeysFrom` names a file, and each `approval.peerKeys` source's origins. None
 /// without an `approval` key: then no page connects this node over the link.
 pub fn github_link_origins(cfg: &NodeConfig) -> Vec<String> {

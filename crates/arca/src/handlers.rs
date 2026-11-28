@@ -3095,6 +3095,7 @@ impl ActionExecutor {
                 | "instance_import_undo"
                 | "instance_move"
                 | "instance_move_finish"
+                | "github_link"
         ) {
             call["approval"] = json!(grant);
         }
