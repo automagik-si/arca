@@ -45,8 +45,10 @@ fn rig() -> Rig {
             "devices": {},
         })],
         pools: vec![("pool1".to_string(), json!({}))],
-        networks: vec![json!({ "name": "arcarun-0000001", "project": "default", "managed": true,
-            "type": "bridge", "config": {} })],
+        networks: vec![
+            json!({ "name": "arcarun-0000001", "project": "default", "managed": true,
+            "type": "bridge", "config": {} }),
+        ],
     };
     let fake = FakeIncus::start(&dir, state).expect("the fake serves");
     Rig { dir, fake }
@@ -109,7 +111,10 @@ fn keys(names: &[&str]) -> Vec<String> {
 /// makes, while the fake keeps what was sent. So the config read back is compared without it.
 fn kept_keys(rig: &Rig, name: &str) -> Value {
     let mut config = config(rig, name);
-    config.as_object_mut().expect("a config").remove("volatile.apply_nvram");
+    config
+        .as_object_mut()
+        .expect("a config")
+        .remove("volatile.apply_nvram");
     config
 }
 
@@ -121,10 +126,16 @@ fn a_copy_of_a_kept_machine_is_made_to_take_fresh_firmware_variables_from_the_ho
         instance: "runner-image".to_string(),
         snapshot: "ready".to_string(),
     };
-    vms.create(&spec("acme-0-0a1b2c3d", source)).expect("create");
+    vms.create(&spec("acme-0-0a1b2c3d", source))
+        .expect("create");
     assert_eq!(
         create_keys(&rig),
-        vec![keys(&[RUNNER_KEY, "limits.cpu", "limits.memory", "volatile.apply_nvram"])]
+        vec![keys(&[
+            RUNNER_KEY,
+            "limits.cpu",
+            "limits.memory",
+            "volatile.apply_nvram"
+        ])]
     );
     // The pool's mark and the machine's limits keep their values.
     assert_eq!(
@@ -140,7 +151,8 @@ fn a_machine_made_from_an_image_is_sent_no_firmware_key() {
     let rig = rig();
     let vms = RunnerVms::new(rig.fake.socket().to_path_buf(), PROJECT, "acme").expect("writer");
     let source = VmSource::Image("arca-runner-image".to_string());
-    vms.create(&spec("acme-0-0a1b2c3e", source)).expect("create");
+    vms.create(&spec("acme-0-0a1b2c3e", source))
+        .expect("create");
     assert_eq!(
         create_keys(&rig),
         vec![keys(&[RUNNER_KEY, "limits.cpu", "limits.memory"])]
