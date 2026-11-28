@@ -2772,7 +2772,8 @@
                           "route_add",
                           "route_remove",
                           "instance_import",
-                          "instance_import_undo"
+                          "instance_import_undo",
+                          "github_link"
                         ],
                         "type": "string"
                       },
@@ -2916,7 +2917,8 @@
               "route_add",
               "route_remove",
               "instance_import",
-              "instance_import_undo"
+              "instance_import_undo",
+              "github_link"
             ],
             "type": "string"
           }
@@ -4620,6 +4622,109 @@
                 ],
                 "title": "instance_import_undo",
                 "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The args of github_link: The steps of a GitHub App connection that a linked node's approval host relays from its GitHub page. begin and disconnect run only from an approved github_link proposal: the owner's passkey assertion, checked by this node against the owner keys it trusts for approvals. created (this node converts GitHub's code and keeps the App's key alone) and installed take only the flow that approved begin made, once, within the hour. refresh, flow and bindings read GitHub or this node. Only for operators and a token whose tool list names it. Example: {\"labelSets\":[[\"self-hosted\",\"linux\"]],\"org\":\"acme\",\"origin\":\"https://page.example.com\",\"purpose\":\"runners\",\"step\":\"begin\"}",
+                "examples": [
+                  {
+                    "labelSets": [
+                      [
+                        "self-hosted",
+                        "linux"
+                      ]
+                    ],
+                    "org": "acme",
+                    "origin": "https://page.example.com",
+                    "purpose": "runners",
+                    "step": "begin"
+                  }
+                ],
+                "properties": {
+                  "binding": {
+                    "description": "A GitHub connection's id, as `github_bindings` lists it.",
+                    "maxLength": 64,
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "code": {
+                    "description": "created: GitHub's one-hour code from the page's return. Never logged or shown.",
+                    "maxLength": 200,
+                    "type": "string"
+                  },
+                  "confirm": {
+                    "description": "Optional. Absent or true: the call runs as without it. False: the call is refused, nothing changes and no approval is spent. It is never part of what an approval binds.",
+                    "type": "boolean"
+                  },
+                  "installationId": {
+                    "description": "installed and refresh: the installation GitHub's return named.",
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "labelSets": {
+                    "description": "begin: the runners' label sets, each as the person chose it, checked as the page's own form checks them.",
+                    "items": {
+                      "items": {
+                        "maxLength": 1000,
+                        "type": "string"
+                      },
+                      "maxItems": 100,
+                      "type": "array"
+                    },
+                    "maxItems": 100,
+                    "type": "array"
+                  },
+                  "org": {
+                    "description": "begin: the organisation's login, checked as the page's own form checks it. created and installed: the same organisation.",
+                    "maxLength": 1000,
+                    "type": "string"
+                  },
+                  "origin": {
+                    "description": "The page the owner connects from, which GitHub sends the browser back to: one whose owner passkeys this node trusts for approvals. begin binds it, and the later steps name the same.",
+                    "maxLength": 300,
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "plan": {
+                    "description": "created, installed and flow: the id of the approved proposal whose begin made the flow.",
+                    "maxLength": 16,
+                    "minLength": 16,
+                    "pattern": "^act-[0-9a-f]{12}$",
+                    "type": "string"
+                  },
+                  "purpose": {
+                    "description": "begin: runners or repositories, the workspace repositories App. created and installed: the same.",
+                    "enum": [
+                      "runners",
+                      "repositories"
+                    ],
+                    "type": "string"
+                  },
+                  "state": {
+                    "description": "created, installed and flow: the manifest flow's state, as begin answered it.",
+                    "maxLength": 100,
+                    "type": "string"
+                  },
+                  "step": {
+                    "description": "begin and disconnect (from an approved proposal only), created and installed (the flow an approved begin made), refresh (an installation of an App this node holds, read again from GitHub), flow and bindings (reads).",
+                    "enum": [
+                      "begin",
+                      "created",
+                      "installed",
+                      "refresh",
+                      "flow",
+                      "bindings",
+                      "disconnect"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "step",
+                  "origin"
+                ],
+                "title": "github_link",
+                "type": "object"
               }
             ],
             "description": "The action's own arguments: those of the anyOf branch whose title is the action.",
@@ -4679,7 +4784,8 @@
                 "route_add",
                 "route_remove",
                 "instance_import",
-                "instance_import_undo"
+                "instance_import_undo",
+                "github_link"
               ],
               "type": "string"
             },
@@ -5188,7 +5294,8 @@
                 "route_add",
                 "route_remove",
                 "instance_import",
-                "instance_import_undo"
+                "instance_import_undo",
+                "github_link"
               ],
               "type": "string"
             },
@@ -16645,6 +16752,368 @@
       "x-arca-class": "L",
       "x-arca-read-only-hint": false,
       "x-arca-scope": "operator",
+      "x-arca-writes": true
+    },
+    {
+      "name": "github_link",
+      "params": [
+        {
+          "name": "origin",
+          "required": true,
+          "schema": {
+            "description": "The page the owner connects from, which GitHub sends the browser back to: one whose owner passkeys this node trusts for approvals. begin binds it, and the later steps name the same.",
+            "maxLength": 300,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        {
+          "name": "step",
+          "required": true,
+          "schema": {
+            "description": "begin and disconnect (from an approved proposal only), created and installed (the flow an approved begin made), refresh (an installation of an App this node holds, read again from GitHub), flow and bindings (reads).",
+            "enum": [
+              "begin",
+              "created",
+              "installed",
+              "refresh",
+              "flow",
+              "bindings",
+              "disconnect"
+            ],
+            "type": "string"
+          }
+        },
+        {
+          "name": "approval",
+          "required": false,
+          "schema": {
+            "description": "The one-shot execution grant an approved action proposal arms. A direct call carries none that works.",
+            "maxLength": 16384,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        {
+          "name": "binding",
+          "required": false,
+          "schema": {
+            "description": "A GitHub connection's id, as `github_bindings` lists it.",
+            "maxLength": 64,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        {
+          "name": "code",
+          "required": false,
+          "schema": {
+            "description": "created: GitHub's one-hour code from the page's return. Never logged or shown.",
+            "maxLength": 200,
+            "type": "string"
+          }
+        },
+        {
+          "name": "confirm",
+          "required": false,
+          "schema": {
+            "description": "Optional. Absent or true: the call runs as without it. False: the call is refused, nothing changes and no approval is spent. It is never part of what an approval binds.",
+            "type": "boolean"
+          }
+        },
+        {
+          "name": "installationId",
+          "required": false,
+          "schema": {
+            "description": "installed and refresh: the installation GitHub's return named.",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        {
+          "name": "labelSets",
+          "required": false,
+          "schema": {
+            "description": "begin: the runners' label sets, each as the person chose it, checked as the page's own form checks them.",
+            "items": {
+              "items": {
+                "maxLength": 1000,
+                "type": "string"
+              },
+              "maxItems": 100,
+              "type": "array"
+            },
+            "maxItems": 100,
+            "type": "array"
+          }
+        },
+        {
+          "name": "org",
+          "required": false,
+          "schema": {
+            "description": "begin: the organisation's login, checked as the page's own form checks it. created and installed: the same organisation.",
+            "maxLength": 1000,
+            "type": "string"
+          }
+        },
+        {
+          "name": "plan",
+          "required": false,
+          "schema": {
+            "description": "created, installed and flow: the id of the approved proposal whose begin made the flow.",
+            "maxLength": 16,
+            "minLength": 16,
+            "pattern": "^act-[0-9a-f]{12}$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "purpose",
+          "required": false,
+          "schema": {
+            "description": "begin: runners or repositories, the workspace repositories App. created and installed: the same.",
+            "enum": [
+              "runners",
+              "repositories"
+            ],
+            "type": "string"
+          }
+        },
+        {
+          "name": "state",
+          "required": false,
+          "schema": {
+            "description": "created, installed and flow: the manifest flow's state, as begin answered it.",
+            "maxLength": 100,
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "properties": {
+            "account": {
+              "type": "string"
+            },
+            "actionUrl": {
+              "type": "string"
+            },
+            "app": {
+              "properties": {
+                "settingsUrl": {
+                  "type": "string"
+                },
+                "slug": {
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            },
+            "appName": {
+              "type": "string"
+            },
+            "binding": {
+              "type": "string"
+            },
+            "bindings": {
+              "items": {
+                "properties": {
+                  "account": {
+                    "type": "string"
+                  },
+                  "app": {
+                    "properties": {
+                      "clientId": {
+                        "type": "string"
+                      },
+                      "htmlUrl": {
+                        "type": "string"
+                      },
+                      "id": {
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "ownerId": {
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "slug": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "id",
+                      "slug",
+                      "clientId",
+                      "htmlUrl",
+                      "ownerId"
+                    ],
+                    "type": "object"
+                  },
+                  "createdAt": {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "createdBy": {
+                    "type": "string"
+                  },
+                  "id": {
+                    "type": "string"
+                  },
+                  "installation": {
+                    "properties": {
+                      "id": {
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "repositories": {
+                        "items": {
+                          "type": "string"
+                        },
+                        "type": "array"
+                      },
+                      "repositorySelection": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "id",
+                      "repositorySelection",
+                      "repositories"
+                    ],
+                    "type": "object"
+                  },
+                  "labelSets": {
+                    "items": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "type": "array"
+                  },
+                  "mode": {
+                    "enum": [
+                      "oauth",
+                      "app",
+                      "push"
+                    ],
+                    "type": "string"
+                  },
+                  "runnerGroup": {
+                    "properties": {
+                      "createdByArca": {
+                        "type": "boolean"
+                      },
+                      "id": {
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "name": {
+                        "type": "string"
+                      },
+                      "warning": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "id",
+                      "name",
+                      "createdByArca"
+                    ],
+                    "type": "object"
+                  },
+                  "runners": {
+                    "items": {
+                      "properties": {
+                        "id": {
+                          "minimum": 0,
+                          "type": "integer"
+                        },
+                        "labels": {
+                          "items": {
+                            "type": "string"
+                          },
+                          "type": "array"
+                        },
+                        "name": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "name",
+                        "id",
+                        "labels"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "status": {
+                    "enum": [
+                      "awaitingInstall",
+                      "active",
+                      "suspended",
+                      "revoked"
+                    ],
+                    "type": "string"
+                  },
+                  "updatedAt": {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "why": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "id",
+                  "mode",
+                  "account",
+                  "status",
+                  "labelSets",
+                  "createdBy",
+                  "createdAt",
+                  "updatedAt"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "id": {
+              "type": "string"
+            },
+            "installUrl": {
+              "type": "string"
+            },
+            "installed": {
+              "type": "boolean"
+            },
+            "known": {
+              "type": "boolean"
+            },
+            "manifest": {
+              "type": "string"
+            },
+            "purpose": {
+              "type": "string"
+            },
+            "state": {
+              "type": "string"
+            },
+            "status": {
+              "type": "string"
+            }
+          },
+          "type": "object"
+        }
+      },
+      "summary": "The steps of a GitHub App connection that a linked node's approval host relays from its GitHub page. begin and disconnect run only from an approved github_link proposal: the owner's passkey assertion, checked by this node against the owner keys it trusts for approvals. created (this node converts GitHub's code and keeps the App's key alone) and installed take only the flow that approved begin made, once, within the hour. refresh, flow and bindings read GitHub or this node. Only for operators and a token whose tool list names it.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
+      "x-arca-scope": "doctor",
       "x-arca-writes": true
     },
     {

@@ -9,8 +9,32 @@
 //!
 //! The intake is a separate router with no page rule: a server posts there with the binding's intake token as its
 //! bearer, and a request that carries an `Origin` (a browser) is refused.
+//!
+//! **A prepared link.** `/approve/github?mode=app&org=<org>&labels=<set>[;<set>…]` opens the page with that mode's form
+//! filled and one button: `mode=repositories` (with `org`, or `repository=<owner>/<name>`), `mode=push` (`org`, `labels`)
+//! and `mode=oauth` (`org`, `group`, `labels`, `runners`) too. The values stay editable and are checked when the form is
+//! posted, exactly as typed ones are; the passkey session is the same.
+//!
+//! **A linked node.** `node=<name>` (one of `approval.linkedHosts`, as `arca_status` lists them) connects that node from
+//! this page. Opening the page asks the node nothing: the form is drawn from the link and the list of linked nodes. The
+//! form's one button is the owner's approval: the page has the node record a `github_link` action proposal for exactly
+//! what the form says (the organisation, the kind of App, the label sets and this page, which GitHub returns to), the
+//! owner's passkey signs its statement, and the node checks that assertion itself, against the owner keys it trusts for
+//! approvals, and spends its nonce before it begins the flow (`crate::github_handlers`). A disconnect is approved the
+//! same way. GitHub's returns are relayed for the flow that approval made, with the proposal's id, and need no second
+//! tap. The linked node converts GitHub's code into the App and its key itself, so the key never reaches this node: what
+//! passes through here is GitHub's one-hour code, in one relayed call's body, never logged, journaled or shown.
+//!
+//! This node remembers, for an hour and in memory only, which node each flow's `state` belongs to, its proposal and the
+//! App's name, so a node that stops answering can be named with what GitHub holds and where to delete it. It also keeps a
+//! small index with no secret in it (each linked node's Apps and the installations GitHub named), so GitHub's later
+//! returns, which carry no `state` (repositories changed, or an install finished after the hour), reach the node whose App
+//! it is.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::Router;
 use axum::body::{Bytes, to_bytes};
@@ -18,10 +42,14 @@ use axum::extract::{Path, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::config::LinkedHost;
+use crate::github_handlers::LINK_VERB;
 use crate::github_oauth::{FlowState, OauthRequest, StartError};
-use crate::github_signer::{Binding, Mode, Signer, Status};
+use crate::github_signer::{Binding, Mode, Signer, Status, check_account, check_labels};
+use crate::linked::RelayError;
 
 /// The page's own path, and its forms and returns.
 pub const PAGE_PATH: &str = "/approve/github";
@@ -31,10 +59,15 @@ pub const PUSH_PATH: &str = "/approve/github/push";
 pub const DISCONNECT_PATH: &str = "/approve/github/disconnect";
 pub const CREATED_PATH: &str = "/approve/github/created";
 pub const INSTALLED_PATH: &str = "/approve/github/installed";
+/// A linked node's form asks here for the card its button approves: the node records the proposal, and this page answers
+/// the statement the owner's passkey signs.
+pub const PREPARE_PATH: &str = "/approve/github/prepare";
+/// A linked node's connections, read when the owner asks for them.
+pub const CONNECTIONS_PATH: &str = "/approve/github/connections";
 /// The push intake: `POST /github/intake/{binding}`.
 pub const INTAKE_PATH: &str = "/github/intake/{binding}";
 
-/// The page template. Its one `<style>` is hashed into the page origin's CSP.
+/// The page template. Its one `<style>` and its one `<script>` are hashed into the page origin's CSP.
 pub const TEMPLATE: &str = include_str!("github_page.html");
 
 /// What a page handler needs.
@@ -44,6 +77,371 @@ pub struct Ctx<'a> {
     pub origin: &'a str,
     /// Who acts, for the audit log.
     pub caller: &'a str,
+    /// This node's own name, as the page names it: its approval host.
+    pub here: &'a str,
+    /// The linked nodes the page connects, and the flows it began on them.
+    pub links: &'a Links,
+    /// The owner passkeys this page trusts, by credential id: the passkey prompt offers them.
+    pub credentials: &'a [String],
+}
+
+/// How long the page remembers which linked node a manifest flow belongs to: GitHub's code lives as long.
+const LINKED_FLOW_TTL_MS: u64 = 60 * 60 * 1000;
+
+/// The relay to the linked nodes.
+pub trait Relay: Send + Sync {
+    /// The linked nodes' names.
+    fn names(&self) -> Vec<String>;
+    /// Calls `verb` with `args` on the linked node `node`, waiting up to `wait`. Blocking.
+    fn call(
+        &self,
+        node: &str,
+        verb: &str,
+        args: Value,
+        wait: Duration,
+    ) -> Result<Value, RelayError>;
+}
+
+/// The relay over each linked host's own socket and token, as `crate::linked` makes every call.
+struct HostsRelay(Vec<LinkedHost>);
+
+impl Relay for HostsRelay {
+    fn names(&self) -> Vec<String> {
+        self.0.iter().map(|host| host.name.clone()).collect()
+    }
+
+    fn call(
+        &self,
+        node: &str,
+        verb: &str,
+        args: Value,
+        wait: Duration,
+    ) -> Result<Value, RelayError> {
+        let host = self
+            .0
+            .iter()
+            .find(|host| host.name == node)
+            .ok_or(RelayError::Unreachable)?;
+        crate::linked::call_within(host, verb, args, wait)
+    }
+}
+
+/// A manifest flow this page began on a linked node: what the owner is told if the node stops answering.
+#[derive(Clone, Debug)]
+struct LinkedFlow {
+    node: String,
+    /// The approved proposal whose begin made the flow; the node takes the later steps for it alone.
+    plan: String,
+    account: String,
+    repositories: bool,
+    app_name: String,
+    created_at: u64,
+    /// The App's name on GitHub and its settings page, once the node took it.
+    app: Option<(String, String)>,
+}
+
+impl LinkedFlow {
+    /// The fields every later step of this flow names: its proposal, organisation and kind.
+    fn bound(&self, origin: &str, state: &str) -> Value {
+        json!({
+            "origin": origin,
+            "state": state,
+            "plan": self.plan,
+            "org": self.account,
+            "purpose": if self.repositories { "repositories" } else { "runners" },
+        })
+    }
+}
+
+/// Which linked node holds which App and installation, so GitHub's later returns, which carry no `state`, reach it. No
+/// secret is in it: node names, App names and GitHub's installation numbers.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct Index {
+    /// `(node, App slug)`, one per App a linked node took.
+    #[serde(default)]
+    apps: Vec<(String, String)>,
+    /// The node each installation GitHub named belongs to.
+    #[serde(default)]
+    installations: BTreeMap<u64, String>,
+}
+
+/// The linked nodes this page connects, the manifest flows it began on them (by `state`, in memory), and the index of
+/// their Apps (in a file, when one is given).
+pub struct Links {
+    relay: Arc<dyn Relay>,
+    flows: Mutex<HashMap<String, LinkedFlow>>,
+    /// How long a relayed `github_link` step waits: past GitHub's own limits.
+    wait: Duration,
+    index: Mutex<Index>,
+    index_file: Option<PathBuf>,
+}
+
+impl Links {
+    /// No linked node.
+    pub fn none() -> Self {
+        Self::over(Vec::new())
+    }
+
+    /// The linked hosts of `approval.linkedHosts`, reached as `crate::linked` reaches them.
+    pub fn over(hosts: Vec<LinkedHost>) -> Self {
+        Self::new(Arc::new(HostsRelay(hosts)))
+    }
+
+    pub fn new(relay: Arc<dyn Relay>) -> Self {
+        Self {
+            relay,
+            flows: Mutex::new(HashMap::new()),
+            wait: crate::linked::timeout_for(LINK_VERB),
+            index: Mutex::new(Index::default()),
+            index_file: None,
+        }
+    }
+
+    /// The same, with each relayed `github_link` step waiting up to `wait`.
+    pub fn with_wait(mut self, wait: Duration) -> Self {
+        self.wait = wait;
+        self
+    }
+
+    /// The same, keeping the index of the linked nodes' Apps in `file` (read now, written on each change).
+    pub fn kept_in(mut self, file: PathBuf) -> Self {
+        let index = std::fs::read(&file)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Index>(&bytes).ok())
+            .unwrap_or_default();
+        self.index = Mutex::new(index);
+        self.index_file = Some(file);
+        self
+    }
+
+    fn names(&self) -> Vec<String> {
+        self.relay.names()
+    }
+
+    async fn call(
+        &self,
+        node: &str,
+        verb: &str,
+        args: Value,
+        wait: Duration,
+    ) -> Result<Value, RelayError> {
+        let relay = Arc::clone(&self.relay);
+        let node = node.to_string();
+        let verb = verb.to_string();
+        tokio::task::spawn_blocking(move || relay.call(&node, &verb, args, wait))
+            .await
+            .unwrap_or(Err(RelayError::Unreachable))
+    }
+
+    /// One `github_link` step on `node`.
+    async fn link(&self, node: &str, args: Value) -> Result<Value, RelayError> {
+        self.call(node, LINK_VERB, args, self.wait).await
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, LinkedFlow>> {
+        self.flows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn remember(&self, state: &str, flow: LinkedFlow) {
+        let mut flows = self.lock();
+        let now = flow.created_at;
+        flows.retain(|_, kept| now.saturating_sub(kept.created_at) < LINKED_FLOW_TTL_MS);
+        flows.insert(state.to_string(), flow);
+    }
+
+    fn flow(&self, state: &str, now: u64) -> Option<LinkedFlow> {
+        self.lock()
+            .get(state)
+            .filter(|flow| now.saturating_sub(flow.created_at) < LINKED_FLOW_TTL_MS)
+            .cloned()
+    }
+
+    fn update(&self, state: &str, change: impl FnOnce(&mut LinkedFlow)) {
+        if let Some(flow) = self.lock().get_mut(state) {
+            change(flow);
+        }
+    }
+
+    fn forget(&self, state: &str) {
+        self.lock().remove(state);
+    }
+
+    /// Changes the index and writes it to its file, when it has one. A write that fails leaves the index in memory.
+    fn index_change(&self, change: impl FnOnce(&mut Index)) {
+        let mut index = self
+            .index
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        change(&mut index);
+        if let (Some(file), Ok(text)) = (&self.index_file, serde_json::to_vec_pretty(&*index)) {
+            let temporary = file.with_extension("tmp");
+            if std::fs::write(&temporary, text).is_err()
+                || std::fs::rename(&temporary, file).is_err()
+            {
+                eprintln!("arca: the index of the linked nodes' GitHub Apps was not written");
+            }
+        }
+    }
+
+    fn index(&self) -> Index {
+        self.index
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn note_app(&self, node: &str, slug: &str) {
+        self.index_change(|index| {
+            let entry = (node.to_string(), slug.to_string());
+            if !index.apps.contains(&entry) {
+                index.apps.push(entry);
+            }
+        });
+    }
+
+    fn note_installation(&self, installation: u64, node: &str) {
+        self.index_change(|index| {
+            index.installations.insert(installation, node.to_string());
+        });
+    }
+}
+
+/// The node a page request is for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Target {
+    Here,
+    Linked(String),
+}
+
+/// The node a form or link names with `node`: this one when it names none or this node's own name, a linked node by its
+/// name, and otherwise a plain error that names the linked nodes (never the name it was given).
+fn target_of(ctx: &Ctx<'_>, form: &HashMap<String, String>) -> Result<Target, Box<Response>> {
+    let node = field(form, "node");
+    if node.is_empty() || node == ctx.here {
+        return Ok(Target::Here);
+    }
+    let names = ctx.links.names();
+    if names.iter().any(|name| name == node) {
+        return Ok(Target::Linked(node.to_string()));
+    }
+    Err(Box::new(message_page(
+        StatusCode::BAD_REQUEST,
+        "Not a linked node",
+        &not_linked_words(&names),
+    )))
+}
+
+fn not_linked_words(names: &[String]) -> String {
+    if names.is_empty() {
+        "That is not a node linked to this one: no node is linked to it.".to_string()
+    } else {
+        format!(
+            "That is not a node linked to this one. The linked nodes are: {}.",
+            names.join(", ")
+        )
+    }
+}
+
+/// The hidden `node` field of a form for `target`.
+fn node_input(target: &Target) -> String {
+    match target {
+        Target::Here => String::new(),
+        Target::Linked(node) => format!(
+            "<input type=\"hidden\" name=\"node\" value=\"{}\">",
+            escape(node)
+        ),
+    }
+}
+
+/// What a form whose button is the owner's approval carries for `target`: the node, the empty fields the passkey fills
+/// in, and the line the page writes what it is doing in. Nothing for this node's own forms.
+fn approve_inputs(target: &Target) -> String {
+    match target {
+        Target::Here => String::new(),
+        Target::Linked(_) => format!(
+            "{}<input type=\"hidden\" name=\"plan\" value=\"\"><input type=\"hidden\" name=\"approval\" value=\"\">\
+             <p class=\"note\" role=\"status\"></p>",
+            node_input(target)
+        ),
+    }
+}
+
+/// The opening tag of a form posted to `action` for `target`: a linked node's is approved with the owner's passkey.
+fn form_open(target: &Target, action: &str) -> String {
+    match target {
+        Target::Here => format!("<form method=\"post\" action=\"{action}\">"),
+        Target::Linked(_) => format!("<form method=\"post\" action=\"{action}\" data-approve>"),
+    }
+}
+
+/// The credential ids the passkey prompt offers, for the page's script.
+fn passkey_ids(ctx: &Ctx<'_>) -> String {
+    format!(
+        "<div id=\"passkeys\" hidden data-ids=\"{}\"></div>",
+        escape(&serde_json::to_string(ctx.credentials).unwrap_or_else(|_| "[]".to_string()))
+    )
+}
+
+/// The page's own address for `target`, with `more` query pairs.
+fn page_for(target: &Target, more: &str) -> String {
+    match (target, more.is_empty()) {
+        (Target::Here, true) => PAGE_PATH.to_string(),
+        (Target::Here, false) => format!("{PAGE_PATH}?{more}"),
+        (Target::Linked(node), true) => format!("{PAGE_PATH}?node={node}"),
+        (Target::Linked(node), false) => format!("{PAGE_PATH}?node={node}&{more}"),
+    }
+}
+
+/// The tools the relay token this page holds for a linked node names, for the GitHub connection.
+const LINK_TOOLS: &str = "github_link, action_propose, plan_list and action_approve";
+
+/// Why a relayed call to `node` did not answer, in words. A node that does not know `github_link` runs an older Arca.
+fn relay_words(node: &str, error: &RelayError) -> String {
+    match error {
+        RelayError::Unreachable => format!("The linked node {node} could not be reached just now."),
+        RelayError::Token => format!(
+            "The linked node {node} does not take this node's token for GitHub connections: the relay token's tools \
+             must name {LINK_TOOLS}."
+        ),
+        RelayError::Failed(why) if why == "not_found" => older_words(node),
+        RelayError::Refused { message, .. } => {
+            format!("The linked node {node} refused: {message}.")
+        }
+        RelayError::Failed(why) => why.clone(),
+    }
+}
+
+/// What the owner reads when the linked node runs an Arca from before GitHub connections over the link.
+fn older_words(node: &str) -> String {
+    format!(
+        "The linked node {node} runs an older Arca, which cannot be connected to GitHub from this page. Update {node}, \
+         then open this link again."
+    )
+}
+
+/// The status of a relayed step that did not answer: arguments the node found invalid are the form's, the rest the
+/// node's.
+fn relay_status(error: &RelayError) -> StatusCode {
+    match error {
+        RelayError::Failed(why) if why != "not_found" => StatusCode::BAD_REQUEST,
+        _ => StatusCode::BAD_GATEWAY,
+    }
+}
+
+/// Whether the call may not have reached the node, or its answer may not have reached this page: the outcome is unknown.
+fn not_reached(error: &RelayError) -> bool {
+    matches!(error, RelayError::Unreachable | RelayError::Token)
+}
+
+/// Whether `url` is an address on GitHub's own web host, as this node's signer names it: the only place the page sends the
+/// browser to from a linked node's answer.
+fn on_github(ctx: &Ctx<'_>, url: &str) -> bool {
+    let web = ctx.signer.endpoints().web.trim_end_matches('/');
+    url.strip_prefix(web)
+        .is_some_and(|rest| rest.starts_with('/') && !rest.starts_with("//"))
+        && !url.contains(['"', '<', '>', '\\', ' '])
 }
 
 /// `text` safe inside HTML text and double-quoted attributes.
@@ -162,70 +560,11 @@ fn mode_words(mode: Mode) -> &'static str {
     }
 }
 
-/// The signed-in page: the connections, an open flow when `flow` names one, and the three ways to connect.
-pub fn view(ctx: &Ctx<'_>, query: &HashMap<String, String>) -> Response {
-    let signer = ctx.signer;
-    let mut body = String::from(
-        "<h1>GitHub runners</h1><p>Connect a GitHub organisation, and its Actions jobs can run on this Arca. \
-         Arca keeps the App's key, the sign-in grant and GitHub's tokens to itself. Each runner's own configuration, its \
-         credential for one job, goes to the machine that runs it, and also to any assistant that holds an Arca \
-         operator token and asks for one.</p>",
-    );
-    let mut refresh = false;
-    if let Some(flow) = query.get("flow").and_then(|id| signer.oauth_flow(id)) {
-        refresh = matches!(
-            flow.state,
-            FlowState::WaitingForPerson | FlowState::Registering
-        );
-        body.push_str("<section>");
-        match flow.state {
-            FlowState::WaitingForPerson => body.push_str(&format!(
-                "<h2>Type this code on GitHub</h2><p class=\"code\">{}</p><p>Open <a href=\"{uri}\" target=\"_blank\" \
-                 rel=\"noopener noreferrer\">{uri}</a>, type the code, and authorise. If your organisation restricts \
-                 OAuth Apps, GitHub shows it with a Grant button on that screen: an owner of {} clicks Grant.</p>",
-                escape(&flow.user_code),
-                escape(&flow.account),
-                uri = escape(&flow.verification_uri),
-            )),
-            FlowState::Registering => body.push_str("<h2>Registering your runners</h2>"),
-            FlowState::Done => body.push_str("<h2 class=\"ok\">Done</h2>"),
-            FlowState::Failed => body.push_str("<h2 class=\"bad\">Stopped</h2>"),
-        }
-        body.push_str("<ol class=\"steps\">");
-        for step in &flow.steps {
-            body.push_str(&format!(
-                "<li class=\"{}\">{} <span class=\"mono\">{}</span></li>",
-                if step.ok { "" } else { "bad" },
-                escape(&step.text),
-                escape(&step.at_text)
-            ));
-        }
-        body.push_str("</ol></section>");
-    }
-    if let Some(id) = query.get("connected")
-        && let Ok(info) = signer.binding(id)
-    {
-        let words = if signer
-            .bindings()
-            .iter()
-            .any(|b| b.id == *id && b.repository_access)
-        {
-            "Its repository App supplies each workspace with access to its own selected repository."
-        } else {
-            "Runners register in its runner group with the labels you chose."
-        };
-        body.push_str(&format!(
-            "<section><h2 class=\"ok\">Connected</h2><p>{} is connected. {words}</p></section>",
-            escape(&info.org_url)
-        ));
-    }
-
-    let bindings = signer.bindings();
-    body.push_str("<section><h2>Connections</h2>");
-    if bindings.is_empty() {
-        body.push_str("<p>None yet.</p>");
-    }
-    for binding in &bindings {
+/// The connection rows of `bindings`, each with its Disconnect form for `target`: a linked node's is approved with the
+/// owner's passkey.
+fn connection_rows(bindings: &[Binding], target: &Target) -> String {
+    let mut body = String::new();
+    for binding in bindings {
         let (tone, words) = status_words(binding);
         body.push_str(&format!(
             "<div class=\"row\"><strong>{}</strong><span class=\"{tone}\">{words}</span></div><p>{}",
@@ -262,32 +601,289 @@ pub fn view(ctx: &Ctx<'_>, query: &HashMap<String, String>) -> Response {
         }
         if binding.status != Status::Revoked {
             body.push_str(&format!(
-                "<form method=\"post\" action=\"{DISCONNECT_PATH}\"><input type=\"hidden\" name=\"binding\" \
-                 value=\"{}\"><button class=\"quiet\" type=\"submit\">Disconnect</button></form>",
-                escape(&binding.id)
+                "{}{}<input type=\"hidden\" name=\"binding\" value=\"{}\"><button class=\"quiet\" type=\"submit\">{}</button></form>",
+                form_open(target, DISCONNECT_PATH),
+                match target {
+                    Target::Here => String::new(),
+                    Target::Linked(_) => approve_inputs(target),
+                },
+                escape(&binding.id),
+                match target {
+                    Target::Here => "Disconnect",
+                    Target::Linked(_) => "Disconnect, with your passkey",
+                }
             ));
         }
+    }
+    body
+}
+
+/// The form a prepared link asks for (`mode`), filled with the link's values, for `target`; `None` when the link names no
+/// mode. The values are shown as the link gave them and checked when the form is posted, as typed ones are.
+fn prepared(ctx: &Ctx<'_>, target: &Target, query: &HashMap<String, String>) -> Option<String> {
+    let mode = field(query, "mode").to_ascii_lowercase();
+    if mode.is_empty() {
+        return None;
+    }
+    let repository = field(query, "repository");
+    let org = match field(query, "org") {
+        "" => repository.split('/').next().unwrap_or("").trim(),
+        org => org,
+    };
+    let labels = field(query, "labels")
+        .split(';')
+        .map(str::trim)
+        .filter(|set| !set.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let to = match target {
+        Target::Here => "this node".to_string(),
+        Target::Linked(node) => format!("the linked node {}", escape(node)),
+    };
+    let app_form = form_open(target, APP_PATH);
+    let inputs = match target {
+        Target::Here => String::new(),
+        Target::Linked(_) => approve_inputs(target),
+    };
+    let go = match target {
+        Target::Here => "Continue to GitHub".to_string(),
+        Target::Linked(node) => format!(
+            "Approve for {} with your passkey, and continue to GitHub",
+            escape(node)
+        ),
+    };
+    let org_input = format!(
+        "<label for=\"l-org\">Organisation</label><input id=\"l-org\" name=\"org\" required maxlength=\"39\" value=\"{}\">",
+        escape(org)
+    );
+    let labels_area = format!(
+        "<label for=\"l-labels\">Labels: one set a line</label><textarea id=\"l-labels\" name=\"labels\" rows=\"2\" required>{}</textarea>",
+        escape(&labels)
+    );
+    let intro =
+        "<p>This link filled in the form. Check the values, change any of them, and go on.</p>";
+    let section = match (mode.as_str(), target) {
+        ("app", _) => format!(
+            "<section id=\"prepared\"><h2>Arca's App in {} for {to}</h2>{intro}{app_form}\
+             {inputs}{org_input}{labels_area}<button type=\"submit\">{go}</button></form></section>",
+            escape(org)
+        ),
+        ("repositories" | "repository", _) => format!(
+            "<section id=\"prepared\"><h2>Workspace repositories of {} for {to}</h2>{intro}{}\
+             {app_form}{inputs}<input type=\"hidden\" name=\"purpose\" value=\"repositories\">\
+             {org_input}<button type=\"submit\">{go}</button></form></section>",
+            escape(org),
+            if repository.contains('/') {
+                format!("<p>On GitHub, select {} among the repositories.</p>", escape(repository))
+            } else {
+                String::new()
+            }
+        ),
+        ("push", Target::Here) => format!(
+            "<section id=\"prepared\"><h2>Your service sends {}'s runners to {to}</h2>{intro}\
+             <form method=\"post\" action=\"{PUSH_PATH}\">{org_input}{labels_area}\
+             <button type=\"submit\">Make the address and token</button></form></section>",
+            escape(org)
+        ),
+        ("oauth" | "device", Target::Here) if ctx.signer.oauth_client_id().is_some() => format!(
+            "<section id=\"prepared\"><h2>Sign in with GitHub for {}'s runners on {to}</h2>{intro}\
+             <form method=\"post\" action=\"{DEVICE_PATH}\">{org_input}\
+             <label for=\"l-group\">Runner group (empty: the default group)</label><input id=\"l-group\" name=\"group\" maxlength=\"100\" value=\"{}\">\
+             <label for=\"l-dlabels\">Labels, as your workflows' runs-on names them</label><input id=\"l-dlabels\" name=\"labels\" required value=\"{}\">\
+             <label for=\"l-runners\">How many runners</label><input id=\"l-runners\" name=\"runners\" type=\"number\" min=\"1\" max=\"50\" value=\"{}\">\
+             <button type=\"submit\">Get a code</button></form></section>",
+            escape(org),
+            escape(field(query, "group")),
+            escape(&labels.replace('\n', ", ")),
+            escape(match field(query, "runners") {
+                "" => "2",
+                runners => runners,
+            }),
+        ),
+        ("oauth" | "device", Target::Here) => "<section id=\"prepared\"><h2>Sign in with GitHub</h2><p>This link asks \
+             for the sign-in with a code, and this Arca has no GitHub OAuth App yet. Whoever looks after it sets one with \
+             github_oauth_app_set.</p></section>"
+            .to_string(),
+        ("push" | "oauth" | "device", Target::Linked(_)) => format!(
+            "<section id=\"prepared\"><h2>Not through the link</h2><p>A linked node is connected from this page with \
+             Arca's App (mode=app) or the workspace repositories App (mode=repositories). Pushed configurations and \
+             the sign-in with a code connect only the node whose page this is. Nothing was begun for {to}.</p></section>"
+        ),
+        (other, _) => format!(
+            "<section id=\"prepared\"><h2>This link's mode is unknown</h2><p>It asks for \"{}\"; a prepared link's \
+             mode is app, repositories, push or oauth. Nothing was begun.</p></section>",
+            escape(other)
+        ),
+    };
+    Some(section)
+}
+
+/// The words that open the page, and the line that names the node it connects.
+fn page_opening(ctx: &Ctx<'_>, target: &Target) -> String {
+    let mut body = String::from(
+        "<h1>GitHub runners</h1><p>Connect a GitHub organisation, and its Actions jobs can run on this Arca. \
+         Arca keeps the App's key, the sign-in grant and GitHub's tokens to itself. Each runner's own configuration, its \
+         credential for one job, goes to the machine that runs it, and also to any assistant that holds an Arca \
+         operator token and asks for one.</p>",
+    );
+    body.push_str(&match target {
+        Target::Here => format!(
+            "<p class=\"node\">You are connecting this node, {}.</p>",
+            escape(ctx.here)
+        ),
+        Target::Linked(node) => format!(
+            "<p class=\"node\">You are connecting the linked node {node}, from the page of {here}. Your passkey approves \
+             each start and each disconnect, and {node} checks it itself. GitHub sends you back here; the App's key and \
+             the connections are kept on {node}, not on {here}.</p>",
+            node = escape(node),
+            here = escape(ctx.here)
+        ),
+    });
+    body.push_str(&passkey_ids(ctx));
+    body
+}
+
+/// The signed-in page: the node it connects, the connections, an open flow when `flow` names one, a prepared link's form
+/// when `mode` names one, and otherwise the ways to connect. A linked node is not asked anything here: its connections
+/// are read when the owner asks for them.
+pub async fn view(ctx: &Ctx<'_>, query: &HashMap<String, String>) -> Response {
+    let target = match target_of(ctx, query) {
+        Ok(target) => target,
+        Err(refusal) => return *refusal,
+    };
+    let signer = ctx.signer;
+    let mut body = page_opening(ctx, &target);
+    let mut refresh = false;
+    if target == Target::Here
+        && let Some(flow) = query.get("flow").and_then(|id| signer.oauth_flow(id))
+    {
+        refresh = matches!(
+            flow.state,
+            FlowState::WaitingForPerson | FlowState::Registering
+        );
+        body.push_str("<section>");
+        match flow.state {
+            FlowState::WaitingForPerson => body.push_str(&format!(
+                "<h2>Type this code on GitHub</h2><p class=\"code\">{}</p><p>Open <a href=\"{uri}\" target=\"_blank\" \
+                 rel=\"noopener noreferrer\">{uri}</a>, type the code, and authorise. If your organisation restricts \
+                 OAuth Apps, GitHub shows it with a Grant button on that screen: an owner of {} clicks Grant.</p>",
+                escape(&flow.user_code),
+                escape(&flow.account),
+                uri = escape(&flow.verification_uri),
+            )),
+            FlowState::Registering => body.push_str("<h2>Registering your runners</h2>"),
+            FlowState::Done => body.push_str("<h2 class=\"ok\">Done</h2>"),
+            FlowState::Failed => body.push_str("<h2 class=\"bad\">Stopped</h2>"),
+        }
+        body.push_str("<ol class=\"steps\">");
+        for step in &flow.steps {
+            body.push_str(&format!(
+                "<li class=\"{}\">{} <span class=\"mono\">{}</span></li>",
+                if step.ok { "" } else { "bad" },
+                escape(&step.text),
+                escape(&step.at_text)
+            ));
+        }
+        body.push_str("</ol></section>");
+    }
+    if let Some(id) = query.get("connected") {
+        match &target {
+            Target::Here => {
+                if let Some(binding) = signer.bindings().iter().find(|binding| binding.id == *id) {
+                    let words = if binding.repository_access {
+                        "Its repository App supplies each workspace with access to its own selected repository."
+                    } else {
+                        "Runners register in its runner group with the labels you chose."
+                    };
+                    body.push_str(&format!(
+                        "<section><h2 class=\"ok\">Connected</h2><p>{} is connected. {words}</p></section>",
+                        escape(&binding.org_url(signer.endpoints()))
+                    ));
+                }
+            }
+            Target::Linked(node) => body.push_str(&format!(
+                "<section><h2 class=\"ok\">Connected</h2><p>{} recorded the connection {}. Its runners register in its \
+                 runner group with the labels you chose.</p></section>",
+                escape(node),
+                escape(id)
+            )),
+        }
+    }
+
+    let prepared = prepared(ctx, &target, query);
+    if let Some(section) = &prepared {
+        body.push_str(section);
+    }
+
+    body.push_str("<section><h2>Connections</h2>");
+    match &target {
+        Target::Here => {
+            let bindings = signer.bindings();
+            if bindings.is_empty() {
+                body.push_str("<p>None yet.</p>");
+            }
+            body.push_str(&connection_rows(&bindings, &target));
+        }
+        Target::Linked(node) => body.push_str(&format!(
+            "<p>{node} keeps its own connections.</p><form method=\"post\" action=\"{CONNECTIONS_PATH}\">{}\
+             <button class=\"quiet\" type=\"submit\">Show the connections on {node}</button></form>",
+            node_input(&target),
+            node = escape(node)
+        )),
     }
     body.push_str("</section>");
 
-    let flows = signer.oauth_flows();
-    if !flows.is_empty() {
-        body.push_str("<section><h2>Sign-ins of the last day</h2><ul>");
-        for flow in flows.iter().take(10) {
-            body.push_str(&format!(
-                "<li><a href=\"{PAGE_PATH}?flow={}\">{}</a>: {:?}</li>",
-                escape(&flow.id),
-                escape(&flow.account),
-                flow.state
-            ));
+    if target == Target::Here {
+        let flows = signer.oauth_flows();
+        if !flows.is_empty() {
+            body.push_str("<section><h2>Sign-ins of the last day</h2><ul>");
+            for flow in flows.iter().take(10) {
+                body.push_str(&format!(
+                    "<li><a href=\"{PAGE_PATH}?flow={}\">{}</a>: {:?}</li>",
+                    escape(&flow.id),
+                    escape(&flow.account),
+                    flow.state
+                ));
+            }
+            body.push_str("</ul></section>");
         }
-        body.push_str("</ul></section>");
     }
 
+    if prepared.is_some() {
+        body.push_str(&format!(
+            "<p><a href=\"{}\">Other ways to connect</a></p>",
+            escape(&page_for(&target, ""))
+        ));
+        return html(&body, refresh);
+    }
+
+    let app_form = form_open(&target, APP_PATH);
+    let inputs = match &target {
+        Target::Here => String::new(),
+        Target::Linked(_) => approve_inputs(&target),
+    };
+    let (repo_go, app_go) = match &target {
+        Target::Here => (
+            "Connect workspace repositories".to_string(),
+            "Continue to GitHub".to_string(),
+        ),
+        Target::Linked(node) => (
+            format!(
+                "Approve for {} with your passkey, and continue to GitHub",
+                escape(node)
+            ),
+            format!(
+                "Approve for {} with your passkey, and continue to GitHub",
+                escape(node)
+            ),
+        ),
+    };
     body.push_str(&format!(
-        "<section><h2>Workspace repositories</h2><p>Create a separate repository App for workspace Git access. It can fetch, push and open draft pull requests in the repositories you select. It does not change branch policies.</p><form method=\"post\" action=\"{APP_PATH}\"><input type=\"hidden\" name=\"purpose\" value=\"repositories\"><label for=\"repo-org\">Organisation</label><input id=\"repo-org\" name=\"org\" required maxlength=\"39\"><button type=\"submit\">Connect workspace repositories</button></form></section>"
+        "<section><h2>Workspace repositories</h2><p>Create a separate repository App for workspace Git access. It can fetch, push and open draft pull requests in the repositories you select. It does not change branch policies.</p>{app_form}{inputs}<input type=\"hidden\" name=\"purpose\" value=\"repositories\"><label for=\"repo-org\">Organisation</label><input id=\"repo-org\" name=\"org\" required maxlength=\"39\"><button type=\"submit\">{repo_go}</button></form></section>"
     ));
-    if signer.oauth_client_id().is_some() {
+    if target != Target::Here {
+        // Only the App's forms go through the link.
+    } else if signer.oauth_client_id().is_some() {
         body.push_str(&format!(
             "<section><h2>Sign in with GitHub</h2><p>Arca shows a code; you type it on GitHub and allow Arca to \
              manage the organisation once (GitHub calls it admin:org). Arca uses that once to register the runners, \
@@ -305,24 +901,79 @@ pub fn view(ctx: &Ctx<'_>, query: &HashMap<String, String>) -> Response {
              sets one with github_oauth_app_set.</p></section>",
         );
     }
+    let inputs = match &target {
+        Target::Here => String::new(),
+        Target::Linked(_) => {
+            approve_inputs(&target).replace("class=\"note\"", "class=\"note\" id=\"a-note\"")
+        }
+    };
     body.push_str(&format!(
         "<section><h2>One click: Arca's App in your organisation</h2><p>GitHub opens with an App ready to create in \
          your organisation. It asks for one permission, Self-hosted runners: Read and write, and nothing else: no \
          code, no settings. GitHub cannot narrow that permission to one runner group; Arca holds itself to the group \
          it makes for the repositories you pick. You must be an owner of the organisation.</p>\
-         <form method=\"post\" action=\"{APP_PATH}\">\
+         {app_form}{inputs}\
          <label for=\"a-org\">Organisation</label><input id=\"a-org\" name=\"org\" required maxlength=\"39\" placeholder=\"acme\">\
          <label for=\"a-labels\">Labels: one set a line</label><textarea id=\"a-labels\" name=\"labels\" rows=\"2\" required placeholder=\"self-hosted, linux, x64\"></textarea>\
-         <button type=\"submit\">Continue to GitHub</button></form></section>\
-         <section><h2>Your service sends the runners</h2><p>For an organisation that gives Arca no GitHub access at \
-         all: your own service makes each runner's just-in-time configuration and sends it to Arca. Arca shows the \
-         address and a token once.</p>\
-         <form method=\"post\" action=\"{PUSH_PATH}\">\
-         <label for=\"p-org\">Organisation</label><input id=\"p-org\" name=\"org\" required maxlength=\"39\" placeholder=\"acme\">\
-         <label for=\"p-labels\">Labels: one set a line</label><textarea id=\"p-labels\" name=\"labels\" rows=\"2\" required placeholder=\"self-hosted, linux, x64\"></textarea>\
-         <button type=\"submit\">Make the address and token</button></form></section>"
+         <button type=\"submit\">{app_go}</button></form></section>"
     ));
+    if target == Target::Here {
+        body.push_str(&format!(
+            "<section><h2>Your service sends the runners</h2><p>For an organisation that gives Arca no GitHub access at \
+             all: your own service makes each runner's just-in-time configuration and sends it to Arca. Arca shows the \
+             address and a token once.</p>\
+             <form method=\"post\" action=\"{PUSH_PATH}\">\
+             <label for=\"p-org\">Organisation</label><input id=\"p-org\" name=\"org\" required maxlength=\"39\" placeholder=\"acme\">\
+             <label for=\"p-labels\">Labels: one set a line</label><textarea id=\"p-labels\" name=\"labels\" rows=\"2\" required placeholder=\"self-hosted, linux, x64\"></textarea>\
+             <button type=\"submit\">Make the address and token</button></form></section>"
+        ));
+    } else {
+        body.push_str(
+            "<section><h2>Other ways</h2><p>Pushed configurations and the sign-in with a code connect only the node \
+             whose page this is; a linked node is connected with one of the Apps above.</p></section>",
+        );
+    }
     html(&body, refresh)
+}
+
+/// `POST /approve/github/connections`: a linked node's connections, read now, each with its Disconnect, which the owner's
+/// passkey approves.
+pub async fn connections(ctx: &Ctx<'_>, form: &HashMap<String, String>) -> Response {
+    let target = match target_of(ctx, form) {
+        Ok(target) => target,
+        Err(refusal) => return *refusal,
+    };
+    let Target::Linked(node) = &target else {
+        return see_other(PAGE_PATH);
+    };
+    let mut body = page_opening(ctx, &target);
+    body.push_str(&format!(
+        "<section><h2>Connections on {}</h2>",
+        escape(node)
+    ));
+    match ctx
+        .links
+        .link(node, json!({ "step": "bindings", "origin": ctx.origin }))
+        .await
+    {
+        Ok(answer) => {
+            let bindings = serde_json::from_value::<Vec<Binding>>(answer["bindings"].clone())
+                .unwrap_or_default();
+            if bindings.is_empty() {
+                body.push_str("<p>None yet.</p>");
+            }
+            body.push_str(&connection_rows(&bindings, &target));
+        }
+        Err(error) => body.push_str(&format!(
+            "<p class=\"bad\">{}</p>",
+            escape(&relay_words(node, &error))
+        )),
+    }
+    body.push_str(&format!(
+        "</section><p><a href=\"{}\">Back</a></p>",
+        escape(&page_for(&target, ""))
+    ));
+    html(&body, false)
 }
 
 /// `POST /approve/github/device`: starts a device flow and shows its code.
@@ -350,44 +1001,42 @@ pub async fn device(ctx: &Ctx<'_>, form: &HashMap<String, String>) -> Response {
     }
 }
 
-/// `POST /approve/github/app`: the page that sends the manifest to GitHub. Its CSP lets one form go to GitHub's web
-/// host.
-pub fn app_start(ctx: &Ctx<'_>, form: &HashMap<String, String>) -> Response {
-    let sets = label_sets(field(form, "labels"));
-    let repositories = field(form, "purpose") == "repositories";
-    let started = if repositories {
-        ctx.signer
-            .repository_app_begin(field(form, "org"), ctx.origin, ctx.caller)
-    } else {
-        ctx.signer
-            .app_begin(field(form, "org"), &sets, ctx.origin, ctx.caller)
+/// The page that sends a manifest to GitHub: a form posted to `action_url` with the manifest, for `target`. Its CSP lets
+/// one form go to GitHub's web host.
+fn manifest_page(
+    ctx: &Ctx<'_>,
+    target: &Target,
+    org: &str,
+    repositories: bool,
+    action_url: &str,
+    manifest: &str,
+) -> Response {
+    let kept = match target {
+        Target::Here => String::new(),
+        Target::Linked(node) => format!(
+            "<p>The App is for the linked node {node}: GitHub sends you back to this page, and {node} keeps its key.</p>",
+            node = escape(node)
+        ),
     };
-    let start = match started {
-        Ok(start) => start,
-        Err(error) => {
-            return message_page(StatusCode::BAD_REQUEST, "Not started", &error.message());
-        }
-    };
-    let body = format!(
-        "<h1>Create the App on GitHub</h1><section><p>GitHub will show an App named for Arca, owned by {org}, asking \
-         for Self-hosted runners: Read and write and nothing else. Click Create there. GitHub then asks where to \
-         install it: choose Only select repositories, pick the ones whose jobs may run here, and Install. You come \
-         back here when it is done.</p>\
-         <form method=\"post\" action=\"{action}\"><input type=\"hidden\" name=\"manifest\" value=\"{manifest}\">\
-         <button type=\"submit\">Create the App on GitHub</button></form></section>",
-        org = escape(field(form, "org")),
-        action = escape(&start.action_url),
-        manifest = escape(&start.manifest),
-    );
     let body = if repositories {
         format!(
-            "<h1>Create the repository App</h1><p>GitHub will suggest a unique repository App name in {}. You may edit the name on GitHub. It asks for Contents and Pull requests: Read and write, and Metadata: Read. No webhook. Choose Only select repositories, select the workspace repositories and install. Existing branch policies stay in place.</p><form method=\"post\" action=\"{}\"><input type=\"hidden\" name=\"manifest\" value=\"{}\"><button type=\"submit\">Create the App on GitHub</button></form>",
-            escape(field(form, "org")),
-            escape(&start.action_url),
-            escape(&start.manifest)
+            "<h1>Create the repository App</h1>{kept}<p>GitHub will suggest a unique repository App name in {}. You may edit the name on GitHub. It asks for Contents and Pull requests: Read and write, and Metadata: Read. No webhook. Choose Only select repositories, select the workspace repositories and install. Existing branch policies stay in place.</p><form method=\"post\" action=\"{}\"><input type=\"hidden\" name=\"manifest\" value=\"{}\"><button type=\"submit\">Create the App on GitHub</button></form>",
+            escape(org),
+            escape(action_url),
+            escape(manifest)
         )
     } else {
-        body
+        format!(
+            "<h1>Create the App on GitHub</h1>{kept}<section><p>GitHub will show an App named for Arca, owned by {org}, asking \
+             for Self-hosted runners: Read and write and nothing else. Click Create there. GitHub then asks where to \
+             install it: choose Only select repositories, pick the ones whose jobs may run here, and Install. You come \
+             back here when it is done.</p>\
+             <form method=\"post\" action=\"{action}\"><input type=\"hidden\" name=\"manifest\" value=\"{manifest}\">\
+             <button type=\"submit\">Create the App on GitHub</button></form></section>",
+            org = escape(org),
+            action = escape(action_url),
+            manifest = escape(manifest),
+        )
     };
     let mut response = html(&body, false);
     let web = web_origin(&ctx.signer.endpoints().web);
@@ -402,6 +1051,120 @@ pub fn app_start(ctx: &Ctx<'_>, form: &HashMap<String, String>) -> Response {
     response
 }
 
+/// `POST /approve/github/app`: begins the manifest flow on this node, or, with the owner's approval the passkey gave, on
+/// the linked node the form names, and shows the page that sends the manifest to GitHub.
+pub async fn app_start(ctx: &Ctx<'_>, form: &HashMap<String, String>) -> Response {
+    let target = match target_of(ctx, form) {
+        Ok(target) => target,
+        Err(refusal) => return *refusal,
+    };
+    let sets = label_sets(field(form, "labels"));
+    let repositories = field(form, "purpose") == "repositories";
+    let org = field(form, "org");
+    let node = match &target {
+        Target::Here => {
+            let started = if repositories {
+                ctx.signer.repository_app_begin(org, ctx.origin, ctx.caller)
+            } else {
+                ctx.signer.app_begin(org, &sets, ctx.origin, ctx.caller)
+            };
+            return match started {
+                Ok(start) => manifest_page(
+                    ctx,
+                    &target,
+                    org,
+                    repositories,
+                    &start.action_url,
+                    &start.manifest,
+                ),
+                Err(error) => {
+                    message_page(StatusCode::BAD_REQUEST, "Not started", &error.message())
+                }
+            };
+        }
+        Target::Linked(node) => node,
+    };
+    let result = match approved(ctx, node, form).await {
+        Ok(result) => result,
+        Err(refusal) => return *refusal,
+    };
+    let text = |key: &str| result[key].as_str().unwrap_or("").to_string();
+    let (action_url, manifest, state) = (text("actionUrl"), text("manifest"), text("state"));
+    if manifest.is_empty() || state.is_empty() || !on_github(ctx, &action_url) {
+        return message_page(
+            StatusCode::BAD_GATEWAY,
+            "Not started",
+            &format!(
+                "The linked node {node} did not answer with a manifest for GitHub. Nothing was made on GitHub."
+            ),
+        );
+    }
+    let account = match text("account") {
+        account if account.is_empty() => org.to_string(),
+        account => account,
+    };
+    let repositories = result["purpose"] == "repositories";
+    ctx.links.remember(
+        &state,
+        LinkedFlow {
+            node: node.clone(),
+            plan: field(form, "plan").to_string(),
+            account: account.clone(),
+            repositories,
+            app_name: text("appName"),
+            created_at: ctx.signer.now(),
+            app: None,
+        },
+    );
+    manifest_page(ctx, &target, &account, repositories, &action_url, &manifest)
+}
+
+/// The owner's approval of the card the form's button prepared, relayed to the linked node `node`, which checks the
+/// passkey's assertion itself and runs the approved step: what the step answered. A form that comes with no approval (a
+/// browser that ran no script) is told so; nothing was asked of the node.
+async fn approved(
+    ctx: &Ctx<'_>,
+    node: &str,
+    form: &HashMap<String, String>,
+) -> Result<Value, Box<Response>> {
+    let (plan, approval) = (field(form, "plan"), field(form, "approval"));
+    if plan.is_empty() || approval.is_empty() {
+        return Err(Box::new(message_page(
+            StatusCode::BAD_REQUEST,
+            "Approve it with your passkey",
+            &format!(
+                "{node} takes this step only with your passkey's approval, which the button asks for. This page needs \
+                 its script for that: allow it, reload, and press the button again. Nothing was done."
+            ),
+        )));
+    }
+    let answer = ctx
+        .links
+        .call(
+            node,
+            "action_approve",
+            json!({ "plan": plan, "approval": approval }),
+            crate::linked::timeout_for("action_approve"),
+        )
+        .await;
+    match answer {
+        Ok(answer) => Ok(answer["result"].clone()),
+        Err(error) => Err(Box::new(message_page(
+            relay_status(&error),
+            "Not done",
+            &if not_reached(&error) {
+                format!(
+                    "{} It may not have heard the approval, or its answer did not come back: open {node}'s connections \
+                     on this page to see what it holds.",
+                    relay_words(node, &error)
+                )
+            } else {
+                format!("{} Nothing was made on GitHub.", relay_words(node, &error))
+            },
+        ))),
+    }
+}
+
 /// The scheme, host and port of an address.
 fn web_origin(url: &str) -> String {
     let after = url.find("://").map_or(0, |at| at + 3);
@@ -411,16 +1174,142 @@ fn web_origin(url: &str) -> String {
     }
 }
 
-/// `GET /approve/github/created`: GitHub's return after Create.
+/// Where the organisation `account`'s Apps are listed on GitHub, to delete one.
+fn apps_settings(ctx: &Ctx<'_>, account: &str) -> String {
+    format!(
+        "{}/organizations/{account}/settings/apps",
+        ctx.signer.endpoints().web
+    )
+}
+
+/// `GET /approve/github/created`: GitHub's return after Create. A flow this page began on a linked node goes to that node,
+/// which takes the App and its key itself. When its answer does not come back, the page says the outcome is not known yet
+/// and asks the node what it holds; it never says nothing is stored unless the node said so.
 pub async fn created(ctx: &Ctx<'_>, query: &HashMap<String, String>) -> Response {
     let (code, state) = (field(query, "code"), field(query, "state"));
-    match ctx.signer.app_created(code, state).await {
-        Ok(install) => see_other(&install),
-        Err(why) => message_page(StatusCode::BAD_REQUEST, "The App was not taken", &why),
+    let Some(flow) = ctx.links.flow(state, ctx.signer.now()) else {
+        return match ctx.signer.app_created(code, state).await {
+            Ok(install) => see_other(&install),
+            Err(why) => message_page(StatusCode::BAD_REQUEST, "The App was not taken", &why),
+        };
+    };
+    let node = &flow.node;
+    let mut args = flow.bound(ctx.origin, state);
+    args["step"] = json!("created");
+    args["code"] = json!(code);
+    let answer = match ctx.links.link(node, args).await {
+        Ok(answer) => answer,
+        Err(error) if not_reached(&error) => {
+            return created_unknown(ctx, &flow, state, &error).await;
+        }
+        Err(error) => {
+            return message_page(
+                relay_status(&error),
+                "The App was not taken",
+                &format!(
+                    "{} If GitHub made the App {} in {} and you do not go on, delete it on GitHub at {}.",
+                    relay_words(node, &error),
+                    flow.app_name,
+                    flow.account,
+                    apps_settings(ctx, &flow.account)
+                ),
+            );
+        }
+    };
+    took(ctx, &flow, state, &answer)
+}
+
+/// The linked node took the App (its answer, or its flow read later): the index learns it, and the browser goes to the
+/// App's install screen, when that is on GitHub's own host.
+fn took(ctx: &Ctx<'_>, flow: &LinkedFlow, state: &str, answer: &Value) -> Response {
+    let node = &flow.node;
+    let install = answer["installUrl"].as_str().unwrap_or("").to_string();
+    let slug = answer.pointer("/app/slug").and_then(Value::as_str);
+    let settings = answer.pointer("/app/settingsUrl").and_then(Value::as_str);
+    if let (Some(slug), Some(settings)) = (slug, settings) {
+        ctx.links.note_app(node, slug);
+        let app = (slug.to_string(), settings.to_string());
+        ctx.links.update(state, |flow| flow.app = Some(app));
+    }
+    if !on_github(ctx, &install) {
+        return message_page(
+            StatusCode::BAD_GATEWAY,
+            "Taken, not installed yet",
+            &format!(
+                "The linked node {node} took the App, but answered no install screen on GitHub, so this page sends you \
+                 nowhere. Install the App from the organisation's settings on GitHub: {}.",
+                apps_settings(ctx, &flow.account)
+            ),
+        );
+    }
+    see_other(&install)
+}
+
+/// GitHub's return whose answer did not come back from `flow`'s node: the outcome is not known yet, so the page asks the
+/// node what it holds of the flow and says that.
+async fn created_unknown(
+    ctx: &Ctx<'_>,
+    flow: &LinkedFlow,
+    state: &str,
+    error: &RelayError,
+) -> Response {
+    let node = &flow.node;
+    let mut args = flow.bound(ctx.origin, state);
+    args["step"] = json!("flow");
+    let read = ctx
+        .links
+        .call(
+            node,
+            LINK_VERB,
+            args,
+            crate::linked::timeout_for("plan_list"),
+        )
+        .await;
+    let delete = format!(
+        "If you do not go on, delete the App {} on GitHub at {}.",
+        flow.app_name,
+        apps_settings(ctx, &flow.account)
+    );
+    match read {
+        Ok(held) if held["binding"].is_string() => took(ctx, flow, state, &held),
+        Ok(held) if held["known"] == json!(true) => message_page(
+            StatusCode::BAD_GATEWAY,
+            "Not known yet",
+            &format!(
+                "{} {node} says it has not taken the App {} yet, and it may still be doing so. Reload this page in a \
+                 minute: GitHub's code lives an hour. {delete}",
+                relay_words(node, error),
+                flow.app_name
+            ),
+        ),
+        Ok(_) => message_page(
+            StatusCode::BAD_GATEWAY,
+            "The App was not taken",
+            &format!(
+                "{} {node} says it no longer knows this flow, so it holds nothing of it. GitHub made the App {} in {}: \
+                 delete it on GitHub at {}, and start again from this page.",
+                relay_words(node, error),
+                flow.app_name,
+                flow.account,
+                apps_settings(ctx, &flow.account)
+            ),
+        ),
+        Err(_) => message_page(
+            StatusCode::BAD_GATEWAY,
+            "Not known yet",
+            &format!(
+                "{} Whether {node} took the App {} is not known yet. Reload this page once {node} answers, within the \
+                 hour, and the connection goes on. {delete}",
+                relay_words(node, error),
+                flow.app_name
+            ),
+        ),
     }
 }
 
-/// `GET /approve/github/installed`: GitHub's return after Install (or a change of repositories).
+/// `GET /approve/github/installed`: GitHub's return after Install (or a change of repositories). A flow this page began on
+/// a linked node goes to that node. A return with no flow (repositories changed, or an install finished after the hour)
+/// goes to the node the index names for its installation, or to this node, or to the linked node whose App it is.
 pub async fn installed(ctx: &Ctx<'_>, query: &HashMap<String, String>) -> Response {
     let Ok(installation) = field(query, "installation_id").parse::<u64>() else {
         return message_page(
@@ -430,10 +1319,103 @@ pub async fn installed(ctx: &Ctx<'_>, query: &HashMap<String, String>) -> Respon
         );
     };
     let state = Some(field(query, "state")).filter(|state| !state.is_empty());
-    match ctx.signer.app_installed(installation, state).await {
-        Ok(id) => see_other(&format!("{PAGE_PATH}?connected={id}")),
-        Err(why) => message_page(StatusCode::BAD_REQUEST, "Not connected", &why),
+    let Some((state, flow)) =
+        state.and_then(|state| Some((state, ctx.links.flow(state, ctx.signer.now())?)))
+    else {
+        return installed_later(ctx, installation, state).await;
+    };
+    let node = &flow.node;
+    let mut args = flow.bound(ctx.origin, state);
+    args["step"] = json!("installed");
+    args["installationId"] = json!(installation);
+    let (app, undo) = match &flow.app {
+        Some((slug, settings)) => (
+            format!("the App {slug}"),
+            format!("uninstall and delete the App on GitHub at {settings}"),
+        ),
+        None => (
+            format!("the App {}", flow.app_name),
+            format!(
+                "uninstall and delete the App on GitHub at {}",
+                apps_settings(ctx, &flow.account)
+            ),
+        ),
+    };
+    match ctx.links.link(node, args).await {
+        Ok(answer) => {
+            ctx.links.forget(state);
+            ctx.links.note_installation(installation, node);
+            let id = answer["binding"].as_str().unwrap_or("");
+            see_other(&page_for(
+                &Target::Linked(node.clone()),
+                &format!("connected={id}"),
+            ))
+        }
+        Err(error) if not_reached(&error) => message_page(
+            StatusCode::BAD_GATEWAY,
+            "Installed, not known to be recorded yet",
+            &format!(
+                "{} GitHub installed {app} in {}, and {node} keeps its key; whether {node} has recorded the \
+                 installation is not known yet. Reload this page once {node} answers to finish. To undo it instead, \
+                 {undo}.",
+                relay_words(node, &error),
+                flow.account,
+            ),
+        ),
+        Err(error) => message_page(
+            relay_status(&error),
+            "Not connected",
+            &format!(
+                "{} GitHub installed {app} in {}. To undo it, {undo}.",
+                relay_words(node, &error),
+                flow.account,
+            ),
+        ),
     }
+}
+
+/// GitHub's return with no flow this page began: the linked node the index names for the installation reads it again
+/// from GitHub; otherwise this node's own Apps are tried, then each linked node that took an App from this page.
+async fn installed_later(ctx: &Ctx<'_>, installation: u64, state: Option<&str>) -> Response {
+    let refresh = |node: String| async move {
+        let args =
+            json!({ "step": "refresh", "origin": ctx.origin, "installationId": installation });
+        (ctx.links.link(&node, args).await, node)
+    };
+    let index = ctx.links.index();
+    if let Some(node) = index.installations.get(&installation).cloned() {
+        return match refresh(node).await {
+            (Ok(answer), node) => see_other(&page_for(
+                &Target::Linked(node),
+                &format!("connected={}", answer["binding"].as_str().unwrap_or("")),
+            )),
+            (Err(error), node) => message_page(
+                relay_status(&error),
+                "Not brought up to date yet",
+                &format!(
+                    "{} GitHub changed the installation of {node}'s App; reload this page once {node} answers and it \
+                     reads the change.",
+                    relay_words(&node, &error)
+                ),
+            ),
+        };
+    }
+    let local = match ctx.signer.app_installed(installation, state).await {
+        Ok(id) => return see_other(&format!("{PAGE_PATH}?connected={id}")),
+        Err(why) => why,
+    };
+    let mut nodes: Vec<String> = index.apps.iter().map(|(node, _)| node.clone()).collect();
+    nodes.dedup();
+    for node in nodes {
+        if let (Ok(answer), node) = refresh(node).await {
+            ctx.links.note_installation(installation, &node);
+            return see_other(&page_for(
+                &Target::Linked(node),
+                &format!("connected={}", answer["binding"].as_str().unwrap_or("")),
+            ));
+        }
+    }
+    message_page(StatusCode::BAD_REQUEST, "Not connected", &local)
 }
 
 /// `POST /approve/github/push`: makes a push binding and shows its address and token once.
@@ -464,14 +1446,169 @@ pub fn push(ctx: &Ctx<'_>, form: &HashMap<String, String>) -> Response {
     }
 }
 
-/// `POST /approve/github/disconnect`.
+/// `POST /approve/github/disconnect`: on this node, or, with the owner's approval the passkey gave, on the linked node the
+/// form names.
 pub async fn disconnect(ctx: &Ctx<'_>, form: &HashMap<String, String>) -> Response {
-    match ctx.signer.revoke(field(form, "binding"), ctx.caller).await {
-        Ok(_) => see_other(PAGE_PATH),
-        Err(error) => message_page(
+    let target = match target_of(ctx, form) {
+        Ok(target) => target,
+        Err(refusal) => return *refusal,
+    };
+    let binding = field(form, "binding");
+    match &target {
+        Target::Here => match ctx.signer.revoke(binding, ctx.caller).await {
+            Ok(_) => see_other(PAGE_PATH),
+            Err(error) => message_page(
+                StatusCode::BAD_REQUEST,
+                "Not disconnected",
+                &error.message(),
+            ),
+        },
+        Target::Linked(node) => match approved(ctx, node, form).await {
+            Ok(_) => see_other(&page_for(&target, "")),
+            Err(refusal) => *refusal,
+        },
+    }
+}
+
+/// A JSON answer of the prepare step.
+fn prepared_answer(status: StatusCode, body: Value) -> Response {
+    (status, axum::Json(body)).into_response()
+}
+
+fn prepare_refused(status: StatusCode, message: &str) -> Response {
+    prepared_answer(status, json!({ "message": message }))
+}
+
+/// `POST /approve/github/prepare`: the card a linked node's form button approves. The form is checked as a typed one is;
+/// the node is asked whether it takes GitHub connections from this page, then records a `github_link` proposal for
+/// exactly what the form says (a begin, or a disconnect of one connection), and the page answers the proposal's id and
+/// the statement the owner's passkey signs, which names the host the node's own statements carry and a fresh nonce.
+/// Nothing is begun or disconnected here: the node does that once it has checked the passkey's assertion.
+pub async fn prepare(ctx: &Ctx<'_>, form: &HashMap<String, String>) -> Response {
+    let target = match target_of(ctx, form) {
+        Ok(target) => target,
+        Err(_) => {
+            return prepare_refused(
+                StatusCode::BAD_REQUEST,
+                &not_linked_words(&ctx.links.names()),
+            );
+        }
+    };
+    let Target::Linked(node) = &target else {
+        return prepare_refused(
             StatusCode::BAD_REQUEST,
-            "Not disconnected",
-            &error.message(),
+            "This node's own forms are posted as they are: only a linked node's need its card.",
+        );
+    };
+    let disconnect = !field(form, "binding").is_empty();
+    let args = if disconnect {
+        json!({ "step": "disconnect", "origin": ctx.origin, "binding": field(form, "binding") })
+    } else {
+        let org = field(form, "org");
+        if let Err(error) = check_account(org) {
+            return prepare_refused(StatusCode::BAD_REQUEST, &error.message());
+        }
+        if field(form, "purpose") == "repositories" {
+            json!({ "step": "begin", "origin": ctx.origin, "org": org, "purpose": "repositories" })
+        } else {
+            let sets = label_sets(field(form, "labels"));
+            if sets.is_empty() || sets.len() > 10 {
+                return prepare_refused(StatusCode::BAD_REQUEST, "labels: one to ten label sets");
+            }
+            let sets = match sets
+                .iter()
+                .map(|set| check_labels("labels", set))
+                .collect::<Result<Vec<_>, _>>()
+            {
+                Ok(sets) => sets,
+                Err(error) => return prepare_refused(StatusCode::BAD_REQUEST, &error.message()),
+            };
+            json!({ "step": "begin", "origin": ctx.origin, "org": org, "purpose": "runners", "labelSets": sets })
+        }
+    };
+    let nothing = if disconnect {
+        "Nothing was disconnected."
+    } else {
+        "Nothing was made on GitHub."
+    };
+    let failed = |error: &RelayError| {
+        prepare_refused(
+            relay_status(error),
+            &format!("{} {nothing}", relay_words(node, error)),
+        )
+    };
+    // Whether the node takes GitHub connections from this page at all: an older Arca, a token that does not name the
+    // verb, or a page it does not trust is said now, before any card is made.
+    if let Err(error) = ctx
+        .links
+        .call(
+            node,
+            LINK_VERB,
+            json!({ "step": "flow", "origin": ctx.origin }),
+            crate::linked::timeout_for("plan_list"),
+        )
+        .await
+    {
+        return failed(&error);
+    }
+    let proposed = match ctx
+        .links
+        .call(
+            node,
+            "action_propose",
+            json!({ "action": LINK_VERB, "args": args }),
+            crate::linked::timeout_for("action_propose"),
+        )
+        .await
+    {
+        Ok(proposed) => proposed,
+        Err(error) => return failed(&error),
+    };
+    let (Some(id), Some(digest)) = (proposed["id"].as_str(), proposed["argsDigest"].as_str())
+    else {
+        return prepare_refused(
+            StatusCode::BAD_GATEWAY,
+            &format!("The linked node {node} recorded no card. {nothing}"),
+        );
+    };
+    // The host the node's own statements carry, as it lists its waiting cards.
+    let host = match ctx
+        .links
+        .call(
+            node,
+            "plan_list",
+            json!({}),
+            crate::linked::timeout_for("plan_list"),
+        )
+        .await
+    {
+        Ok(listed) => listed["plans"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|row| row["id"] == json!(id))
+            .and_then(|row| row["host"].as_str())
+            .map(str::to_string),
+        Err(error) => return failed(&error),
+    };
+    let Some(host) = host else {
+        return prepare_refused(
+            StatusCode::BAD_GATEWAY,
+            &format!("The linked node {node} did not list the card it recorded. {nothing}"),
+        );
+    };
+    let statement = crate::handlers::fresh_nonce().ok().and_then(|nonce| {
+        crate::handlers::action_statement(&host, id, LINK_VERB, digest, ctx.signer.now(), &nonce)
+            .ok()
+    });
+    match statement {
+        Some(statement) => prepared_answer(
+            StatusCode::OK,
+            json!({ "plan": id, "statement": statement, "summary": proposed["summary"] }),
+        ),
+        None => prepare_refused(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("This page could not write the card's statement. {nothing}"),
         ),
     }
 }

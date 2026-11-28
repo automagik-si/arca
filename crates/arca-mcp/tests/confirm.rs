@@ -184,6 +184,12 @@ fn cases() -> Vec<(&'static str, Value, Value, &'static str)> {
             "confirm is false: nothing was disconnected",
         ),
         (
+            "github_link",
+            json!({ "step": "disconnect", "origin": "https://page.example.com", "binding": "gh-0123456789abcdef", "approval": "x.y" }),
+            json!({ "id": "gh-0123456789abcdef", "status": "revoked" }),
+            "confirm is false: nothing was disconnected and no approval was spent",
+        ),
+        (
             "instance_import_undo",
             json!({ "project": "people", "name": "web-1", "approval": "x.y" }),
             json!({ "instance": "web-1", "project": "people", "removed": ["the instance web-1"], "left": [], "note": "removed" }),

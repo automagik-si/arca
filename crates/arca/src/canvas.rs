@@ -397,6 +397,7 @@ static CSP: LazyLock<String> = LazyLock::new(|| {
     for (html, tag) in [
         (include_str!("approve_page.html"), "script"),
         (SIGN_IN_PAGE, "script"),
+        (include_str!("github_page.html"), "script"),
     ] {
         if let Some(hash) = inline_hash(html, tag) {
             scripts.push(hash);

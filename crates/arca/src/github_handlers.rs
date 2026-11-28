@@ -1,8 +1,19 @@
 //! The MCP verbs of the GitHub signer. They start, read and end connections, mint runners and read the audit log. None
 //! returns a key, a grant or a token, but `github_runner_mint` returns a runner's just-in-time configuration, which is
 //! that runner's credential, to any caller with an `operator` token (see `crate::github_signer`).
+//!
+//! `github_link` is the verb a linked node serves its approval host's GitHub page with (see `crate::github_page`). The
+//! owner proves themself to this node, not to the page: begin (the organisation, the kind of App, the label sets and the
+//! page GitHub returns to) and disconnect are a `github_link` action proposal, approved with the owner's passkey, whose
+//! assertion this node checks itself against the owner keys it trusts for approvals (`approval.peerKeys`, or
+//! `trustOwnerKeysFrom` with `approval.origins`), spending its nonce, as for every approved action. Only the one-shot grant
+//! that approval arms runs them; any token without one is refused. GitHub's two returns (created, with GitHub's code, and
+//! installed) are taken only for the flow that approved begin made: the same proposal id, page, organisation and kind,
+//! within the hour, and installed once. refresh reads an installation of an App this node holds again from GitHub; flow
+//! and bindings read this node. The node converts GitHub's code into the App and its key itself, so the key is made into a
+//! file here and never passes through the page's node.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use arca_mcp::{CallError, Caller, ToolHandler};
 use serde_json::{Value, json};
@@ -10,7 +21,8 @@ use serde_json::{Value, json};
 use crate::github_api::Secret;
 use crate::github_app::{JobRef, MintRefused, MintRequest};
 use crate::github_oauth::{OauthRequest, StartError};
-use crate::github_signer::{Signer, SignerError};
+use crate::github_signer::{Signer, SignerError, check_account, check_labels};
+use crate::kernel::Kernel;
 
 /// The verbs, keyed by name.
 pub const VERBS: [&str; 8] = [
@@ -27,6 +39,376 @@ pub const VERBS: [&str; 8] = [
 struct GithubHandler {
     verb: &'static str,
     signer: Signer,
+}
+
+/// The verb a linked node serves its approval host's GitHub page with.
+pub const LINK_VERB: &str = "github_link";
+
+/// `github_link` for `signer` on the kernel `kernel`: begin and disconnect run only with the one-shot grant `kernel` arms
+/// when it has checked the owner's passkey for an approved `github_link` proposal, and every step names one of `origins`,
+/// the page origins whose owner passkeys this node trusts for approvals.
+pub fn link_handler(
+    signer: &Signer,
+    kernel: Arc<Mutex<Kernel>>,
+    origins: Vec<String>,
+) -> Arc<dyn ToolHandler> {
+    Arc::new(LinkHandler {
+        signer: signer.clone(),
+        kernel,
+        origins,
+    })
+}
+
+struct LinkHandler {
+    signer: Signer,
+    kernel: Arc<Mutex<Kernel>>,
+    origins: Vec<String>,
+}
+
+/// The refusal of a later step whose flow is not one an approved begin made for the page, organisation and kind it names.
+fn unknown_flow() -> CallError {
+    CallError::Refused {
+        code: "UnknownFlow".to_string(),
+        message: "This link is unknown or older than an hour. Start again from Arca's GitHub page."
+            .to_string(),
+    }
+}
+
+/// The refusal of a begin or a disconnect that comes with no grant of an approved proposal.
+fn not_approved() -> CallError {
+    CallError::Refused {
+        code: "NotApproved".to_string(),
+        message: "a GitHub connection begins or ends here only from a github_link proposal the owner approved with a \
+                  passkey this node trusts: nothing was begun or disconnected"
+            .to_string(),
+    }
+}
+
+/// The fields each step of a proposal takes.
+const BEGIN_FIELDS: [&str; 5] = ["step", "origin", "org", "purpose", "labelSets"];
+const DISCONNECT_FIELDS: [&str; 3] = ["step", "origin", "binding"];
+
+/// Checks a proposed `github_link` (already held to the verb's schema) and returns what the owner approves: a begin with
+/// its organisation, its kind (`purpose`, written out) and, for runners, its label sets checked as the page's own form
+/// checks them; or a disconnect of one connection. No other step is proposed, and no field of another step is carried.
+pub fn prepare_link(mut args: Value) -> Result<Value, String> {
+    let step = args["step"].as_str().unwrap_or_default().to_string();
+    let fields: &[&str] = match step.as_str() {
+        "begin" => &BEGIN_FIELDS,
+        "disconnect" => &DISCONNECT_FIELDS,
+        _ => {
+            return Err(
+                "args/step: a proposal begins a GitHub connection or ends one: begin or disconnect"
+                    .to_string(),
+            );
+        }
+    };
+    let Some(object) = args.as_object_mut() else {
+        return Err("args: expected an object".to_string());
+    };
+    if let Some(extra) = object.keys().find(|key| !fields.contains(&key.as_str())) {
+        return Err(format!(
+            "args/{extra}: a {step} takes only {}",
+            fields.join(", ")
+        ));
+    }
+    if step == "disconnect" {
+        if !object.contains_key("binding") {
+            return Err("args/binding: the connection to disconnect is required".to_string());
+        }
+        return Ok(args);
+    }
+    let org = object
+        .get("org")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    check_account(org).map_err(|error| format!("args/{}", error.message()))?;
+    let repositories = object.get("purpose").and_then(Value::as_str) == Some("repositories");
+    object.insert(
+        "purpose".to_string(),
+        json!(if repositories {
+            "repositories"
+        } else {
+            "runners"
+        }),
+    );
+    if repositories {
+        if object
+            .get("labelSets")
+            .and_then(Value::as_array)
+            .is_some_and(|sets| !sets.is_empty())
+        {
+            return Err(
+                "args/labelSets: the workspace repositories App has no runners, so no labels"
+                    .to_string(),
+            );
+        }
+        object.remove("labelSets");
+        return Ok(args);
+    }
+    let sets = label_sets_of(object.get("labelSets"));
+    if sets.is_empty() || sets.len() > 10 {
+        return Err("args/labelSets: one to ten label sets".to_string());
+    }
+    let sets = sets
+        .iter()
+        .map(|set| check_labels("args/labelSets", set))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.message())?;
+    object.insert("labelSets".to_string(), json!(sets));
+    Ok(args)
+}
+
+/// The label sets of a `labelSets` value, each label as given.
+fn label_sets_of(value: Option<&Value>) -> Vec<Vec<String>> {
+    value
+        .and_then(Value::as_array)
+        .map(|sets| {
+            sets.iter()
+                .map(|set| {
+                    set.as_array()
+                        .map(|labels| {
+                            labels
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_string)
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The card rows of a proposed `github_link`, in the owner's words.
+pub fn link_rows(args: &Value) -> Vec<(&'static str, String)> {
+    let text = |key: &str| args[key].as_str().unwrap_or_default().to_string();
+    if args["step"] == "disconnect" {
+        return vec![
+            ("Connection", text("binding")),
+            ("Page", text("origin")),
+            (
+                "Effect",
+                "This node ends the GitHub connection: it deletes the connection's key, removes its runners from GitHub \
+                 where it can, and takes no more jobs for it. The App stays on GitHub until you delete it there."
+                    .to_string(),
+            ),
+        ];
+    }
+    let repositories = args["purpose"] == "repositories";
+    let mut rows = vec![
+        ("Organisation", text("org")),
+        (
+            "Kind",
+            if repositories {
+                "The workspace repositories App: Git access to the repositories you select"
+                    .to_string()
+            } else {
+                "Arca's App for the organisation's Actions runners".to_string()
+            },
+        ),
+    ];
+    if !repositories {
+        rows.push((
+            "Labels",
+            label_sets_of(args.get("labelSets"))
+                .iter()
+                .map(|set| set.join(", "))
+                .collect::<Vec<_>>()
+                .join(" | "),
+        ));
+    }
+    rows.push(("Page", text("origin")));
+    rows.push((
+        "Effect",
+        "This node begins making the App: GitHub opens with it ready to create in the organisation, and sends you back to \
+         this page. This node takes GitHub's code itself and keeps the App's key; nothing is made until you click Create \
+         on GitHub, and the flow ends after an hour."
+            .to_string(),
+    ));
+    rows
+}
+
+/// The card's sentence for a proposed `github_link`.
+pub fn link_summary(args: &Value) -> String {
+    let text = |key: &str| args[key].as_str().unwrap_or_default();
+    match (text("step"), text("purpose")) {
+        ("disconnect", _) => format!(
+            "Disconnect the GitHub connection {} on this node",
+            text("binding")
+        ),
+        (_, "repositories") => format!(
+            "Make the workspace repositories App in the GitHub organisation {} for this node",
+            text("org")
+        ),
+        _ => format!(
+            "Connect the GitHub organisation {}'s Actions runners to this node with Arca's App",
+            text("org")
+        ),
+    }
+}
+
+impl LinkHandler {
+    /// Spends the one-shot grant that the kernel armed for an approved `github_link` with exactly these arguments, and
+    /// answers the approved proposal's id. Without one nothing runs.
+    fn spend(&self, args: &Value, grant: Option<&str>) -> Result<String, CallError> {
+        let grant = grant.ok_or_else(not_approved)?;
+        let mut kernel = self
+            .kernel
+            .lock()
+            .map_err(|_| CallError::Internal("the kernel lock is poisoned".to_string()))?;
+        let id = kernel.action_grant_id(grant).ok_or_else(not_approved)?;
+        if !kernel.consume_action_grant(LINK_VERB, args, grant) {
+            return Err(not_approved());
+        }
+        Ok(id)
+    }
+
+    /// The manifest flow a later step names: one the approved begin `plan` made for the page `origin`, for the organisation
+    /// and kind the step names, within its hour.
+    fn approved_flow<'a>(&self, args: &'a Value, origin: &str) -> Result<&'a str, CallError> {
+        let state = text(args, "state")?;
+        let plan = text(args, "plan")?;
+        let flow = self.signer.app_flow(state).ok_or_else(unknown_flow)?;
+        let repositories = args.get("purpose").and_then(Value::as_str) == Some("repositories");
+        let same = flow.approved.as_deref() == Some(plan)
+            && flow.origin == origin
+            && args.get("org").and_then(Value::as_str) == Some(flow.account.as_str())
+            && repositories == flow.repository_access;
+        if same { Ok(state) } else { Err(unknown_flow()) }
+    }
+}
+
+impl ToolHandler for LinkHandler {
+    fn call(&self, args: Value, _caller: &Caller) -> Result<Value, CallError> {
+        let mut args = args;
+        let grant = args
+            .as_object_mut()
+            .and_then(|object| object.remove("approval"))
+            .and_then(|value| value.as_str().map(str::to_string));
+        let origin = text(&args, "origin")?.to_string();
+        if !self.origins.contains(&origin) {
+            return Err(CallError::Refused {
+                code: "NotApprovalHost".to_string(),
+                message: "this node takes GitHub connections only from a page whose owner passkeys it trusts for \
+                          approvals (approval.origins with trustOwnerKeysFrom, or an approval.peerKeys source's origins), \
+                          and this page is not one: nothing was done"
+                    .to_string(),
+            });
+        }
+        match text(&args, "step")? {
+            "begin" => {
+                let plan = self.spend(&args, grant.as_deref())?;
+                let org = text(&args, "org")?;
+                let repositories = args["purpose"] == "repositories";
+                let sets = label_sets_of(args.get("labelSets"));
+                let by = format!("approved:{plan}");
+                let start = self
+                    .signer
+                    .app_begin_approved(org, &sets, &origin, &by, repositories, &plan)
+                    .map_err(|error| refusal(&error))?;
+                let name = serde_json::from_str::<Value>(&start.manifest)
+                    .ok()
+                    .and_then(|manifest| manifest["name"].as_str().map(str::to_string))
+                    .unwrap_or_default();
+                Ok(json!({
+                    "actionUrl": start.action_url,
+                    "manifest": start.manifest,
+                    "state": start.state,
+                    "appName": name,
+                    "account": org,
+                    "purpose": if repositories { "repositories" } else { "runners" },
+                }))
+            }
+            "disconnect" => {
+                let plan = self.spend(&args, grant.as_deref())?;
+                let binding = text(&args, "binding")?;
+                let record = runtime()?
+                    .block_on(self.signer.revoke(binding, &format!("approved:{plan}")))
+                    .map_err(|error| refusal(&error))?;
+                json_of(&record)
+            }
+            "created" => {
+                let state = self.approved_flow(&args, &origin)?;
+                let code = text(&args, "code")?;
+                let install = runtime()?
+                    .block_on(self.signer.app_created(code, state))
+                    .map_err(|why| CallError::UntrustedRefused {
+                        code: "NotTaken".to_string(),
+                        message: why,
+                    })?;
+                let mut answer = self.flow_words(state);
+                answer["installUrl"] = json!(install);
+                Ok(answer)
+            }
+            "installed" => {
+                let state = self.approved_flow(&args, &origin)?;
+                let installation = installation_of(&args)?;
+                let id = runtime()?
+                    .block_on(self.signer.app_installed(installation, Some(state)))
+                    .map_err(|why| CallError::UntrustedRefused {
+                        code: "NotConnected".to_string(),
+                        message: why,
+                    })?;
+                Ok(json!({ "binding": id }))
+            }
+            // GitHub's later return with no flow (repositories changed, or an install finished after the hour): the
+            // installation is read again from GitHub with the key of an App this node holds, and its runner group made
+            // to match. Nothing is taken that GitHub does not say.
+            "refresh" => {
+                let installation = installation_of(&args)?;
+                let id = runtime()?
+                    .block_on(self.signer.app_installed(installation, None))
+                    .map_err(|why| CallError::UntrustedRefused {
+                        code: "NotConnected".to_string(),
+                        message: why,
+                    })?;
+                Ok(json!({ "binding": id }))
+            }
+            "flow" => match self.approved_flow(&args, &origin) {
+                Ok(state) => Ok(self.flow_words(state)),
+                Err(_) => Ok(json!({ "known": false })),
+            },
+            "bindings" => Ok(json!({ "bindings": json_of(&self.signer.bindings())? })),
+            _ => Err(CallError::Invalid(
+                "step: begin, created, installed, refresh, flow, bindings or disconnect"
+                    .to_string(),
+            )),
+        }
+    }
+}
+
+impl LinkHandler {
+    /// What this node holds of the live flow `state`: whether GitHub handed its App over, the connection it made, its
+    /// install screen and the App's settings page.
+    fn flow_words(&self, state: &str) -> Value {
+        let Some(id) = self.signer.app_flow_binding(state) else {
+            return json!({ "known": true });
+        };
+        let mut answer = json!({ "known": true, "binding": id });
+        if let Some(install) = self.signer.app_flow_install(state) {
+            answer["installUrl"] = json!(install);
+        }
+        if let Some(binding) = self.signer.bindings().into_iter().find(|b| b.id == id) {
+            answer["account"] = json!(binding.account);
+            answer["installed"] = json!(binding.installation.is_some());
+            if let Some(app) = binding.app {
+                let settings = self.signer.inner.http.web(&format!(
+                    "/organizations/{}/settings/apps/{}",
+                    binding.account, app.slug
+                ));
+                answer["app"] = json!({ "slug": app.slug, "settingsUrl": settings });
+            }
+        }
+        answer
+    }
+}
+
+fn installation_of(args: &Value) -> Result<u64, CallError> {
+    args.get("installationId")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| CallError::Invalid("installationId: a whole number is required".to_string()))
 }
 
 /// The handlers of the GitHub verbs for `signer`.

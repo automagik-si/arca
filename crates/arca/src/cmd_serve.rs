@@ -741,6 +741,18 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
             Arc::new(cfg.clone()),
         ))
         .chain(crate::instance_move::handlers(moves))
+        // Its approval host's GitHub page connects this node over the link: begin and disconnect from a github_link
+        // proposal the owner approved (so it runs from here too), the returns for the flow that approval made.
+        .chain(github_signer.as_ref().map(|signer| {
+            (
+                crate::github_handlers::LINK_VERB,
+                crate::github_handlers::link_handler(
+                    signer,
+                    Arc::clone(&kernel),
+                    github_link_origins(&cfg),
+                ),
+            )
+        }))
         .collect();
     // The owner approval requests: the three verbs and the approval page share one store in the state directory.
     let dashboard = cfg
@@ -1441,6 +1453,28 @@ fn peer_passkeys(cfg: &NodeConfig) -> Vec<PeerPasskeys> {
             peer
         })
         .collect()
+}
+
+/// The page origins `github_link` takes steps from: the origins whose owner passkeys this kernel trusts for approvals, which are
+/// `approval.origins` when `approval.trustOwnerKeysFrom` names a file, and each `approval.peerKeys` source's origins. None
+/// without an `approval` key: then no page connects this node over the link.
+pub fn github_link_origins(cfg: &NodeConfig) -> Vec<String> {
+    let Some(approval) = cfg.approval.as_ref() else {
+        return Vec::new();
+    };
+    let mut origins = if approval.trust_owner_keys_from.is_empty() {
+        Vec::new()
+    } else {
+        approval.origins.clone()
+    };
+    if let Some(peers) = &approval.peer_keys {
+        for source in peers.sources() {
+            origins.extend(source.origins.iter().cloned());
+        }
+    }
+    origins.sort();
+    origins.dedup();
+    origins
 }
 
 /// Whether this kernel accepts approvals relayed from another kernel's page: its config has an `approval` key that names at

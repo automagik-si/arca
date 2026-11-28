@@ -64,6 +64,8 @@ pub enum ArcaAction {
     RouteRemove,
     InstanceImport,
     InstanceImportUndo,
+    /// Begins a GitHub App connection on this node, or disconnects one (`github_link`), from its approval host's page.
+    GithubLink,
 }
 
 impl ArcaAction {
@@ -115,6 +117,7 @@ impl ArcaAction {
             Self::RouteRemove => "route_remove",
             Self::InstanceImport => "instance_import",
             Self::InstanceImportUndo => "instance_import_undo",
+            Self::GithubLink => "github_link",
         }
     }
 
@@ -166,6 +169,7 @@ impl ArcaAction {
             "route_remove" => Some(Self::RouteRemove),
             "instance_import" => Some(Self::InstanceImport),
             "instance_import_undo" => Some(Self::InstanceImportUndo),
+            "github_link" => Some(Self::GithubLink),
             _ => None,
         }
     }

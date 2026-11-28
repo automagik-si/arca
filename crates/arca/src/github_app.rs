@@ -62,8 +62,14 @@ pub struct AppFlow {
     pub label_sets: Vec<Vec<String>>,
     pub caller: String,
     pub created_at: u64,
+    /// The page origin GitHub sends the browser back to: this node's own page, or the page of the approval host that
+    /// began the flow for this node over the link.
+    pub origin: String,
     /// The binding the flow made once GitHub handed over the App.
     pub binding: Option<String>,
+    /// The approved `github_link` proposal whose begin made the flow, when the approval host's page began it over the
+    /// link. Only that flow's later steps are taken over the link.
+    pub approved: Option<String>,
 }
 
 /// Where the person's browser goes to create the App: a form posted to `action_url` with one field, `manifest`.
@@ -269,7 +275,28 @@ impl Signer {
         origin: &str,
         caller: &str,
     ) -> Result<AppStart, SignerError> {
-        self.app_begin_for(account, label_sets, origin, caller, false)
+        self.app_begin_for(account, label_sets, origin, caller, false, None)
+    }
+
+    /// Starts a manifest flow from the approved `github_link` proposal `approved`: for `account`'s runners, or for its
+    /// workspace repositories when `repository_access`.
+    pub fn app_begin_approved(
+        &self,
+        account: &str,
+        label_sets: &[Vec<String>],
+        origin: &str,
+        caller: &str,
+        repository_access: bool,
+        approved: &str,
+    ) -> Result<AppStart, SignerError> {
+        self.app_begin_for(
+            account,
+            label_sets,
+            origin,
+            caller,
+            repository_access,
+            Some(approved),
+        )
     }
 
     pub(crate) fn app_begin_for(
@@ -279,6 +306,7 @@ impl Signer {
         origin: &str,
         caller: &str,
         repository_access: bool,
+        approved: Option<&str>,
     ) -> Result<AppStart, SignerError> {
         check_account(account)?;
         if !repository_access && (label_sets.is_empty() || label_sets.len() > 10) {
@@ -324,7 +352,9 @@ impl Signer {
                     label_sets: label_sets.clone(),
                     caller: caller.to_string(),
                     created_at: now,
+                    origin: origin.to_string(),
                     binding: None,
+                    approved: approved.map(str::to_string),
                 },
             );
         }
@@ -343,7 +373,39 @@ impl Signer {
         })
     }
 
-    fn app_flow(&self, state: &str) -> Option<AppFlow> {
+    /// The page origin the manifest flow `state` was begun for, while it lives.
+    pub fn app_flow_origin(&self, state: &str) -> Option<String> {
+        self.app_flow(state).map(|flow| flow.origin)
+    }
+
+    /// The binding the manifest flow `state` made, once GitHub handed its App over.
+    pub fn app_flow_binding(&self, state: &str) -> Option<String> {
+        self.app_flow(state).and_then(|flow| flow.binding)
+    }
+
+    /// The install screen of the App the manifest flow `state` made, once GitHub handed it over.
+    pub fn app_flow_install(&self, state: &str) -> Option<String> {
+        let binding = self.app_flow_binding(state)?;
+        self.install_address(&binding, state)
+    }
+
+    /// The address of the install screen of the App `binding` holds, for the manifest flow `state`.
+    fn install_address(&self, binding: &str, state: &str) -> Option<String> {
+        let app = self.lock().bindings.get(binding)?.app.clone()?;
+        let target = if app.owner_id > 0 {
+            format!("/permissions?target_id={}&state={state}", app.owner_id)
+        } else {
+            format!("?state={state}")
+        };
+        Some(
+            self.inner
+                .http
+                .web(&format!("/apps/{}/installations/new{target}", app.slug)),
+        )
+    }
+
+    /// The manifest flow `state`, while it lives (an hour).
+    pub fn app_flow(&self, state: &str) -> Option<AppFlow> {
         let now = self.now();
         self.lock()
             .app_flows
@@ -358,6 +420,13 @@ impl Signer {
         let flow = self.app_flow(state).ok_or(
             "This link is unknown or older than an hour. Start again from Arca's GitHub page.",
         )?;
+        // GitHub's return once more (a reload, or the page asking again after this node answered too late): the App is
+        // already taken, so the same install screen, and GitHub is not asked again.
+        if let Some(binding) = &flow.binding {
+            return self.install_address(binding, state).ok_or_else(|| {
+                "The App of this link is no longer kept here. Start again from Arca's GitHub page.".to_string()
+            });
+        }
         if code.is_empty()
             || code.len() > 200
             || !code
@@ -407,10 +476,21 @@ impl Signer {
             .pointer("/owner/id")
             .and_then(Value::as_u64)
             .unwrap_or(0);
-        AppKey::from_pem(&pem).map_err(|why| format!("GitHub's key for the new App: {why}."))?;
-        let binding_id = fresh_id("gh-").map_err(|error| error.message())?;
-        write_private(&self.key_path(&binding_id), pem.as_bytes())
-            .map_err(|error| error.message())?;
+        // From here GitHub holds an App: a failure keeps nothing of it here and says where to delete it.
+        let orphan = |why: String| {
+            format!(
+                "{why} GitHub has made the App {slug} in {owner_login}, and Arca kept nothing of it: delete it on GitHub at {}.",
+                self.inner.http.web(&format!(
+                    "/organizations/{owner_login}/settings/apps/{slug}"
+                ))
+            )
+        };
+        AppKey::from_pem(&pem)
+            .map_err(|why| orphan(format!("GitHub's key for the new App: {why}.")))?;
+        let binding_id = fresh_id("gh-").map_err(|error| orphan(error.message()))?;
+        let key_path = self.key_path(&binding_id);
+        write_private(&key_path, pem.as_bytes()).map_err(|error| orphan(error.message()))?;
+        drop(pem);
         let now = self.now();
         let binding = Binding {
             id: binding_id.clone(),
@@ -436,7 +516,11 @@ impl Signer {
             created_at: now,
             updated_at: now,
         };
-        self.save(binding).map_err(|error| error.message())?;
+        if let Err(error) = self.save(binding) {
+            // Nothing half-stored: the key goes with the record that was not written.
+            let _ = fs::remove_file(&key_path);
+            return Err(orphan(error.message()));
+        }
         if let Some(flow) = self.lock().app_flows.get_mut(state) {
             flow.binding = Some(binding_id.clone());
         }
@@ -448,15 +532,8 @@ impl Signer {
             "appId": id,
             "appSlug": slug,
         }));
-        let target = if owner_id > 0 {
-            format!("/permissions?target_id={owner_id}&state={state}")
-        } else {
-            format!("?state={state}")
-        };
-        Ok(self
-            .inner
-            .http
-            .web(&format!("/apps/{slug}/installations/new{target}")))
+        self.install_address(&binding_id, state)
+            .ok_or_else(|| "the connection is gone".to_string())
     }
 
     /// GitHub's return after the person installed (or changed) the App: checks the installation with the App's own JWT,

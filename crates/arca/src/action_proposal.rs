@@ -89,6 +89,7 @@ pub enum ActionKind {
     RouteRemove,
     InstanceImport,
     InstanceImportUndo,
+    GithubLink,
 }
 
 /// `text` as one line of a card: control characters become spaces, and past `max` characters it ends in an ellipsis.
@@ -148,7 +149,7 @@ fn setting_words(value: &Value) -> String {
 
 impl ActionKind {
     /// Every allowed action, in the order the table documents them.
-    pub const ALL: [ActionKind; 35] = [
+    pub const ALL: [ActionKind; 36] = [
         Self::ServiceCreate,
         Self::ServiceRemove,
         Self::ServiceUpdate,
@@ -184,6 +185,7 @@ impl ActionKind {
         Self::RouteRemove,
         Self::InstanceImport,
         Self::InstanceImportUndo,
+        Self::GithubLink,
     ];
 
     /// How the owner undoes this action once it has run, in the owner's words: the card says it beside what the action
@@ -261,12 +263,18 @@ impl ActionKind {
             Self::InstanceImportUndo => {
                 "It cannot be undone: the imported VM's disks are deleted, with anything written to them since the import. The source in the outside hypervisor is untouched; power it on there to go back, or import it again."
             }
+            Self::GithubLink => {
+                "Nothing is made until you create the App on GitHub. Once it is, disconnect it on Arca's GitHub page, and delete the App in the organisation's settings on GitHub."
+            }
         }
     }
 
     /// [`Self::undo_words`] for these arguments: an update that states `eraseData` cannot be undone, since the data is
     /// gone.
     pub fn undo_words_for(self, args: &Value) -> &'static str {
+        if self == Self::GithubLink && args["step"] == "disconnect" {
+            return "It cannot be undone: this node deletes the connection's key and forgets its runners. To connect the organisation again, start again from Arca's GitHub page.";
+        }
         if self == Self::ServiceUpdate && args.get("settings").is_some() {
             return "Propose another settings update to restore previous values or choose a different supported value for a newly added setting.";
         }
@@ -299,6 +307,7 @@ impl ActionKind {
             | Self::InstanceImportUndo
             | Self::StorageAdd => true,
             Self::ServiceUpdate => args.get("eraseData").and_then(Value::as_bool) == Some(true),
+            Self::GithubLink => args["step"] == "disconnect",
             _ => false,
         }
     }
@@ -349,6 +358,7 @@ impl ActionKind {
             Self::RouteRemove => "route_remove",
             Self::InstanceImport => "instance_import",
             Self::InstanceImportUndo => "instance_import_undo",
+            Self::GithubLink => "github_link",
         }
     }
 
@@ -575,6 +585,7 @@ impl ActionKind {
                     return Err("args/name: expected an instance name".to_string());
                 }
             }
+            Self::GithubLink => args = crate::github_handlers::prepare_link(args)?,
             _ => {}
         }
         Ok(args)
@@ -1047,6 +1058,10 @@ impl ActionKind {
                 }
                 Err(why) => vec![row("Source", &shown(&why, 400))],
             },
+            Self::GithubLink => crate::github_handlers::link_rows(args)
+                .into_iter()
+                .map(|(label, value)| row(label, &shown(&value, 400)))
+                .collect(),
             Self::InstanceImportUndo => vec![
                 row("Instance", text("name")),
                 row("Project", text("project")),
@@ -1300,6 +1315,7 @@ impl ActionKind {
                 text("name"),
                 text("project")
             ),
+            Self::GithubLink => crate::github_handlers::link_summary(args),
         };
         let says_service_access = self == Self::ServiceCreate
             || (self == Self::PostgresCreate && args.get("template").is_some());

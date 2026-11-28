@@ -172,7 +172,7 @@ macro_rules! on_node {
     }};
 }
 
-static VERBS: [Verb; 103] = [
+static VERBS: [Verb; 104] = [
     Verb {
         name: "arca_status",
         summary: "Node status: the API version, the node id, the mode, the uptime, whether Incus answers and the last applied sequence number.",
@@ -1529,6 +1529,21 @@ static VERBS: [Verb; 103] = [
         target: Target::Node,
     },
     Verb {
+        name: "github_link",
+        summary: "The steps of a GitHub App connection that a linked node's approval host relays from its GitHub page. begin and disconnect run only from an approved github_link proposal: the owner's passkey assertion, checked by this node against the owner keys it trusts for approvals. created (this node converts GitHub's code and keeps the App's key alone) and installed take only the flow that approved begin made, once, within the hour. refresh, flow and bindings read GitHub or this node. Only for operators and a token whose tool list names it.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: true,
+        untrusted: true,
+        output_key: None,
+        summary_text: summary_github_link,
+        cut: no_cut,
+        params: github_link_params,
+        result: github_link_result,
+        target: Target::Node,
+    },
+    Verb {
         name: "os_update",
         summary: "The node's OS update state: the version, channel, check frequency, automatic updates, the last check and update, and the OS's own error kind and update-key trust. Read every 5 minutes; known is false on a node that is not Arca OS.",
         class: VerbClass::L,
@@ -2308,6 +2323,105 @@ fn github_mint_job_params() -> Value {
 
 fn github_mint_job_result() -> Value {
     result(vec![("ok", true, boolean())])
+}
+
+fn summary_github_link(v: &Value) -> String {
+    if let Some(binding) = v["binding"].as_str() {
+        return format!("GitHub connection {binding}");
+    }
+    if let Some(bindings) = v["bindings"].as_array() {
+        return format!("{} GitHub connection(s)", bindings.len());
+    }
+    if v["actionUrl"].is_string() {
+        return format!(
+            "GitHub App flow begun: {}",
+            v["appName"].as_str().unwrap_or("?")
+        );
+    }
+    format!(
+        "GitHub connection {} for {}: {}",
+        v["id"].as_str().unwrap_or("?"),
+        v["account"].as_str().unwrap_or("?"),
+        v["status"].as_str().unwrap_or("?")
+    )
+}
+
+fn github_link_params() -> Value {
+    with_confirm(params(vec![
+        (
+            "step",
+            true,
+            json!({ "description": "begin and disconnect (from an approved proposal only), created and installed (the flow an approved begin made), refresh (an installation of an App this node holds, read again from GitHub), flow and bindings (reads).", "enum": ["begin", "created", "installed", "refresh", "flow", "bindings", "disconnect"], "type": "string" }),
+        ),
+        (
+            "origin",
+            true,
+            json!({ "description": "The page the owner connects from, which GitHub sends the browser back to: one whose owner passkeys this node trusts for approvals. begin binds it, and the later steps name the same.", "maxLength": 300, "minLength": 1, "type": "string" }),
+        ),
+        (
+            "org",
+            false,
+            json!({ "description": "begin: the organisation's login, checked as the page's own form checks it. created and installed: the same organisation.", "maxLength": 1000, "type": "string" }),
+        ),
+        (
+            "labelSets",
+            false,
+            json!({ "description": "begin: the runners' label sets, each as the person chose it, checked as the page's own form checks them.", "items": { "items": { "maxLength": 1000, "type": "string" }, "maxItems": 100, "type": "array" }, "maxItems": 100, "type": "array" }),
+        ),
+        (
+            "purpose",
+            false,
+            json!({ "description": "begin: runners or repositories, the workspace repositories App. created and installed: the same.", "enum": ["runners", "repositories"], "type": "string" }),
+        ),
+        (
+            "plan",
+            false,
+            json!({ "description": "created, installed and flow: the id of the approved proposal whose begin made the flow.", "maxLength": 16, "minLength": 16, "pattern": "^act-[0-9a-f]{12}$", "type": "string" }),
+        ),
+        (
+            "state",
+            false,
+            json!({ "description": "created, installed and flow: the manifest flow's state, as begin answered it.", "maxLength": 100, "type": "string" }),
+        ),
+        (
+            "code",
+            false,
+            json!({ "description": "created: GitHub's one-hour code from the page's return. Never logged or shown.", "maxLength": 200, "type": "string" }),
+        ),
+        (
+            "installationId",
+            false,
+            json!({ "description": "installed and refresh: the installation GitHub's return named.", "minimum": 0, "type": "integer" }),
+        ),
+        ("binding", false, github_binding_schema()),
+        ("approval", false, approval_schema()),
+    ]))
+}
+
+fn github_link_result() -> Value {
+    result(vec![
+        ("actionUrl", false, string()),
+        ("manifest", false, string()),
+        ("state", false, string()),
+        ("appName", false, string()),
+        ("installUrl", false, string()),
+        ("known", false, boolean()),
+        ("installed", false, boolean()),
+        ("purpose", false, string()),
+        ("binding", false, string()),
+        ("account", false, string()),
+        (
+            "app",
+            false,
+            result(vec![
+                ("slug", false, string()),
+                ("settingsUrl", false, string()),
+            ]),
+        ),
+        ("bindings", false, array(github_binding_record())),
+        ("id", false, string()),
+        ("status", false, string()),
+    ])
 }
 
 fn github_disconnect_params() -> Value {
@@ -3842,12 +3956,13 @@ pub fn may_call(scope: Scope, v: &Verb) -> bool {
     scope >= v.min_scope
 }
 
-/// The verbs a token reaches only as an operator (or admin), or by naming the verb in its tool list. Their minimum scope is
-/// viewer, so one narrow token can be made for them (a support triage token), but a viewer or doctor token with no list
-/// never reaches them: the support feed holds every filer's words, and the ack changes what each filer is told. A list
+/// The verbs a token reaches only as an operator (or admin), or by naming the verb in its tool list. The support feed's
+/// minimum scope is viewer, so one narrow token can be made for them (a support triage token), but a viewer or doctor token
+/// with no list never reaches them: the support feed holds every filer's words, and the ack changes what each filer is
+/// told. `github_link` (doctor) is the relay token's alone: an agent's doctor token with no list is not offered it. A list
 /// that names one widens rather than narrows, so a path that lets a caller pick its own list (an OAuth refresh) checks
 /// [`may_call_listed`] with no list against what was approved.
-pub const NAMED_ONLY: [&str; 2] = ["support_reports", "support_report_ack"];
+pub const NAMED_ONLY: [&str; 3] = ["support_reports", "support_report_ack", "github_link"];
 
 /// Whether a token of `scope` with the tool list `tools` (`None`: no list) may call `v`: [`may_call`], the list, and for a
 /// [`NAMED_ONLY`] verb an operator scope or a list that names it.
@@ -3901,7 +4016,7 @@ fn not_confirmed(name: &str) -> String {
         "deploy_rollback" => "nothing was rolled back",
         "deploy_remove" => "nothing was removed",
         "function_remove" => "nothing was removed",
-        "github_disconnect" => "nothing was disconnected",
+        "github_disconnect" | "github_link" => "nothing was disconnected",
         "instance_import_undo" => "nothing was removed",
         "instance_move" => "nothing was moved",
         _ => "nothing was deleted",
@@ -4562,7 +4677,7 @@ fn plan_list_result() -> Value {
 }
 
 /// The verbs an action proposal may name. The list is closed here and checked by the handler again.
-pub(crate) const ACTION_NAMES: [&str; 35] = [
+pub(crate) const ACTION_NAMES: [&str; 36] = [
     "reach_connect",
     "reach_disconnect",
     "service_create",
@@ -4598,6 +4713,7 @@ pub(crate) const ACTION_NAMES: [&str; 35] = [
     "route_remove",
     "instance_import",
     "instance_import_undo",
+    "github_link",
 ];
 
 /// A plan or action proposal id: a delete plan's 64 hex digits, or an action proposal's `act-` and twelve.
@@ -4676,7 +4792,7 @@ pub fn kernel_filled(action: &str) -> &'static [&'static str] {
 }
 
 /// One `args` of each action, as an assistant proposes it: the fields it must name, and no field in [`KERNEL_FILLED`].
-const ACTION_EXAMPLES: [(&str, &str); 35] = [
+const ACTION_EXAMPLES: [(&str, &str); 36] = [
     ("reach_connect", r#"{"kind":"tailscale"}"#),
     ("reach_disconnect", r#"{"name":"node-ts"}"#),
     ("service_create", r#"{"name":"nats","template":"nats"}"#),
@@ -4744,6 +4860,10 @@ const ACTION_EXAMPLES: [(&str, &str); 35] = [
     (
         "instance_import_undo",
         r#"{"project":"people","name":"web-1"}"#,
+    ),
+    (
+        "github_link",
+        r#"{"step":"begin","origin":"https://page.example.com","org":"acme","purpose":"runners","labelSets":[["self-hosted","linux"]]}"#,
     ),
 ];
 
