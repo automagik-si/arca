@@ -3016,6 +3016,9 @@ fn canvas_chat_needs_a_session_before_any_upstream_connect() {
 /// The Origin rule's refusal, whole: what the person does next, and nothing of the rule (issue 325).
 const NOT_FROM_THIS_PAGE: &str = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Arca</title></head><body><p>This request did not come from this page. Open the page again and press the button there.</p></body></html>";
 
+/// The same refusal to a request with no Fetch Metadata header at all, as from a browser too old for the page.
+const TOO_OLD_FOR_THIS_PAGE: &str = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Arca</title></head><body><p>This browser is too old for this page. Open the page again in a current browser and press the button there.</p></body></html>";
+
 #[test]
 fn canvas_chat_refuses_a_foreign_origin_before_any_upstream_connect() {
     let (rig, _) = Rig::new("canvas-chat-csrf", true);
@@ -3026,26 +3029,33 @@ fn canvas_chat_refuses_a_foreign_origin_before_any_upstream_connect() {
         (Some("https://elsewhere.example"), "a foreign Origin"),
         (Some("http://box1.example.com"), "a different scheme"),
     ] {
-        let (status, head, response) = rig.request_full_on(
-            false,
-            None,
-            "POST",
-            CHAT_PATH,
-            origin,
-            &body,
-            Some(&cookie),
-            &[],
-        );
-        assert_eq!(status, 403, "{label} is refused");
-        assert_eq!(
-            String::from_utf8_lossy(&response),
-            NOT_FROM_THIS_PAGE,
-            "{label} returns the Origin rule's plain page and no upstream bytes"
-        );
-        assert!(
-            header_value(&head, "content-security-policy").is_some(),
-            "{label} keeps the canvas headers"
-        );
+        // A browser says where the request came from; one too old to say is told so.
+        let cross_site: &[(&str, &str)] = &[("Sec-Fetch-Site", "cross-site")];
+        for (fetch_metadata, page) in [
+            (cross_site, NOT_FROM_THIS_PAGE),
+            (&[][..], TOO_OLD_FOR_THIS_PAGE),
+        ] {
+            let (status, head, response) = rig.request_full_on(
+                false,
+                None,
+                "POST",
+                CHAT_PATH,
+                origin,
+                &body,
+                Some(&cookie),
+                fetch_metadata,
+            );
+            assert_eq!(status, 403, "{label} is refused");
+            assert_eq!(
+                String::from_utf8_lossy(&response),
+                page,
+                "{label} returns the Origin rule's plain page and no upstream bytes"
+            );
+            assert!(
+                header_value(&head, "content-security-policy").is_some(),
+                "{label} keeps the canvas headers"
+            );
+        }
     }
     let (status, _, _) = rig.request_full_on(
         false,

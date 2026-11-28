@@ -149,7 +149,7 @@ impl Setup {
 /// Alpha, the page host, and beta, the linked node, on one fake GitHub.
 struct Rig {
     scratch: Scratch,
-    _incus_scratch: Scratch,
+    incus_scratch: Scratch,
     _incus: arca_incus::FakeIncus,
     fake: Fake,
     alpha: Signer,
@@ -277,7 +277,7 @@ impl Rig {
         }
         let rig = Self {
             scratch,
-            _incus_scratch: incus_scratch,
+            incus_scratch,
             _incus: incus,
             fake,
             alpha,
@@ -357,6 +357,13 @@ impl Rig {
             .iter()
             .filter(|proposal| proposal.action == LINK_VERB)
             .count()
+    }
+
+    /// How many owner approvals beta has spent: one nonce for each card the owner's passkey approved there.
+    fn beta_spent(&self) -> usize {
+        fs::read_to_string(self.incus_scratch.path("beta-nonces.jsonl"))
+            .map(|text| text.lines().filter(|line| !line.trim().is_empty()).count())
+            .unwrap_or(0)
     }
 
     /// Every file of alpha's, as text.
@@ -2265,9 +2272,18 @@ async fn a_relayed_call_to_a_trickling_node_ends_at_its_deadline() {
 
 // ---- Issue 325: the page's own forms, as a browser posts them -----------------------------------------------------
 
+/// The longest the real-browser test may take, its rig included.
+const BROWSER_BOUND: Duration = Duration::from_secs(240);
+
 /// The Origin rule's answer to a request that did not come from the page.
 const NOT_FROM_PAGE: &str =
     "This request did not come from this page. Open the page again and press the button there.";
+
+/// The Origin rule's answer to a request that carries no Fetch Metadata header: a browser too old for the page.
+const TOO_OLD: &str = "This browser is too old for this page. Open the page again in a current browser and press the button there.";
+
+/// The refused case of a browser that sends no Fetch Metadata.
+const NO_FETCH_METADATA: &str = "a browser without Fetch Metadata";
 
 /// The GitHub page's forms a browser posts as a navigation, not by the page's script.
 const PAGE_FORMS: [&str; 5] = [
@@ -2415,7 +2431,7 @@ async fn a_form_post_with_a_null_origin_passes_only_from_this_page_and_only_on_i
             ),
             ("no Sec-Fetch-Site", &[("Sec-Fetch-Site", None)]),
             (
-                "a browser without Fetch Metadata",
+                NO_FETCH_METADATA,
                 &[
                     ("Sec-Fetch-Site", None),
                     ("Sec-Fetch-Mode", None),
@@ -2455,7 +2471,13 @@ async fn a_form_post_with_a_null_origin_passes_only_from_this_page_and_only_on_i
                 )
                 .await;
                 assert_eq!(status, 403, "{what} on {path}: {body}");
-                assert!(body.contains(NOT_FROM_PAGE), "{what} on {path}: {body}");
+                // Without any Fetch Metadata header the browser is too old for the page: pressing again would not help.
+                let words = if what == NO_FETCH_METADATA {
+                    TOO_OLD
+                } else {
+                    NOT_FROM_PAGE
+                };
+                assert!(body.contains(words), "{what} on {path}: {body}");
                 assert_eq!(
                     head_value(&head, "content-type").as_deref(),
                     Some("text/html; charset=utf-8"),
@@ -2498,6 +2520,25 @@ async fn a_form_post_with_a_null_origin_passes_only_from_this_page_and_only_on_i
             push,
         )
         .await;
+        for word in ["Origin", "Sec-Fetch", "same-origin", "referrer", "null"] {
+            assert!(!body.contains(word), "the refusal says {word}: {body}");
+        }
+        let (_, _, body) = call_page(
+            &socket,
+            "POST",
+            github_page::PUSH_PATH,
+            form_post(
+                &cookie,
+                &[
+                    ("Sec-Fetch-Site", None),
+                    ("Sec-Fetch-Mode", None),
+                    ("Sec-Fetch-Dest", None),
+                ],
+            ),
+            b"org=acme&labels=self-hosted".to_vec(),
+        )
+        .await;
+        assert!(body.contains(TOO_OLD), "{body}");
         for word in ["Origin", "Sec-Fetch", "same-origin", "referrer", "null"] {
             assert!(!body.contains(word), "the refusal says {word}: {body}");
         }
@@ -2577,230 +2618,232 @@ async fn a_waiting_github_link_card_is_listed_as_the_listing_schemas_say() {
 /// (which the session cookie reaches), from a sandboxed frame and from a `data:` address lands on the Origin rule's page
 /// and makes nothing.
 ///
-/// Without Chrome it says so and passes: the forms are then not driven in a real browser. Every browser step is bounded
-/// by thirty seconds, the browser part by four minutes.
+/// Without Chrome (no `ARCA_TEST_CHROME` and nothing at `/usr/bin/google-chrome`) it says so where a passing test's
+/// output is seen, and passes: the forms are then not driven in a real browser. `ARCA_TEST_CHROME` naming a missing file
+/// fails. Every browser step is bounded by thirty seconds, the whole test by [`BROWSER_BOUND`].
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_real_browser_presses_each_button_of_the_github_page_for_this_node_and_a_linked_one() {
     let Some(binary) = browser::binary() else {
-        eprintln!(
-            "SKIPPED: no Chrome at {} or ${}; the GitHub page's forms were not driven in a real browser",
-            browser::DEFAULT_CHROME,
-            browser::CHROME_ENV
+        browser::skipped(
+            "a_real_browser_presses_each_button_of_the_github_page_for_this_node_and_a_linked_one",
+            &format!(
+                "no Chrome at {}; set {} to a Chrome or Chromium binary to drive the GitHub page's forms in a real browser",
+                browser::DEFAULT_CHROME,
+                browser::CHROME_ENV
+            ),
         );
         return;
     };
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
-    let origin = format!(
-        "http://localhost:{}",
-        listener.local_addr().expect("an address").port()
-    );
-    let mut setup = Setup::new(&[&origin], &RELAY_TOOLS);
-    setup.owner_origin = Some(origin.clone());
-    let rig = Arc::new(Rig::with(setup).await);
-    let alpha = rig.alpha_page(&origin);
-    listener.set_nonblocking(true).expect("nonblocking");
-    let listener = tokio::net::TcpListener::from_std(listener).expect("the page's listener");
-    let router = alpha.page.router(false);
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, router).await;
-    });
+    tokio::time::timeout(BROWSER_BOUND, async move {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+        let origin = format!(
+            "http://localhost:{}",
+            listener.local_addr().expect("an address").port()
+        );
+        let mut setup = Setup::new(&[&origin], &RELAY_TOOLS);
+        setup.owner_origin = Some(origin.clone());
+        let rig = Arc::new(Rig::with(setup).await);
+        let alpha = rig.alpha_page(&origin);
+        listener.set_nonblocking(true).expect("nonblocking");
+        let listener = tokio::net::TcpListener::from_std(listener).expect("the page's listener");
+        let router = alpha.page.router(false);
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
 
-    // Pages that post to the page's push form as soon as they load, from no page of the GitHub page's: each sends no
-    // referrer either, so the browser's Origin is null.
-    let push_url = format!("{origin}{}", github_page::PUSH_PATH);
-    let post = format!(
-        "<form id=\"f\" method=\"post\" action=\"{push_url}\" target=\"_top\"><input name=\"org\" value=\"acme\">\
-         <input name=\"labels\" value=\"self-hosted\"></form><script>document.getElementById(\"f\").submit()</script>"
-    );
-    let frame = format!(
-        "<!doctype html><iframe sandbox=\"allow-forms allow-scripts allow-top-navigation\" srcdoc=\"{}\"></iframe>",
-        post.replace('&', "&amp;").replace('"', "&quot;")
-    );
-    let data_url = format!(
-        "data:text/html;base64,{}",
-        base64::engine::general_purpose::STANDARD.encode(format!("<!doctype html>{post}"))
-    );
-    let other = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("another port");
-    let other_port = other.local_addr().expect("an address").port();
-    let page_of = |body: String| {
-        move || {
-            let body = body.clone();
-            async move {
-                (
-                    [
-                        ("content-type", "text/html; charset=utf-8"),
-                        ("referrer-policy", "no-referrer"),
-                    ],
-                    body,
-                )
+        // Pages that post to the page's push form as soon as they load, from no page of the GitHub page's: each sends no
+        // referrer either, so the browser's Origin is null.
+        let push_url = format!("{origin}{}", github_page::PUSH_PATH);
+        let post = format!(
+            "<form id=\"f\" method=\"post\" action=\"{push_url}\" target=\"_top\"><input name=\"org\" value=\"acme\">\
+             <input name=\"labels\" value=\"self-hosted\"></form><script>document.getElementById(\"f\").submit()</script>"
+        );
+        let frame = format!(
+            "<!doctype html><iframe sandbox=\"allow-forms allow-scripts allow-top-navigation\" srcdoc=\"{}\"></iframe>",
+            post.replace('&', "&amp;").replace('"', "&quot;")
+        );
+        let data_url = format!(
+            "data:text/html;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(format!("<!doctype html>{post}"))
+        );
+        let other = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("another port");
+        let other_port = other.local_addr().expect("an address").port();
+        let page_of = |body: String| {
+            move || {
+                let body = body.clone();
+                async move {
+                    (
+                        [
+                            ("content-type", "text/html; charset=utf-8"),
+                            ("referrer-policy", "no-referrer"),
+                        ],
+                        body,
+                    )
+                }
             }
-        }
-    };
-    let others = axum::Router::new()
-        .route(
-            "/post",
-            axum::routing::get(page_of(format!("<!doctype html>{post}"))),
-        )
-        .route("/frame", axum::routing::get(page_of(frame)));
-    tokio::spawn(async move {
-        let _ = axum::serve(other, others).await;
-    });
-
-    let browsing = Arc::clone(&rig);
-    let driven = tokio::task::spawn_blocking(move || {
-        let rig = browsing;
-        let page = |q: &str| format!("{origin}{}{q}", github_page::PAGE_PATH);
-        let mut chrome = Chrome::launch(
-            &binary,
-            &rig.scratch.path("chrome"),
-            &rig.scratch.path("chrome.log"),
-        );
-        chrome.passkey(
-            "localhost",
-            &rig.owner.credential_id,
-            &browser::p256_pkcs8(&rig.owner.signing),
-        );
-
-        // Signed out, a prepared link shows the passkey sign-in; signed in, its form.
-        chrome.open(&page("?mode=app&org=acme&labels=self-hosted,linux"));
-        chrome.press("#sign-in");
-        chrome.until_text("This link filled in the form");
-
-        let manifest_goes_to_github = |chrome: &mut Chrome| {
-            let action = chrome
-                .eval("document.querySelector('form').action")
-                .expect("the manifest form");
-            let web = rig.fake.endpoints().web;
-            assert!(
-                action.as_str().is_some_and(|a| a.starts_with(&web)),
-                "{action}"
-            );
         };
+        let others = axum::Router::new()
+            .route(
+                "/post",
+                axum::routing::get(page_of(format!("<!doctype html>{post}"))),
+            )
+            .route("/frame", axum::routing::get(page_of(frame)));
+        tokio::spawn(async move {
+            let _ = axum::serve(other, others).await;
+        });
 
-        // This node: the App, the repository App, the push address and the device code.
-        chrome.open(&page("?mode=app&org=acme&labels=self-hosted,linux"));
-        chrome.press("#prepared button[type=submit]");
-        let (href, _) = chrome.until_text("Create the App on GitHub");
-        assert_eq!(href, format!("{origin}{}", github_page::APP_PATH));
-        manifest_goes_to_github(&mut chrome);
-
-        // No page but the GitHub page's own gets a post past the Origin rule: not another site's, not one of the same
-        // site on another port (the session cookie goes there), not a sandboxed frame's, not a data: address's.
-        for url in [
-            format!("http://localhost:{other_port}/post"),
-            format!("http://127.0.0.1:{other_port}/post"),
-            format!("http://localhost:{other_port}/frame"),
-            data_url,
-        ] {
-            chrome.open(&url);
-            let (href, _) = chrome.until_text(NOT_FROM_PAGE);
-            assert!(href.starts_with(&push_url), "{url} ends at {href}");
-        }
-        assert!(rig.alpha.bindings().is_empty(), "no post made a connection");
-
-        chrome.open(&page("?mode=repositories&org=acme"));
-        chrome.press("#prepared button[type=submit]");
-        let (href, _) = chrome.until_text("Create the repository App");
-        assert_eq!(href, format!("{origin}{}", github_page::APP_PATH));
-        manifest_goes_to_github(&mut chrome);
-
-        chrome.open(&page("?mode=push&org=acme&labels=self-hosted,linux"));
-        chrome.press("#prepared button[type=submit]");
-        let (href, _) = chrome.until_text("Your service's address and token");
-        assert_eq!(href, push_url);
-        let pushed = rig.alpha.bindings();
-        assert_eq!(pushed.len(), 1, "the push connection is made");
-
-        chrome.open(&page(
-            "?mode=oauth&org=acme&labels=self-hosted,linux&runners=1",
-        ));
-        chrome.press("#prepared button[type=submit]");
-        let (href, _) = chrome.until_text(USER_CODE);
-        assert!(href.starts_with(&page("?flow=")), "{href}");
-
-        // This node's Disconnect, on its connection's row.
-        chrome.open(&page(""));
-        chrome.press(&format!(
-            "form[action=\"{}\"] button[type=submit]",
-            github_page::DISCONNECT_PATH
-        ));
-        let deadline = Instant::now() + browser::WAIT;
-        while rig
-            .alpha
-            .bindings()
-            .iter()
-            .any(|binding| binding.id == pushed[0].id && binding.status != Status::Revoked)
-        {
-            assert!(
-                Instant::now() < deadline,
-                "the push connection is disconnected"
+        let browsing = Arc::clone(&rig);
+        let driven = tokio::task::spawn_blocking(move || {
+            let rig = browsing;
+            let page = |q: &str| format!("{origin}{}{q}", github_page::PAGE_PATH);
+            let mut chrome = Chrome::launch(
+                &binary,
+                &rig.scratch.path("chrome"),
+                &rig.scratch.path("chrome.log"),
             );
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        let (href, _) = chrome.until_text("GitHub runners");
-        assert_eq!(href, page(""));
-
-        // The linked node: its App and repository App, each card approved with the passkey on the button's press.
-        chrome.open(&page(
-            "?mode=app&node=beta&org=acme&labels=self-hosted,linux",
-        ));
-        chrome.press("#prepared button[type=submit]");
-        let (href, _) = chrome.until_text("Create the App on GitHub");
-        assert_eq!(href, format!("{origin}{}", github_page::APP_PATH));
-        manifest_goes_to_github(&mut chrome);
-        assert_eq!(
-            rig.waiting_cards(),
-            0,
-            "beta spent the card the passkey approved"
-        );
-
-        chrome.open(&page("?mode=repositories&node=beta&org=acme"));
-        chrome.press("#prepared button[type=submit]");
-        let (href, _) = chrome.until_text("Create the repository App");
-        assert_eq!(href, format!("{origin}{}", github_page::APP_PATH));
-        assert_eq!(
-            rig.waiting_cards(),
-            0,
-            "beta spent the card the passkey approved"
-        );
-
-        // The linked node's connections, and its Disconnect, approved with the passkey.
-        let (held, _) = rig
-            .beta
-            .push_create("acme", &[vec!["self-hosted".to_string()]], "test")
-            .expect("beta holds a connection");
-        chrome.open(&page("?node=beta"));
-        chrome.press(&format!(
-            "form[action=\"{}\"] button[type=submit]",
-            github_page::CONNECTIONS_PATH
-        ));
-        let (href, _) = chrome.until_text("Connections on beta");
-        assert_eq!(href, format!("{origin}{}", github_page::CONNECTIONS_PATH));
-        chrome.press(&format!(
-            "form[action=\"{}\"] button[type=submit]",
-            github_page::DISCONNECT_PATH
-        ));
-        let deadline = Instant::now() + browser::WAIT;
-        while rig
-            .beta
-            .bindings()
-            .iter()
-            .any(|binding| binding.id == held.id && binding.status != Status::Revoked)
-        {
-            assert!(
-                Instant::now() < deadline,
-                "beta's connection is disconnected"
+            chrome.passkey(
+                "localhost",
+                &rig.owner.credential_id,
+                &browser::p256_pkcs8(&rig.owner.signing),
             );
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        let (href, text) = chrome.until_text("GitHub runners");
-        assert_eq!(href, page("?node=beta"));
-        assert!(!text.contains(NOT_FROM_PAGE), "{text}");
-    });
-    tokio::time::timeout(Duration::from_secs(240), driven)
-        .await
-        .expect("the browser part ends in time")
-        .expect("the browser part passes");
+
+            // Signed out, a prepared link shows the passkey sign-in; signed in, its form.
+            chrome.open(&page("?mode=app&org=acme&labels=self-hosted,linux"));
+            chrome.press("#sign-in");
+            chrome.until_text("This link filled in the form");
+
+            let manifest_goes_to_github = |chrome: &mut Chrome| {
+                let action = chrome
+                    .eval("document.querySelector('form').action")
+                    .expect("the manifest form");
+                let web = rig.fake.endpoints().web;
+                assert!(
+                    action.as_str().is_some_and(|a| a.starts_with(&web)),
+                    "{action}"
+                );
+            };
+
+            // This node: the App, the repository App, the push address and the device code.
+            chrome.open(&page("?mode=app&org=acme&labels=self-hosted,linux"));
+            chrome.press("#prepared button[type=submit]");
+            let (href, _) = chrome.until_text("Create the App on GitHub");
+            assert_eq!(href, format!("{origin}{}", github_page::APP_PATH));
+            manifest_goes_to_github(&mut chrome);
+
+            // No page but the GitHub page's own gets a post past the Origin rule: not another site's, not one of the same
+            // site on another port (the session cookie goes there), not a sandboxed frame's, not a data: address's.
+            for url in [
+                format!("http://localhost:{other_port}/post"),
+                format!("http://127.0.0.1:{other_port}/post"),
+                format!("http://localhost:{other_port}/frame"),
+                data_url,
+            ] {
+                chrome.open(&url);
+                let (href, _) = chrome.until_text(NOT_FROM_PAGE);
+                assert!(href.starts_with(&push_url), "{url} ends at {href}");
+            }
+            assert!(rig.alpha.bindings().is_empty(), "no post made a connection");
+
+            chrome.open(&page("?mode=repositories&org=acme"));
+            chrome.press("#prepared button[type=submit]");
+            let (href, _) = chrome.until_text("Create the repository App");
+            assert_eq!(href, format!("{origin}{}", github_page::APP_PATH));
+            manifest_goes_to_github(&mut chrome);
+
+            chrome.open(&page("?mode=push&org=acme&labels=self-hosted,linux"));
+            chrome.press("#prepared button[type=submit]");
+            let (href, _) = chrome.until_text("Your service's address and token");
+            assert_eq!(href, push_url);
+            let pushed = rig.alpha.bindings();
+            assert_eq!(pushed.len(), 1, "the push connection is made");
+
+            chrome.open(&page(
+                "?mode=oauth&org=acme&labels=self-hosted,linux&runners=1",
+            ));
+            chrome.press("#prepared button[type=submit]");
+            let (href, _) = chrome.until_text(USER_CODE);
+            assert!(href.starts_with(&page("?flow=")), "{href}");
+
+            // This node's Disconnect, on its connection's row.
+            chrome.open(&page(""));
+            chrome.press(&format!(
+                "form[action=\"{}\"] button[type=submit]",
+                github_page::DISCONNECT_PATH
+            ));
+            let deadline = Instant::now() + browser::WAIT;
+            while rig
+                .alpha
+                .bindings()
+                .iter()
+                .any(|binding| binding.id == pushed[0].id && binding.status != Status::Revoked)
+            {
+                assert!(
+                    Instant::now() < deadline,
+                    "the push connection is disconnected"
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            let (href, _) = chrome.until_text("GitHub runners");
+            assert_eq!(href, page(""));
+
+            // The linked node: its App and repository App, each card approved with the passkey on the button's press.
+            let mut spent = rig.beta_spent();
+            chrome.open(&page(
+                "?mode=app&node=beta&org=acme&labels=self-hosted,linux",
+            ));
+            chrome.press("#prepared button[type=submit]");
+            let (href, _) = chrome.until_text("Create the App on GitHub");
+            assert_eq!(href, format!("{origin}{}", github_page::APP_PATH));
+            manifest_goes_to_github(&mut chrome);
+            assert_eq!(rig.beta_spent(), spent + 1, "beta made a card and spent the passkey's approval of it");
+            assert_eq!(rig.waiting_cards(), 0, "no card is left waiting on beta");
+            spent += 1;
+
+            chrome.open(&page("?mode=repositories&node=beta&org=acme"));
+            chrome.press("#prepared button[type=submit]");
+            let (href, _) = chrome.until_text("Create the repository App");
+            assert_eq!(href, format!("{origin}{}", github_page::APP_PATH));
+            manifest_goes_to_github(&mut chrome);
+            assert_eq!(rig.beta_spent(), spent + 1, "beta made a card and spent the passkey's approval of it");
+            assert_eq!(rig.waiting_cards(), 0, "no card is left waiting on beta");
+
+            // The linked node's connections, and its Disconnect, approved with the passkey.
+            let (held, _) = rig
+                .beta
+                .push_create("acme", &[vec!["self-hosted".to_string()]], "test")
+                .expect("beta holds a connection");
+            chrome.open(&page("?node=beta"));
+            chrome.press(&format!(
+                "form[action=\"{}\"] button[type=submit]",
+                github_page::CONNECTIONS_PATH
+            ));
+            let (href, _) = chrome.until_text("Connections on beta");
+            assert_eq!(href, format!("{origin}{}", github_page::CONNECTIONS_PATH));
+            chrome.press(&format!(
+                "form[action=\"{}\"] button[type=submit]",
+                github_page::DISCONNECT_PATH
+            ));
+            let deadline = Instant::now() + browser::WAIT;
+            while rig
+                .beta
+                .bindings()
+                .iter()
+                .any(|binding| binding.id == held.id && binding.status != Status::Revoked)
+            {
+                assert!(
+                    Instant::now() < deadline,
+                    "beta's connection is disconnected"
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            let (href, text) = chrome.until_text("GitHub runners");
+            assert_eq!(href, page("?node=beta"));
+            assert!(!text.contains(NOT_FROM_PAGE), "{text}");
+        });
+        driven.await.expect("the browser part passes");
+    })
+    .await
+    .expect("the test ends in time");
 }

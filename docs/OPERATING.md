@@ -4344,7 +4344,9 @@ the GitHub page's forms that the browser posts itself (`/approve/github/app`, `/
 `Sec-Fetch-Mode: navigate` and `Sec-Fetch-Dest: document`, which no page script can set: a post from another site, from
 the same site on another port, from a sandboxed frame or from a `data:` page is still refused, and so is a browser that
 sends no Fetch Metadata. A refused request gets a 403 with a short page: "This request did not come from this page. Open
-the page again and press the button there." `/mcp` and every other MCP route keep refusing every `Origin`.
+the page again and press the button there." A refused request with no Fetch Metadata header at all, from a browser too
+old for the page, reads instead: "This browser is too old for this page. Open the page again in a current browser and
+press the button there." `/mcp` and every other MCP route keep refusing every `Origin`.
 
 With `approvalOrigin` set, the same page origin also serves the remote canvas at exactly these URLs, each with or
 without one trailing slash: `GET /approve/canvas`

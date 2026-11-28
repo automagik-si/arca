@@ -25,10 +25,37 @@ pub const CHROME_ENV: &str = "ARCA_TEST_CHROME";
 /// The Chrome binary when `ARCA_TEST_CHROME` names none.
 pub const DEFAULT_CHROME: &str = "/usr/bin/google-chrome";
 
-/// The Chrome binary to drive: `ARCA_TEST_CHROME`, or `/usr/bin/google-chrome`; `None` when there is no file there.
+/// The Chrome binary to drive: the file `ARCA_TEST_CHROME` names, or `/usr/bin/google-chrome`. `None` when the variable
+/// is not set and there is no file at the default; a variable that names no file fails the test, so a typo never turns
+/// the browser test into a skip.
 pub fn binary() -> Option<PathBuf> {
-    let path = PathBuf::from(std::env::var(CHROME_ENV).unwrap_or_else(|_| DEFAULT_CHROME.into()));
-    path.is_file().then_some(path)
+    match std::env::var_os(CHROME_ENV) {
+        Some(named) => {
+            let path = PathBuf::from(named);
+            assert!(
+                path.is_file(),
+                "{CHROME_ENV} names {}, and there is no file there",
+                path.display()
+            );
+            Some(path)
+        }
+        None => {
+            let path = PathBuf::from(DEFAULT_CHROME);
+            path.is_file().then_some(path)
+        }
+    }
+}
+
+/// Says that `test` was skipped, and `why`, where a passing test's output is still seen: straight on stderr, which the
+/// test harness does not capture (it captures only the `print!` macros), and, under GitHub Actions, as a warning on the
+/// run's summary.
+pub fn skipped(test: &str, why: &str) {
+    let line = format!("SKIPPED {test}: {why}\n");
+    let _ = std::io::stderr().write_all(line.as_bytes());
+    if std::env::var_os("GITHUB_ACTIONS").is_some_and(|value| value == "true") {
+        let warning = format!("::warning title=Browser test skipped::{test}: {why}\n");
+        let _ = std::io::stdout().write_all(warning.as_bytes());
+    }
 }
 
 pub struct Chrome {

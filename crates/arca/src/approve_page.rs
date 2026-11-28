@@ -610,9 +610,15 @@ const NAVIGATION_FORMS: [&str; 5] = [
 /// sends `Referrer-Policy: no-referrer`, and under it a browser sends `Origin: null` on a form post even to its own origin,
 /// so the page's own forms were refused. The browser sets the Fetch Metadata headers and no page script can: a page of
 /// another origin, of the same site on another port, a sandboxed frame and a `data:` or `file:` page (an opaque origin)
-/// are `same-site` or `cross-site`, a redirect through another origin makes the post `cross-site`, and a framed form is
-/// not a `document`. A browser that sends no Fetch Metadata is still refused. The session cookie stays `SameSite=Strict`,
+/// are `same-site` or `cross-site`, and a redirect through another origin makes the post `cross-site`. A form in a frame
+/// that posts into its own frame is an `iframe`, not a `document`; one that posts to the top window is a `document`, but
+/// its frame is `same-site` or `cross-site` all the same, and no page here can frame or be framed. A browser that sends no
+/// Fetch Metadata is still refused, and told that it is too old for the page. The session cookie stays `SameSite=Strict`,
 /// and a linked node's form still carries the owner's passkey approval, which that node checks.
+///
+/// The exception trusts every document of this origin: a form injected into one of its pages would pass, as it would
+/// under `Referrer-Policy: same-origin`. No page here writes HTML it did not make (no HTML sink, and every value the
+/// GitHub page shows is escaped), and the CSP lets no frame in.
 async fn origin_rule(
     State(state): State<Arc<PageState>>,
     request: Request,
@@ -639,18 +645,30 @@ async fn origin_rule(
         origin_valid || !origin_present
     };
     if !allowed {
-        return not_from_this_page();
+        let fetch_metadata = ["sec-fetch-site", "sec-fetch-mode", "sec-fetch-dest"]
+            .iter()
+            .any(|name| headers.contains_key(*name));
+        return not_from_this_page(fetch_metadata);
     }
     next.run(request).await
 }
 
-/// The Origin rule's refusal: what the person does next, and nothing of the rule.
-fn not_from_this_page() -> Response {
+/// The Origin rule's refusal: what the person does next, and nothing of the rule. A request that carries no Fetch Metadata
+/// header (`fetch_metadata` false) comes from a browser too old for the page's forms, or from no browser: pressing the
+/// button again would end here again, so the page says to use a current browser.
+fn not_from_this_page(fetch_metadata: bool) -> Response {
+    let words = if fetch_metadata {
+        "This request did not come from this page. Open the page again and press the button there."
+    } else {
+        "This browser is too old for this page. Open the page again in a current browser and press the button there."
+    };
     let mut response = (
         StatusCode::FORBIDDEN,
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
-         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Arca</title></head>\
-         <body><p>This request did not come from this page. Open the page again and press the button there.</p></body></html>",
+        format!(
+            "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+             <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Arca</title></head>\
+             <body><p>{words}</p></body></html>"
+        ),
     )
         .into_response();
     response.headers_mut().insert(
