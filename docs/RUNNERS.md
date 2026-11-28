@@ -178,6 +178,12 @@ Records and logs go to `<stateDir>/runners/<pool>/`.
    the start take one to two and a half seconds, the boot to a ready agent about 25 seconds. ZFS and Ceph RBD are
    expected to clone the same way and are not measured: a Ceph pool clones only with `ceph.rbd.clone_copy` left on
    (Incus's default), and only when the image or the kept machine is in the same storage pool as the job machines.
+   A copy of a kept machine's snapshot is also sent `volatile.apply_nvram=true`, so it gets fresh UEFI variables from
+   the host it runs on at its first start: a kept machine built on one host runs on another whose Incus names its
+   firmware files otherwise, and the machine keeps its Secure Boot setting (on by default). A machine made from an
+   image builds its variables that way anyway and is sent no such key. A kept machine moved between hosts needs a
+   runner project that is not restricted, or one with `restricted.virtual-machines.lowlevel=allow`: a restricted
+   project drops the key.
 2. **Boot and wait for the Incus agent.** The launcher never uses a network path into the VM.
 3. **Hand over.** The controller asks the signer for one JIT configuration (`workFolder` `/home/runner/work`) and the
    launcher writes it into the VM through the agent's file API, on `/run` (memory), mode 0600, owned by root (`arca-job`
