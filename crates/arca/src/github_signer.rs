@@ -21,7 +21,7 @@
 //! mint is a line of `<stateDir>/github/audit.jsonl`: who asked, when, for which binding, runner group and labels, and the
 //! outcome.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{self, Write as _};
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
@@ -204,12 +204,23 @@ impl Binding {
     pub fn open_to_none(&self) -> bool {
         match self.group_access() {
             Some(GroupAccess::NoRepository) => true,
-            Some(GroupAccess::Selected) => self
-                .installation
-                .as_ref()
-                .is_some_and(|installation| installation.repositories.is_empty()),
+            Some(GroupAccess::Selected) => self.group_repositories().is_empty(),
             _ => false,
         }
+    }
+
+    /// The repositories a `selected` group is open to: its own as read when the owner kept them, else the
+    /// installation's.
+    fn group_repositories(&self) -> Vec<String> {
+        self.runner_group
+            .as_ref()
+            .and_then(|group| group.repositories.clone())
+            .or_else(|| {
+                self.installation
+                    .as_ref()
+                    .map(|installation| installation.repositories.clone())
+            })
+            .unwrap_or_default()
     }
 
     /// Whether the page and `github_bindings` should say the group's access as the connection's `why`: when no job can
@@ -234,10 +245,7 @@ impl Binding {
             ),
             GroupAccess::Selected => format!(
                 "Only these repositories of {org} may send jobs here: {}.",
-                self.installation
-                    .as_ref()
-                    .map(|installation| installation.repositories.join(", "))
-                    .unwrap_or_default()
+                self.group_repositories().join(", ")
             ),
             GroupAccess::Unknown => format!(
                 "Arca did not make the runner group \"{}\", so it cannot tell which repositories of {org} may send \
@@ -245,12 +253,16 @@ impl Binding {
                 group.name
             ),
             GroupAccess::Unchecked => format!(
-                "Arca has not checked yet which repositories of {org} may send jobs to the runner group \"{}\": {}. \
-                 It checks again at the next sync.",
+                "Arca has not checked yet which repositories of {org} may send jobs to the runner group \"{}\": {}. {}",
                 group.name,
                 self.sync_error
                     .as_deref()
-                    .unwrap_or("the last check failed")
+                    .unwrap_or("the last check failed"),
+                match self.sync_retry_in_ms {
+                    Some(ms) => format!("Arca checks again in about {}.", wait_words(ms)),
+                    None => "Arca checks again when a pool signs in or GitHub's page returns."
+                        .to_string(),
+                }
             ),
             GroupAccess::NoRepository => format!(
                 "The runner group \"{}\" is open to no repository, so no job reaches these runners. Arca opens it to \
@@ -300,6 +312,21 @@ pub struct BindingInfo {
     pub org_url: String,
     pub runner_group_id: Option<u64>,
     pub label_sets: Vec<Vec<String>>,
+}
+
+/// A wait in words: "a second", "20 seconds", "a minute", "10 minutes".
+fn wait_words(ms: u64) -> String {
+    if ms < 60_000 {
+        match ms.div_ceil(1000).max(1) {
+            1 => "a second".to_string(),
+            seconds => format!("{seconds} seconds"),
+        }
+    } else {
+        match (ms + 30_000) / 60_000 {
+            1 => "a minute".to_string(),
+            minutes => format!("{minutes} minutes"),
+        }
+    }
 }
 
 /// A registered runner's three files, as the runner reads them from its own folder. They are its lasting credential.
@@ -380,8 +407,11 @@ pub(crate) struct State {
     pub(crate) installation_tokens: HashMap<String, (Secret, u64)>,
     /// Actions service connections, by binding.
     pub(crate) actions: HashMap<String, crate::github_app::ActionsConnection>,
-    /// When a pool's sign-in last synced each binding's runner group (ms), behind a lock that lets one run at a time.
+    /// When a sign-in or retry sync of each binding's runner group last succeeded (ms), behind a lock that lets one run
+    /// at a time.
     pub(crate) sign_in_syncs: HashMap<String, Arc<tokio::sync::Mutex<Option<u64>>>>,
+    /// The bindings whose failed sync the node is retrying by itself.
+    pub(crate) sync_retries: HashSet<String>,
 }
 
 impl Signer {

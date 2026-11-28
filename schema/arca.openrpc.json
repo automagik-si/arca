@@ -16103,6 +16103,12 @@
                       "name": {
                         "type": "string"
                       },
+                      "repositories": {
+                        "items": {
+                          "type": "string"
+                        },
+                        "type": "array"
+                      },
                       "warning": {
                         "type": "string"
                       }
@@ -16151,6 +16157,10 @@
                   },
                   "syncError": {
                     "type": "string"
+                  },
+                  "syncRetryInMs": {
+                    "minimum": 0,
+                    "type": "integer"
                   },
                   "updatedAt": {
                     "minimum": 0,
@@ -16710,6 +16720,12 @@
                 "name": {
                   "type": "string"
                 },
+                "repositories": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
                 "warning": {
                   "type": "string"
                 }
@@ -16758,6 +16774,10 @@
             },
             "syncError": {
               "type": "string"
+            },
+            "syncRetryInMs": {
+              "minimum": 0,
+              "type": "integer"
             },
             "updatedAt": {
               "minimum": 0,
@@ -17064,6 +17084,12 @@
                       "name": {
                         "type": "string"
                       },
+                      "repositories": {
+                        "items": {
+                          "type": "string"
+                        },
+                        "type": "array"
+                      },
                       "warning": {
                         "type": "string"
                       }
@@ -17112,6 +17138,10 @@
                   },
                   "syncError": {
                     "type": "string"
+                  },
+                  "syncRetryInMs": {
+                    "minimum": 0,
+                    "type": "integer"
                   },
                   "updatedAt": {
                     "minimum": 0,

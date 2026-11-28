@@ -2583,6 +2583,7 @@ fn github_binding_record() -> Value {
         ("why", false, string()),
         ("labelSets", true, array(array(string()))),
         ("syncError", false, string()),
+        ("syncRetryInMs", false, at_least(0)),
         (
             "runnerGroup",
             false,
@@ -2597,6 +2598,7 @@ fn github_binding_record() -> Value {
                     one_of(&["all-private", "selected", "unknown", "none", "unchecked"]),
                 ),
                 ("accessWords", false, string()),
+                ("repositories", false, array(string())),
             ]),
         ),
         (
