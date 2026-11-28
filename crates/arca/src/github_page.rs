@@ -301,9 +301,16 @@ impl Links {
         });
     }
 
+    /// Notes the node an installation belongs to: only for one GitHub installed in a flow this page relayed.
     fn note_installation(&self, installation: u64, node: &str) {
         self.index_change(|index| {
             index.installations.insert(installation, node.to_string());
+        });
+    }
+
+    fn forget_installation(&self, installation: u64) {
+        self.index_change(|index| {
+            index.installations.remove(&installation);
         });
     }
 }
@@ -1341,17 +1348,28 @@ pub async fn installed(ctx: &Ctx<'_>, query: &HashMap<String, String>) -> Respon
             ),
         ),
     };
-    match ctx.links.link(node, args).await {
-        Ok(answer) => {
+    let answer = match ctx.links.link(node, args).await {
+        Ok(answer) => answer["binding"].as_str().map(str::to_string).ok_or(None),
+        // No answer, or the node no longer knows the flow (an answer that came late finished it): what the node holds
+        // is read before the page says anything.
+        Err(error) => connection_for(ctx, node, installation)
+            .await
+            .ok_or(Some(error)),
+    };
+    let error = match answer {
+        Ok(id) => {
             ctx.links.forget(state);
             ctx.links.note_installation(installation, node);
-            let id = answer["binding"].as_str().unwrap_or("");
-            see_other(&page_for(
+            return see_other(&page_for(
                 &Target::Linked(node.clone()),
                 &format!("connected={id}"),
-            ))
+            ));
         }
-        Err(error) if not_reached(&error) => message_page(
+        Err(Some(error)) => error,
+        Err(None) => RelayError::Failed("no connection in the answer".to_string()),
+    };
+    match error {
+        error if not_reached(&error) => message_page(
             StatusCode::BAD_GATEWAY,
             "Installed, not known to be recorded yet",
             &format!(
@@ -1362,7 +1380,7 @@ pub async fn installed(ctx: &Ctx<'_>, query: &HashMap<String, String>) -> Respon
                 flow.account,
             ),
         ),
-        Err(error) => message_page(
+        error => message_page(
             relay_status(&error),
             "Not connected",
             &format!(
@@ -1374,48 +1392,94 @@ pub async fn installed(ctx: &Ctx<'_>, query: &HashMap<String, String>) -> Respon
     }
 }
 
+/// The connection `node` holds for GitHub's installation `installation`, once it is in use: read from the node itself.
+async fn connection_for(ctx: &Ctx<'_>, node: &str, installation: u64) -> Option<String> {
+    let answer = ctx
+        .links
+        .link(node, json!({ "step": "bindings", "origin": ctx.origin }))
+        .await
+        .ok()?;
+    answer["bindings"]
+        .as_array()?
+        .iter()
+        .find(|binding| {
+            binding["installation"]["id"] == json!(installation) && binding["status"] == "active"
+        })
+        .and_then(|binding| binding["id"].as_str())
+        .map(str::to_string)
+}
+
 /// GitHub's return with no flow this page began: the linked node the index names for the installation reads it again
-/// from GitHub; otherwise this node's own Apps are tried, then each linked node that took an App from this page.
+/// from GitHub. When it does not recognise it, this node's own Apps are tried, then each other linked node that took an
+/// App from this page; the index is not written for those, as this page never saw that installation made.
 async fn installed_later(ctx: &Ctx<'_>, installation: u64, state: Option<&str>) -> Response {
     let refresh = |node: String| async move {
         let args =
             json!({ "step": "refresh", "origin": ctx.origin, "installationId": installation });
         (ctx.links.link(&node, args).await, node)
     };
-    let index = ctx.links.index();
-    if let Some(node) = index.installations.get(&installation).cloned() {
-        return match refresh(node).await {
-            (Ok(answer), node) => see_other(&page_for(
-                &Target::Linked(node),
-                &format!("connected={}", answer["binding"].as_str().unwrap_or("")),
-            )),
-            (Err(error), node) => message_page(
-                relay_status(&error),
-                "Not brought up to date yet",
-                &format!(
-                    "{} GitHub changed the installation of {node}'s App; reload this page once {node} answers and it \
-                     reads the change.",
-                    relay_words(&node, &error)
-                ),
-            ),
-        };
-    }
-    let local = match ctx.signer.app_installed(installation, state).await {
-        Ok(id) => return see_other(&format!("{PAGE_PATH}?connected={id}")),
-        Err(why) => why,
+    let connected = |node: String, answer: Value| {
+        see_other(&page_for(
+            &Target::Linked(node),
+            &format!("connected={}", answer["binding"].as_str().unwrap_or("")),
+        ))
     };
-    let mut nodes: Vec<String> = index.apps.iter().map(|(node, _)| node.clone()).collect();
-    nodes.dedup();
-    for node in nodes {
-        if let (Ok(answer), node) = refresh(node).await {
-            ctx.links.note_installation(installation, &node);
-            return see_other(&page_for(
-                &Target::Linked(node),
-                &format!("connected={}", answer["binding"].as_str().unwrap_or("")),
-            ));
+    let index = ctx.links.index();
+    // A node no longer linked recognises nothing.
+    let indexed = index
+        .installations
+        .get(&installation)
+        .filter(|node| ctx.links.names().contains(node))
+        .cloned();
+    let stale = index.installations.contains_key(&installation);
+    let mut unreached = None;
+    if let Some(node) = indexed.clone() {
+        match refresh(node).await {
+            (Ok(answer), node) => return connected(node, answer),
+            (Err(error), node) if not_reached(&error) => unreached = Some((node, error)),
+            (Err(_), _) => {}
         }
     }
-    message_page(StatusCode::BAD_REQUEST, "Not connected", &local)
+    let local = match ctx.signer.app_installed(installation, state).await {
+        Ok(id) => {
+            if stale && unreached.is_none() {
+                ctx.links.forget_installation(installation);
+            }
+            return see_other(&format!("{PAGE_PATH}?connected={id}"));
+        }
+        Err(why) => why,
+    };
+    let mut nodes: Vec<String> = Vec::new();
+    for (node, _) in &index.apps {
+        if Some(node) != indexed.as_ref() && !nodes.contains(node) {
+            nodes.push(node.clone());
+        }
+    }
+    for node in nodes {
+        if let (Ok(answer), node) = refresh(node).await {
+            if stale && unreached.is_none() {
+                ctx.links.forget_installation(installation);
+            }
+            return connected(node, answer);
+        }
+    }
+    match unreached {
+        Some((node, error)) => message_page(
+            relay_status(&error),
+            "Not brought up to date yet",
+            &format!(
+                "{} GitHub changed the installation of {node}'s App; reload this page once {node} answers and it \
+                 reads the change.",
+                relay_words(&node, &error)
+            ),
+        ),
+        None => {
+            if stale {
+                ctx.links.forget_installation(installation);
+            }
+            message_page(StatusCode::BAD_REQUEST, "Not connected", &local)
+        }
+    }
 }
 
 /// `POST /approve/github/push`: makes a push binding and shows its address and token once.

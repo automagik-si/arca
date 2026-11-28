@@ -1530,7 +1530,7 @@ static VERBS: [Verb; 104] = [
     },
     Verb {
         name: "github_link",
-        summary: "The steps of a GitHub App connection that a linked node's approval host relays from its GitHub page. begin and disconnect run only from an approved github_link proposal: the owner's passkey assertion, checked by this node against the owner keys it trusts for approvals. created (this node converts GitHub's code and keeps the App's key alone) and installed take only the flow that approved begin made, once, within the hour. refresh, flow and bindings read GitHub or this node. Only for operators and a token whose tool list names it.",
+        summary: "The steps of a GitHub App connection that a linked node's approval host relays from its GitHub page. begin and disconnect run only from a github_link proposal approved on this node: the owner's passkey, checked against the owner keys it trusts, or this node's other owner approvals. created (this node converts GitHub's code and keeps the App's key alone) and installed take only the flow that approved begin made, once, within the hour. refresh, flow and bindings read GitHub or this node. Only for operators and a token whose tool list names it.",
         class: VerbClass::L,
         min_scope: Scope::Doctor,
         writes: true,

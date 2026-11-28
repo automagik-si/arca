@@ -77,18 +77,23 @@ fn write_mode(path: &Path, text: &str, mode: u32) {
     fs::set_permissions(path, fs::Permissions::from_mode(mode)).expect("its mode");
 }
 
-/// Beta's `github_link` with its `created` answer held back for a while after the step has run: an answer that comes late.
+/// Beta's `github_link` with the answer of the first call of each listed step held back for a while after the step has
+/// run: an answer that comes late, once.
 struct Late {
     inner: Arc<dyn ToolHandler>,
-    delay: Duration,
+    delays: Mutex<Vec<(&'static str, Duration)>>,
 }
 
 impl ToolHandler for Late {
     fn call(&self, args: Value, caller: &Caller) -> Result<Value, CallError> {
-        let created = args["step"] == "created";
+        let delay = {
+            let mut delays = self.delays.lock().expect("the delays");
+            let at = delays.iter().position(|(step, _)| args["step"] == *step);
+            at.map(|at| delays.remove(at).1)
+        };
         let answer = self.inner.call(args, caller);
-        if created {
-            std::thread::sleep(self.delay);
+        if let Some(delay) = delay {
+            std::thread::sleep(delay);
         }
         answer
     }
@@ -102,8 +107,8 @@ struct Setup {
     tools: Vec<String>,
     /// How long the page waits for a `github_link` step.
     wait: Option<Duration>,
-    /// Beta's `created` answers this late.
-    late: Option<Duration>,
+    /// The first answer of each of these steps comes this late.
+    late: Vec<(&'static str, Duration)>,
     /// Beta runs an Arca from before `github_link`.
     older: bool,
 }
@@ -114,7 +119,7 @@ impl Setup {
             trusted: trusted.iter().map(|origin| origin.to_string()).collect(),
             tools: tools.iter().map(|tool| tool.to_string()).collect(),
             wait: None,
-            late: None,
+            late: Vec::new(),
             older: false,
         }
     }
@@ -225,9 +230,13 @@ impl Rig {
         }
         let _ = slot.set(ActionExecutor::new([(LINK_VERB, Arc::clone(&link))]));
         if !setup.older {
-            let served: Arc<dyn ToolHandler> = match setup.late {
-                Some(delay) => Arc::new(Late { inner: link, delay }),
-                None => link,
+            let served: Arc<dyn ToolHandler> = if setup.late.is_empty() {
+                link
+            } else {
+                Arc::new(Late {
+                    inner: link,
+                    delays: Mutex::new(setup.late),
+                })
             };
             server = server.handle(LINK_VERB, served);
         }
@@ -1088,7 +1097,7 @@ async fn a_late_answer_is_read_back_from_the_linked_node() {
     tokio::time::timeout(BOUND, async {
         let mut setup = Setup::new(&[ORIGIN], &RELAY_TOOLS);
         setup.wait = Some(Duration::from_secs(1));
-        setup.late = Some(Duration::from_secs(4));
+        setup.late = vec![("created", Duration::from_secs(4))];
         let rig = Rig::with(setup).await;
         let state = begin_on_beta(&rig).await;
         let (status, location, body) = created(&rig, &state).await;
@@ -1150,10 +1159,13 @@ async fn githubs_later_returns_without_a_state_reach_the_linked_node() {
         });
         assert_eq!(kept, Some(json!([11])));
 
-        // The index holds no secret, and a page that starts again still knows where the installation is.
+        // The index holds no secret. It names beta's App, but not the installation: this page never saw that
+        // installation made in a flow it relayed. A page that starts again still finds beta through its App.
         let index = fs::read_to_string(rig.scratch.path("alpha/github-linked-apps.json"))
             .expect("the index file");
         assert!(index.contains(NODE) && index.contains(APP_SLUG), "{index}");
+        let written: Value = serde_json::from_str(&index).expect("the index is JSON");
+        assert_eq!(written["installations"], json!({}), "{index}");
         assert_no_secret("the index", &index);
         let again = Links::over(vec![rig.as_token("relay")])
             .kept_in(rig.scratch.path("alpha/github-linked-apps.json"));
@@ -1168,6 +1180,101 @@ async fn githubs_later_returns_without_a_state_reach_the_linked_node() {
         assert_eq!(status, 303, "{body}");
         assert!(location.unwrap().contains(&format!("node={NODE}")));
         assert!(rig.alpha.bindings().is_empty());
+    })
+    .await
+    .expect("the test ends in time");
+}
+
+/// Review 2 of PR 321, L1: beta recorded the installation, but its answer came after the page stopped waiting, and the
+/// first read of its connections came late too. The reload the page asks for finds the connection in use, and never
+/// tells the owner to undo it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_late_install_answer_then_a_reload_finds_the_connection_in_use() {
+    tokio::time::timeout(BOUND, async {
+        let mut setup = Setup::new(&[ORIGIN], &RELAY_TOOLS);
+        setup.wait = Some(Duration::from_secs(1));
+        setup.late = vec![
+            ("installed", Duration::from_secs(3)),
+            ("bindings", Duration::from_secs(3)),
+        ];
+        let rig = Rig::with(setup).await;
+        let state = begin_on_beta(&rig).await;
+        let (status, _, body) = created(&rig, &state).await;
+        assert_eq!(status, 303, "{body}");
+        rig.fake.with(|s| s.installed = true);
+
+        // Neither answer came in time: the page says it does not know yet, and asks for a reload.
+        let (status, _, body) = installed(&rig, &state).await;
+        assert_eq!(status, 502, "{body}");
+        assert!(body.contains("not known"), "{body}");
+        assert!(!body.contains("Not connected"), "{body}");
+        // Beta did record it.
+        assert_eq!(rig.beta.bindings()[0].status, Status::Active);
+
+        // The reload: beta no longer knows the flow (it was finished), so the page reads beta's connections.
+        let (status, location, body) = installed(&rig, &state).await;
+        assert_eq!(status, 303, "{body}");
+        let binding = rig.beta.bindings()[0].id.clone();
+        assert_eq!(
+            location.as_deref(),
+            Some(format!("{}?node={NODE}&connected={binding}", github_page::PAGE_PATH).as_str())
+        );
+        assert!(!body.contains("uninstall"), "{body}");
+
+        // And once more: the same, from the index the relayed flow wrote.
+        let (status, location, _) = installed(&rig, &state).await;
+        assert_eq!(status, 303);
+        assert!(location.unwrap().contains(&format!("connected={binding}")));
+        let index = fs::read_to_string(rig.scratch.path("alpha/github-linked-apps.json"))
+            .expect("the index file");
+        let written: Value = serde_json::from_str(&index).expect("the index is JSON");
+        assert_eq!(
+            written["installations"][INSTALLATION.to_string()],
+            json!(NODE)
+        );
+    })
+    .await
+    .expect("the test ends in time");
+}
+
+/// Review 2 of PR 321, L3: an installation the index names for a node that does not recognise it (here a node no longer
+/// linked) is tried on the other linked nodes that took an App from this page, and the stale entry goes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_return_the_indexed_node_does_not_recognise_reaches_the_other_linked_nodes() {
+    tokio::time::timeout(BOUND, async {
+        let rig = Rig::new(&[ORIGIN], &RELAY_TOOLS).await;
+        let state = begin_on_beta(&rig).await;
+        let (status, _, body) = created(&rig, &state).await;
+        assert_eq!(status, 303, "{body}");
+        rig.fake.with(|s| s.installed = true);
+
+        // A page that starts again, whose index sends the installation to a node that is gone.
+        let file = rig.scratch.path("alpha/github-linked-apps.json");
+        let mut written: Value =
+            serde_json::from_str(&fs::read_to_string(&file).expect("the index file"))
+                .expect("JSON");
+        written["installations"] = json!({ INSTALLATION.to_string(): "gamma" });
+        fs::write(&file, written.to_string()).expect("the index is written");
+        let again = Links::over(vec![rig.as_token("relay")]).kept_in(file.clone());
+        let ctx = Ctx {
+            links: &again,
+            ..rig.ctx()
+        };
+        let q = query(&format!(
+            "installation_id={INSTALLATION}&setup_action=install"
+        ));
+        let (status, location, body) = read(github_page::installed(&ctx, &q).await).await;
+        assert_eq!(status, 303, "{body}");
+        assert!(
+            location
+                .unwrap()
+                .contains(&format!("node={NODE}&connected=gh-"))
+        );
+        assert_eq!(rig.beta.bindings()[0].status, Status::Active);
+        let written: Value =
+            serde_json::from_str(&fs::read_to_string(&file).expect("the index file"))
+                .expect("JSON");
+        assert_eq!(written["installations"], json!({}), "{written}");
     })
     .await
     .expect("the test ends in time");

@@ -7514,18 +7514,30 @@ tap:
 
 GitHub's two returns go to the linked node with the proposal's id, and are taken only for the flow that approved begin
 made: the same proposal, page, organisation and kind, within the hour. The owner taps once. A disconnect is approved
-the same way (`github_link` with `disconnect` and the connection), and a disconnect card always needs the passkey.
-Without a valid owner assertion `github_link` begins and disconnects nothing for any token, the relay token included.
+the same way (`github_link` with `disconnect` and the connection).
+
+Who can approve a `github_link` card on the linked node is who can approve any action proposal there:
+
+- the owner's passkey, with a key the linked node trusts for approvals: the page's button, as above, or the same card
+  on an approval page that lists the linked node's plans;
+- the owner's signed-in session on the linked node ("Approving in your own signed-in session"), for `begin` only: it
+  is never asked about a `disconnect`, which erases, and that card keeps its passkey;
+- the terminal of a static `admin` token on the linked node ("Approving a plan from the terminal"), for both.
+
+No other token approves one: the relay token, the linked node's operator and doctor tokens, and the page's node itself
+begin and disconnect nothing without one of these approvals.
 
 The linked node converts GitHub's code into the App and its key itself, so the key is written on the linked node alone,
 and `github_bindings` there shows the connection. What passes through this node is GitHub's one-hour code, in one
 relayed call's body: never logged, journaled or shown. This node keeps, in memory for an hour, which node each flow
 belongs to, its proposal and the App's name, and in `github-linked-apps.json` in its state directory (no secret in it)
-which linked node holds which App and installation. GitHub's later returns carry no `state` (the owner changed the
-repositories, or finished an install after the hour); this node sends each to the linked node whose App it is
-(`github_link` step `refresh`), which reads the installation again from GitHub with its own App's key and brings its
-runner group to the repositories GitHub names, so a repository the owner removes leaves the pool's group. This node
-sends the browser only to addresses on GitHub's own web host.
+which linked node holds which App, and which installation GitHub made in a flow this node relayed. GitHub's later
+returns carry no `state` (the owner changed the repositories, or finished an install after the hour); this node sends
+each to the linked node the file names for that installation, and when that node does not recognise it, to its own Apps
+and then to each other linked node that holds an App from this page (`github_link` step `refresh`). An installation
+found that way is not written to the file. The node reads the installation again from GitHub with its own App's key
+and brings its runner group to the repositories GitHub names, so a repository the owner removes leaves the pool's
+group. This node sends the browser only to addresses on GitHub's own web host.
 
 What the linked node needs, once:
 
@@ -7551,9 +7563,12 @@ When something goes wrong, the page says so in plain words:
   page says it does not know yet. GitHub holds the new App (the page names it, `Arca runners xxxxxx`); delete it at
   `https://github.com/organizations/<org>/settings/apps` if you do not go on. The page never says nothing is stored
   unless the linked node said so.
-- It does not answer after **Install**: GitHub holds the App and its installation, and the linked node holds its key;
-  whether it recorded the installation is not known yet. Reload the page once the node answers to finish, or uninstall
-  and delete the App at the settings page the page links.
+- Its answer does not come back after **Install**: the page first reads the linked node's connections (step
+  `bindings`). If the installation is in use there, the page says it is connected. If the node cannot be asked yet,
+  GitHub holds the App and its installation and the linked node holds its key; whether it recorded the installation is
+  not known yet. Reload the page once the node answers: the reload reads the node's connections again, and goes on as
+  connected if the node recorded it while the page was not waiting. Only if it did not is the owner told how to
+  uninstall and delete the App.
 - A linked node that took GitHub's code but could not store the App keeps nothing of it (no key without its
   connection) and names the App to delete.
 
