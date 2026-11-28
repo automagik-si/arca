@@ -4,6 +4,8 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 
 ## Unreleased
 
+## 0.40.0 (2026-11-28)
+
 A service whose instance was marked hung reads its journal again once the instance is stopped. When a command inside
 an instance does not answer, Arca marks the instance and runs nothing more in it. The mark was meant to go when Arca saw
 the instance stopped, but nothing cleared it short of restarting the node, so `service_logs` kept reading the console
@@ -40,6 +42,19 @@ reads the state of each running instance with a card instead. The reads run side
 seconds. A create never fails because one of them did not answer: it counts that instance's records, leases and
 devices, goes on, and names it in a new `stateProblem` field of its answer. Stopped instances and instances off the
 service network are never waited for.
+
+- Merge PR 316: a runner job machine gets Arca's own network card and rules, on the pool's own bridge
+- Merge PR 318: hung-mark follow-ups (per-instance clears, the real wait in the answer, a probe that dies ends) and the v0.39.0 template entry that turns the release-list test green
+- Merge PR 313: a hung mark clears on a stop or restart, ages out after five minutes, and service_logs says where its lines came from
+- Merge PR 317: a restart whose outcome is not known says unknown, and no wait error lets a start join it
+- Merge PR 311: a restart that leaves the instance stopped is followed by one start, and a restart still running is waited on, never started into
+- Merge PR 315: runner proof follow-ups (leak check reads everything collected, live-pool guard, measured-on-btrfs wording, budget example)
+- Merge PR 312: the per-job runner hand-over is proven on a real machine
+- Merge PR 305: identical read-only calls in flight are joined
+- Merge PR 304: a create never depends on every instance's state
+- Merge PR 294: refuse service_update over instance snapshots
+- Merge origin/dev (v0.39.0 release) into dev
+- Merge PR 301: bound workspace server lane checks
 
 ## 0.39.0 (2026-11-26)
 
