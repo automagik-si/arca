@@ -7466,13 +7466,29 @@ you stop.
 ### Mode 2: a GitHub App made for you (manifest flow)
 
 The page posts an App manifest to GitHub. The person sees GitHub's own "Create GitHub App" screen with everything
-filled in, presses Create, then picks the repositories on the install screen. The App asks for organisation
-"Self-hosted runners: read and write" and nothing else, has no webhook, and is private to the organisation. GitHub
+filled in, presses Create, then installs it with GitHub's own Install button. The App asks for organisation
+"Self-hosted runners: read and write" and nothing else, so GitHub's install screen offers no repository choice, has no webhook, and is private to the organisation. GitHub
 hands its private key to Arca's callback, which writes it to the store.
 
-After the install, Arca makes a runner group called `Arca runners` open to exactly the repositories picked (or adopts
-the group of that name if one exists). When GitHub's plan has no runner groups, it falls back to the default group and
-says so. Every runner is then minted just in time, one per job: `github_runner_mint` (or the signer's in-process call,
+After the install, Arca makes a runner group called `Arca runners` (or adopts the group of that name if one exists),
+public repositories off, open to:
+
+| The installation lists | Group made by | What Arca does | What the page, `github_bindings` (`runnerGroup.access`) and the audit `sync` line say |
+|---|---|---|---|
+| no repository (the usual case) | Arca | `visibility: all` | `all-private`: "Every private repository of `<org>` may send jobs here. Narrow it in the runner group on GitHub." |
+| some repositories | Arca | `visibility: selected`, exactly those | `selected`: "Only these repositories of `<org>` may send jobs here: …" |
+| anything | not Arca | nothing; the group is left as it is | `unknown`: "Arca did not make the runner group …, so it cannot tell which repositories of `<org>` may send jobs here." |
+
+To narrow an `all-private` group, choose selected repositories in the group's settings on GitHub ("Settings",
+"Actions", "Runner groups"). Arca opens the group to every private repository only when it changes what the group is
+open to (a new group, a repair, or an installation that lost its last repository), so a group you narrowed stays as
+you left it; Arca's words still read `all-private` then, since it does not read the list back.
+When GitHub's plan has no runner groups, it falls back to the default group and says so (`unknown`).
+
+A connection made by Arca 0.45 or older whose installation lists no repository has its group open to no repository, and no
+job reaches it: the page shows it as "connected, open to no repository" and `github_bindings` as `access: none` with a
+`why`. Nothing is asked of the owner: the next sync opens it, which runs when a pool session signs in (the pool's start
+included) and when GitHub's page returns (`refresh`, or the install return). Every runner is then minted just in time, one per job: `github_runner_mint` (or the signer's in-process call,
 `Signer::mint`) returns one ephemeral runner configuration and writes who asked, when, the labels, the runner group and,
 once known, the job. A runner for a scale set is minted only when GitHub says the scale set is in the connection's own
 runner group; another group's scale set is refused (`ScaleSetOutsideGroup`) and the refusal logs the group it is in.
