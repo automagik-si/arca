@@ -7538,25 +7538,33 @@ GitHub sends them through the owner's own browser to `/approve/github/installed`
 without a live flow acts only with the owner's signed-in session on this page. Without it the page shows the GitHub
 page's passkey sign-in and goes on with the return after it; nobody else gets more than that sign-in, whatever
 installation the address names, and no node and no GitHub API is asked. With the session, one installation is read at
-most once a minute ("Read a moment ago" otherwise); a read counts only once a node answered, so the reload after "Not
-brought up to date yet" is read.
+most once a minute ("Read a moment ago" otherwise), and one read at a time: a reload while it runs is told "Being read
+now" and asks nothing. A read counts against the minute only once the update itself answered (or every node said it
+does not hold the installation, or two claim it), so the reload after "Not brought up to date yet" is read.
 
-This node, and each linked node that holds an App from this page, is asked whether one of its Apps holds the
-installation (`github_link` step `claim`: the node asks GitHub with its App's own key and writes nothing). The linked
-node the file names for the installation took it in a flow this page relayed; any other linked node's claim counts only
-when it names an App this page relayed for that node. So a linked node can claim a return only for an App this page
-relayed to it, and a compromised node that claims an installation it does not hold, with its own App, is caught when
-the real holder claims it too:
+Who brings the installation up to date (`github_link` step `refresh`: the node reads the installation again from
+GitHub with its own App's key and brings its runner group to the repositories GitHub names, so a repository the owner
+removes leaves the pool's group):
 
-- **Exactly one claim:** that node reads the installation again from GitHub with its own App's key (step `refresh`) and
-  brings its runner group to the repositories GitHub names, so a repository the owner removes leaves the pool's group.
-- **Two or more:** nothing is done on any of them, and the page names the nodes that claim it ("Claimed by more than
-  one node"). Disconnect it on the node that should not hold it, then reload.
-- **None:** "Not connected".
-- **The node the file names does not answer:** "Not brought up to date yet", and nothing is decided until it does.
+- **An installation the file names.** This page saw GitHub make it for that node's App in a flow it relayed, and GitHub
+  never moves an installation to another App, so that node alone decides. It is asked whether its App still holds it
+  (`github_link` step `claim`: the node asks GitHub with its App's own key and writes nothing). If it does, it is
+  brought up to date. If GitHub tells it the installation is not its App's (404), nobody gets the update ("Not
+  connected"), whatever another node claims.
+- **Any other installation** (an install finished after the hour). This node and every linked node that holds an App
+  from this page are asked at the same time, all within 30 seconds together. A linked node's claim counts only when it
+  names an App this page relayed for that node, so a linked node can claim a return only for an App this page relayed
+  to it. Exactly one claim: that node brings it up to date. Two or more: nothing is done on any of them, and the page
+  names the nodes that claim it ("Claimed by more than one node"); disconnect it on the node that should not hold it,
+  then reload. None: "Not connected". A compromised node that claims, with its own App, an installation no other node
+  holds cannot be told apart here from an honest one: only GitHub knows, and only that App's key may ask it.
+- **A node that does not say.** Only GitHub's 404 means "not this App's". A node that does not answer within the bound,
+  or whose GitHub answers an error, a refusal or its rate limit (5xx, 403, 429), decides nothing: the page says "Not
+  brought up to date yet", names it, and changes nothing (no entry is removed from the file and no other node gets the
+  update) until it does.
 
-An installation found this way is not written to the file. A return of a flow is shown as connected only for the connection that flow made. This node
-sends the browser only to addresses on GitHub's own web host.
+An installation found this way is not written to the file. A return of a flow is shown as connected only for the
+connection that flow made. This node sends the browser only to addresses on GitHub's own web host.
 
 What the linked node needs, once:
 

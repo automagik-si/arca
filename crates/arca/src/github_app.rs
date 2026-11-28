@@ -537,7 +537,8 @@ impl Signer {
     }
 
     /// The App connection whose App holds GitHub's installation `installation_id`, asked of GitHub with each App's own
-    /// key. Nothing is written. `Err` only when GitHub could not be reached.
+    /// key. Nothing is written. Only GitHub's 404 (or a refused App key) means not held; `Err` when GitHub could not be
+    /// reached or could not say (5xx, 403, 429), so nothing is decided on it.
     pub async fn app_owning(&self, installation_id: u64) -> Result<Option<String>, String> {
         let candidates: Vec<String> = self
             .bindings()
@@ -563,8 +564,16 @@ impl Signer {
                 .map_err(|why| {
                     format!("Arca could not reach GitHub to check the installation: {why}.")
                 })?;
-            if answer.ok() {
-                return Ok(Some(id));
+            match answer.status {
+                _ if answer.ok() => return Ok(Some(id)),
+                // Not this App's installation, or an App key GitHub no longer takes (the App is gone): not held.
+                401 | 404 => continue,
+                // GitHub could not say (an error, a refusal or its rate limit): nothing is decided on it.
+                status => {
+                    return Err(format!(
+                        "GitHub could not say whether the installation is this node's (it answered {status})."
+                    ));
+                }
             }
         }
         Ok(None)
