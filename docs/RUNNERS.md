@@ -163,16 +163,20 @@ job machine's network"). A named bridge must be visible from the pool's project 
 sees its own networks only) and have an IPv4 address, its gateway: the pool's access rules are built from it. A
 `network` Incus does not have (a misspelling) stops the pool, and the kernel's log says so. Any `eth0` a profile of
 `profiles` gives is replaced by the card, and a profile or an image machine that gives any other device but the root
-disk (a second card, a proxy, a passed-through device, a disk from a host directory, a host block device or a shared
-volume) makes every create fail. `name` makes the pool's ACL `arca-runner-<name>`, which Incus allows up to 63
+disk and the agent drive (a second card, a proxy, a passed-through device, a disk from a host directory, a host block
+device or a shared volume) makes every create fail. `name` makes the pool's ACL `arca-runner-<name>`, which Incus allows up to 63
 characters.
 Records and logs go to `<stateDir>/runners/<pool>/`.
 
 ## The job machine
 
 1. **Clone.** `POST /1.0/instances` with `type: virtual-machine`, the runner image as source, the class's
-   `limits.cpu`, `limits.memory` and root disk size, and the card below as `eth0`, in the pool's own Incus project, marked
-   `user.arcakernel.runner=<pool>`. On a storage pool whose driver clones volumes (btrfs, ZFS, Ceph RBD) the root disk is
+   `limits.cpu`, `limits.memory` and root disk size, the card below as `eth0` and the agent drive `agent`
+   (`{"type": "disk", "source": "agent:config"}`), in the pool's own Incus project, marked
+   `user.arcakernel.runner=<pool>`. The agent drive carries the Incus agent's config into the guest, so a job machine's
+   agent starts on a host whose QEMU has no 9p file sharing (the RHEL family's qemu-kvm, for one), where Incus has no
+   other way to give it; Incus builds the drive for each machine from the host's agent and that machine's own
+   certificates, so it shares nothing between jobs. On a storage pool whose driver clones volumes (btrfs, ZFS, Ceph RBD) the root disk is
    a copy-on-write clone of the image's volume, and it costs only the blocks the job writes; on another driver
    (`dir`, LVM without a thin pool) it is a full copy. Only btrfs is measured (below, "How it is proven"): the copy and
    the start take one to two and a half seconds, the boot to a ready agent about 25 seconds. ZFS and Ceph RBD are
@@ -238,8 +242,9 @@ for about that long.
 pool's bridge with `security.mac_filtering`, `security.ipv4_filtering` and `security.ipv6_filtering` on (the address
 is the one Incus's DHCP gives it; a bridge without IPv6 drops every IPv6 frame), both default actions `reject`, and
 the pool's network ACL `arca-runner-<pool>` in `security.acls`. The machine is made stopped and read back: one with
-any device but its root disk and that card (another card, a proxy, an InfiniBand or passed-through device, a disk from
-a host directory, a host block device or a shared volume, from a profile or copied from the image machine) is deleted
+any device but its root disk, that card and the agent drive exactly as Arca sends it (another card, a proxy, an
+InfiniBand or passed-through device, a disk from a host directory, a host block device or a shared volume, an agent drive
+with a path or another source, from a profile or copied from the image machine) is deleted
 before it ever starts, and the create fails naming the device. Only then
 is it started. The ACL is made when the pool starts and found and reused at the next start; before each machine its rules
 are built again from the host's addresses as they are then and replaced when they changed (a new host address is
@@ -272,7 +277,7 @@ towards the host; in the forward path Incus turns a reject into a drop, so a ref
 its machines leave the bridge their project's profile gave them. The pool's project must be allowed to make a network
 (an unrestricted project, as a runner project is; with `features.networks` off the bridge lives in `default`), and
 `172.16.0.0/12` must have a free /24. A pool that should stay on a bridge it was on names it in `network`. A profile in
-`profiles` that gives a device other than the root disk or `eth0` must lose it, or every create fails.
+`profiles` that gives a device other than the root disk, `eth0` or `agent` must lose it, or every create fails.
 
 **A runner that refuses its configuration.** A runner that exits with an error before it took a job (its
 configuration was refused, or the image cannot run it) is a failure, as a machine that could not boot is: its record
