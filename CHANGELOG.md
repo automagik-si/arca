@@ -4,6 +4,10 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 
 ## Unreleased
 
+## 0.46.0 (2026-11-28)
+
+- Merge PR 329: a runner group Arca made open to no repository is opened to all private repositories, by itself and with retries
+
 ## 0.45.0 (2026-11-28)
 
 - Merge PR 327: the browser test's skip is seen and a wrong Chrome path fails; an old browser is told why it is refused
