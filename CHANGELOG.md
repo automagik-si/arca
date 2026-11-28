@@ -4,6 +4,10 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 
 ## Unreleased
 
+## 0.45.0 (2026-11-28)
+
+- Merge PR 327: the browser test's skip is seen and a wrong Chrome path fails; an old browser is told why it is refused
+
 ## 0.44.0 (2026-11-28)
 
 - Merge PR 326: the GitHub page's own form posts pass the Origin rule in a real browser, proven by a browser test
