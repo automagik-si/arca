@@ -2093,3 +2093,101 @@ async fn a_reload_while_a_read_runs_is_told_it_is_running() {
     .await
     .expect("the test ends in time");
 }
+
+/// Review 2 of PR 324, D1: GitHub refusing the App's key (401: a clock that is off, or an App GitHub no longer takes) is
+/// not an answer about the installation. Nothing is decided: no "uninstalled or deleted" words, and the index entry
+/// stays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_app_key_decides_nothing() {
+    tokio::time::timeout(BOUND, async {
+        let rig = Rig::new(&[ORIGIN], &RELAY_TOOLS).await;
+        connect_beta(&rig).await;
+        let file = rig.scratch.path("alpha/github-linked-apps.json");
+        let indexed = index_of(&file);
+        rig.fake.with(|s| s.app_deleted = true);
+        let (status, location, body) = installed_later(&rig, "update").await;
+        assert_eq!(status, 502, "{body}");
+        assert_eq!(location, None);
+        assert!(body.contains("Not brought up to date yet"), "{body}");
+        assert!(!body.contains("uninstalled or deleted"), "{body}");
+        assert!(!body.contains("Not connected"), "{body}");
+        assert_eq!(index_of(&file), indexed);
+        assert!(!rig.steps().iter().any(|step| step == "refresh"));
+        assert_eq!(rig.beta.bindings()[0].status, Status::Active);
+    })
+    .await
+    .expect("the test ends in time");
+}
+
+/// A linked node's door that answers every request one byte every 0.3 s, never finishing: each read gets a byte in
+/// time, so only a deadline over the whole call ends it.
+async fn trickling_door(socket: PathBuf) {
+    let listener = tokio::net::UnixListener::bind(&socket).expect("the trickling door binds");
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+                let mut buffer = [0u8; 4096];
+                let _ = stream.read(&mut buffer).await;
+                for byte in b"HTTP/1.1 200 OK\r\nX-Slow: "
+                    .iter()
+                    .chain(std::iter::repeat(&b'a'))
+                {
+                    if stream.write_all(&[*byte]).await.is_err() {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                }
+            });
+        }
+    });
+}
+
+/// Review 2 of PR 324, D2 (probe N): the bound for asking the nodes is a hard deadline. A node that keeps sending a byte
+/// at a time, the node the index names or any other, is cut off at it, decides nothing, and changes nothing after.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_node_that_trickles_its_answer_is_cut_off_at_the_deadline() {
+    tokio::time::timeout(BOUND, async {
+        let rig = Rig::new(&[ORIGIN], &RELAY_TOOLS).await;
+        let socket = rig.scratch.path("trickle.sock");
+        trickling_door(socket.clone()).await;
+        let trickle = LinkedHost {
+            name: "trickle".to_string(),
+            socket,
+            token_file: rig.scratch.path("relay-to-beta.secret"),
+            incus_socket: None,
+            ceph: None,
+        };
+        for installations in [json!({ INSTALLATION.to_string(): "trickle" }), json!({})] {
+            let file = rig.write_index(json!([["trickle", "a1"]]), installations.clone());
+            let links = Links::over(vec![trickle.clone()])
+                .kept_in(file.clone())
+                .with_reconcile_gap(Duration::ZERO)
+                .with_claim_bound(Duration::from_secs(2));
+            let ctx = Ctx {
+                links: &links,
+                ..rig.ctx()
+            };
+            let started = Instant::now();
+            let (status, location, body) =
+                read(github_page::installed(&ctx, &update_query(), true).await).await;
+            let took = started.elapsed();
+            assert!(took < Duration::from_secs(4), "{installations}: {took:?}");
+            assert_eq!(status, 502, "{installations}: {body}");
+            assert_eq!(location, None);
+            assert!(body.contains("trickle"), "{body}");
+            let before = index_of(&file);
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            assert_eq!(
+                index_of(&file),
+                before,
+                "nothing changes after the deadline"
+            );
+        }
+    })
+    .await
+    .expect("the test ends in time");
+}
