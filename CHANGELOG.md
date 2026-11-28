@@ -4,6 +4,11 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 
 ## Unreleased
 
+## 0.42.0 (2026-11-28)
+
+- Merge PR 323: GitHub's return address acts only for the owner's signed-in session, and a connection is matched by its own App
+- Merge PR 322: a late install answer reads the node's real connections, returns fall through to the node that owns them, and the docs name who may approve
+
 ## 0.41.0 (2026-11-28)
 
 - Merge PR 321: GitHub is connected by one prepared link, and a linked node from the owner's own page with the owner's passkey checked on that node
