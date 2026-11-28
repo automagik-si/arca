@@ -4,6 +4,10 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 
 ## Unreleased
 
+## 0.44.0 (2026-11-28)
+
+- Merge PR 326: the GitHub page's own form posts pass the Origin rule in a real browser, proven by a browser test
+
 ## 0.43.0 (2026-11-28)
 
 - Merge PR 324: a state-less GitHub return acts only when exactly one node holds the installation, within one hard deadline, and only GitHub's 404 means not held
