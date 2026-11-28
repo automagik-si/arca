@@ -6,7 +6,8 @@
 //! and refuses one that does not carry this pool's mark, so no other instance of the project, and no instance of
 //! another pool, is ever started, written into or deleted from here.
 //!
-//! What it sends: an instance create (a VM, made stopped and started once its devices are checked), files written into and read from the guest through
+//! What it sends: an instance create (a VM with its root disk, Arca's card and the agent drive, made stopped and started
+//! once its devices are checked), files written into and read from the guest through
 //! the Incus agent, one command started through the agent, a forced stop and a delete. And the pool's one network ACL,
 //! `arca-runner-<pool>` ([`RunnerVms::acl_name`]), which every job machine's card names: created, its rules replaced
 //! (a PATCH) and deleted, requested in the pool's project (Incus keeps it in the project that holds that project's networks), and
@@ -201,6 +202,11 @@ impl RunnerVms {
                 "security.acls.default.egress.action": "reject",
             }),
         );
+        // The agent's config share as a drive. Incus 7.6 offers that share over 9p only, which a QEMU built without
+        // virtio-9p cannot give the guest, so without the drive the agent never starts (Rule 59). The name gives the
+        // guest's `incus_agent` CD-ROM. Incus builds the drive for each machine from the host's agent and that machine's
+        // own certificates, so it shares nothing between jobs.
+        devices.insert(AGENT_DEVICE.to_string(), agent_drive());
         let mut body = json!({
             "name": spec.name,
             "type": "virtual-machine",
@@ -240,10 +246,10 @@ impl RunnerVms {
                 "the created instance does not carry the pool's mark",
             ));
         }
-        // Arca's card is the machine's only way out, and its root disk its only other device: a card, a proxy, a
-        // passed-through device, a disk from a host directory, a host block device or a shared volume, or anything else a
-        // profile or the copied image machine gives would bypass the rules or share state between jobs. Such a machine
-        // is deleted before it ever starts.
+        // Arca's card is the machine's only way out, and its root disk and the agent drive Arca gives it its only other
+        // devices: a card, a proxy, a passed-through device, a disk from a host directory, a host block device or a shared
+        // volume, a changed agent drive, or anything else a profile or the copied image machine gives would bypass the
+        // rules or share state between jobs. Such a machine is deleted before it ever starts.
         let devices = made
             .get("expanded_devices")
             .or_else(|| made.get("devices"))
@@ -261,7 +267,8 @@ impl RunnerVms {
                 let root = kind == "disk"
                     && device.get("path").and_then(Value::as_str) == Some("/")
                     && device.get("source").is_none();
-                (!root && !arcas).then(|| format!("{name} ({kind})"))
+                let agent = name == AGENT_DEVICE && *device == agent_drive();
+                (!root && !arcas && !agent).then(|| format!("{name} ({kind})"))
             })
             .collect();
         if !others.is_empty() {
@@ -280,7 +287,7 @@ impl RunnerVms {
                     uuid: None,
                     owner: None,
                     reason: format!(
-                        "the job machine had a device other than its root disk and Arca's card ({named}, from a profile or the image machine), so it was {} before it started; give the pool profiles and an image without one",
+                        "the job machine had a device other than its root disk, Arca's card and its agent drive ({named}, from a profile or the image machine), so it was {} before it started; give the pool profiles and an image without one",
                         if deleted.is_ok() {
                             "deleted"
                         } else {
@@ -766,6 +773,14 @@ fn operation_id(text: &str) -> bool {
         && text
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
+/// The name of a job machine's agent drive: Incus gives the guest a drive named `agent` as the `incus_agent` CD-ROM.
+const AGENT_DEVICE: &str = "agent";
+
+/// A job machine's agent drive, exactly: the agent's config share, which Incus builds for each machine, and no path.
+fn agent_drive() -> Value {
+    json!({ "type": "disk", "source": "agent:config" })
 }
 
 fn is_fingerprint(text: &str) -> bool {
