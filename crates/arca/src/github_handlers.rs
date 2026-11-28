@@ -11,8 +11,8 @@
 //! for any action: the owner's signed-in session (begin only; a disconnect erases) and a static admin token's terminal.
 //! GitHub's two returns (created, with GitHub's code, and
 //! installed) are taken only for the flow that approved begin made: the same proposal id, page, organisation and kind,
-//! within the hour, and installed once. refresh reads an installation of an App this node holds again from GitHub; flow
-//! and bindings read this node. The node converts GitHub's code into the App and its key itself, so the key is made into a
+//! within the hour, and installed once. refresh reads an installation of an App this node holds again from GitHub; claim
+//! asks GitHub, writing nothing, whether one of this node's Apps holds an installation; flow and bindings read this node. The node converts GitHub's code into the App and its key itself, so the key is made into a
 //! file here and never passes through the page's node.
 
 use std::sync::{Arc, Mutex};
@@ -366,18 +366,19 @@ impl ToolHandler for LinkHandler {
                         code: "NotConnected".to_string(),
                         message: why,
                     })?;
-                let app = self
-                    .signer
-                    .bindings()
-                    .into_iter()
-                    .find(|binding| binding.id == id)
-                    .and_then(|binding| binding.app)
-                    .map(|app| json!({ "id": app.id, "slug": app.slug }));
-                let mut answer = json!({ "binding": id });
-                if let Some(app) = app {
-                    answer["app"] = app;
-                }
-                Ok(answer)
+                Ok(self.claim_words(&id))
+            }
+            // Whether one of this node's Apps holds the installation, asked of GitHub with the App's own key; nothing is
+            // written here or on GitHub.
+            "claim" => {
+                let installation = installation_of(&args)?;
+                let owner = runtime()?
+                    .block_on(self.signer.app_owning(installation))
+                    .map_err(|why| CallError::UntrustedRefused {
+                        code: "GitHubUnreachable".to_string(),
+                        message: why,
+                    })?;
+                Ok(owner.map_or_else(|| json!({}), |id| self.claim_words(&id)))
             }
             "flow" => match self.approved_flow(&args, &origin) {
                 Ok(state) => Ok(self.flow_words(state)),
@@ -385,7 +386,7 @@ impl ToolHandler for LinkHandler {
             },
             "bindings" => Ok(json!({ "bindings": json_of(&self.signer.bindings())? })),
             _ => Err(CallError::Invalid(
-                "step: begin, created, installed, refresh, flow, bindings or disconnect"
+                "step: begin, created, installed, refresh, claim, flow, bindings or disconnect"
                     .to_string(),
             )),
         }
@@ -393,6 +394,22 @@ impl ToolHandler for LinkHandler {
 }
 
 impl LinkHandler {
+    /// The connection `id` and its App, by its id and its name on GitHub.
+    fn claim_words(&self, id: &str) -> Value {
+        let app = self
+            .signer
+            .bindings()
+            .into_iter()
+            .find(|binding| binding.id == id)
+            .and_then(|binding| binding.app)
+            .map(|app| json!({ "id": app.id, "slug": app.slug }));
+        let mut answer = json!({ "binding": id });
+        if let Some(app) = app {
+            answer["app"] = app;
+        }
+        answer
+    }
+
     /// What this node holds of the live flow `state`: whether GitHub handed its App over, the connection it made, its
     /// install screen and the App's settings page.
     fn flow_words(&self, state: &str) -> Value {

@@ -1530,7 +1530,7 @@ static VERBS: [Verb; 104] = [
     },
     Verb {
         name: "github_link",
-        summary: "The steps of a GitHub App connection that a linked node's approval host relays from its GitHub page. begin and disconnect run only from a github_link proposal approved on this node: the owner's passkey, checked against the owner keys it trusts, or this node's other owner approvals. created (this node converts GitHub's code and keeps the App's key alone) and installed take only the flow that approved begin made, once, within the hour. refresh, flow and bindings read GitHub or this node. Only for operators and a token whose tool list names it.",
+        summary: "The steps of a GitHub App connection that a linked node's approval host relays from its GitHub page. begin and disconnect run only from a github_link proposal approved on this node: the owner's passkey, checked against the owner keys it trusts, or this node's other owner approvals. created (this node converts GitHub's code and keeps the App's key alone) and installed take only the flow that approved begin made, once, within the hour. refresh brings an installation of its App up to date from GitHub; claim, flow and bindings only read. Only for operators and a token whose tool list names it.",
         class: VerbClass::L,
         min_scope: Scope::Doctor,
         writes: true,
@@ -2351,7 +2351,7 @@ fn github_link_params() -> Value {
         (
             "step",
             true,
-            json!({ "description": "begin and disconnect (from an approved proposal only), created and installed (the flow an approved begin made), refresh (an installation of an App this node holds, read again from GitHub), flow and bindings (reads).", "enum": ["begin", "created", "installed", "refresh", "flow", "bindings", "disconnect"], "type": "string" }),
+            json!({ "description": "begin and disconnect (from an approved proposal only), created and installed (the flow an approved begin made), refresh (an installation of an App this node holds, read again from GitHub), claim (whether one of this node's Apps holds an installation, writing nothing), flow and bindings (reads).", "enum": ["begin", "created", "installed", "refresh", "claim", "flow", "bindings", "disconnect"], "type": "string" }),
         ),
         (
             "origin",
@@ -2391,7 +2391,7 @@ fn github_link_params() -> Value {
         (
             "installationId",
             false,
-            json!({ "description": "installed and refresh: the installation GitHub's return named.", "minimum": 0, "type": "integer" }),
+            json!({ "description": "installed, refresh and claim: the installation GitHub's return named.", "minimum": 0, "type": "integer" }),
         ),
         ("binding", false, github_binding_schema()),
         ("approval", false, approval_schema()),

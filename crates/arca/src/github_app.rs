@@ -536,6 +536,40 @@ impl Signer {
             .ok_or_else(|| "the connection is gone".to_string())
     }
 
+    /// The App connection whose App holds GitHub's installation `installation_id`, asked of GitHub with each App's own
+    /// key. Nothing is written. `Err` only when GitHub could not be reached.
+    pub async fn app_owning(&self, installation_id: u64) -> Result<Option<String>, String> {
+        let candidates: Vec<String> = self
+            .bindings()
+            .into_iter()
+            .filter(|binding| binding.mode == Mode::App && binding.status != Status::Revoked)
+            .map(|binding| binding.id)
+            .collect();
+        for id in candidates {
+            let Ok(jwt) = self.app_jwt(&id) else { continue };
+            let answer = self
+                .inner
+                .http
+                .send(
+                    Method::GET,
+                    &self
+                        .inner
+                        .http
+                        .api(&format!("/app/installations/{installation_id}")),
+                    Auth::Bearer(&jwt),
+                    None,
+                )
+                .await
+                .map_err(|why| {
+                    format!("Arca could not reach GitHub to check the installation: {why}.")
+                })?;
+            if answer.ok() {
+                return Ok(Some(id));
+            }
+        }
+        Ok(None)
+    }
+
     /// GitHub's return after the person installed (or changed) the App: checks the installation with the App's own JWT,
     /// records it, and puts the runner group in place. Answers the binding's id; `Err` is in words for the person.
     pub async fn app_installed(
