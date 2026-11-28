@@ -2191,3 +2191,37 @@ async fn a_node_that_trickles_its_answer_is_cut_off_at_the_deadline() {
     .await
     .expect("the test ends in time");
 }
+
+/// Review 2 of PR 324, D2 (probe N): one relayed call has one deadline for its whole reply, not one per read, so a node
+/// that keeps sending a byte at a time does not hold the call (and its thread) past it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_relayed_call_to_a_trickling_node_ends_at_its_deadline() {
+    tokio::time::timeout(BOUND, async {
+        let rig = Rig::new(&[ORIGIN], &RELAY_TOOLS).await;
+        let socket = rig.scratch.path("trickle.sock");
+        trickling_door(socket.clone()).await;
+        let trickle = LinkedHost {
+            name: "trickle".to_string(),
+            socket,
+            token_file: rig.scratch.path("relay-to-beta.secret"),
+            incus_socket: None,
+            ceph: None,
+        };
+        let started = Instant::now();
+        let answer = tokio::task::spawn_blocking(move || {
+            linked::call_within(
+                &trickle,
+                LINK_VERB,
+                json!({ "step": "bindings" }),
+                Duration::from_secs(2),
+            )
+        })
+        .await
+        .expect("the call ends");
+        let took = started.elapsed();
+        assert!(matches!(answer, Err(RelayError::Unreachable)), "{answer:?}");
+        assert!(took < Duration::from_secs(4), "{took:?}");
+    })
+    .await
+    .expect("the test ends in time");
+}
