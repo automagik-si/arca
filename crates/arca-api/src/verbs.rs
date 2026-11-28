@@ -2414,6 +2414,7 @@ fn github_link_result() -> Value {
             "app",
             false,
             result(vec![
+                ("id", false, at_least(0)),
                 ("slug", false, string()),
                 ("settingsUrl", false, string()),
             ]),

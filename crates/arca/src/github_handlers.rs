@@ -366,7 +366,18 @@ impl ToolHandler for LinkHandler {
                         code: "NotConnected".to_string(),
                         message: why,
                     })?;
-                Ok(json!({ "binding": id }))
+                let app = self
+                    .signer
+                    .bindings()
+                    .into_iter()
+                    .find(|binding| binding.id == id)
+                    .and_then(|binding| binding.app)
+                    .map(|app| json!({ "id": app.id, "slug": app.slug }));
+                let mut answer = json!({ "binding": id });
+                if let Some(app) = app {
+                    answer["app"] = app;
+                }
+                Ok(answer)
             }
             "flow" => match self.approved_flow(&args, &origin) {
                 Ok(state) => Ok(self.flow_words(state)),

@@ -138,6 +138,8 @@ struct LinkedFlow {
     created_at: u64,
     /// The App's name on GitHub and its settings page, once the node took it.
     app: Option<(String, String)>,
+    /// The connection the node made for the flow's App, once it took it.
+    binding: Option<String>,
 }
 
 impl LinkedFlow {
@@ -174,7 +176,14 @@ pub struct Links {
     wait: Duration,
     index: Mutex<Index>,
     index_file: Option<PathBuf>,
+    /// When each installation's state-less return was last read, in epoch milliseconds.
+    reconciled: Mutex<HashMap<u64, u64>>,
+    /// How long after one state-less return of an installation the next is read.
+    reconcile_gap: Duration,
 }
+
+/// How often a state-less return of one installation is read: each read costs its node several GitHub calls.
+pub const RECONCILE_GAP: Duration = Duration::from_secs(60);
 
 impl Links {
     /// No linked node.
@@ -194,7 +203,32 @@ impl Links {
             wait: crate::linked::timeout_for(LINK_VERB),
             index: Mutex::new(Index::default()),
             index_file: None,
+            reconciled: Mutex::new(HashMap::new()),
+            reconcile_gap: RECONCILE_GAP,
         }
+    }
+
+    /// The same, reading a state-less return of one installation at most once per `gap`.
+    pub fn with_reconcile_gap(mut self, gap: Duration) -> Self {
+        self.reconcile_gap = gap;
+        self
+    }
+
+    /// Whether a state-less return of `installation` may be read now; if so, the read is noted.
+    fn may_reconcile(&self, installation: u64, now: u64) -> bool {
+        let gap = self.reconcile_gap.as_millis() as u64;
+        let mut reconciled = self
+            .reconciled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reconciled.retain(|_, at| now.saturating_sub(*at) < gap);
+        if reconciled.contains_key(&installation) {
+            return false;
+        }
+        if gap > 0 {
+            reconciled.insert(installation, now);
+        }
+        true
     }
 
     /// The same, with each relayed `github_link` step waiting up to `wait`.
@@ -1121,6 +1155,7 @@ pub async fn app_start(ctx: &Ctx<'_>, form: &HashMap<String, String>) -> Respons
             app_name: text("appName"),
             created_at: ctx.signer.now(),
             app: None,
+            binding: None,
         },
     );
     manifest_page(ctx, &target, &account, repositories, &action_url, &manifest)
@@ -1238,6 +1273,10 @@ fn took(ctx: &Ctx<'_>, flow: &LinkedFlow, state: &str, answer: &Value) -> Respon
         let app = (slug.to_string(), settings.to_string());
         ctx.links.update(state, |flow| flow.app = Some(app));
     }
+    if let Some(binding) = answer["binding"].as_str().filter(|id| !id.is_empty()) {
+        let binding = binding.to_string();
+        ctx.links.update(state, |flow| flow.binding = Some(binding));
+    }
     if !on_github(ctx, &install) {
         return message_page(
             StatusCode::BAD_GATEWAY,
@@ -1315,9 +1354,14 @@ async fn created_unknown(
 }
 
 /// `GET /approve/github/installed`: GitHub's return after Install (or a change of repositories). A flow this page began on
-/// a linked node goes to that node. A return with no flow (repositories changed, or an install finished after the hour)
-/// goes to the node the index names for its installation, or to this node, or to the linked node whose App it is.
-pub async fn installed(ctx: &Ctx<'_>, query: &HashMap<String, String>) -> Response {
+/// a linked node goes to that node. A return with no live flow (repositories changed, or an install finished after the
+/// hour) acts only when `signed_in` (the owner's session on this page), at most once a minute per installation, and goes
+/// to the node the index names for its installation, or to this node, or to the linked node whose App it is.
+pub async fn installed(
+    ctx: &Ctx<'_>,
+    query: &HashMap<String, String>,
+    signed_in: bool,
+) -> Response {
     let Ok(installation) = field(query, "installation_id").parse::<u64>() else {
         return message_page(
             StatusCode::BAD_REQUEST,
@@ -1329,6 +1373,21 @@ pub async fn installed(ctx: &Ctx<'_>, query: &HashMap<String, String>) -> Respon
     let Some((state, flow)) =
         state.and_then(|state| Some((state, ctx.links.flow(state, ctx.signer.now())?)))
     else {
+        // No live flow of this page's: the return address is public, so it acts only for the owner, signed in on this
+        // page, and reads one installation at most once a minute.
+        if !local_flow(ctx, state) {
+            if !signed_in {
+                return sign_in_first();
+            }
+            if !ctx.links.may_reconcile(installation, ctx.signer.now()) {
+                return message_page(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "Read a moment ago",
+                    "GitHub's change to this installation was read less than a minute ago. Reload this page in a \
+                     minute to read it again.",
+                );
+            }
+        }
         return installed_later(ctx, installation, state).await;
     };
     let node = &flow.node;
@@ -1352,7 +1411,7 @@ pub async fn installed(ctx: &Ctx<'_>, query: &HashMap<String, String>) -> Respon
         Ok(answer) => answer["binding"].as_str().map(str::to_string).ok_or(None),
         // No answer, or the node no longer knows the flow (an answer that came late finished it): what the node holds
         // is read before the page says anything.
-        Err(error) => connection_for(ctx, node, installation)
+        Err(error) => connection_for(ctx, &flow, installation)
             .await
             .ok_or(Some(error)),
     };
@@ -1393,20 +1452,53 @@ pub async fn installed(ctx: &Ctx<'_>, query: &HashMap<String, String>) -> Respon
 }
 
 /// The connection `node` holds for GitHub's installation `installation`, once it is in use: read from the node itself.
-async fn connection_for(ctx: &Ctx<'_>, node: &str, installation: u64) -> Option<String> {
+/// Whether `state` names a live App flow this node began for itself: its own return, which its state binds.
+fn local_flow(ctx: &Ctx<'_>, state: Option<&str>) -> bool {
+    state.is_some_and(|state| ctx.signer.app_flow(state).is_some())
+}
+
+/// Whether GitHub's return `query` belongs to a live flow this page began, on this node or a linked one: the only
+/// returns that act without the owner's signed-in session.
+pub fn live_return(ctx: &Ctx<'_>, query: &HashMap<String, String>) -> bool {
+    let state = Some(field(query, "state")).filter(|state| !state.is_empty());
+    local_flow(ctx, state)
+        || state.is_some_and(|state| ctx.links.flow(state, ctx.signer.now()).is_some())
+}
+
+/// The answer to a return with no live flow and no signed-in session: the same for every installation, naming none.
+fn sign_in_first() -> Response {
+    message_page(
+        StatusCode::UNAUTHORIZED,
+        "Sign in to finish",
+        "Sign in on Arca's GitHub page with your passkey, then open GitHub's link again.",
+    )
+}
+
+/// The flow's own connection, the one its node made for the flow's App, when that connection is in use with GitHub's
+/// installation `installation`: read from the node itself. Another connection with that installation is not this flow's.
+async fn connection_for(ctx: &Ctx<'_>, flow: &LinkedFlow, installation: u64) -> Option<String> {
+    let own = flow.binding.as_deref()?;
     let answer = ctx
         .links
-        .link(node, json!({ "step": "bindings", "origin": ctx.origin }))
+        .link(
+            &flow.node,
+            json!({ "step": "bindings", "origin": ctx.origin }),
+        )
         .await
         .ok()?;
     answer["bindings"]
         .as_array()?
         .iter()
         .find(|binding| {
-            binding["installation"]["id"] == json!(installation) && binding["status"] == "active"
+            binding["id"] == own
+                && binding["installation"]["id"] == json!(installation)
+                && binding["status"] == "active"
+                && flow
+                    .app
+                    .as_ref()
+                    .is_none_or(|(slug, _)| binding["app"]["slug"] == slug.as_str())
         })
-        .and_then(|binding| binding["id"].as_str())
-        .map(str::to_string)
+        .map(|_| own.to_string())
 }
 
 /// GitHub's return with no flow this page began: the linked node the index names for the installation reads it again
@@ -1456,7 +1548,14 @@ async fn installed_later(ctx: &Ctx<'_>, installation: u64, state: Option<&str>) 
         }
     }
     for node in nodes {
-        if let (Ok(answer), node) = refresh(node).await {
+        // A node the index does not name for this installation counts only when it names an App this page relayed for
+        // it: no node takes another node's returns by claiming them.
+        if let (Ok(answer), node) = refresh(node).await
+            && answer
+                .pointer("/app/slug")
+                .and_then(Value::as_str)
+                .is_some_and(|slug| index.apps.contains(&(node.clone(), slug.to_string())))
+        {
             if stale && unreached.is_none() {
                 ctx.links.forget_installation(installation);
             }
