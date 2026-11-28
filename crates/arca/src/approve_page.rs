@@ -592,36 +592,72 @@ fn page_closed(why: String) -> Response {
         .into_response()
 }
 
+/// The GitHub page's forms that a browser posts itself, as a navigation, rather than the page's script by `fetch`.
+const NAVIGATION_FORMS: [&str; 5] = [
+    crate::github_page::APP_PATH,
+    crate::github_page::PUSH_PATH,
+    crate::github_page::DEVICE_PATH,
+    crate::github_page::DISCONNECT_PATH,
+    crate::github_page::CONNECTIONS_PATH,
+];
+
 /// The page's Origin rule, before any body is read: a POST needs the exact configured Origin; a GET needs none or the exact
 /// one. The canvas chat POST also accepts a browser's `Sec-Fetch-Site: same-origin` when no Origin is sent. A present but
 /// non-text Origin is never treated as missing, and a foreign Origin is always 403.
+///
+/// One more POST passes, on the GitHub page's own forms ([`NAVIGATION_FORMS`]) only: `Origin: null` together with
+/// `Sec-Fetch-Site: same-origin`, `Sec-Fetch-Mode: navigate` and `Sec-Fetch-Dest: document` (issue 325). Every page here
+/// sends `Referrer-Policy: no-referrer`, and under it a browser sends `Origin: null` on a form post even to its own origin,
+/// so the page's own forms were refused. The browser sets the Fetch Metadata headers and no page script can: a page of
+/// another origin, of the same site on another port, a sandboxed frame and a `data:` or `file:` page (an opaque origin)
+/// are `same-site` or `cross-site`, a redirect through another origin makes the post `cross-site`, and a framed form is
+/// not a `document`. A browser that sends no Fetch Metadata is still refused. The session cookie stays `SameSite=Strict`,
+/// and a linked node's form still carries the owner's passkey approval, which that node checks.
 async fn origin_rule(
     State(state): State<Arc<PageState>>,
     request: Request,
     next: Next,
 ) -> Response {
-    let origin = request
-        .headers()
-        .get(header::ORIGIN)
-        .map(|value| value.to_str().ok());
+    let headers = request.headers();
+    let origin = headers.get(header::ORIGIN).map(|value| value.to_str().ok());
     let origin_present = origin.is_some();
     let origin_valid = origin.is_some_and(|value| value.is_some_and(|value| value == state.origin));
-    let same_origin_fetch = request
-        .headers()
-        .get("sec-fetch-site")
-        .and_then(|value| value.to_str().ok())
-        == Some("same-origin");
+    let fetch = |name: &str| headers.get(name).and_then(|value| value.to_str().ok());
+    let same_origin_fetch = fetch("sec-fetch-site") == Some("same-origin");
     let path = request.uri().path();
-    let chat = path.strip_suffix('/').unwrap_or(path) == canvas::CHAT_PATH;
+    let path = path.strip_suffix('/').unwrap_or(path);
+    let chat = path == canvas::CHAT_PATH;
+    let page_form = state.github.is_some()
+        && NAVIGATION_FORMS.contains(&path)
+        && origin == Some(Some("null"))
+        && same_origin_fetch
+        && fetch("sec-fetch-mode") == Some("navigate")
+        && fetch("sec-fetch-dest") == Some("document");
     let allowed = if request.method() == Method::POST {
-        origin_valid || (chat && !origin_present && same_origin_fetch)
+        origin_valid || (chat && !origin_present && same_origin_fetch) || page_form
     } else {
         origin_valid || !origin_present
     };
     if !allowed {
-        return StatusCode::FORBIDDEN.into_response();
+        return not_from_this_page();
     }
     next.run(request).await
+}
+
+/// The Origin rule's refusal: what the person does next, and nothing of the rule.
+fn not_from_this_page() -> Response {
+    let mut response = (
+        StatusCode::FORBIDDEN,
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Arca</title></head>\
+         <body><p>This request did not come from this page. Open the page again and press the button there.</p></body></html>",
+    )
+        .into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    response
 }
 
 /// Headers on every `/approve` response, including the existing approval page, refusals and the proxied canvas. No response,

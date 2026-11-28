@@ -3013,6 +3013,9 @@ fn canvas_chat_needs_a_session_before_any_upstream_connect() {
     assert!(rig.upstream.chat_requests().is_empty());
 }
 
+/// The Origin rule's refusal, whole: what the person does next, and nothing of the rule (issue 325).
+const NOT_FROM_THIS_PAGE: &str = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Arca</title></head><body><p>This request did not come from this page. Open the page again and press the button there.</p></body></html>";
+
 #[test]
 fn canvas_chat_refuses_a_foreign_origin_before_any_upstream_connect() {
     let (rig, _) = Rig::new("canvas-chat-csrf", true);
@@ -3034,7 +3037,11 @@ fn canvas_chat_refuses_a_foreign_origin_before_any_upstream_connect() {
             &[],
         );
         assert_eq!(status, 403, "{label} is refused");
-        assert!(response.is_empty(), "{label} returns no bytes");
+        assert_eq!(
+            String::from_utf8_lossy(&response),
+            NOT_FROM_THIS_PAGE,
+            "{label} returns the Origin rule's plain page and no upstream bytes"
+        );
         assert!(
             header_value(&head, "content-security-policy").is_some(),
             "{label} keeps the canvas headers"
@@ -3562,7 +3569,7 @@ fn canvas_chat_invalid_origin_is_never_treated_as_missing() {
     request.extend_from_slice(&body);
     let (status, head, response) = rig.raw_request_response(&request);
     assert_eq!(status, 403, "a non-text Origin is not missing");
-    assert!(response.is_empty());
+    assert_eq!(String::from_utf8_lossy(&response), NOT_FROM_THIS_PAGE);
     assert!(header_value(&head, "content-security-policy").is_some());
 
     let mut get =

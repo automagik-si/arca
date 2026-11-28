@@ -9,6 +9,8 @@
 //! proposal whose passkey assertion it checks itself; it converts GitHub's code itself, so the App's key is made into a
 //! file on beta alone.
 
+#[path = "github/browser.rs"]
+mod browser;
 mod common;
 #[path = "github/fake.rs"]
 mod fake;
@@ -42,8 +44,12 @@ use arca_mcp::{CallError, Caller, Server, TokenStore, ToolHandler, mint_with_too
 use axum::response::Response;
 use serde_json::{Value, json};
 
+use base64::Engine as _;
+use browser::Chrome;
 use common::{NAMESPACE, Scratch, kernel_on_host, start_fake};
-use fake::{APP_SLUG, CLIENT_ID, CLIENT_SECRET, Fake, INSTALLATION, MANIFEST_CODE, SECRETS};
+use fake::{
+    APP_SLUG, CLIENT_ID, CLIENT_SECRET, Fake, INSTALLATION, MANIFEST_CODE, SECRETS, USER_CODE,
+};
 use webauthn::{Assert, ORIGIN, SoftPasskey, passkey_approval};
 
 /// The page host's own name.
@@ -122,6 +128,8 @@ struct Setup {
     /// The page reads a state-less return of one installation at most once a minute, as in production; otherwise the
     /// rig lets every return through.
     throttle: bool,
+    /// The page origin the owner's passkey is for, at `localhost` (a real browser's page); otherwise the fixture's.
+    owner_origin: Option<String>,
 }
 
 impl Setup {
@@ -133,6 +141,7 @@ impl Setup {
             late: Vec::new(),
             older: false,
             throttle: false,
+            owner_origin: None,
         }
     }
 }
@@ -176,7 +185,11 @@ impl Rig {
         let beta = Signer::open(&beta_state, fake.endpoints(), clock()).expect("beta's signer");
 
         // Beta's kernel: no passkey of its own; it keeps alpha's owner passkey, synced, for the trusted page origins.
-        let owner = SoftPasskey::from_seed(1);
+        let mut owner = SoftPasskey::from_seed(1);
+        if let Some(origin) = &setup.owner_origin {
+            owner.rp_id = "localhost".to_string();
+            owner.origin = origin.clone();
+        }
         let peer = PeerPasskeys::new(
             incus_scratch.path("peer-passkeys"),
             HERE.to_string(),
@@ -369,6 +382,62 @@ impl Rig {
         );
         form.insert("approval".to_string(), passkey_approval(&statement, &proof));
         form
+    }
+}
+
+/// Alpha's page as the node serves it at `origin`, with alpha's kernel trusting the owner's passkey; its kernel's scratch
+/// directory and fake Incus live as long as it does.
+struct AlphaPage {
+    page: Page,
+    _scratch: Scratch,
+    _incus: arca_incus::FakeIncus,
+}
+
+impl Rig {
+    fn alpha_page(&self, origin: &str) -> AlphaPage {
+        let scratch = Scratch::new("ghlink-alpha-kernel");
+        let passkeys = PasskeyVerifier::new(
+            arca_approval::parse_passkeys(format!("{}\n", self.owner.line(NAMESPACE)).as_bytes())
+                .expect("the owner passkey"),
+            FileSignCounts::open(&scratch.path("alpha-counts.jsonl")).expect("counts"),
+        );
+        let verifier = ApprovalVerifier::new(
+            "alpha.example".to_string(),
+            OwnerKeys::new(SshSigVerifier::new(Vec::new()), passkeys),
+            FileNonces::open(&scratch.path("alpha-nonces.jsonl")).expect("nonces"),
+        );
+        let incus = start_fake(&scratch);
+        let kernel = Arc::new(Mutex::new(
+            kernel_on_host(&scratch, &incus, verifier, now_ms(), None, "alpha.example")
+                .expect("alpha's kernel opens"),
+        ));
+        let page = Page::new(
+            origin.to_string(),
+            kernel,
+            clock(),
+            self.scratch.path("alpha"),
+            Arc::new(NoDisplay),
+        )
+        .with_github(self.alpha.clone())
+        .with_linked_hosts(vec![self.as_token("relay")]);
+        AlphaPage {
+            page,
+            _scratch: scratch,
+            _incus: incus,
+        }
+    }
+}
+
+/// Serves `router` on the unix socket `socket`, once it answers.
+async fn serve_on(router: axum::Router, socket: &Path) {
+    let served = socket.to_path_buf();
+    tokio::spawn(async move {
+        let _ = serve_unix(router, &served).await;
+    });
+    let until = Instant::now() + Duration::from_secs(5);
+    while !socket.exists() {
+        assert!(Instant::now() < until, "the page started");
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 
@@ -1678,41 +1747,9 @@ async fn the_return_address_signs_in_first_through_the_router_and_goes_on_after(
         let binding = connect_beta(&rig).await;
 
         // Alpha's page as the node serves it, with alpha's kernel trusting the owner's passkey.
-        let kernel_scratch = Scratch::new("ghlink-alpha-kernel");
-        let passkeys = PasskeyVerifier::new(
-            arca_approval::parse_passkeys(format!("{}\n", rig.owner.line(NAMESPACE)).as_bytes()).expect("the owner passkey"),
-            FileSignCounts::open(&kernel_scratch.path("alpha-counts.jsonl")).expect("counts"),
-        );
-        let verifier = ApprovalVerifier::new(
-            "alpha.example".to_string(),
-            OwnerKeys::new(SshSigVerifier::new(Vec::new()), passkeys),
-            FileNonces::open(&kernel_scratch.path("alpha-nonces.jsonl")).expect("nonces"),
-        );
-        let incus = start_fake(&kernel_scratch);
-        let kernel = Arc::new(Mutex::new(
-            kernel_on_host(&kernel_scratch, &incus, verifier, now_ms(), None, "alpha.example")
-                .expect("alpha's kernel opens"),
-        ));
-        let page = Page::new(
-            ORIGIN.to_string(),
-            kernel,
-            clock(),
-            rig.scratch.path("alpha"),
-            Arc::new(NoDisplay),
-        )
-        .with_github(rig.alpha.clone())
-        .with_linked_hosts(vec![rig.as_token("relay")]);
-        let router = page.router(false);
+        let alpha = rig.alpha_page(ORIGIN);
         let socket = rig.scratch.path("alpha-page.sock");
-        let served = socket.clone();
-        tokio::spawn(async move {
-            let _ = serve_unix(router, &served).await;
-        });
-        let until = Instant::now() + Duration::from_secs(5);
-        while !socket.exists() {
-            assert!(Instant::now() < until, "alpha's page started");
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        serve_on(alpha.page.router(false), &socket).await;
         let call = |method: &'static str, path: String, headers: Vec<(&'static str, String)>, body: Vec<u8>| {
             let socket = socket.clone();
             tokio::task::spawn_blocking(move || {
@@ -2224,4 +2261,546 @@ async fn a_relayed_call_to_a_trickling_node_ends_at_its_deadline() {
     })
     .await
     .expect("the test ends in time");
+}
+
+// ---- Issue 325: the page's own forms, as a browser posts them -----------------------------------------------------
+
+/// The Origin rule's answer to a request that did not come from the page.
+const NOT_FROM_PAGE: &str =
+    "This request did not come from this page. Open the page again and press the button there.";
+
+/// The GitHub page's forms a browser posts as a navigation, not by the page's script.
+const PAGE_FORMS: [&str; 5] = [
+    github_page::APP_PATH,
+    github_page::PUSH_PATH,
+    github_page::DEVICE_PATH,
+    github_page::DISCONNECT_PATH,
+    github_page::CONNECTIONS_PATH,
+];
+
+/// What Chrome sends with a form post from a page on its own origin under the page's `Referrer-Policy: no-referrer`:
+/// `Origin: null`, with Fetch Metadata saying the post came from the same origin as a top-level navigation.
+const FORM_POST: [(&str, &str); 5] = [
+    ("Content-Type", "application/x-www-form-urlencoded"),
+    ("Origin", "null"),
+    ("Sec-Fetch-Site", "same-origin"),
+    ("Sec-Fetch-Mode", "navigate"),
+    ("Sec-Fetch-Dest", "document"),
+];
+
+/// Headers to change in [`FORM_POST`]: each replaced by its value or, for `None`, left out.
+type HeaderChanges = &'static [(&'static str, Option<&'static str>)];
+
+/// [`FORM_POST`] with the session `cookie`, each header of `changes` replaced by its value or, for `None`, left out.
+fn form_post(cookie: &str, changes: &[(&str, Option<&str>)]) -> Vec<(String, String)> {
+    let mut headers: Vec<(String, String)> = FORM_POST
+        .iter()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect();
+    for (name, value) in changes {
+        headers.retain(|(have, _)| have != name);
+        if let Some(value) = value {
+            headers.push((name.to_string(), value.to_string()));
+        }
+    }
+    headers.push(("Cookie".to_string(), cookie.to_string()));
+    headers
+}
+
+/// One request to the page on `socket`, off the runtime's threads: the status, the head and the body.
+async fn call_page(
+    socket: &Path,
+    method: &'static str,
+    path: &str,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+) -> (u16, String, String) {
+    let socket = socket.to_path_buf();
+    let path = path.to_string();
+    tokio::task::spawn_blocking(move || {
+        let headers: Vec<(&str, &str)> = headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+        let (status, head, body) = http(&socket, method, &path, &headers, &body);
+        (status, head, String::from_utf8_lossy(&body).into_owned())
+    })
+    .await
+    .expect("the request ends")
+}
+
+/// Signs in on the page on `socket` with the owner's passkey, as the sign-in page's script does: the session cookie.
+async fn sign_in(rig: &Rig, socket: &Path) -> String {
+    let headers = vec![
+        ("Content-Type".to_string(), "application/json".to_string()),
+        ("Origin".to_string(), ORIGIN.to_string()),
+    ];
+    let path = github_page::PAGE_PATH;
+    let (status, _, body) = call_page(socket, "POST", path, headers.clone(), b"{}".to_vec()).await;
+    assert_eq!(status, 200, "{body}");
+    let statement = serde_json::from_str::<Value>(&body).expect("JSON")["statement"]
+        .as_str()
+        .expect("a statement")
+        .to_string();
+    let signed = json!({
+        "statement": statement,
+        "proof": rig.owner.proof_value(&Assert::over(NAMESPACE, statement.as_bytes())),
+    })
+    .to_string()
+    .into_bytes();
+    let (status, head, body) = call_page(socket, "POST", path, headers, signed).await;
+    assert_eq!(status, 200, "{body}");
+    head_value(&head, "set-cookie")
+        .expect("a session cookie")
+        .split(';')
+        .next()
+        .expect("its pair")
+        .to_string()
+}
+
+/// Issue 325: a browser posts the page's own forms with `Origin: null`, because the page sends no referrer. Such a post
+/// passes the Origin rule only on those forms' paths, and only when the browser says it is a top-level navigation from
+/// the page's own origin (`Sec-Fetch-Site`, `-Mode` and `-Dest`, which no page script can set). Any other post, any other
+/// path, a browser without Fetch Metadata and a foreign or malformed Origin get the rule's plain page, and nothing is made.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_form_post_with_a_null_origin_passes_only_from_this_page_and_only_on_its_own_forms() {
+    tokio::time::timeout(BOUND, async {
+        let rig = Rig::new(&[ORIGIN], &RELAY_TOOLS).await;
+        let alpha = rig.alpha_page(ORIGIN);
+        let socket = rig.scratch.path("alpha-page.sock");
+        serve_on(alpha.page.router(false), &socket).await;
+        let cookie = sign_in(&rig, &socket).await;
+        let push = b"org=acme&labels=self-hosted%2C+linux".to_vec();
+
+        // As Chrome posts them, the page's own forms reach their handlers, with or without the trailing slash.
+        let (status, _, body) = call_page(
+            &socket,
+            "POST",
+            github_page::PUSH_PATH,
+            form_post(&cookie, &[]),
+            push.clone(),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("Your service's address and token"), "{body}");
+        assert_eq!(rig.alpha.bindings().len(), 1);
+        for path in PAGE_FORMS {
+            for path in [path.to_string(), format!("{path}/")] {
+                let (status, _, body) = call_page(
+                    &socket,
+                    "POST",
+                    &path,
+                    form_post(&cookie, &[]),
+                    b"org=acme".to_vec(),
+                )
+                .await;
+                assert!(
+                    !body.contains(NOT_FROM_PAGE),
+                    "{path} reaches its handler: {status} {body}"
+                );
+            }
+        }
+        let made = rig.alpha.bindings().len();
+
+        // Everything else a browser, or anyone, could send is refused by the rule, with its plain page.
+        let cases: [(&str, HeaderChanges); 14] = [
+            (
+                "another page of the same site",
+                &[("Sec-Fetch-Site", Some("same-site"))],
+            ),
+            ("another site", &[("Sec-Fetch-Site", Some("cross-site"))]),
+            (
+                "an address the person typed",
+                &[("Sec-Fetch-Site", Some("none"))],
+            ),
+            ("no Sec-Fetch-Site", &[("Sec-Fetch-Site", None)]),
+            (
+                "a browser without Fetch Metadata",
+                &[
+                    ("Sec-Fetch-Site", None),
+                    ("Sec-Fetch-Mode", None),
+                    ("Sec-Fetch-Dest", None),
+                ],
+            ),
+            (
+                "a script's fetch",
+                &[
+                    ("Sec-Fetch-Mode", Some("cors")),
+                    ("Sec-Fetch-Dest", Some("empty")),
+                ],
+            ),
+            ("a no-cors fetch", &[("Sec-Fetch-Mode", Some("no-cors"))]),
+            ("no Sec-Fetch-Mode", &[("Sec-Fetch-Mode", None)]),
+            (
+                "a frame's navigation",
+                &[("Sec-Fetch-Dest", Some("iframe"))],
+            ),
+            ("no Sec-Fetch-Dest", &[("Sec-Fetch-Dest", None)]),
+            ("no Origin", &[("Origin", None)]),
+            (
+                "a foreign Origin",
+                &[("Origin", Some("https://other.example.com"))],
+            ),
+            ("an Origin that is almost null", &[("Origin", Some("Null"))]),
+            ("two Origins in one", &[("Origin", Some("null, null"))]),
+        ];
+        for (what, changes) in cases {
+            for path in [github_page::PUSH_PATH, github_page::APP_PATH] {
+                let (status, head, body) = call_page(
+                    &socket,
+                    "POST",
+                    path,
+                    form_post(&cookie, changes),
+                    push.clone(),
+                )
+                .await;
+                assert_eq!(status, 403, "{what} on {path}: {body}");
+                assert!(body.contains(NOT_FROM_PAGE), "{what} on {path}: {body}");
+                assert_eq!(
+                    head_value(&head, "content-type").as_deref(),
+                    Some("text/html; charset=utf-8"),
+                    "{what}"
+                );
+            }
+        }
+        // No other path takes a post with a null Origin, the page's own script posts and GitHub's returns included.
+        for path in [
+            "/approve/approve",
+            "/approve/decline",
+            "/approve/requests/begin",
+            "/approve/requests/approve",
+            "/approve/requests/deny",
+            "/approve/peer-keys",
+            "/approve/peer-keys/sync",
+            "/approve/setup-code",
+            "/approve/setup-code/verify",
+            "/approve/register",
+            "/approve/passkeys/change",
+            "/approve/reach/sign-in",
+            arca::canvas::PAGE_PATH,
+            arca::canvas::CHAT_PATH,
+            github_page::PAGE_PATH,
+            github_page::PREPARE_PATH,
+            github_page::INSTALLED_PATH,
+            "/approve/github/app/more",
+        ] {
+            let (status, _, body) =
+                call_page(&socket, "POST", path, form_post(&cookie, &[]), push.clone()).await;
+            assert_eq!(status, 403, "{path}: {body}");
+            assert!(body.contains(NOT_FROM_PAGE), "{path}: {body}");
+        }
+        // The rule's page names no header and no rule: only what the person does next.
+        let (_, _, body) = call_page(
+            &socket,
+            "POST",
+            github_page::PUSH_PATH,
+            form_post(&cookie, &[("Sec-Fetch-Site", Some("cross-site"))]),
+            push,
+        )
+        .await;
+        for word in ["Origin", "Sec-Fetch", "same-origin", "referrer", "null"] {
+            assert!(!body.contains(word), "the refusal says {word}: {body}");
+        }
+        assert_eq!(rig.alpha.bindings().len(), made, "nothing more was made");
+    })
+    .await
+    .expect("the test ends in time");
+}
+
+/// Issue 325: what a linked node lists of a waiting `github_link` card conforms to the current schemas of `plan_list` and
+/// `owner_approval_pending`, so an MCP client that checks answers against them takes the list. (A client holding a
+/// schema from before `github_link`, 0.40 and older, refused it: that is the client's copy, not the node's answer.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_waiting_github_link_card_is_listed_as_the_listing_schemas_say() {
+    tokio::time::timeout(BOUND, async {
+        let rig = Rig::new(&[ORIGIN], &RELAY_TOOLS).await;
+        let (status, prepared) = prepare(&rig, &query(BEGIN_FORM)).await;
+        assert_eq!(status, 200, "{prepared}");
+
+        let listed = rig
+            .direct("relay", "plan_list", json!({}))
+            .await
+            .expect("plan_list answers");
+        let schema = (arca_api::verb("plan_list").expect("plan_list").result)();
+        arca_api::conforms(&schema, &listed).unwrap_or_else(|why| panic!("{why}: {listed}"));
+        let card = listed["plans"]
+            .as_array()
+            .expect("plans")
+            .iter()
+            .find(|plan| plan["action"] == LINK_VERB)
+            .expect("the github_link card is listed");
+        assert_eq!(card["id"], prepared["plan"]);
+
+        let requests = rig.scratch.path("beta-requests");
+        fs::create_dir(&requests).expect("the requests' directory");
+        let pending = arca::handlers::OwnerApprovalPending {
+            kernel: Arc::clone(&rig.beta_kernel),
+            clock: clock(),
+            requests: Arc::new(
+                arca::approval_requests::ApprovalRequests::open(&requests, None, now_ms())
+                    .expect("the requests open"),
+            ),
+            oauth: None,
+            page: None,
+        };
+        let operator = Caller {
+            token_id: "operator".to_string(),
+            scope: Scope::Operator,
+            tools: None,
+            limits: Default::default(),
+        };
+        let answer = pending
+            .call(json!({}), &operator)
+            .expect("owner_approval_pending answers");
+        let schema = (arca_api::verb("owner_approval_pending")
+            .expect("owner_approval_pending")
+            .result)();
+        arca_api::conforms(&schema, &answer).unwrap_or_else(|why| panic!("{why}: {answer}"));
+        assert!(
+            answer["plans"]
+                .as_array()
+                .expect("plans")
+                .iter()
+                .any(|plan| plan["action"] == LINK_VERB && plan["id"] == prepared["plan"]),
+            "{answer}"
+        );
+    })
+    .await
+    .expect("the test ends in time");
+}
+
+/// Issue 325, in a real browser: headless Chrome (`ARCA_TEST_CHROME`, or `/usr/bin/google-chrome`) signs in on the
+/// GitHub page served at `http://localhost:<port>` with the owner's passkey in a WebAuthn virtual authenticator, opens
+/// each prepared link and presses each button: this node's App, repository App, push and device forms and a disconnect;
+/// a linked node's App and repository App (its card approved by the passkey), its connections and its disconnect. Each
+/// lands on the page it should, not on a 403. A post from another site, from a page of the same site on another port
+/// (which the session cookie reaches), from a sandboxed frame and from a `data:` address lands on the Origin rule's page
+/// and makes nothing.
+///
+/// Without Chrome it says so and passes: the forms are then not driven in a real browser. Every browser step is bounded
+/// by thirty seconds, the browser part by four minutes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_real_browser_presses_each_button_of_the_github_page_for_this_node_and_a_linked_one() {
+    let Some(binary) = browser::binary() else {
+        eprintln!(
+            "SKIPPED: no Chrome at {} or ${}; the GitHub page's forms were not driven in a real browser",
+            browser::DEFAULT_CHROME,
+            browser::CHROME_ENV
+        );
+        return;
+    };
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+    let origin = format!(
+        "http://localhost:{}",
+        listener.local_addr().expect("an address").port()
+    );
+    let mut setup = Setup::new(&[&origin], &RELAY_TOOLS);
+    setup.owner_origin = Some(origin.clone());
+    let rig = Arc::new(Rig::with(setup).await);
+    let alpha = rig.alpha_page(&origin);
+    listener.set_nonblocking(true).expect("nonblocking");
+    let listener = tokio::net::TcpListener::from_std(listener).expect("the page's listener");
+    let router = alpha.page.router(false);
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    // Pages that post to the page's push form as soon as they load, from no page of the GitHub page's: each sends no
+    // referrer either, so the browser's Origin is null.
+    let push_url = format!("{origin}{}", github_page::PUSH_PATH);
+    let post = format!(
+        "<form id=\"f\" method=\"post\" action=\"{push_url}\" target=\"_top\"><input name=\"org\" value=\"acme\">\
+         <input name=\"labels\" value=\"self-hosted\"></form><script>document.getElementById(\"f\").submit()</script>"
+    );
+    let frame = format!(
+        "<!doctype html><iframe sandbox=\"allow-forms allow-scripts allow-top-navigation\" srcdoc=\"{}\"></iframe>",
+        post.replace('&', "&amp;").replace('"', "&quot;")
+    );
+    let data_url = format!(
+        "data:text/html;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(format!("<!doctype html>{post}"))
+    );
+    let other = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("another port");
+    let other_port = other.local_addr().expect("an address").port();
+    let page_of = |body: String| {
+        move || {
+            let body = body.clone();
+            async move {
+                (
+                    [
+                        ("content-type", "text/html; charset=utf-8"),
+                        ("referrer-policy", "no-referrer"),
+                    ],
+                    body,
+                )
+            }
+        }
+    };
+    let others = axum::Router::new()
+        .route(
+            "/post",
+            axum::routing::get(page_of(format!("<!doctype html>{post}"))),
+        )
+        .route("/frame", axum::routing::get(page_of(frame)));
+    tokio::spawn(async move {
+        let _ = axum::serve(other, others).await;
+    });
+
+    let browsing = Arc::clone(&rig);
+    let driven = tokio::task::spawn_blocking(move || {
+        let rig = browsing;
+        let page = |q: &str| format!("{origin}{}{q}", github_page::PAGE_PATH);
+        let mut chrome = Chrome::launch(
+            &binary,
+            &rig.scratch.path("chrome"),
+            &rig.scratch.path("chrome.log"),
+        );
+        chrome.passkey(
+            "localhost",
+            &rig.owner.credential_id,
+            &browser::p256_pkcs8(&rig.owner.signing),
+        );
+
+        // Signed out, a prepared link shows the passkey sign-in; signed in, its form.
+        chrome.open(&page("?mode=app&org=acme&labels=self-hosted,linux"));
+        chrome.press("#sign-in");
+        chrome.until_text("This link filled in the form");
+
+        let manifest_goes_to_github = |chrome: &mut Chrome| {
+            let action = chrome
+                .eval("document.querySelector('form').action")
+                .expect("the manifest form");
+            let web = rig.fake.endpoints().web;
+            assert!(
+                action.as_str().is_some_and(|a| a.starts_with(&web)),
+                "{action}"
+            );
+        };
+
+        // This node: the App, the repository App, the push address and the device code.
+        chrome.open(&page("?mode=app&org=acme&labels=self-hosted,linux"));
+        chrome.press("#prepared button[type=submit]");
+        let (href, _) = chrome.until_text("Create the App on GitHub");
+        assert_eq!(href, format!("{origin}{}", github_page::APP_PATH));
+        manifest_goes_to_github(&mut chrome);
+
+        // No page but the GitHub page's own gets a post past the Origin rule: not another site's, not one of the same
+        // site on another port (the session cookie goes there), not a sandboxed frame's, not a data: address's.
+        for url in [
+            format!("http://localhost:{other_port}/post"),
+            format!("http://127.0.0.1:{other_port}/post"),
+            format!("http://localhost:{other_port}/frame"),
+            data_url,
+        ] {
+            chrome.open(&url);
+            let (href, _) = chrome.until_text(NOT_FROM_PAGE);
+            assert!(href.starts_with(&push_url), "{url} ends at {href}");
+        }
+        assert!(rig.alpha.bindings().is_empty(), "no post made a connection");
+
+        chrome.open(&page("?mode=repositories&org=acme"));
+        chrome.press("#prepared button[type=submit]");
+        let (href, _) = chrome.until_text("Create the repository App");
+        assert_eq!(href, format!("{origin}{}", github_page::APP_PATH));
+        manifest_goes_to_github(&mut chrome);
+
+        chrome.open(&page("?mode=push&org=acme&labels=self-hosted,linux"));
+        chrome.press("#prepared button[type=submit]");
+        let (href, _) = chrome.until_text("Your service's address and token");
+        assert_eq!(href, push_url);
+        let pushed = rig.alpha.bindings();
+        assert_eq!(pushed.len(), 1, "the push connection is made");
+
+        chrome.open(&page(
+            "?mode=oauth&org=acme&labels=self-hosted,linux&runners=1",
+        ));
+        chrome.press("#prepared button[type=submit]");
+        let (href, _) = chrome.until_text(USER_CODE);
+        assert!(href.starts_with(&page("?flow=")), "{href}");
+
+        // This node's Disconnect, on its connection's row.
+        chrome.open(&page(""));
+        chrome.press(&format!(
+            "form[action=\"{}\"] button[type=submit]",
+            github_page::DISCONNECT_PATH
+        ));
+        let deadline = Instant::now() + browser::WAIT;
+        while rig
+            .alpha
+            .bindings()
+            .iter()
+            .any(|binding| binding.id == pushed[0].id && binding.status != Status::Revoked)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the push connection is disconnected"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let (href, _) = chrome.until_text("GitHub runners");
+        assert_eq!(href, page(""));
+
+        // The linked node: its App and repository App, each card approved with the passkey on the button's press.
+        chrome.open(&page(
+            "?mode=app&node=beta&org=acme&labels=self-hosted,linux",
+        ));
+        chrome.press("#prepared button[type=submit]");
+        let (href, _) = chrome.until_text("Create the App on GitHub");
+        assert_eq!(href, format!("{origin}{}", github_page::APP_PATH));
+        manifest_goes_to_github(&mut chrome);
+        assert_eq!(
+            rig.waiting_cards(),
+            0,
+            "beta spent the card the passkey approved"
+        );
+
+        chrome.open(&page("?mode=repositories&node=beta&org=acme"));
+        chrome.press("#prepared button[type=submit]");
+        let (href, _) = chrome.until_text("Create the repository App");
+        assert_eq!(href, format!("{origin}{}", github_page::APP_PATH));
+        assert_eq!(
+            rig.waiting_cards(),
+            0,
+            "beta spent the card the passkey approved"
+        );
+
+        // The linked node's connections, and its Disconnect, approved with the passkey.
+        let (held, _) = rig
+            .beta
+            .push_create("acme", &[vec!["self-hosted".to_string()]], "test")
+            .expect("beta holds a connection");
+        chrome.open(&page("?node=beta"));
+        chrome.press(&format!(
+            "form[action=\"{}\"] button[type=submit]",
+            github_page::CONNECTIONS_PATH
+        ));
+        let (href, _) = chrome.until_text("Connections on beta");
+        assert_eq!(href, format!("{origin}{}", github_page::CONNECTIONS_PATH));
+        chrome.press(&format!(
+            "form[action=\"{}\"] button[type=submit]",
+            github_page::DISCONNECT_PATH
+        ));
+        let deadline = Instant::now() + browser::WAIT;
+        while rig
+            .beta
+            .bindings()
+            .iter()
+            .any(|binding| binding.id == held.id && binding.status != Status::Revoked)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "beta's connection is disconnected"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let (href, text) = chrome.until_text("GitHub runners");
+        assert_eq!(href, page("?node=beta"));
+        assert!(!text.contains(NOT_FROM_PAGE), "{text}");
+    });
+    tokio::time::timeout(Duration::from_secs(240), driven)
+        .await
+        .expect("the browser part ends in time")
+        .expect("the browser part passes");
 }
