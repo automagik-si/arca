@@ -42,6 +42,13 @@ pub const AUDIT_FILE: &str = "audit.jsonl";
 const AUDIT_MAX_BYTES: u64 = 8 * 1024 * 1024;
 /// The OAuth App's public record (its client ID) and its secret, apart.
 const OAUTH_APP_FILE: &str = "oauth-app.json";
+/// How long a pool's sign-in waits for the runner group's sync before it goes on with the group as recorded.
+pub const SIGN_IN_SYNC_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+/// After a failed sync the node retries it by itself: first after a minute, then doubling, up to ten minutes.
+pub const SYNC_RETRY: (std::time::Duration, std::time::Duration) = (
+    std::time::Duration::from_secs(60),
+    std::time::Duration::from_secs(600),
+);
 const OAUTH_SECRET_FILE: &str = "oauth-app.secret";
 
 /// How a binding reaches GitHub.
@@ -81,6 +88,33 @@ pub struct RunnerGroup {
     /// What the person should know about it, in words, such as that it is the organisation's default group.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,
+    /// The group's own repositories as read from GitHub, when they are not the installation's (an owner's own way
+    /// around issue 328, kept as it is).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repositories: Option<Vec<String>>,
+    /// Which repositories may send jobs to the group, as Arca last set or read it. A record from before Arca kept it
+    /// has none; [`Binding::group_access`] then says what it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<GroupAccess>,
+}
+
+/// Which repositories of the organisation may send jobs to a binding's runner group.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GroupAccess {
+    /// Every private repository of the organisation, public ones off: Arca's group when the installation lists no
+    /// repository (an App with only the organisation permission is given none).
+    AllPrivate,
+    /// Exactly the repositories the installation lists.
+    Selected,
+    /// A group Arca did not make: Arca leaves it as it is and cannot tell what it is open to.
+    Unknown,
+    /// No repository at all, so no job ever reaches the runners: Arca's group as Arca before issue 328 left it for an
+    /// installation that lists none. The next sync opens it.
+    #[serde(rename = "none")]
+    NoRepository,
+    /// The last sync failed, so Arca has not checked what the group is open to; [`Binding::sync_error`] says why.
+    Unchecked,
 }
 
 /// A runner registered for an OAuth binding. Its credential is in the store, never in this record.
@@ -120,6 +154,12 @@ pub struct Binding {
     /// The App's installation in the organisation, once installed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub installation: Option<InstallationRecord>,
+    /// Why the last sync of the runner group failed, in words, until one succeeds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_error: Option<String>,
+    /// When a sync failed: when the node's own retry runs (ms since the epoch).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_retry_at: Option<u64>,
     /// Who made it: a token id, or `page` for the owner's page.
     pub created_by: String,
     pub created_at: u64,
@@ -134,6 +174,107 @@ impl Binding {
     /// The organisation's address on GitHub's web host, as a runner's `gitHubUrl` names it.
     pub fn org_url(&self, endpoints: &Endpoints) -> String {
         format!("{}/{}", endpoints.web, self.account)
+    }
+
+    /// Which repositories may send jobs to the runner group: as recorded, or, for a record from before Arca kept it,
+    /// what Arca's code then made (an App's own group open to exactly the installation's repositories, which is to
+    /// none when it lists none; a signed-in connection's own group open to every private repository).
+    pub fn group_access(&self) -> Option<GroupAccess> {
+        let group = self.runner_group.as_ref()?;
+        if self.sync_error.is_some() {
+            return Some(GroupAccess::Unchecked);
+        }
+        if let Some(access) = group.access {
+            return Some(access);
+        }
+        Some(match (group.created_by_arca, self.mode) {
+            (false, _) => GroupAccess::Unknown,
+            (true, Mode::Oauth) => GroupAccess::AllPrivate,
+            (true, _) => match &self.installation {
+                Some(installation) if installation.repositories.is_empty() => {
+                    GroupAccess::NoRepository
+                }
+                _ => GroupAccess::Selected,
+            },
+        })
+    }
+
+    /// Whether the runner group is open to no repository, so no job reaches the runners: Arca's group as Arca before
+    /// issue 328 left it, or a `selected` group whose installation now lists none.
+    pub fn open_to_none(&self) -> bool {
+        match self.group_access() {
+            Some(GroupAccess::NoRepository) => true,
+            Some(GroupAccess::Selected) => self.group_repositories().is_empty(),
+            _ => false,
+        }
+    }
+
+    /// The repositories a `selected` group is open to: its own as read when the owner kept them, else the
+    /// installation's.
+    fn group_repositories(&self) -> Vec<String> {
+        self.runner_group
+            .as_ref()
+            .and_then(|group| group.repositories.clone())
+            .or_else(|| {
+                self.installation
+                    .as_ref()
+                    .map(|installation| installation.repositories.clone())
+            })
+            .unwrap_or_default()
+    }
+
+    /// Whether the page and `github_bindings` should say the group's access as the connection's `why`: when no job can
+    /// reach it, or Arca could not check it.
+    pub fn group_access_is_news(&self) -> bool {
+        self.open_to_none() || self.group_access() == Some(GroupAccess::Unchecked)
+    }
+
+    /// [`Binding::group_access`] in words for the person.
+    pub fn group_access_words(&self) -> Option<String> {
+        let group = self.runner_group.as_ref()?;
+        let org = &self.account;
+        Some(match self.group_access()? {
+            GroupAccess::AllPrivate => format!(
+                "Every private and internal repository of {org} may send jobs here. Narrow it in the runner group on \
+                 GitHub."
+            ),
+            GroupAccess::Selected if self.open_to_none() => format!(
+                "The runner group \"{}\" is open to no repository: the App's installation on GitHub lists none, so no \
+                 job reaches these runners. Give the installation the repositories of {org} that should send jobs here.",
+                group.name
+            ),
+            GroupAccess::Selected => format!(
+                "Only these repositories of {org} may send jobs here: {}.",
+                self.group_repositories().join(", ")
+            ),
+            GroupAccess::Unknown => format!(
+                "Arca leaves the runner group \"{}\" as GitHub has it, so it cannot tell which repositories of {org} may send \
+                 jobs here. See the group's repository access on GitHub.",
+                group.name
+            ),
+            GroupAccess::Unchecked => format!(
+                "Arca has not checked yet which repositories of {org} may send jobs to the runner group \"{}\": {}.{}",
+                group.name,
+                self.sync_error
+                    .as_deref()
+                    .unwrap_or("the last check failed"),
+                // Only an active connection is checked again.
+                match (self.status, self.sync_retry_at) {
+                    (Status::Active, Some(at)) =>
+                        format!(" Arca checks again at {}.", utc_minute(at)),
+                    (Status::Active, None) => {
+                        " Arca checks again when a pool signs in or GitHub's page returns."
+                            .to_string()
+                    }
+                    _ => String::new(),
+                }
+            ),
+            GroupAccess::NoRepository => format!(
+                "The runner group \"{}\" is open to no repository, so no job reaches these runners. Arca opens it to \
+                 every private and internal repository of {org} at its next sync: when the pool starts or GitHub's page returns.",
+                group.name
+            ),
+        })
     }
 }
 
@@ -176,6 +317,12 @@ pub struct BindingInfo {
     pub org_url: String,
     pub runner_group_id: Option<u64>,
     pub label_sets: Vec<Vec<String>>,
+}
+
+/// A time (ms since the epoch) as "HH:MM UTC".
+fn utc_minute(at: u64) -> String {
+    let minute = at / 60_000 % 1440;
+    format!("{:02}:{:02} UTC", minute / 60, minute % 60)
 }
 
 /// A registered runner's three files, as the runner reads them from its own folder. They are its lasting credential.
@@ -236,6 +383,10 @@ pub(crate) struct Inner {
     pub(crate) clock: Clock,
     /// The bits of the runner keys the signer makes.
     pub(crate) runner_key_bits: usize,
+    /// How long a pool's sign-in waits for the runner group's sync.
+    pub(crate) sign_in_deadline: std::time::Duration,
+    /// After a failed sync: the first wait before the node's own retry, and the most it doubles to.
+    pub(crate) sync_retry: (std::time::Duration, std::time::Duration),
     pub(crate) state: Mutex<State>,
     /// Held while a line is appended to the audit log, so lines never interleave.
     audit: Mutex<()>,
@@ -252,6 +403,18 @@ pub(crate) struct State {
     pub(crate) installation_tokens: HashMap<String, (Secret, u64)>,
     /// Actions service connections, by binding.
     pub(crate) actions: HashMap<String, crate::github_app::ActionsConnection>,
+    /// When a sign-in or retry sync of each binding's runner group last succeeded (ms), behind a lock that lets one run
+    /// at a time.
+    pub(crate) sign_in_syncs: HashMap<String, Arc<tokio::sync::Mutex<SyncGate>>>,
+    /// The bindings whose failed sync the node is retrying by itself, with when the next try runs (ms).
+    pub(crate) sync_retries: HashMap<String, u64>,
+}
+
+/// One binding's sign-in and retry syncs: when one last succeeded, and when the last one ended, with its outcome (ms).
+#[derive(Default)]
+pub(crate) struct SyncGate {
+    pub(crate) succeeded: Option<u64>,
+    pub(crate) last: Option<(u64, Result<(), String>)>,
 }
 
 impl Signer {
@@ -286,6 +449,8 @@ impl Signer {
                 http,
                 clock,
                 runner_key_bits: crate::github_api::RUNNER_KEY_BITS,
+                sign_in_deadline: SIGN_IN_SYNC_DEADLINE,
+                sync_retry: SYNC_RETRY,
                 state: Mutex::new(State {
                     bindings,
                     ..State::default()
@@ -303,6 +468,32 @@ impl Signer {
         Self {
             inner: Arc::new(Inner {
                 runner_key_bits: bits,
+                ..inner
+            }),
+        }
+    }
+
+    /// The same signer, with a pool's sign-in waiting `deadline` for the runner group's sync. Tests use a short one.
+    pub fn with_sign_in_deadline(self, deadline: std::time::Duration) -> Self {
+        let inner = Arc::try_unwrap(self.inner).unwrap_or_else(|_| {
+            panic!("with_sign_in_deadline is called on a fresh signer before it is shared")
+        });
+        Self {
+            inner: Arc::new(Inner {
+                sign_in_deadline: deadline,
+                ..inner
+            }),
+        }
+    }
+
+    /// The same signer, retrying a failed sync first after `first`, doubling up to `cap`. Tests use short ones.
+    pub fn with_sync_retry(self, first: std::time::Duration, cap: std::time::Duration) -> Self {
+        let inner = Arc::try_unwrap(self.inner).unwrap_or_else(|_| {
+            panic!("with_sync_retry is called on a fresh signer before it is shared")
+        });
+        Self {
+            inner: Arc::new(Inner {
+                sync_retry: (first, cap),
                 ..inner
             }),
         }
@@ -372,16 +563,44 @@ impl Signer {
 
     /// Writes `binding` to the store and to the state.
     pub(crate) fn save(&self, binding: Binding) -> Result<(), SignerError> {
+        self.write(&binding)?;
+        self.lock().bindings.insert(binding.id.clone(), binding);
+        Ok(())
+    }
+
+    /// Changes binding `id` while it is active, under the state lock every write ends in, so a record a disconnect
+    /// wrote meanwhile is never written back. `change` says whether there is anything to write; whether it was written.
+    pub(crate) fn save_active(
+        &self,
+        id: &str,
+        change: impl FnOnce(&mut Binding) -> bool,
+    ) -> Result<bool, SignerError> {
+        let mut state = self.lock();
+        let Some(mut binding) = state
+            .bindings
+            .get(id)
+            .filter(|binding| binding.status == Status::Active)
+            .cloned()
+        else {
+            return Ok(false);
+        };
+        if !change(&mut binding) {
+            return Ok(false);
+        }
+        self.write(&binding)?;
+        state.bindings.insert(binding.id.clone(), binding);
+        Ok(true)
+    }
+
+    fn write(&self, binding: &Binding) -> Result<(), SignerError> {
         let path = self
             .inner
             .dir
             .join("bindings")
             .join(format!("{}.json", binding.id));
-        let text = serde_json::to_string_pretty(&binding)
+        let text = serde_json::to_string_pretty(binding)
             .map_err(|_| SignerError::Store("a GitHub connection cannot be written".to_string()))?;
-        write_private(&path, text.as_bytes())?;
-        self.lock().bindings.insert(binding.id.clone(), binding);
-        Ok(())
+        write_private(&path, text.as_bytes())
     }
 
     /// Sets the node's OAuth App: its client ID, in its own file, and its secret, in another. The secret is never read

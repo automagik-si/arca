@@ -16080,6 +16080,19 @@
                   },
                   "runnerGroup": {
                     "properties": {
+                      "access": {
+                        "enum": [
+                          "all-private",
+                          "selected",
+                          "unknown",
+                          "none",
+                          "unchecked"
+                        ],
+                        "type": "string"
+                      },
+                      "accessWords": {
+                        "type": "string"
+                      },
                       "createdByArca": {
                         "type": "boolean"
                       },
@@ -16089,6 +16102,12 @@
                       },
                       "name": {
                         "type": "string"
+                      },
+                      "repositories": {
+                        "items": {
+                          "type": "string"
+                        },
+                        "type": "array"
                       },
                       "warning": {
                         "type": "string"
@@ -16135,6 +16154,13 @@
                       "revoked"
                     ],
                     "type": "string"
+                  },
+                  "syncError": {
+                    "type": "string"
+                  },
+                  "syncRetryAt": {
+                    "minimum": 0,
+                    "type": "integer"
                   },
                   "updatedAt": {
                     "minimum": 0,
@@ -16270,7 +16296,7 @@
           "type": "object"
         }
       },
-      "summary": "The GitHub organisations connected to this node: each one's id, mode (oauth, app or push), organisation, status, runner group, label sets and registered runners, and the device flows of the last day. Never a key, a grant, a token or a runner's credential.",
+      "summary": "The GitHub organisations connected to this node: each one's id, mode (oauth, app or push), organisation, status, runner group (with what it is open to: `access` all-private, every private and internal repository of the organisation; selected, the installation's repositories; unknown, a group Arca did not make; none, no repository, which the next sync opens; unchecked, the last sync failed, `syncError` says why; and `accessWords`, the same in words), label sets and registered runners, and the device flows of the last day. Never a key, a grant, a token or a runner's credential.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
       "x-arca-read-only-hint": true,
@@ -16671,6 +16697,19 @@
             },
             "runnerGroup": {
               "properties": {
+                "access": {
+                  "enum": [
+                    "all-private",
+                    "selected",
+                    "unknown",
+                    "none",
+                    "unchecked"
+                  ],
+                  "type": "string"
+                },
+                "accessWords": {
+                  "type": "string"
+                },
                 "createdByArca": {
                   "type": "boolean"
                 },
@@ -16680,6 +16719,12 @@
                 },
                 "name": {
                   "type": "string"
+                },
+                "repositories": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
                 },
                 "warning": {
                   "type": "string"
@@ -16726,6 +16771,13 @@
                 "revoked"
               ],
               "type": "string"
+            },
+            "syncError": {
+              "type": "string"
+            },
+            "syncRetryAt": {
+              "minimum": 0,
+              "type": "integer"
             },
             "updatedAt": {
               "minimum": 0,
@@ -17009,6 +17061,19 @@
                   },
                   "runnerGroup": {
                     "properties": {
+                      "access": {
+                        "enum": [
+                          "all-private",
+                          "selected",
+                          "unknown",
+                          "none",
+                          "unchecked"
+                        ],
+                        "type": "string"
+                      },
+                      "accessWords": {
+                        "type": "string"
+                      },
                       "createdByArca": {
                         "type": "boolean"
                       },
@@ -17018,6 +17083,12 @@
                       },
                       "name": {
                         "type": "string"
+                      },
+                      "repositories": {
+                        "items": {
+                          "type": "string"
+                        },
+                        "type": "array"
                       },
                       "warning": {
                         "type": "string"
@@ -17064,6 +17135,13 @@
                       "revoked"
                     ],
                     "type": "string"
+                  },
+                  "syncError": {
+                    "type": "string"
+                  },
+                  "syncRetryAt": {
+                    "minimum": 0,
+                    "type": "integer"
                   },
                   "updatedAt": {
                     "minimum": 0,

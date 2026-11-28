@@ -48,7 +48,9 @@ use serde_json::{Value, json};
 use crate::config::LinkedHost;
 use crate::github_handlers::LINK_VERB;
 use crate::github_oauth::{FlowState, OauthRequest, StartError};
-use crate::github_signer::{Binding, Mode, Signer, Status, check_account, check_labels};
+use crate::github_signer::{
+    Binding, GroupAccess, Mode, Signer, Status, check_account, check_labels,
+};
 use crate::linked::RelayError;
 
 /// The page's own path, and its forms and returns.
@@ -648,6 +650,10 @@ fn field<'a>(form: &'a HashMap<String, String>, key: &str) -> &'a str {
 
 fn status_words(binding: &Binding) -> (&'static str, &'static str) {
     match binding.status {
+        Status::Active if binding.open_to_none() => ("bad", "connected, open to no repository"),
+        Status::Active if binding.group_access() == Some(GroupAccess::Unchecked) => {
+            ("bad", "connected, runner group not checked yet")
+        }
         Status::Active => ("ok", "connected"),
         Status::AwaitingInstall => ("bad", "made, not installed yet"),
         Status::Suspended => ("bad", "suspended on GitHub"),
@@ -699,7 +705,26 @@ fn connection_rows(bindings: &[Binding], target: &Target) -> String {
         {
             body.push_str(&format!("<p class=\"bad\">{}</p>", escape(warning)));
         }
-        if let Some(why) = &binding.why {
+        let words = binding.group_access_words();
+        // A group's own warning already says what it is open to, unless no job can reach it or it is not checked.
+        let warned = binding
+            .runner_group
+            .as_ref()
+            .is_some_and(|group| group.warning.is_some())
+            && !binding.group_access_is_news();
+        if let Some(words) = words.as_ref().filter(|_| !warned) {
+            let tone = if binding.group_access_is_news() {
+                " class=\"bad\""
+            } else {
+                ""
+            };
+            body.push_str(&format!("<p{tone}>{}</p>", escape(words)));
+        }
+        if let Some(why) = binding
+            .why
+            .as_ref()
+            .filter(|why| Some(*why) != words.as_ref())
+        {
             body.push_str(&format!("<p>{}</p>", escape(why)));
         }
         if binding.status != Status::Revoked {
@@ -2065,5 +2090,84 @@ mod tests {
         );
         assert_eq!(web_origin("https://github.com"), "https://github.com");
         assert_eq!(web_origin("http://127.0.0.1:9/web"), "http://127.0.0.1:9");
+    }
+
+    /// Issue 328: a row says what the runner group is open to, and a connection whose own group is open to no
+    /// repository is not shown as simply connected.
+    #[test]
+    fn a_row_says_what_the_runner_group_is_open_to() {
+        use crate::github_signer::{GroupAccess, InstallationRecord, RunnerGroup};
+        let binding = |access: Option<GroupAccess>, repositories: &[&str]| Binding {
+            id: "gh-0123456789abcdef".to_string(),
+            mode: Mode::App,
+            repository_access: false,
+            account: "acme".to_string(),
+            status: Status::Active,
+            why: None,
+            label_sets: vec![vec!["linux".to_string()]],
+            runner_group: Some(RunnerGroup {
+                id: 20,
+                name: "Arca runners".to_string(),
+                created_by_arca: true,
+                warning: None,
+                repositories: None,
+                access,
+            }),
+            runners: Vec::new(),
+            app: None,
+            installation: Some(InstallationRecord {
+                id: 5,
+                repository_selection: "selected".to_string(),
+                repositories: repositories.iter().map(|name| name.to_string()).collect(),
+            }),
+            sync_error: None,
+            sync_retry_at: None,
+            created_by: "page".to_string(),
+            created_at: 0,
+            updated_at: 0,
+        };
+
+        let row = connection_rows(
+            &[binding(Some(GroupAccess::AllPrivate), &[])],
+            &Target::Here,
+        );
+        assert!(row.contains("<span class=\"ok\">connected</span>"), "{row}");
+        assert!(
+            row.contains(
+                "Every private and internal repository of acme may send jobs here. Narrow it in the runner group \
+                 on GitHub."
+            ),
+            "{row}"
+        );
+
+        let row = connection_rows(
+            &[binding(Some(GroupAccess::Selected), &["acme/web"])],
+            &Target::Here,
+        );
+        assert!(row.contains("<span class=\"ok\">connected</span>"), "{row}");
+        assert!(row.contains("acme/web"), "{row}");
+
+        // A record from before issue 328: Arca's group, an installation listing nothing, no access recorded.
+        let row = connection_rows(&[binding(None, &[])], &Target::Here);
+        assert!(!row.contains("<span class=\"ok\">"), "{row}");
+        assert!(row.contains("open to no repository"), "{row}");
+
+        // A group whose own warning says what it is open to (a signed-in connection's) says it once.
+        let mut warned = binding(Some(GroupAccess::AllPrivate), &[]);
+        warned.runner_group.as_mut().unwrap().warning =
+            Some("Arca made this group open.".to_string());
+        let row = connection_rows(&[warned], &Target::Here);
+        assert!(row.contains("Arca made this group open."), "{row}");
+        assert!(!row.contains("Every private and internal"), "{row}");
+
+        // A failed check: not checked yet, with the reason.
+        let mut failed = binding(Some(GroupAccess::Selected), &["acme/web"]);
+        failed.sync_error = Some("GitHub answered 502".to_string());
+        let row = connection_rows(&[failed], &Target::Here);
+        assert!(
+            row.contains("<span class=\"bad\">connected, runner group not checked yet</span>"),
+            "{row}"
+        );
+        assert!(row.contains("GitHub answered 502"), "{row}");
     }
 }

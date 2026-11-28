@@ -89,7 +89,7 @@ pub struct FakeState {
     pub repositories: Vec<(u64, String)>,
     /// What creating a runner group answers instead of making it, if anything.
     pub group_create_refusal: Option<u16>,
-    /// The runner groups' repositories, by group id.
+    /// The runner groups' repositories, by group id (ids; an object is answered as it is).
     pub group_repositories: Vec<(u64, Value)>,
     /// The organisation's scale sets: `(id, runner group id)`.
     pub scale_sets: Vec<(u64, u64)>,
@@ -98,6 +98,14 @@ pub struct FakeState {
     pub poll_script: Vec<&'static str>,
     /// What reading the App's installation answers instead, if anything: a GitHub error such as 500, 403 or 429.
     pub installation_refusal: Option<u16>,
+    /// What listing the installation's repositories answers instead, if anything: a failure, or a 2xx not in GitHub's
+    /// shape (a JSON string is sent as a body that is not JSON).
+    pub listing: Option<(u16, Value)>,
+    /// How long listing the installation's repositories waits before it answers, in milliseconds.
+    pub listing_delay_ms: u64,
+    /// Listings of the installation's repositories being answered now, and the most there ever were at once.
+    pub listing_at_once: u64,
+    pub listing_most_at_once: u64,
 }
 
 pub struct Fake {
@@ -158,6 +166,10 @@ impl Fake {
             scale_sets: Vec::new(),
             poll_script: Vec::new(),
             installation_refusal: None,
+            listing: None,
+            listing_delay_ms: 0,
+            listing_at_once: 0,
+            listing_most_at_once: 0,
         }));
         let router = Router::new().fallback(serve).with_state(Arc::clone(&state));
         tokio::spawn(async move {
@@ -175,6 +187,21 @@ impl Fake {
 
     pub fn with<T>(&self, f: impl FnOnce(&mut FakeState) -> T) -> T {
         f(&mut self.state.lock().expect("the fake's lock"))
+    }
+
+    /// The organisation's runner group `id`, as GitHub holds it now.
+    pub fn group(&self, id: u64) -> Option<Value> {
+        self.with(|s| s.groups.iter().find(|group| group["id"] == id).cloned())
+    }
+
+    /// The repositories GitHub holds for runner group `id`, when a list was set.
+    pub fn group_repositories(&self, id: u64) -> Option<Value> {
+        self.with(|s| {
+            s.group_repositories
+                .iter()
+                .find(|(group, _)| *group == id)
+                .map(|(_, list)| list.clone())
+        })
     }
 
     pub fn seen(&self, method: &str, path: &str) -> Vec<Seen> {
@@ -295,7 +322,22 @@ async fn serve(State(state): State<Arc<Mutex<FakeState>>>, request: Request) -> 
         .await
         .unwrap_or_default();
     let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    let listing = path == "/api/installation/repositories";
+    if listing {
+        let delay = {
+            let mut s = state.lock().expect("the fake's lock");
+            s.listing_at_once += 1;
+            s.listing_most_at_once = s.listing_most_at_once.max(s.listing_at_once);
+            s.listing_delay_ms
+        };
+        if delay > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+        }
+    }
     let mut state = state.lock().expect("the fake's lock");
+    if listing {
+        state.listing_at_once -= 1;
+    }
     state.seen.push(Seen {
         method: method.clone(),
         path: path.clone(),
@@ -437,6 +479,9 @@ fn answer(
             if !grant_ok {
                 return (401, message("Bad credentials"));
             }
+            if let Some((status, answer)) = s.listing.clone() {
+                return (status, answer);
+            }
             let repositories: Vec<Value> = s
                 .repositories
                 .iter()
@@ -464,11 +509,70 @@ fn answer(
                 .push((id, body["selected_repository_ids"].clone()));
             (204, Value::Null)
         }
+        ("GET", p)
+            if p.starts_with(&format!("/api/orgs/{org}/actions/runner-groups/"))
+                && p.ends_with("/repositories") =>
+        {
+            if !grant_ok {
+                return (401, message("Bad credentials"));
+            }
+            let id: u64 = p
+                .trim_start_matches(&format!("/api/orgs/{org}/actions/runner-groups/"))
+                .trim_end_matches("/repositories")
+                .parse()
+                .unwrap_or(0);
+            let listed = s.group_repositories.iter().find(|(group, _)| *group == id);
+            // An object is answered as it is: a listing not in GitHub's shape.
+            if let Some((_, answer)) = listed.filter(|(_, list)| list.is_object()) {
+                return (200, answer.clone());
+            }
+            let ids: Vec<Value> = listed
+                .and_then(|(_, list)| list.as_array().cloned())
+                .unwrap_or_default();
+            let repositories: Vec<Value> = ids
+                .iter()
+                .map(|id| json!({ "id": id, "full_name": format!("{org}/r{id}") }))
+                .collect();
+            (
+                200,
+                json!({ "total_count": repositories.len(), "repositories": repositories }),
+            )
+        }
+        ("GET", p) if p.starts_with(&format!("/api/orgs/{org}/actions/runner-groups/")) => {
+            if !grant_ok {
+                return (401, message("Bad credentials"));
+            }
+            let id: u64 = p
+                .trim_start_matches(&format!("/api/orgs/{org}/actions/runner-groups/"))
+                .parse()
+                .unwrap_or(0);
+            match s.groups.iter().find(|group| group["id"] == id) {
+                Some(group) => (200, group.clone()),
+                None => (404, message("Not Found")),
+            }
+        }
+        // GitHub's "Update a self-hosted runner group": `name` is required; `visibility` and
+        // `allows_public_repositories` change what may send jobs to the group.
         ("PATCH", p) if p.starts_with(&format!("/api/orgs/{org}/actions/runner-groups/")) => {
             if !grant_ok {
                 return (401, message("Bad credentials"));
             }
-            (200, json!({ "ok": true }))
+            if !body["name"].is_string() {
+                return (422, message("name is required"));
+            }
+            let id: u64 = p
+                .trim_start_matches(&format!("/api/orgs/{org}/actions/runner-groups/"))
+                .parse()
+                .unwrap_or(0);
+            let Some(group) = s.groups.iter_mut().find(|group| group["id"] == id) else {
+                return (404, message("Not Found"));
+            };
+            for key in ["name", "visibility", "allows_public_repositories"] {
+                if !body[key].is_null() {
+                    group[key] = body[key].clone();
+                }
+            }
+            (200, group.clone())
         }
         ("POST", p) if p == format!("/api/orgs/{org}/actions/runners/generate-jitconfig") => {
             if !grant_ok || !auth.contains(INSTALL_TOKEN) {
@@ -642,6 +746,10 @@ fn answer(
                 "allows_public_repositories": body["allows_public_repositories"],
             });
             s.groups.push(group.clone());
+            if !body["selected_repository_ids"].is_null() {
+                s.group_repositories
+                    .push((id, body["selected_repository_ids"].clone()));
+            }
             (201, group)
         }
         ("POST", "/api/actions/runner-registration") => {

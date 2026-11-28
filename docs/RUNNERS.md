@@ -66,6 +66,13 @@ Scale sets are GitHub's mechanism for runners that come and go with demand.
 - Each size class is one scale set, named after its first label, in the pool's runner group. A scale set receives
   only the jobs whose `runs-on` matches its labels, so the label a job asks for decides the size of its machine.
 - The runner group is GitHub's list of repositories that may send jobs here. It is the access control; a label is not.
+  When the App's installation lists no repository (the usual case: the App asks only for the organisation
+  permission, so GitHub offers no choice), Arca opens its own group to every private and internal repository of the
+  organisation (`visibility: all`), public repositories off; when it lists repositories, to exactly those. A group of
+  Arca's name it did not make is left as it is. The table, and how a change you make on GitHub is kept, are under
+  "Mode 2" in [OPERATING.md](OPERATING.md). `github_bindings` says which holds as `runnerGroup.access` (`all-private`,
+  `selected`, `unknown`; `none` for a connection made by Arca 0.45 or older that the next sync opens; `unchecked`
+  after a sync that failed) and in words as `runnerGroup.accessWords`.
 
 **Public repositories and fork pull requests.** A runner group serves a public repository only when its "Allow public
 repositories" setting is on. Then a pull request from a fork can carry its own workflow file naming the pool's label, and
@@ -135,9 +142,13 @@ The node config's `runners` key (a kernel-mode node only):
 }
 ```
 
-`binding` is the signer connection's id. The scale sets go into the runner group the connection made for the
-repositories the person picked. Leave `runnerGroupId` unset: a pool that names any other group makes its scale sets
-there, and the signer then refuses every runner configuration, since it mints only into the connection's own group.
+`binding` is the signer connection's id. The scale sets go into the runner group the connection made (above). A
+session's sign-in, the pool's start included, first brings that group up to date (the signer's `sync`, for twenty
+seconds at most, not again for ten minutes after one that succeeded); a sync that fails keeps the group as recorded,
+logs why, and is retried by the node itself after about a minute, doubling up to ten minutes. Leave
+`runnerGroupId` unset: a pool that names it does not run that sync, and a pool that names any other group makes its
+scale sets there, and the signer then refuses every runner configuration, since it mints only into the connection's
+own group.
 Each class's labels must be one of the connection's label sets. A class whose labels are not boots a machine, is
 refused at the mint and waits; it tries again every five minutes at most, one machine boot each time, and never runs a
 job.

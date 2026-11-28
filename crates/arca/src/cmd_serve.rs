@@ -550,6 +550,11 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     } else {
         None
     };
+    if let Some(signer) = &github_signer {
+        // The node's own retries of failed runner-group syncs start again, at the times their records keep (issue 328).
+        let _entered = runtime.enter();
+        signer.resume_retries();
+    }
     let repository_secrets = if kernel_mode {
         let signer = github_signer
             .clone()

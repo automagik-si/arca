@@ -27,8 +27,8 @@ use serde_json::{Value, json};
 
 use crate::github_api::{ACTIONS_API_VERSION, Answer, Auth, RunnerKey, Secret};
 use crate::github_signer::{
-    Binding, Mode, RegisteredRunner, RunnerGroup, Signer, SignerError, Status, check_account,
-    check_labels, fresh_id, write_private,
+    Binding, GroupAccess, Mode, RegisteredRunner, RunnerGroup, Signer, SignerError, Status,
+    check_account, check_labels, fresh_id, write_private,
 };
 
 /// The scope the grant asks for. GitHub has no narrower scope that can make a runner registration token for an
@@ -604,6 +604,8 @@ impl Signer {
             runners: Vec::new(),
             app: None,
             installation: None,
+            sync_error: None,
+            sync_retry_at: None,
             created_by: flow.created_by.clone(),
             created_at: now,
             updated_at: now,
@@ -729,6 +731,13 @@ impl Signer {
                 name: group.get("name")?.as_str()?.to_string(),
                 created_by_arca,
                 warning,
+                // Arca makes a signed-in connection's group open to every private repository; another it cannot tell.
+                repositories: None,
+                access: Some(if created_by_arca {
+                    GroupAccess::AllPrivate
+                } else {
+                    GroupAccess::Unknown
+                }),
             })
         };
         let Some(name) = wanted else {
@@ -744,6 +753,8 @@ impl Signer {
                     name: "Default".to_string(),
                     created_by_arca: false,
                     warning: Some(default_warning),
+                    repositories: None,
+                    access: Some(GroupAccess::Unknown),
                 });
             self.step(
                 id,
@@ -791,7 +802,7 @@ impl Signer {
                 &answer,
             ));
         }
-        let warning = "Arca made this group open to every private repository of the organisation, public ones off. \
+        let warning = "Arca made this group open to every private and internal repository of the organisation, public ones off. \
             To narrow it, choose selected repositories in the group's settings on GitHub."
             .to_string();
         let group = group_of(&answer.json(), true, Some(warning.clone()))

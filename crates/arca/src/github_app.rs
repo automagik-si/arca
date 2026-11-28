@@ -23,6 +23,7 @@
 //! and deletes the key.
 
 use std::fs;
+use std::sync::Arc;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
@@ -33,8 +34,8 @@ use sha2::{Digest as _, Sha256};
 
 use crate::github_api::{ACTIONS_API_VERSION, Answer, AppKey, Auth, Secret};
 use crate::github_signer::{
-    AppRecord, Binding, InstallationRecord, Mode, RunnerGroup, Signer, SignerError, Status,
-    check_account, check_labels, fresh_id, same_labels, write_private,
+    AppRecord, Binding, GroupAccess, InstallationRecord, Mode, RunnerGroup, Signer, SignerError,
+    Status, SyncGate, check_account, check_labels, fresh_id, same_labels, write_private,
 };
 
 /// The name of the runner group Arca makes for an App binding.
@@ -43,6 +44,8 @@ pub const RUNNER_GROUP_NAME: &str = "Arca runners";
 pub const APP_PERMISSION: &str = "organization_self_hosted_runners";
 /// A manifest flow lives an hour, as GitHub's code does.
 const APP_FLOW_TTL_MS: u64 = 60 * 60 * 1000;
+/// A pool's sign-in syncs a connection's runner group at most once in this long.
+const SIGN_IN_SYNC_GAP_MS: u64 = 10 * 60 * 1000;
 /// An installation token lasts an hour; the signer uses one for fifty minutes.
 const TOKEN_USE_MS: u64 = 50 * 60 * 1000;
 /// An Actions connection is renewed five minutes before it ends.
@@ -261,6 +264,27 @@ fn github(answer: &Answer) -> MintRefused {
 /// A random 32-hex value.
 fn fresh_state() -> Result<String, SignerError> {
     Ok(format!("{}{}", fresh_id("")?, fresh_id("")?))
+}
+
+/// A duration in ms.
+fn millis(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Frees a connection's retry slot however its task ends, a panic included; unless it panicked, a failure that landed
+/// after the task's last look gets a new retry.
+struct RetrySlot {
+    signer: Signer,
+    id: String,
+}
+
+impl Drop for RetrySlot {
+    fn drop(&mut self) {
+        self.signer.lock().sync_retries.remove(&self.id);
+        if !std::thread::panicking() {
+            self.signer.retry_later(&self.id);
+        }
+    }
 }
 
 impl Signer {
@@ -512,6 +536,8 @@ impl Signer {
                 bot_login: None,
             }),
             installation: None,
+            sync_error: None,
+            sync_retry_at: None,
             created_by: flow.caller.clone(),
             created_at: now,
             updated_at: now,
@@ -633,6 +659,14 @@ impl Signer {
             {
                 binding.account = login.to_string();
             }
+            // The repositories last read stay until the sync reads them again, so a sync that fails leaves the record
+            // as it was.
+            let repositories = binding
+                .installation
+                .as_ref()
+                .filter(|known| known.id == installation_id)
+                .map(|known| known.repositories.clone())
+                .unwrap_or_default();
             binding.installation = Some(InstallationRecord {
                 id: installation_id,
                 repository_selection: installation
@@ -640,7 +674,7 @@ impl Signer {
                     .and_then(Value::as_str)
                     .unwrap_or("selected")
                     .to_string(),
-                repositories: Vec::new(),
+                repositories,
             });
             binding.status = Status::Active;
             binding.why = None;
@@ -654,6 +688,7 @@ impl Signer {
                 "account": binding.account,
                 "installationId": installation_id,
             }));
+            // A connection with a group says a failed check through `syncError`; one without says it here.
             if let Err(why) = self.sync(&id).await {
                 let mut binding = self
                     .lock()
@@ -661,10 +696,12 @@ impl Signer {
                     .get(&id)
                     .cloned()
                     .ok_or("the connection is gone")?;
-                binding.why = Some(format!(
-                    "Installed; the runner group is not in place yet: {why}"
-                ));
-                self.save(binding).map_err(|error| error.message())?;
+                if binding.runner_group.is_none() {
+                    binding.why = Some(format!(
+                        "Installed; the runner group is not in place yet: {why}"
+                    ));
+                    self.save(binding).map_err(|error| error.message())?;
+                }
             }
             if let Some(state) = state {
                 self.lock().app_flows.remove(state);
@@ -677,10 +714,178 @@ impl Signer {
         )
     }
 
-    /// Reads the installation's repositories and puts the runner group in place: Arca's own group made with exactly
-    /// those repositories (public repositories off) or brought up to date, or, when GitHub lets Arca make no group, the
-    /// organisation's default group with a warning.
+    /// Reads the installation's repositories and puts the runner group in place (what Arca's own group is opened to is
+    /// [`Signer::open_group`]'s), or, when GitHub lets Arca make no group, the organisation's default group with a
+    /// warning. A failure changes nothing on GitHub and is kept on the binding (`syncError`), so the page says the
+    /// group is not checked yet; a sync that changes nothing writes nothing.
     pub async fn sync(&self, id: &str) -> Result<(), String> {
+        let result = self.sync_once(id).await;
+        if let Err(why) = &result {
+            self.note_sync_error(id, why);
+            self.retry_later(id);
+        }
+        result
+    }
+
+    /// Keeps why the last sync of `id` failed, when that is news and the connection is active.
+    fn note_sync_error(&self, id: &str, why: &str) {
+        let now = self.now();
+        let _ = self.save_active(id, |binding| {
+            if binding.sync_error.as_deref() == Some(why) {
+                return false;
+            }
+            binding.sync_error = Some(why.to_string());
+            binding.updated_at = now;
+            true
+        });
+    }
+
+    /// The lock that lets one sign-in or retry sync of `id` run at a time, with what the last ones did.
+    fn sync_gate(&self, id: &str) -> Arc<tokio::sync::Mutex<SyncGate>> {
+        Arc::clone(self.lock().sign_in_syncs.entry(id.to_string()).or_default())
+    }
+
+    /// One sync cut off at the signer's sign-in deadline; one cut off is a failure like any other: kept, and retried.
+    async fn sync_within_deadline(&self, id: &str) -> Result<(), String> {
+        let deadline = self.inner.sign_in_deadline;
+        match tokio::time::timeout(deadline, self.sync(id)).await {
+            Ok(result) => result,
+            Err(_) => {
+                let why = format!(
+                    "GitHub did not answer the runner group's check within {} seconds",
+                    deadline.as_secs_f64()
+                );
+                self.note_sync_error(id, &why);
+                self.retry_later(id);
+                Err(why)
+            }
+        }
+    }
+
+    /// One sync under `id`'s gate, its end and outcome kept for the callers that waited on it.
+    async fn attempt(&self, id: &str, gate: &mut SyncGate) -> Result<(), String> {
+        let result = self.sync_within_deadline(id).await;
+        let ended = self.now();
+        if result.is_ok() {
+            gate.succeeded = Some(ended);
+        }
+        gate.last = Some((ended, result.clone()));
+        result
+    }
+
+    /// The sync a pool's sign-in runs first (issue 328): one at a time per connection (with the node's own retries),
+    /// within the signer's sign-in deadline. The classes that wait while one runs take its outcome, a failure included,
+    /// and none runs for ten minutes after one that succeeded. Its failure is the caller's to log; the group as
+    /// recorded stands.
+    pub async fn sync_for_sign_in(&self, id: &str) -> Result<(), String> {
+        let gate = self.sync_gate(id);
+        let arrived = self.now();
+        let (mut held, waited) = match gate.try_lock() {
+            Ok(held) => (held, false),
+            Err(_) => (gate.lock().await, true),
+        };
+        if waited
+            && let Some((ended, result)) = &held.last
+            && *ended >= arrived
+        {
+            return result.clone();
+        }
+        if held
+            .succeeded
+            .is_some_and(|at| arrived.saturating_sub(at) < SIGN_IN_SYNC_GAP_MS)
+        {
+            return Ok(());
+        }
+        self.attempt(id, &mut held).await
+    }
+
+    /// Starts the node's own retry of `id`'s failed sync, after the signer's first wait (issue 328, so a healthy pool
+    /// session does not hide a failed repair).
+    fn retry_later(&self, id: &str) {
+        let first = millis(self.inner.sync_retry.0);
+        self.retry_at(id, self.now().saturating_add(first));
+    }
+
+    /// Starts the node's own retry of `id`'s failed sync at `at` (ms), unless one is waiting already: then doubling up
+    /// to the signer's cap, through the sign-in syncs' lock, until one succeeds or the connection is no longer an
+    /// active one whose sync failed. The record keeps when the next one runs. Needs a running Tokio runtime; without
+    /// one the next sign-in or GitHub's return syncs.
+    fn retry_at(&self, id: &str, at: u64) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        if !self.still_failing(id) {
+            return;
+        }
+        let waiting = {
+            let mut state = self.lock();
+            let waiting = state.sync_retries.get(id).copied();
+            if waiting.is_none() {
+                state.sync_retries.insert(id.to_string(), at);
+            }
+            waiting
+        };
+        self.note_retry_at(id, waiting.unwrap_or(at));
+        if waiting.is_some() {
+            return;
+        }
+        let (first, cap) = self.inner.sync_retry;
+        let signer = self.clone();
+        let id = id.to_string();
+        runtime.spawn(async move {
+            let _slot = RetrySlot {
+                signer: signer.clone(),
+                id: id.clone(),
+            };
+            let (mut at, mut wait) = (at, first);
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    at.saturating_sub(signer.now()),
+                ))
+                .await;
+                let gate = signer.sync_gate(&id);
+                let mut held = gate.lock().await;
+                if !signer.still_failing(&id) || signer.attempt(&id, &mut held).await.is_ok() {
+                    break;
+                }
+                wait = (wait * 2).min(cap);
+                at = signer.now().saturating_add(millis(wait));
+                signer.lock().sync_retries.insert(id.clone(), at);
+                signer.note_retry_at(&id, at);
+            }
+        });
+    }
+
+    /// Starts the node's own retry of every active connection whose last sync failed, at the time its record keeps
+    /// (issue 328): the node calls it when it starts, so the words' promise holds after a restart.
+    pub fn resume_retries(&self) {
+        let due: Vec<(String, Option<u64>)> = self
+            .lock()
+            .bindings
+            .values()
+            .map(|binding| (binding.id.clone(), binding.sync_retry_at))
+            .collect();
+        let first = self.now().saturating_add(millis(self.inner.sync_retry.0));
+        for (id, at) in due {
+            self.retry_at(&id, at.unwrap_or(first));
+        }
+    }
+
+    /// Whether `id` still waits for a sync that succeeds: an active App connection whose last sync failed.
+    fn still_failing(&self, id: &str) -> bool {
+        self.lock().bindings.get(id).is_some_and(|binding| {
+            binding.mode == Mode::App
+                && binding.status == Status::Active
+                && binding.sync_error.is_some()
+        })
+    }
+
+    /// Keeps when the node's own retry of `id` runs, so the words say it.
+    fn note_retry_at(&self, id: &str, at: u64) {
+        let _ = self.save_active(id, |binding| binding.sync_retry_at.replace(at) != Some(at));
+    }
+
+    async fn sync_once(&self, id: &str) -> Result<(), String> {
         let binding = self
             .lock()
             .bindings
@@ -694,7 +899,72 @@ impl Signer {
             .installation_token(id)
             .await
             .map_err(|refused| refused.message())?;
+        let (ids, names) = self.installation_repositories(&token).await?;
+        let org = binding.account.clone();
+        let recorded = binding
+            .installation
+            .as_ref()
+            .map(|installation| installation.repositories.clone())
+            .unwrap_or_default();
+        let group = match binding.runner_group.clone() {
+            Some(group) if group.created_by_arca => {
+                self.open_group(&org, &group, &ids, &names, &recorded, &token)
+                    .await?
+            }
+            // A group Arca did not make is left as it is, with what Arca read of it when it took it.
+            Some(group) => RunnerGroup {
+                access: Some(group.access.unwrap_or(GroupAccess::Unknown)),
+                ..group
+            },
+            None => self.make_group(&org, &ids, &token).await?,
+        };
+        // Written only while the connection is active, so a disconnect meanwhile is never written back.
+        let now = self.now();
+        let mut words = None;
+        let written = self
+            .save_active(id, |binding| {
+                let before = binding.clone();
+                if let Some(installation) = binding.installation.as_mut() {
+                    installation.repositories = names.clone();
+                }
+                binding.runner_group = Some(group.clone());
+                binding.sync_error = None;
+                binding.sync_retry_at = None;
+                if *binding == before {
+                    return false;
+                }
+                binding.updated_at = now;
+                words = binding.group_access_words();
+                true
+            })
+            .map_err(|error| error.message())?;
+        if !written {
+            return Ok(());
+        }
+        self.audit(json!({
+            "kind": "sync",
+            "binding": id,
+            "account": org,
+            "runnerGroupId": group.id,
+            "runnerGroupAccess": group.access,
+            "words": words,
+            "repositories": names,
+        }));
+        Ok(())
+    }
+
+    /// The installation's repositories, ids and `owner/name`. It lists none only when GitHub says so: page 1 holds a
+    /// `repositories` array and `total_count` 0. Any other answer, a 2xx not in that shape included, is an error, so
+    /// nothing is changed on it.
+    async fn installation_repositories(
+        &self,
+        token: &Secret,
+    ) -> Result<(Vec<u64>, Vec<String>), String> {
         let http = &self.inner.http;
+        let shape = || {
+            "GitHub's list of the installation's repositories was not in its usual shape, so Arca changed nothing"
+                .to_string()
+        };
         let mut names = Vec::new();
         let mut ids = Vec::new();
         for page in 1..=10 {
@@ -704,7 +974,7 @@ impl Signer {
                     &http.api(&format!(
                         "/installation/repositories?per_page=100&page={page}"
                     )),
-                    Auth::Bearer(&token),
+                    Auth::Bearer(token),
                     None,
                 )
                 .await?;
@@ -715,63 +985,203 @@ impl Signer {
             let repositories = body
                 .get("repositories")
                 .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            for repository in &repositories {
-                if let (Some(id), Some(name)) = (
+                .ok_or_else(shape)?;
+            if page == 1
+                && repositories.is_empty()
+                && body.get("total_count").and_then(Value::as_u64) != Some(0)
+            {
+                return Err(shape());
+            }
+            for repository in repositories {
+                let (Some(id), Some(name)) = (
                     repository.get("id").and_then(Value::as_u64),
                     repository.get("full_name").and_then(Value::as_str),
-                ) {
-                    ids.push(id);
-                    names.push(name.to_string());
-                }
+                ) else {
+                    return Err(shape());
+                };
+                ids.push(id);
+                names.push(name.to_string());
             }
             if repositories.len() < 100 {
                 break;
             }
         }
-        let org = binding.account.clone();
-        let group = match binding.runner_group.clone() {
-            Some(group) if group.created_by_arca => {
-                let answer = http
-                    .send(
-                        Method::PUT,
-                        &http.api(&format!(
-                            "/orgs/{org}/actions/runner-groups/{}/repositories",
-                            group.id
-                        )),
-                        Auth::Bearer(&token),
-                        Some(&json!({ "selected_repository_ids": ids })),
-                    )
-                    .await?;
-                if !answer.ok() {
-                    return Err(answer.why());
-                }
-                group
+        Ok((ids, names))
+    }
+
+    /// Opens Arca's own runner group (issue 328):
+    /// - the installation lists repositories: `selected`, exactly those;
+    /// - it lists none: every private and internal repository (`all`) for a group new to this rule (a record with no
+    ///   access yet, the state Arca before issue 328 left, or one recorded `all-private`); a group recorded `selected`
+    ///   stays `selected`, now with none, since the owner took the last repository away.
+    ///
+    /// Public repositories stay off. The visibility is set only when what the group is open to changes, under the name
+    /// GitHub has for the group (it is never renamed), and the repository list only when it differs from the one last
+    /// recorded, so what the owner narrows on GitHub stays.
+    async fn open_group(
+        &self,
+        org: &str,
+        group: &RunnerGroup,
+        ids: &[u64],
+        names: &[String],
+        recorded: &[String],
+        token: &Secret,
+    ) -> Result<RunnerGroup, String> {
+        let http = &self.inner.http;
+        let id = group.id;
+        // A record with no access yet (Arca 0.45 or older) is widened only when its group is still open to no
+        // repository (`selected` with none); any other state is the owner's own, kept as it is and recorded as read.
+        if group.access.is_none() && ids.is_empty() {
+            let (name, visibility, public) = self.group_read(org, id, token).await?;
+            let listed = if visibility == "selected" {
+                Some(self.group_repositories(org, id, token).await?)
+            } else {
+                None
+            };
+            if !matches!(&listed, Some((0, _))) {
+                // Recorded as not Arca's, so no later sync writes to it either.
+                return Ok(RunnerGroup {
+                    name,
+                    created_by_arca: false,
+                    access: Some(match visibility.as_str() {
+                        "selected" => GroupAccess::Selected,
+                        "all" if public == Some(false) => GroupAccess::AllPrivate,
+                        _ => GroupAccess::Unknown,
+                    }),
+                    repositories: listed.map(|(_, names)| names),
+                    ..group.clone()
+                });
             }
-            Some(group) => group,
-            None => self.make_group(&org, &ids, &token).await?,
-        };
-        let mut binding = self
-            .lock()
-            .bindings
-            .get(id)
-            .cloned()
-            .ok_or("no such connection")?;
-        if let Some(installation) = binding.installation.as_mut() {
-            installation.repositories = names.clone();
         }
-        binding.runner_group = Some(group.clone());
-        binding.updated_at = self.now();
-        self.save(binding).map_err(|error| error.message())?;
-        self.audit(json!({
-            "kind": "sync",
-            "binding": id,
-            "account": org,
-            "runnerGroupId": group.id,
-            "repositories": names,
-        }));
-        Ok(())
+        let access = if !ids.is_empty() || group.access == Some(GroupAccess::Selected) {
+            GroupAccess::Selected
+        } else {
+            GroupAccess::AllPrivate
+        };
+        let mut name = group.name.clone();
+        let mut calls = Vec::new();
+        if group.access != Some(access) {
+            name = self.group_read(org, id, token).await?.0;
+            calls.push((
+                Method::PATCH,
+                format!("/orgs/{org}/actions/runner-groups/{id}"),
+                json!({
+                    "name": name,
+                    "visibility": if access == GroupAccess::Selected { "selected" } else { "all" },
+                    "allows_public_repositories": false,
+                }),
+            ));
+        }
+        let same = {
+            let (mut ours, mut theirs) = (names.to_vec(), recorded.to_vec());
+            ours.sort();
+            theirs.sort();
+            ours == theirs
+        };
+        let put = access == GroupAccess::Selected
+            && (group.access != Some(GroupAccess::Selected) || !same);
+        if put {
+            calls.push((
+                Method::PUT,
+                format!("/orgs/{org}/actions/runner-groups/{id}/repositories"),
+                json!({ "selected_repository_ids": ids }),
+            ));
+        }
+        for (method, path, body) in calls {
+            let answer = http
+                .send(method, &http.api(&path), Auth::Bearer(token), Some(&body))
+                .await?;
+            if !answer.ok() {
+                return Err(answer.why());
+            }
+        }
+        // A list the owner kept (N2) stays until Arca sets the group's list or visibility itself.
+        let repositories = if put || group.access != Some(access) {
+            None
+        } else {
+            group.repositories.clone()
+        };
+        Ok(RunnerGroup {
+            name,
+            repositories,
+            access: Some(access),
+            ..group.clone()
+        })
+    }
+
+    /// A runner group as GitHub has it now: its name, its visibility and whether it admits public repositories.
+    async fn group_read(
+        &self,
+        org: &str,
+        id: u64,
+        token: &Secret,
+    ) -> Result<(String, String, Option<bool>), String> {
+        let http = &self.inner.http;
+        let answer = http
+            .send(
+                Method::GET,
+                &http.api(&format!("/orgs/{org}/actions/runner-groups/{id}")),
+                Auth::Bearer(token),
+                None,
+            )
+            .await?;
+        if !answer.ok() {
+            return Err(answer.why());
+        }
+        let body = answer.json();
+        let name = body
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or("GitHub's runner group had no name")?;
+        Ok((
+            name.to_string(),
+            body.get("visibility")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            // Not said is not known (never taken as off).
+            body.get("allows_public_repositories")
+                .and_then(Value::as_bool),
+        ))
+    }
+
+    /// The repositories GitHub lists for runner group `id`: how many, and the first hundred by `owner/name`.
+    async fn group_repositories(
+        &self,
+        org: &str,
+        id: u64,
+        token: &Secret,
+    ) -> Result<(u64, Vec<String>), String> {
+        let http = &self.inner.http;
+        let answer = http
+            .send(
+                Method::GET,
+                &http.api(&format!(
+                    "/orgs/{org}/actions/runner-groups/{id}/repositories?per_page=100"
+                )),
+                Auth::Bearer(token),
+                None,
+            )
+            .await?;
+        if !answer.ok() {
+            return Err(answer.why());
+        }
+        let body = answer.json();
+        let total = body
+            .get("total_count")
+            .and_then(Value::as_u64)
+            .ok_or("GitHub did not say how many repositories the runner group holds")?;
+        // A count without the list, or a count the list does not bear out, is not GitHub's shape (the M1 rule).
+        let names = body
+            .get("repositories")
+            .and_then(Value::as_array)
+            .filter(|list| !list.is_empty() || total == 0)
+            .ok_or("GitHub's list of the runner group's repositories was not in its usual shape")?
+            .iter()
+            .filter_map(|repository| repository.get("full_name").and_then(Value::as_str))
+            .map(str::to_string)
+            .collect();
+        Ok((total, names))
     }
 
     async fn make_group(
@@ -781,17 +1191,33 @@ impl Signer {
         token: &Secret,
     ) -> Result<RunnerGroup, String> {
         let http = &self.inner.http;
+        // Open to exactly the installation's repositories, or to every private and internal one when it lists none.
+        let (body, access) = if ids.is_empty() {
+            (
+                json!({
+                    "name": RUNNER_GROUP_NAME,
+                    "visibility": "all",
+                    "allows_public_repositories": false,
+                }),
+                GroupAccess::AllPrivate,
+            )
+        } else {
+            (
+                json!({
+                    "name": RUNNER_GROUP_NAME,
+                    "visibility": "selected",
+                    "selected_repository_ids": ids,
+                    "allows_public_repositories": false,
+                }),
+                GroupAccess::Selected,
+            )
+        };
         let answer = http
             .send(
                 Method::POST,
                 &http.api(&format!("/orgs/{org}/actions/runner-groups")),
                 Auth::Bearer(token),
-                Some(&json!({
-                    "name": RUNNER_GROUP_NAME,
-                    "visibility": "selected",
-                    "selected_repository_ids": ids,
-                    "allows_public_repositories": false,
-                })),
+                Some(&body),
             )
             .await?;
         if answer.ok() {
@@ -804,10 +1230,14 @@ impl Signer {
                 name: RUNNER_GROUP_NAME.to_string(),
                 created_by_arca: true,
                 warning: None,
+                repositories: None,
+                access: Some(access),
             });
         }
         if answer.status == 409 || answer.status == 422 {
-            // A group of that name is there: take it, and give it exactly these repositories.
+            // A group of that name is there. It is Arca's only when it is open to no repository (`selected` with none:
+            // what an earlier connection of Arca's left); then it is opened as Arca opens its own. Any other is left as
+            // GitHub has it.
             let listed = http
                 .send(
                     Method::GET,
@@ -825,30 +1255,27 @@ impl Signer {
                 .find(|group| group.get("name").and_then(Value::as_str) == Some(RUNNER_GROUP_NAME))
                 .and_then(|group| group.get("id").and_then(Value::as_u64));
             if let Some(group_id) = found {
-                for (method, path, body) in [
-                    (
-                        Method::PATCH,
-                        format!("/orgs/{org}/actions/runner-groups/{group_id}"),
-                        json!({ "visibility": "selected", "allows_public_repositories": false }),
-                    ),
-                    (
-                        Method::PUT,
-                        format!("/orgs/{org}/actions/runner-groups/{group_id}/repositories"),
-                        json!({ "selected_repository_ids": ids }),
-                    ),
-                ] {
-                    let answer = http
-                        .send(method, &http.api(&path), Auth::Bearer(token), Some(&body))
-                        .await?;
-                    if !answer.ok() {
-                        return Err(answer.why());
-                    }
+                let (name, visibility, public) = self.group_read(org, group_id, token).await?;
+                let empty = visibility == "selected"
+                    && self.group_repositories(org, group_id, token).await?.0 == 0;
+                let group = RunnerGroup {
+                    id: group_id,
+                    name,
+                    created_by_arca: empty,
+                    warning: None,
+                    repositories: None,
+                    access: None,
+                };
+                if empty {
+                    return self.open_group(org, &group, ids, &[], &[], token).await;
                 }
                 return Ok(RunnerGroup {
-                    id: group_id,
-                    name: RUNNER_GROUP_NAME.to_string(),
-                    created_by_arca: true,
-                    warning: None,
+                    access: Some(if visibility == "all" && public == Some(false) {
+                        GroupAccess::AllPrivate
+                    } else {
+                        GroupAccess::Unknown
+                    }),
+                    ..group
                 });
             }
         }
@@ -862,6 +1289,8 @@ impl Signer {
                  plan up.",
                 answer.why()
             )),
+            repositories: None,
+            access: Some(GroupAccess::Unknown),
         })
     }
 
@@ -1366,6 +1795,8 @@ impl Signer {
             runners: Vec::new(),
             app: None,
             installation: None,
+            sync_error: None,
+            sync_retry_at: None,
             created_by: caller.to_string(),
             created_at: now,
             updated_at: now,

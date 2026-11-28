@@ -7466,13 +7466,47 @@ you stop.
 ### Mode 2: a GitHub App made for you (manifest flow)
 
 The page posts an App manifest to GitHub. The person sees GitHub's own "Create GitHub App" screen with everything
-filled in, presses Create, then picks the repositories on the install screen. The App asks for organisation
-"Self-hosted runners: read and write" and nothing else, has no webhook, and is private to the organisation. GitHub
-hands its private key to Arca's callback, which writes it to the store.
+filled in, presses Create, then installs it with GitHub's own Install button. The App asks for organisation
+"Self-hosted runners: read and write" and nothing else, has no webhook, and is private to the organisation; since it
+asks for no repository permission, GitHub's install screen offers no repository choice. GitHub hands its private key
+to Arca's callback, which writes it to the store.
 
-After the install, Arca makes a runner group called `Arca runners` open to exactly the repositories picked (or adopts
-the group of that name if one exists). When GitHub's plan has no runner groups, it falls back to the default group and
-says so. Every runner is then minted just in time, one per job: `github_runner_mint` (or the signer's in-process call,
+After the install, Arca makes a runner group called `Arca runners`, public repositories off. What it opens the group to,
+and what the page, `github_bindings` (`runnerGroup.access`, `accessWords`) and the audit `sync` line
+(`runnerGroupAccess`, `words`) say:
+
+| The installation lists | The group | What Arca does | `access` and words |
+|---|---|---|---|
+| no repository (the usual case) | made by Arca now, or recorded without an access (made by Arca 0.45 or older) | `visibility: all` | `all-private`: "Every private and internal repository of `<org>` may send jobs here. Narrow it in the runner group on GitHub." |
+| repositories | Arca's | `visibility: selected`, exactly those | `selected`: "Only these repositories of `<org>` may send jobs here: …" |
+| no repository any more | Arca's, recorded `selected` | stays `selected`, with none | `selected`: open to no repository; "connected, open to no repository" on the page |
+| anything | a group of that name already there, `selected` with no repository | taken as Arca's, as in the rows above | as above |
+| anything | a group of that name already there, any other (yours) | nothing: not opened, not renamed | `all-private` when it is `all` with public repositories off, else `unknown` |
+| anything | the default group (a plan without runner groups) | nothing | `unknown`, with a warning |
+
+Arca changes a group's visibility only when what it is open to changes, under the name GitHub has for it, and sends
+its repository list only when the installation's list changed. So what you narrow or rename in the group's settings on
+GitHub ("Settings", "Actions", "Runner groups") stays; Arca's words then still say what it last set, since it does not
+read the group back.
+
+The sync runs on GitHub's install return, on its later returns (`refresh`), and when a pool session signs in (the
+pool's start included): one at a time per connection, for twenty seconds at most, after which the sign-in goes on with
+the group as recorded, and not again for ten minutes after one that succeeded (the classes that start together share
+it). A listing GitHub answers in any shape but a `repositories` array (an empty one only with `total_count: 0`), or does
+not answer, changes nothing: the connection reads `unchecked`, "connected, runner group not checked yet" on the page,
+with the reason (`syncError`) and the time Arca checks again (`syncRetryAt`, shown as "HH:MM UTC"). The node retries
+such a sync by itself, with no sign-in or `refresh`: after about a minute, then doubling, up to ten minutes, until one
+succeeds; a restart starts it again at the time the record keeps. The classes that wait while a sync runs take its
+outcome, a failure included. A suspended or disconnected connection is not checked again and promises no check, and a
+disconnected one's record is not written again. A sync that changes nothing writes no audit line.
+
+A connection made by Arca 0.45 or older whose installation lists no repository reads `none` ("connected, open to no
+repository", with a `why`) until its next sync. That sync reads the group first: still `selected` with no repository,
+it opens it; `selected` with repositories you gave it on GitHub, it leaves it and records those
+(`runnerGroup.repositories`); anything else it records as it reads it. Any group it does not open is recorded as not
+Arca's (`createdByArca: false`), so no later sync writes to it. Nothing is asked of the owner.
+
+Every runner is then minted just in time, one per job: `github_runner_mint` (or the signer's in-process call,
 `Signer::mint`) returns one ephemeral runner configuration and writes who asked, when, the labels, the runner group and,
 once known, the job. A runner for a scale set is minted only when GitHub says the scale set is in the connection's own
 runner group; another group's scale set is refused (`ScaleSetOutsideGroup`) and the refusal logs the group it is in.
