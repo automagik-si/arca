@@ -605,7 +605,7 @@ impl Signer {
             app: None,
             installation: None,
             sync_error: None,
-            sync_retry_in_ms: None,
+            sync_retry_at: None,
             created_by: flow.created_by.clone(),
             created_at: now,
             updated_at: now,

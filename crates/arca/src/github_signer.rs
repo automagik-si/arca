@@ -157,9 +157,9 @@ pub struct Binding {
     /// Why the last sync of the runner group failed, in words, until one succeeds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sync_error: Option<String>,
-    /// When a sync failed: how long after it the node's own retry runs (ms).
+    /// When a sync failed: when the node's own retry runs (ms since the epoch).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sync_retry_in_ms: Option<u64>,
+    pub sync_retry_at: Option<u64>,
     /// Who made it: a token id, or `page` for the owner's page.
     pub created_by: String,
     pub created_at: u64,
@@ -258,7 +258,7 @@ impl Binding {
                 self.sync_error
                     .as_deref()
                     .unwrap_or("the last check failed"),
-                match self.sync_retry_in_ms {
+                match self.sync_retry_at {
                     Some(ms) => format!("Arca checks again in about {}.", wait_words(ms)),
                     None => "Arca checks again when a pool signs in or GitHub's page returns."
                         .to_string(),

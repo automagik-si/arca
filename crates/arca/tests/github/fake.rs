@@ -89,7 +89,7 @@ pub struct FakeState {
     pub repositories: Vec<(u64, String)>,
     /// What creating a runner group answers instead of making it, if anything.
     pub group_create_refusal: Option<u16>,
-    /// The runner groups' repositories, by group id.
+    /// The runner groups' repositories, by group id (ids; an object is answered as it is).
     pub group_repositories: Vec<(u64, Value)>,
     /// The organisation's scale sets: `(id, runner group id)`.
     pub scale_sets: Vec<(u64, u64)>,
@@ -521,10 +521,12 @@ fn answer(
                 .trim_end_matches("/repositories")
                 .parse()
                 .unwrap_or(0);
-            let ids: Vec<Value> = s
-                .group_repositories
-                .iter()
-                .find(|(group, _)| *group == id)
+            let listed = s.group_repositories.iter().find(|(group, _)| *group == id);
+            // An object is answered as it is: a listing not in GitHub's shape.
+            if let Some((_, answer)) = listed.filter(|(_, list)| list.is_object()) {
+                return (200, answer.clone());
+            }
+            let ids: Vec<Value> = listed
                 .and_then(|(_, list)| list.as_array().cloned())
                 .unwrap_or_default();
             let repositories: Vec<Value> = ids

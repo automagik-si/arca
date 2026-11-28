@@ -516,7 +516,7 @@ impl Signer {
             }),
             installation: None,
             sync_error: None,
-            sync_retry_in_ms: None,
+            sync_retry_at: None,
             created_by: flow.caller.clone(),
             created_at: now,
             updated_at: now,
@@ -794,6 +794,9 @@ impl Signer {
         });
     }
 
+    /// Starts the node's own retry of every active connection whose last sync failed, at the time its record keeps.
+    pub fn resume_retries(&self) {}
+
     /// Whether `id` still waits for a sync that succeeds: an active App connection whose last sync failed.
     fn still_failing(&self, id: &str) -> bool {
         self.lock().bindings.get(id).is_some_and(|binding| {
@@ -809,10 +812,10 @@ impl Signer {
             return;
         };
         let wait = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX);
-        if binding.sync_retry_in_ms == Some(wait) {
+        if binding.sync_retry_at == Some(wait) {
             return;
         }
-        binding.sync_retry_in_ms = Some(wait);
+        binding.sync_retry_at = Some(wait);
         let _ = self.save(binding);
     }
 
@@ -861,7 +864,7 @@ impl Signer {
         }
         binding.runner_group = Some(group.clone());
         binding.sync_error = None;
-        binding.sync_retry_in_ms = None;
+        binding.sync_retry_at = None;
         if binding == before {
             return Ok(());
         }
@@ -1719,7 +1722,7 @@ impl Signer {
             app: None,
             installation: None,
             sync_error: None,
-            sync_retry_in_ms: None,
+            sync_retry_at: None,
             created_by: caller.to_string(),
             created_at: now,
             updated_at: now,

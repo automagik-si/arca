@@ -2121,7 +2121,7 @@ mod tests {
                 repositories: repositories.iter().map(|name| name.to_string()).collect(),
             }),
             sync_error: None,
-            sync_retry_in_ms: None,
+            sync_retry_at: None,
             created_by: "page".to_string(),
             created_at: 0,
             updated_at: 0,
