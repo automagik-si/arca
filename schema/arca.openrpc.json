@@ -16158,7 +16158,7 @@
                   "syncError": {
                     "type": "string"
                   },
-                  "syncRetryInMs": {
+                  "syncRetryAt": {
                     "minimum": 0,
                     "type": "integer"
                   },
@@ -16775,7 +16775,7 @@
             "syncError": {
               "type": "string"
             },
-            "syncRetryInMs": {
+            "syncRetryAt": {
               "minimum": 0,
               "type": "integer"
             },
@@ -17139,7 +17139,7 @@
                   "syncError": {
                     "type": "string"
                   },
-                  "syncRetryInMs": {
+                  "syncRetryAt": {
                     "minimum": 0,
                     "type": "integer"
                   },

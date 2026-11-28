@@ -35,7 +35,7 @@ use sha2::{Digest as _, Sha256};
 use crate::github_api::{ACTIONS_API_VERSION, Answer, AppKey, Auth, Secret};
 use crate::github_signer::{
     AppRecord, Binding, GroupAccess, InstallationRecord, Mode, RunnerGroup, Signer, SignerError,
-    Status, check_account, check_labels, fresh_id, same_labels, write_private,
+    Status, SyncGate, check_account, check_labels, fresh_id, same_labels, write_private,
 };
 
 /// The name of the runner group Arca makes for an App binding.
@@ -264,6 +264,27 @@ fn github(answer: &Answer) -> MintRefused {
 /// A random 32-hex value.
 fn fresh_state() -> Result<String, SignerError> {
     Ok(format!("{}{}", fresh_id("")?, fresh_id("")?))
+}
+
+/// A duration in ms.
+fn millis(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Frees a connection's retry slot however its task ends, a panic included; unless it panicked, a failure that landed
+/// after the task's last look gets a new retry.
+struct RetrySlot {
+    signer: Signer,
+    id: String,
+}
+
+impl Drop for RetrySlot {
+    fn drop(&mut self) {
+        self.signer.lock().sync_retries.remove(&self.id);
+        if !std::thread::panicking() {
+            self.signer.retry_later(&self.id);
+        }
+    }
 }
 
 impl Signer {
@@ -706,21 +727,21 @@ impl Signer {
         result
     }
 
-    /// Keeps why the last sync of `id` failed, when that is news.
+    /// Keeps why the last sync of `id` failed, when that is news and the connection is active.
     fn note_sync_error(&self, id: &str, why: &str) {
-        let Some(mut binding) = self.lock().bindings.get(id).cloned() else {
-            return;
-        };
-        if binding.sync_error.as_deref() == Some(why) {
-            return;
-        }
-        binding.sync_error = Some(why.to_string());
-        binding.updated_at = self.now();
-        let _ = self.save(binding);
+        let now = self.now();
+        let _ = self.save_active(id, |binding| {
+            if binding.sync_error.as_deref() == Some(why) {
+                return false;
+            }
+            binding.sync_error = Some(why.to_string());
+            binding.updated_at = now;
+            true
+        });
     }
 
-    /// The lock that lets one sign-in or retry sync of `id` run at a time, over when one last succeeded (ms).
-    fn sync_gate(&self, id: &str) -> Arc<tokio::sync::Mutex<Option<u64>>> {
+    /// The lock that lets one sign-in or retry sync of `id` run at a time, with what the last ones did.
+    fn sync_gate(&self, id: &str) -> Arc<tokio::sync::Mutex<SyncGate>> {
         Arc::clone(self.lock().sign_in_syncs.entry(id.to_string()).or_default())
     }
 
@@ -741,61 +762,114 @@ impl Signer {
         }
     }
 
-    /// The sync a pool's sign-in runs first (issue 328): one at a time per connection (with the node's own retries),
-    /// within the signer's sign-in deadline, and not again for ten minutes after one that succeeded (the classes of a
-    /// pool that start together share it). A failed one holds nothing off. Its failure is the caller's to log; the group
-    /// as recorded stands.
-    pub async fn sync_for_sign_in(&self, id: &str) -> Result<(), String> {
-        let gate = self.sync_gate(id);
-        let mut succeeded = gate.lock().await;
-        let now = self.now();
-        if succeeded.is_some_and(|at| now.saturating_sub(at) < SIGN_IN_SYNC_GAP_MS) {
-            return Ok(());
-        }
+    /// One sync under `id`'s gate, its end and outcome kept for the callers that waited on it.
+    async fn attempt(&self, id: &str, gate: &mut SyncGate) -> Result<(), String> {
         let result = self.sync_within_deadline(id).await;
+        let ended = self.now();
         if result.is_ok() {
-            *succeeded = Some(self.now());
+            gate.succeeded = Some(ended);
         }
+        gate.last = Some((ended, result.clone()));
         result
     }
 
-    /// Starts the node's own retry of `id`'s failed sync, unless one runs (issue 328, so a healthy pool session does not
-    /// hide a failed repair): after the signer's first wait, then doubling up to its cap, through the sign-in syncs'
-    /// lock, until one succeeds or the connection no longer needs it. Needs a running Tokio runtime; without one the
-    /// next sign-in or GitHub's return syncs.
+    /// The sync a pool's sign-in runs first (issue 328): one at a time per connection (with the node's own retries),
+    /// within the signer's sign-in deadline. The classes that wait while one runs take its outcome, a failure included,
+    /// and none runs for ten minutes after one that succeeded. Its failure is the caller's to log; the group as
+    /// recorded stands.
+    pub async fn sync_for_sign_in(&self, id: &str) -> Result<(), String> {
+        let gate = self.sync_gate(id);
+        let arrived = self.now();
+        let (mut held, waited) = match gate.try_lock() {
+            Ok(held) => (held, false),
+            Err(_) => (gate.lock().await, true),
+        };
+        if waited
+            && let Some((ended, result)) = &held.last
+            && *ended >= arrived
+        {
+            return result.clone();
+        }
+        if held
+            .succeeded
+            .is_some_and(|at| arrived.saturating_sub(at) < SIGN_IN_SYNC_GAP_MS)
+        {
+            return Ok(());
+        }
+        self.attempt(id, &mut held).await
+    }
+
+    /// Starts the node's own retry of `id`'s failed sync, after the signer's first wait (issue 328, so a healthy pool
+    /// session does not hide a failed repair).
     fn retry_later(&self, id: &str) {
+        let first = millis(self.inner.sync_retry.0);
+        self.retry_at(id, self.now().saturating_add(first));
+    }
+
+    /// Starts the node's own retry of `id`'s failed sync at `at` (ms), unless one is waiting already: then doubling up
+    /// to the signer's cap, through the sign-in syncs' lock, until one succeeds or the connection is no longer an
+    /// active one whose sync failed. The record keeps when the next one runs. Needs a running Tokio runtime; without
+    /// one the next sign-in or GitHub's return syncs.
+    fn retry_at(&self, id: &str, at: u64) {
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
-        if !self.lock().sync_retries.insert(id.to_string()) {
+        if !self.still_failing(id) {
+            return;
+        }
+        let waiting = {
+            let mut state = self.lock();
+            let waiting = state.sync_retries.get(id).copied();
+            if waiting.is_none() {
+                state.sync_retries.insert(id.to_string(), at);
+            }
+            waiting
+        };
+        self.note_retry_at(id, waiting.unwrap_or(at));
+        if waiting.is_some() {
             return;
         }
         let (first, cap) = self.inner.sync_retry;
-        self.note_retry(id, first);
         let signer = self.clone();
         let id = id.to_string();
         runtime.spawn(async move {
-            let mut wait = first;
+            let _slot = RetrySlot {
+                signer: signer.clone(),
+                id: id.clone(),
+            };
+            let (mut at, mut wait) = (at, first);
             loop {
-                tokio::time::sleep(wait).await;
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    at.saturating_sub(signer.now()),
+                ))
+                .await;
                 let gate = signer.sync_gate(&id);
-                let mut succeeded = gate.lock().await;
-                if !signer.still_failing(&id) {
-                    break;
-                }
-                if signer.sync_within_deadline(&id).await.is_ok() {
-                    *succeeded = Some(signer.now());
+                let mut held = gate.lock().await;
+                if !signer.still_failing(&id) || signer.attempt(&id, &mut held).await.is_ok() {
                     break;
                 }
                 wait = (wait * 2).min(cap);
-                signer.note_retry(&id, wait);
+                at = signer.now().saturating_add(millis(wait));
+                signer.lock().sync_retries.insert(id.clone(), at);
+                signer.note_retry_at(&id, at);
             }
-            signer.lock().sync_retries.remove(&id);
         });
     }
 
-    /// Starts the node's own retry of every active connection whose last sync failed, at the time its record keeps.
-    pub fn resume_retries(&self) {}
+    /// Starts the node's own retry of every active connection whose last sync failed, at the time its record keeps
+    /// (issue 328): the node calls it when it starts, so the words' promise holds after a restart.
+    pub fn resume_retries(&self) {
+        let due: Vec<(String, Option<u64>)> = self
+            .lock()
+            .bindings
+            .values()
+            .map(|binding| (binding.id.clone(), binding.sync_retry_at))
+            .collect();
+        let first = self.now().saturating_add(millis(self.inner.sync_retry.0));
+        for (id, at) in due {
+            self.retry_at(&id, at.unwrap_or(first));
+        }
+    }
 
     /// Whether `id` still waits for a sync that succeeds: an active App connection whose last sync failed.
     fn still_failing(&self, id: &str) -> bool {
@@ -807,16 +881,8 @@ impl Signer {
     }
 
     /// Keeps when the node's own retry of `id` runs, so the words say it.
-    fn note_retry(&self, id: &str, wait: std::time::Duration) {
-        let Some(mut binding) = self.lock().bindings.get(id).cloned() else {
-            return;
-        };
-        let wait = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX);
-        if binding.sync_retry_at == Some(wait) {
-            return;
-        }
-        binding.sync_retry_at = Some(wait);
-        let _ = self.save(binding);
+    fn note_retry_at(&self, id: &str, at: u64) {
+        let _ = self.save_active(id, |binding| binding.sync_retry_at.replace(at) != Some(at));
     }
 
     async fn sync_once(&self, id: &str) -> Result<(), String> {
@@ -852,25 +918,29 @@ impl Signer {
             },
             None => self.make_group(&org, &ids, &token).await?,
         };
-        let mut binding = self
-            .lock()
-            .bindings
-            .get(id)
-            .cloned()
-            .ok_or("no such connection")?;
-        let before = binding.clone();
-        if let Some(installation) = binding.installation.as_mut() {
-            installation.repositories = names.clone();
-        }
-        binding.runner_group = Some(group.clone());
-        binding.sync_error = None;
-        binding.sync_retry_at = None;
-        if binding == before {
+        // Written only while the connection is active, so a disconnect meanwhile is never written back.
+        let now = self.now();
+        let mut words = None;
+        let written = self
+            .save_active(id, |binding| {
+                let before = binding.clone();
+                if let Some(installation) = binding.installation.as_mut() {
+                    installation.repositories = names.clone();
+                }
+                binding.runner_group = Some(group.clone());
+                binding.sync_error = None;
+                binding.sync_retry_at = None;
+                if *binding == before {
+                    return false;
+                }
+                binding.updated_at = now;
+                words = binding.group_access_words();
+                true
+            })
+            .map_err(|error| error.message())?;
+        if !written {
             return Ok(());
         }
-        binding.updated_at = self.now();
-        let words = binding.group_access_words();
-        self.save(binding).map_err(|error| error.message())?;
         self.audit(json!({
             "kind": "sync",
             "binding": id,
@@ -969,8 +1039,10 @@ impl Signer {
                 None
             };
             if !matches!(&listed, Some((0, _))) {
+                // Recorded as not Arca's, so no later sync writes to it either.
                 return Ok(RunnerGroup {
                     name,
+                    created_by_arca: false,
                     access: Some(match visibility.as_str() {
                         "selected" => GroupAccess::Selected,
                         "all" if public == Some(false) => GroupAccess::AllPrivate,
@@ -1099,11 +1171,13 @@ impl Signer {
             .get("total_count")
             .and_then(Value::as_u64)
             .ok_or("GitHub did not say how many repositories the runner group holds")?;
+        // A count without the list, or a count the list does not bear out, is not GitHub's shape (the M1 rule).
         let names = body
             .get("repositories")
             .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
+            .filter(|list| !list.is_empty() || total == 0)
+            .ok_or("GitHub's list of the runner group's repositories was not in its usual shape")?
+            .iter()
             .filter_map(|repository| repository.get("full_name").and_then(Value::as_str))
             .map(str::to_string)
             .collect();

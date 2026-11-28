@@ -21,7 +21,7 @@
 //! mint is a line of `<stateDir>/github/audit.jsonl`: who asked, when, for which binding, runner group and labels, and the
 //! outcome.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::{self, Write as _};
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
@@ -248,20 +248,25 @@ impl Binding {
                 self.group_repositories().join(", ")
             ),
             GroupAccess::Unknown => format!(
-                "Arca did not make the runner group \"{}\", so it cannot tell which repositories of {org} may send \
+                "Arca leaves the runner group \"{}\" as GitHub has it, so it cannot tell which repositories of {org} may send \
                  jobs here. See the group's repository access on GitHub.",
                 group.name
             ),
             GroupAccess::Unchecked => format!(
-                "Arca has not checked yet which repositories of {org} may send jobs to the runner group \"{}\": {}. {}",
+                "Arca has not checked yet which repositories of {org} may send jobs to the runner group \"{}\": {}.{}",
                 group.name,
                 self.sync_error
                     .as_deref()
                     .unwrap_or("the last check failed"),
-                match self.sync_retry_at {
-                    Some(ms) => format!("Arca checks again in about {}.", wait_words(ms)),
-                    None => "Arca checks again when a pool signs in or GitHub's page returns."
-                        .to_string(),
+                // Only an active connection is checked again.
+                match (self.status, self.sync_retry_at) {
+                    (Status::Active, Some(at)) =>
+                        format!(" Arca checks again at {}.", utc_minute(at)),
+                    (Status::Active, None) => {
+                        " Arca checks again when a pool signs in or GitHub's page returns."
+                            .to_string()
+                    }
+                    _ => String::new(),
                 }
             ),
             GroupAccess::NoRepository => format!(
@@ -314,19 +319,10 @@ pub struct BindingInfo {
     pub label_sets: Vec<Vec<String>>,
 }
 
-/// A wait in words: "a second", "20 seconds", "a minute", "10 minutes".
-fn wait_words(ms: u64) -> String {
-    if ms < 60_000 {
-        match ms.div_ceil(1000).max(1) {
-            1 => "a second".to_string(),
-            seconds => format!("{seconds} seconds"),
-        }
-    } else {
-        match (ms + 30_000) / 60_000 {
-            1 => "a minute".to_string(),
-            minutes => format!("{minutes} minutes"),
-        }
-    }
+/// A time (ms since the epoch) as "HH:MM UTC".
+fn utc_minute(at: u64) -> String {
+    let minute = at / 60_000 % 1440;
+    format!("{:02}:{:02} UTC", minute / 60, minute % 60)
 }
 
 /// A registered runner's three files, as the runner reads them from its own folder. They are its lasting credential.
@@ -409,9 +405,16 @@ pub(crate) struct State {
     pub(crate) actions: HashMap<String, crate::github_app::ActionsConnection>,
     /// When a sign-in or retry sync of each binding's runner group last succeeded (ms), behind a lock that lets one run
     /// at a time.
-    pub(crate) sign_in_syncs: HashMap<String, Arc<tokio::sync::Mutex<Option<u64>>>>,
-    /// The bindings whose failed sync the node is retrying by itself.
-    pub(crate) sync_retries: HashSet<String>,
+    pub(crate) sign_in_syncs: HashMap<String, Arc<tokio::sync::Mutex<SyncGate>>>,
+    /// The bindings whose failed sync the node is retrying by itself, with when the next try runs (ms).
+    pub(crate) sync_retries: HashMap<String, u64>,
+}
+
+/// One binding's sign-in and retry syncs: when one last succeeded, and when the last one ended, with its outcome (ms).
+#[derive(Default)]
+pub(crate) struct SyncGate {
+    pub(crate) succeeded: Option<u64>,
+    pub(crate) last: Option<(u64, Result<(), String>)>,
 }
 
 impl Signer {
@@ -560,16 +563,44 @@ impl Signer {
 
     /// Writes `binding` to the store and to the state.
     pub(crate) fn save(&self, binding: Binding) -> Result<(), SignerError> {
+        self.write(&binding)?;
+        self.lock().bindings.insert(binding.id.clone(), binding);
+        Ok(())
+    }
+
+    /// Changes binding `id` while it is active, under the state lock every write ends in, so a record a disconnect
+    /// wrote meanwhile is never written back. `change` says whether there is anything to write; whether it was written.
+    pub(crate) fn save_active(
+        &self,
+        id: &str,
+        change: impl FnOnce(&mut Binding) -> bool,
+    ) -> Result<bool, SignerError> {
+        let mut state = self.lock();
+        let Some(mut binding) = state
+            .bindings
+            .get(id)
+            .filter(|binding| binding.status == Status::Active)
+            .cloned()
+        else {
+            return Ok(false);
+        };
+        if !change(&mut binding) {
+            return Ok(false);
+        }
+        self.write(&binding)?;
+        state.bindings.insert(binding.id.clone(), binding);
+        Ok(true)
+    }
+
+    fn write(&self, binding: &Binding) -> Result<(), SignerError> {
         let path = self
             .inner
             .dir
             .join("bindings")
             .join(format!("{}.json", binding.id));
-        let text = serde_json::to_string_pretty(&binding)
+        let text = serde_json::to_string_pretty(binding)
             .map_err(|_| SignerError::Store("a GitHub connection cannot be written".to_string()))?;
-        write_private(&path, text.as_bytes())?;
-        self.lock().bindings.insert(binding.id.clone(), binding);
-        Ok(())
+        write_private(&path, text.as_bytes())
     }
 
     /// Sets the node's OAuth App: its client ID, in its own file, and its secret, in another. The secret is never read
