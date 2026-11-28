@@ -22,7 +22,8 @@ use serde_json::{Value, json};
 pub const WAIT: Duration = Duration::from_secs(30);
 /// Names another Chrome binary.
 pub const CHROME_ENV: &str = "ARCA_TEST_CHROME";
-const DEFAULT_CHROME: &str = "/usr/bin/google-chrome";
+/// The Chrome binary when `ARCA_TEST_CHROME` names none.
+pub const DEFAULT_CHROME: &str = "/usr/bin/google-chrome";
 
 /// The Chrome binary to drive: `ARCA_TEST_CHROME`, or `/usr/bin/google-chrome`; `None` when there is no file there.
 pub fn binary() -> Option<PathBuf> {

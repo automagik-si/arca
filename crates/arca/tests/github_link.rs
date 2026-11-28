@@ -2288,6 +2288,9 @@ const FORM_POST: [(&str, &str); 5] = [
     ("Sec-Fetch-Dest", "document"),
 ];
 
+/// Headers to change in [`FORM_POST`]: each replaced by its value or, for `None`, left out.
+type HeaderChanges = &'static [(&'static str, Option<&'static str>)];
+
 /// [`FORM_POST`] with the session `cookie`, each header of `changes` replaced by its value or, for `None`, left out.
 fn form_post(cookie: &str, changes: &[(&str, Option<&str>)]) -> Vec<(String, String)> {
     let mut headers: Vec<(String, String)> = FORM_POST
@@ -2400,7 +2403,7 @@ async fn a_form_post_with_a_null_origin_passes_only_from_this_page_and_only_on_i
         let made = rig.alpha.bindings().len();
 
         // Everything else a browser, or anyone, could send is refused by the rule, with its plain page.
-        let cases: [(&str, &[(&str, Option<&str>)]); 14] = [
+        let cases: [(&str, HeaderChanges); 14] = [
             (
                 "another page of the same site",
                 &[("Sec-Fetch-Site", Some("same-site"))],
@@ -2581,7 +2584,7 @@ async fn a_real_browser_presses_each_button_of_the_github_page_for_this_node_and
     let Some(binary) = browser::binary() else {
         eprintln!(
             "SKIPPED: no Chrome at {} or ${}; the GitHub page's forms were not driven in a real browser",
-            "/usr/bin/google-chrome",
+            browser::DEFAULT_CHROME,
             browser::CHROME_ENV
         );
         return;
