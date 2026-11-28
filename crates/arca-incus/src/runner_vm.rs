@@ -211,6 +211,10 @@ impl RunnerVms {
                 RUNNER_KEY: self.pool,
                 "limits.cpu": spec.cpu.to_string(),
                 "limits.memory": format!("{}MiB", spec.memory_mib),
+                // At its first start Incus rebuilds the machine's UEFI variables from the running host's own template,
+                // Secure Boot kept on: a copy of an image machine built on a host whose firmware files have other names
+                // would otherwise keep that host's variables file and fail to start.
+                "volatile.apply_nvram": "true",
             },
             "devices": devices,
         });
