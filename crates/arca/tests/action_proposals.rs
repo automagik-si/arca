@@ -401,6 +401,10 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
                 "target": "node-b",
             }),
             ActionKind::InstanceMoveFinish => json!({ "move": "mv-0123456789ab" }),
+            ActionKind::GithubLink => json!({
+                "step": "begin", "origin": "https://page.example.com", "org": "acme",
+                "purpose": "runners", "labelSets": [["self-hosted", "linux"], ["gpu"]],
+            }),
         }
     }
 

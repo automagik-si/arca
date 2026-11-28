@@ -334,7 +334,7 @@ fn each_verb_has_its_table_row_for_class_scope_and_writes() {
             true,
             true,
         ),
-        ("github_link", VerbClass::L, Scope::Doctor, true, false),
+        ("github_link", VerbClass::L, Scope::Doctor, true, true),
         ("route_add", VerbClass::L, Scope::Doctor, true, false),
         ("route_remove", VerbClass::L, Scope::Doctor, true, false),
         ("route_list", VerbClass::L, Scope::Viewer, false, false),
@@ -494,6 +494,7 @@ fn plan_verb_schemas_equal_their_table_rows() {
         "route_remove",
         "instance_import",
         "instance_import_undo",
+        "github_link",
     ];
     let action_proposal = open(
         json!({
@@ -1868,6 +1869,7 @@ fn every_destructive_verb_takes_an_optional_boolean_confirm_and_no_other_verb_do
             "instance_move",
             "instance_move_finish",
             "github_disconnect",
+            "github_link",
             "reach_disconnect",
             "instance_import_undo",
         ]
@@ -2352,7 +2354,10 @@ fn support_verbs_have_their_schemas_scopes_and_marks() {
 fn the_support_feed_and_ack_need_an_operator_or_a_list_that_names_them() {
     use arca_api::may_call_listed;
     use arca_api::verbs::NAMED_ONLY;
-    assert_eq!(NAMED_ONLY, ["support_reports", "support_report_ack"]);
+    assert_eq!(
+        NAMED_ONLY,
+        ["support_reports", "support_report_ack", "github_link"]
+    );
     let list = |tools: &[&str]| {
         tools
             .iter()
@@ -2367,7 +2372,11 @@ fn the_support_feed_and_ack_need_an_operator_or_a_list_that_names_them() {
         assert!(may_call_listed(Scope::Operator, None, v), "{name}");
         assert!(may_call_listed(Scope::Admin, None, v), "{name}");
         assert!(
-            may_call_listed(Scope::Viewer, Some(&list(&[name])), v),
+            may_call_listed(v.min_scope, Some(&list(&[name])), v),
+            "{name}"
+        );
+        assert!(
+            v.min_scope > Scope::Viewer || may_call_listed(Scope::Viewer, Some(&list(&[name])), v),
             "{name}"
         );
         assert!(
