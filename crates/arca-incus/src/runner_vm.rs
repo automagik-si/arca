@@ -211,13 +211,18 @@ impl RunnerVms {
                 RUNNER_KEY: self.pool,
                 "limits.cpu": spec.cpu.to_string(),
                 "limits.memory": format!("{}MiB", spec.memory_mib),
-                // At its first start Incus rebuilds the machine's UEFI variables from the running host's own template,
-                // Secure Boot kept on: a copy of an image machine built on a host whose firmware files have other names
-                // would otherwise keep that host's variables file and fail to start.
-                "volatile.apply_nvram": "true",
             },
             "devices": devices,
         });
+        if matches!(spec.source, VmSource::Snapshot { .. }) {
+            // A copy keeps the kept machine's UEFI variables file, named after the firmware of the host it was built on;
+            // on a host whose firmware files have other names it would not start. With this key Incus rebuilds the
+            // variables from the running host's own template at the first start, and the machine keeps its Secure Boot
+            // setting (on by default). A machine made from an image builds them that way anyway, and a restricted
+            // project refuses the key on an image create, so only a copy is sent it. A restricted project without
+            // `restricted.virtual-machines.lowlevel=allow` drops it from a copy.
+            body["config"]["volatile.apply_nvram"] = json!("true");
+        }
         if !spec.profiles.is_empty() {
             body["profiles"] = json!(spec.profiles);
         }
