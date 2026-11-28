@@ -604,6 +604,7 @@ impl Signer {
             runners: Vec::new(),
             app: None,
             installation: None,
+            sync_error: None,
             created_by: flow.created_by.clone(),
             created_at: now,
             updated_at: now,

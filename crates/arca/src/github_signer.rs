@@ -42,6 +42,8 @@ pub const AUDIT_FILE: &str = "audit.jsonl";
 const AUDIT_MAX_BYTES: u64 = 8 * 1024 * 1024;
 /// The OAuth App's public record (its client ID) and its secret, apart.
 const OAUTH_APP_FILE: &str = "oauth-app.json";
+/// How long a pool's sign-in waits for the runner group's sync before it goes on with the group as recorded.
+pub const SIGN_IN_SYNC_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
 const OAUTH_SECRET_FILE: &str = "oauth-app.secret";
 
 /// How a binding reaches GitHub.
@@ -102,6 +104,8 @@ pub enum GroupAccess {
     /// installation that lists none. The next sync opens it.
     #[serde(rename = "none")]
     NoRepository,
+    /// The last sync failed, so Arca has not checked what the group is open to; [`Binding::sync_error`] says why.
+    Unchecked,
 }
 
 /// A runner registered for an OAuth binding. Its credential is in the store, never in this record.
@@ -141,6 +145,9 @@ pub struct Binding {
     /// The App's installation in the organisation, once installed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub installation: Option<InstallationRecord>,
+    /// Why the last sync of the runner group failed, in words, until one succeeds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_error: Option<String>,
     /// Who made it: a token id, or `page` for the owner's page.
     pub created_by: String,
     pub created_at: u64,
@@ -196,6 +203,14 @@ impl Binding {
                 "Arca did not make the runner group \"{}\", so it cannot tell which repositories of {org} may send \
                  jobs here. See the group's repository access on GitHub.",
                 group.name
+            ),
+            GroupAccess::Unchecked => format!(
+                "Arca has not checked yet which repositories of {org} may send jobs to the runner group \"{}\": {}. \
+                 It checks again at the next sync.",
+                group.name,
+                self.sync_error
+                    .as_deref()
+                    .unwrap_or("the last check failed")
             ),
             GroupAccess::NoRepository => format!(
                 "The runner group \"{}\" is open to no repository, so no job reaches these runners. Arca opens it to \
@@ -305,6 +320,8 @@ pub(crate) struct Inner {
     pub(crate) clock: Clock,
     /// The bits of the runner keys the signer makes.
     pub(crate) runner_key_bits: usize,
+    /// How long a pool's sign-in waits for the runner group's sync.
+    pub(crate) sign_in_deadline: std::time::Duration,
     pub(crate) state: Mutex<State>,
     /// Held while a line is appended to the audit log, so lines never interleave.
     audit: Mutex<()>,
@@ -355,6 +372,7 @@ impl Signer {
                 http,
                 clock,
                 runner_key_bits: crate::github_api::RUNNER_KEY_BITS,
+                sign_in_deadline: SIGN_IN_SYNC_DEADLINE,
                 state: Mutex::new(State {
                     bindings,
                     ..State::default()
@@ -372,6 +390,19 @@ impl Signer {
         Self {
             inner: Arc::new(Inner {
                 runner_key_bits: bits,
+                ..inner
+            }),
+        }
+    }
+
+    /// The same signer, with a pool's sign-in waiting `deadline` for the runner group's sync. Tests use a short one.
+    pub fn with_sign_in_deadline(self, deadline: std::time::Duration) -> Self {
+        let inner = Arc::try_unwrap(self.inner).unwrap_or_else(|_| {
+            panic!("with_sign_in_deadline is called on a fresh signer before it is shared")
+        });
+        Self {
+            inner: Arc::new(Inner {
+                sign_in_deadline: deadline,
                 ..inner
             }),
         }

@@ -2112,6 +2112,7 @@ mod tests {
                 repository_selection: "selected".to_string(),
                 repositories: repositories.iter().map(|name| name.to_string()).collect(),
             }),
+            sync_error: None,
             created_by: "page".to_string(),
             created_at: 0,
             updated_at: 0,
@@ -2124,7 +2125,8 @@ mod tests {
         assert!(row.contains("<span class=\"ok\">connected</span>"), "{row}");
         assert!(
             row.contains(
-                "Every private repository of acme may send jobs here. Narrow it in the runner group on GitHub."
+                "Every private and internal repository of acme may send jobs here. Narrow it in the runner group \
+                 on GitHub."
             ),
             "{row}"
         );

@@ -98,6 +98,11 @@ pub struct FakeState {
     pub poll_script: Vec<&'static str>,
     /// What reading the App's installation answers instead, if anything: a GitHub error such as 500, 403 or 429.
     pub installation_refusal: Option<u16>,
+    /// What listing the installation's repositories answers instead, if anything: a failure, or a 2xx not in GitHub's
+    /// shape (a JSON string is sent as a body that is not JSON).
+    pub listing: Option<(u16, Value)>,
+    /// How long listing the installation's repositories waits before it answers, in milliseconds.
+    pub listing_delay_ms: u64,
 }
 
 pub struct Fake {
@@ -158,6 +163,8 @@ impl Fake {
             scale_sets: Vec::new(),
             poll_script: Vec::new(),
             installation_refusal: None,
+            listing: None,
+            listing_delay_ms: 0,
         }));
         let router = Router::new().fallback(serve).with_state(Arc::clone(&state));
         tokio::spawn(async move {
@@ -310,6 +317,12 @@ async fn serve(State(state): State<Arc<Mutex<FakeState>>>, request: Request) -> 
         .await
         .unwrap_or_default();
     let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    if path == "/api/installation/repositories" {
+        let delay = state.lock().expect("the fake's lock").listing_delay_ms;
+        if delay > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+        }
+    }
     let mut state = state.lock().expect("the fake's lock");
     state.seen.push(Seen {
         method: method.clone(),
@@ -452,6 +465,9 @@ fn answer(
             if !grant_ok {
                 return (401, message("Bad credentials"));
             }
+            if let Some((status, answer)) = s.listing.clone() {
+                return (status, answer);
+            }
             let repositories: Vec<Value> = s
                 .repositories
                 .iter()
@@ -478,6 +494,46 @@ fn answer(
             s.group_repositories
                 .push((id, body["selected_repository_ids"].clone()));
             (204, Value::Null)
+        }
+        ("GET", p)
+            if p.starts_with(&format!("/api/orgs/{org}/actions/runner-groups/"))
+                && p.ends_with("/repositories") =>
+        {
+            if !grant_ok {
+                return (401, message("Bad credentials"));
+            }
+            let id: u64 = p
+                .trim_start_matches(&format!("/api/orgs/{org}/actions/runner-groups/"))
+                .trim_end_matches("/repositories")
+                .parse()
+                .unwrap_or(0);
+            let ids: Vec<Value> = s
+                .group_repositories
+                .iter()
+                .find(|(group, _)| *group == id)
+                .and_then(|(_, list)| list.as_array().cloned())
+                .unwrap_or_default();
+            let repositories: Vec<Value> = ids
+                .iter()
+                .map(|id| json!({ "id": id, "full_name": format!("{org}/r{id}") }))
+                .collect();
+            (
+                200,
+                json!({ "total_count": repositories.len(), "repositories": repositories }),
+            )
+        }
+        ("GET", p) if p.starts_with(&format!("/api/orgs/{org}/actions/runner-groups/")) => {
+            if !grant_ok {
+                return (401, message("Bad credentials"));
+            }
+            let id: u64 = p
+                .trim_start_matches(&format!("/api/orgs/{org}/actions/runner-groups/"))
+                .parse()
+                .unwrap_or(0);
+            match s.groups.iter().find(|group| group["id"] == id) {
+                Some(group) => (200, group.clone()),
+                None => (404, message("Not Found")),
+            }
         }
         // GitHub's "Update a self-hosted runner group": `name` is required; `visibility` and
         // `allows_public_repositories` change what may send jobs to the group.
