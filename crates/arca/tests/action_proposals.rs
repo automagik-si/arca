@@ -897,6 +897,25 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
             assert_eq!(shown.len(), 4);
             continue;
         }
+        // A GitHub connection's card names the organisation, the kind of App, the label sets and the page GitHub returns
+        // to; the steps that ride the approval (GitHub's code, the install) are never proposed, so never shown.
+        if action == ActionKind::GithubLink {
+            let shown: Vec<(&str, &str)> = details
+                .iter()
+                .map(|row| (row.label.as_str(), row.value.as_str()))
+                .collect();
+            assert_eq!(shown[0], ("Organisation", "acme"));
+            assert_eq!(shown[1].0, "Kind");
+            assert_eq!(shown[2], ("Labels", "self-hosted, linux | gpu"));
+            assert_eq!(shown[3], ("Page", "https://page.example.com"));
+            assert_eq!(shown[4].0, "Effect");
+            assert_eq!(shown.len(), 5);
+            assert_eq!(
+                action.summary(&prepared),
+                "Connect the GitHub organisation acme's Actions runners to this node with Arca's App"
+            );
+            continue;
+        }
         // With nothing read from the node, a tenant's removal says what it holds is read when the removal runs.
         if action == ActionKind::TenantRemove {
             let labels: Vec<&str> = details.iter().map(|row| row.label.as_str()).collect();
@@ -2514,7 +2533,7 @@ fn arguments_the_action_does_not_take_are_an_is_error_result_in_words_with_the_n
         .iter()
         .map(|action| action.as_str().expect("a name"))
         .collect();
-    assert_eq!(all.len(), 35);
+    assert_eq!(all.len(), 36);
     assert_eq!(
         failure(json!({ "action": "postgres_creat", "args": { "name": "orders" } })),
         format!(
