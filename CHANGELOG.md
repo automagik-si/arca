@@ -4,6 +4,11 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 
 ## Unreleased
 
+## 0.47.0 (2026-11-28)
+
+- style(runner): cargo fmt the firmware key tests (#332)
+- Merge PR 333: a job machine copied from a kept machine takes fresh firmware variables from the host it runs on
+
 ## 0.46.0 (2026-11-28)
 
 - Merge PR 329: a runner group Arca made open to no repository is opened to all private repositories, by itself and with retries
