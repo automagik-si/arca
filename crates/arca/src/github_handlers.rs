@@ -7,7 +7,9 @@
 //! page GitHub returns to) and disconnect are a `github_link` action proposal, approved with the owner's passkey, whose
 //! assertion this node checks itself against the owner keys it trusts for approvals (`approval.peerKeys`, or
 //! `trustOwnerKeysFrom` with `approval.origins`), spending its nonce, as for every approved action. Only the one-shot grant
-//! that approval arms runs them; any token without one is refused. GitHub's two returns (created, with GitHub's code, and
+//! that approval arms runs them; any token without one is refused. The node's other owner approvals arm that grant too, as
+//! for any action: the owner's signed-in session (begin only; a disconnect erases) and a static admin token's terminal.
+//! GitHub's two returns (created, with GitHub's code, and
 //! installed) are taken only for the flow that approved begin made: the same proposal id, page, organisation and kind,
 //! within the hour, and installed once. refresh reads an installation of an App this node holds again from GitHub; flow
 //! and bindings read this node. The node converts GitHub's code into the App and its key itself, so the key is made into a
