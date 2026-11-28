@@ -16901,6 +16901,10 @@
             },
             "app": {
               "properties": {
+                "id": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
                 "settingsUrl": {
                   "type": "string"
                 },

@@ -7531,13 +7531,21 @@ The linked node converts GitHub's code into the App and its key itself, so the k
 and `github_bindings` there shows the connection. What passes through this node is GitHub's one-hour code, in one
 relayed call's body: never logged, journaled or shown. This node keeps, in memory for an hour, which node each flow
 belongs to, its proposal and the App's name, and in `github-linked-apps.json` in its state directory (no secret in it)
-which linked node holds which App, and which installation GitHub made in a flow this node relayed. GitHub's later
-returns carry no `state` (the owner changed the repositories, or finished an install after the hour); this node sends
-each to the linked node the file names for that installation, and when that node does not recognise it, to its own Apps
-and then to each other linked node that holds an App from this page (`github_link` step `refresh`). An installation
-found that way is not written to the file. The node reads the installation again from GitHub with its own App's key
-and brings its runner group to the repositories GitHub names, so a repository the owner removes leaves the pool's
-group. This node sends the browser only to addresses on GitHub's own web host.
+which linked node holds which App, and which installation GitHub made in a flow this node relayed.
+
+GitHub's later returns carry no `state` (the owner changed the repositories, or finished an install after the hour).
+GitHub sends them through the owner's own browser to `/approve/github/installed`, a public address, so a return
+without a live flow acts only with the owner's signed-in session on this page. Without it the page shows the GitHub
+page's passkey sign-in and goes on with the return after it; nobody else gets more than that sign-in, whatever
+installation the address names, and no node and no GitHub API is asked. With the session, one installation is read at
+most once a minute ("Read a moment ago" otherwise). This node sends each to the linked node the file names for that
+installation, and when that node does not recognise it, to its own Apps and then to each other linked node that holds
+an App from this page (`github_link` step `refresh`). A node the file does not name for the installation counts only
+when its answer names an App this page relayed for that node, so no node takes another node's returns by claiming
+them, and an installation found that way is not written to the file. The node reads the installation again from GitHub
+with its own App's key and brings its runner group to the repositories GitHub names, so a repository the owner removes
+leaves the pool's group. A return of a flow is shown as connected only for the connection that flow made. This node
+sends the browser only to addresses on GitHub's own web host.
 
 What the linked node needs, once:
 

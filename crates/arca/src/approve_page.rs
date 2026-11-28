@@ -528,7 +528,10 @@ impl Page {
                 (gh::PREPARE_PATH, post(github_prepare)),
                 (gh::CONNECTIONS_PATH, post(github_connections)),
                 (gh::CREATED_PATH, get(github_created)),
-                (gh::INSTALLED_PATH, get(github_installed)),
+                (
+                    gh::INSTALLED_PATH,
+                    get(github_installed).post(canvas_sign_in),
+                ),
             ] {
                 router = both(router, path, route);
             }
@@ -712,22 +715,28 @@ async fn github_view(
     };
     let now = (state.clock)();
     let Some(credential) = state.canvas.session(&headers, now) else {
-        let ids = trusted_credential_ids(&state);
-        return canvas_html(
-            render_credentials(canvas::SIGN_IN_PAGE, &ids)
-                .replace("<title>Automagik Arca canvas</title>", "<title>Arca: GitHub runners</title>")
-                .replace("<h1>Arca canvas</h1>", "<h1>GitHub runners</h1>")
-                .replace(
-                    "<p>Sign in with the passkey you use for Arca. It views the canvas; it approves nothing.</p>",
-                    "<p>Sign in with the passkey you use for Arca to connect GitHub runners and see their connections.</p>",
-                ),
-        );
+        return github_sign_in(&state);
     };
     let caller = github_caller(&credential);
     let query = crate::github_page::parse_form(uri.query().unwrap_or(""));
     let here = github_here(&state);
     let ids = trusted_credential_ids(&state);
     crate::github_page::view(&github_ctx(&state, signer, &caller, &here, &ids), &query).await
+}
+
+/// The GitHub page's passkey sign-in. Its script signs in at the address it is on and loads it again, so a return from
+/// GitHub that needs the session goes on after it.
+fn github_sign_in(state: &PageState) -> Response {
+    let ids = trusted_credential_ids(state);
+    canvas_html(
+        render_credentials(canvas::SIGN_IN_PAGE, &ids)
+            .replace("<title>Automagik Arca canvas</title>", "<title>Arca: GitHub runners</title>")
+            .replace("<h1>Arca canvas</h1>", "<h1>GitHub runners</h1>")
+            .replace(
+                "<p>Sign in with the passkey you use for Arca. It views the canvas; it approves nothing.</p>",
+                "<p>Sign in with the passkey you use for Arca to connect GitHub runners and see their connections.</p>",
+            ),
+    )
 }
 
 /// The signed-in caller and the form of a GitHub page POST; `None` when no passkey session came with it.
@@ -879,14 +888,29 @@ async fn github_created(State(state): State<Arc<PageState>>, uri: axum::http::Ur
     crate::github_page::created(&github_ctx(&state, signer, "github", &here, &ids), &query).await
 }
 
-async fn github_installed(State(state): State<Arc<PageState>>, uri: axum::http::Uri) -> Response {
+/// GitHub's return after Install. A return of a live flow this page began acts on its own; any other (a change of
+/// repositories, an install finished after the hour, or anyone at all) acts only for the owner's signed-in session, and
+/// without one the GitHub page's sign-in comes first and the return goes on after it.
+async fn github_installed(
+    State(state): State<Arc<PageState>>,
+    headers: HeaderMap,
+    uri: axum::http::Uri,
+) -> Response {
     let Some(signer) = &state.github else {
         return StatusCode::NOT_FOUND.into_response();
     };
     let query = crate::github_page::parse_form(uri.query().unwrap_or(""));
     let here = github_here(&state);
     let ids = trusted_credential_ids(&state);
-    crate::github_page::installed(&github_ctx(&state, signer, "github", &here, &ids), &query).await
+    let credential = state.canvas.session(&headers, (state.clock)());
+    let caller = credential
+        .as_deref()
+        .map_or_else(|| "github".to_string(), github_caller);
+    let ctx = github_ctx(&state, signer, &caller, &here, &ids);
+    if credential.is_none() && !crate::github_page::live_return(&ctx, &query) {
+        return github_sign_in(&state);
+    }
+    crate::github_page::installed(&ctx, &query, credential.is_some()).await
 }
 
 async fn canvas_page(State(state): State<Arc<PageState>>, headers: HeaderMap) -> Response {
