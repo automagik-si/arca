@@ -767,6 +767,11 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
         for (verb, handler) in crate::github_handlers::handlers(signer) {
             server = server.handle(verb, handler);
         }
+        // Its approval host's GitHub page connects this node over the link, from the page origins it trusts alone.
+        server = server.handle(
+            crate::github_handlers::LINK_VERB,
+            crate::github_handlers::link_handler(signer, github_link_origins(&cfg)),
+        );
     }
     // The runner pools run while the kernel serves: this holds them. The network ACL and the own bridge of a pool that
     // is gone from the config go first.
@@ -1441,6 +1446,28 @@ fn peer_passkeys(cfg: &NodeConfig) -> Vec<PeerPasskeys> {
             peer
         })
         .collect()
+}
+
+/// The page origins `github_link` takes steps from: the origins whose owner passkeys this kernel trusts, which are
+/// `approval.origins` when `approval.trustOwnerKeysFrom` names a file, and each `approval.peerKeys` source's origins. None
+/// without an `approval` key: then no page connects this node over the link.
+pub fn github_link_origins(cfg: &NodeConfig) -> Vec<String> {
+    let Some(approval) = cfg.approval.as_ref() else {
+        return Vec::new();
+    };
+    let mut origins = if approval.trust_owner_keys_from.is_empty() {
+        Vec::new()
+    } else {
+        approval.origins.clone()
+    };
+    if let Some(peers) = &approval.peer_keys {
+        for source in peers.sources() {
+            origins.extend(source.origins.iter().cloned());
+        }
+    }
+    origins.sort();
+    origins.dedup();
+    origins
 }
 
 /// Whether this kernel accepts approvals relayed from another kernel's page: its config has an `approval` key that names at

@@ -16648,6 +16648,337 @@
       "x-arca-writes": true
     },
     {
+      "name": "github_link",
+      "params": [
+        {
+          "name": "origin",
+          "required": true,
+          "schema": {
+            "description": "The page origin the step comes from, which GitHub sends the browser back to: one whose owner passkeys this node trusts.",
+            "maxLength": 300,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        {
+          "name": "step",
+          "required": true,
+          "schema": {
+            "description": "begin, created, installed, bindings or disconnect.",
+            "enum": [
+              "begin",
+              "created",
+              "installed",
+              "bindings",
+              "disconnect"
+            ],
+            "type": "string"
+          }
+        },
+        {
+          "name": "binding",
+          "required": false,
+          "schema": {
+            "description": "A GitHub connection's id, as `github_bindings` lists it.",
+            "maxLength": 64,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        {
+          "name": "by",
+          "required": false,
+          "schema": {
+            "description": "Who acts on the page, for this node's GitHub log.",
+            "maxLength": 100,
+            "type": "string"
+          }
+        },
+        {
+          "name": "code",
+          "required": false,
+          "schema": {
+            "description": "created: GitHub's one-hour code from the page's return. Never logged or shown.",
+            "maxLength": 200,
+            "type": "string"
+          }
+        },
+        {
+          "name": "installationId",
+          "required": false,
+          "schema": {
+            "description": "installed: the installation GitHub's return named.",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        {
+          "name": "labelSets",
+          "required": false,
+          "schema": {
+            "description": "begin: the runners' label sets, each as the person chose it, checked as the page's own form checks them.",
+            "items": {
+              "items": {
+                "maxLength": 1000,
+                "type": "string"
+              },
+              "maxItems": 100,
+              "type": "array"
+            },
+            "maxItems": 100,
+            "type": "array"
+          }
+        },
+        {
+          "name": "org",
+          "required": false,
+          "schema": {
+            "description": "begin: the organisation's login, checked as the page's own form checks it.",
+            "maxLength": 1000,
+            "type": "string"
+          }
+        },
+        {
+          "name": "purpose",
+          "required": false,
+          "schema": {
+            "description": "begin: runners (the default) or repositories, the workspace repositories App.",
+            "enum": [
+              "runners",
+              "repositories"
+            ],
+            "type": "string"
+          }
+        },
+        {
+          "name": "state",
+          "required": false,
+          "schema": {
+            "description": "created and installed: the manifest flow's state, as begin answered it.",
+            "maxLength": 100,
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "properties": {
+            "account": {
+              "type": "string"
+            },
+            "actionUrl": {
+              "type": "string"
+            },
+            "app": {
+              "properties": {
+                "settingsUrl": {
+                  "type": "string"
+                },
+                "slug": {
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            },
+            "appName": {
+              "type": "string"
+            },
+            "binding": {
+              "type": "string"
+            },
+            "bindings": {
+              "items": {
+                "properties": {
+                  "account": {
+                    "type": "string"
+                  },
+                  "app": {
+                    "properties": {
+                      "clientId": {
+                        "type": "string"
+                      },
+                      "htmlUrl": {
+                        "type": "string"
+                      },
+                      "id": {
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "ownerId": {
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "slug": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "id",
+                      "slug",
+                      "clientId",
+                      "htmlUrl",
+                      "ownerId"
+                    ],
+                    "type": "object"
+                  },
+                  "createdAt": {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "createdBy": {
+                    "type": "string"
+                  },
+                  "id": {
+                    "type": "string"
+                  },
+                  "installation": {
+                    "properties": {
+                      "id": {
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "repositories": {
+                        "items": {
+                          "type": "string"
+                        },
+                        "type": "array"
+                      },
+                      "repositorySelection": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "id",
+                      "repositorySelection",
+                      "repositories"
+                    ],
+                    "type": "object"
+                  },
+                  "labelSets": {
+                    "items": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "type": "array"
+                  },
+                  "mode": {
+                    "enum": [
+                      "oauth",
+                      "app",
+                      "push"
+                    ],
+                    "type": "string"
+                  },
+                  "runnerGroup": {
+                    "properties": {
+                      "createdByArca": {
+                        "type": "boolean"
+                      },
+                      "id": {
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "name": {
+                        "type": "string"
+                      },
+                      "warning": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "id",
+                      "name",
+                      "createdByArca"
+                    ],
+                    "type": "object"
+                  },
+                  "runners": {
+                    "items": {
+                      "properties": {
+                        "id": {
+                          "minimum": 0,
+                          "type": "integer"
+                        },
+                        "labels": {
+                          "items": {
+                            "type": "string"
+                          },
+                          "type": "array"
+                        },
+                        "name": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "name",
+                        "id",
+                        "labels"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "status": {
+                    "enum": [
+                      "awaitingInstall",
+                      "active",
+                      "suspended",
+                      "revoked"
+                    ],
+                    "type": "string"
+                  },
+                  "updatedAt": {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "why": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "id",
+                  "mode",
+                  "account",
+                  "status",
+                  "labelSets",
+                  "createdBy",
+                  "createdAt",
+                  "updatedAt"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "id": {
+              "type": "string"
+            },
+            "installUrl": {
+              "type": "string"
+            },
+            "manifest": {
+              "type": "string"
+            },
+            "state": {
+              "type": "string"
+            },
+            "status": {
+              "type": "string"
+            }
+          },
+          "type": "object"
+        }
+      },
+      "summary": "The steps a linked node's approval host relays from its GitHub page, so the owner connects this node there with one sign-in: begin an App's manifest flow, created (this node converts GitHub's code into the App and keeps its key alone), installed, bindings and disconnect. Each step names the page origin, taken only from a page whose owner passkeys this node trusts, and created and installed only for a flow begun for that origin. For this node's operators and a token whose tool list names it.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
+      "x-arca-scope": "doctor",
+      "x-arca-writes": true
+    },
+    {
       "name": "os_update",
       "params": [
         {

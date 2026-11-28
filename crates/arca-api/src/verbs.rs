@@ -172,7 +172,7 @@ macro_rules! on_node {
     }};
 }
 
-static VERBS: [Verb; 103] = [
+static VERBS: [Verb; 104] = [
     Verb {
         name: "arca_status",
         summary: "Node status: the API version, the node id, the mode, the uptime, whether Incus answers and the last applied sequence number.",
@@ -1529,6 +1529,21 @@ static VERBS: [Verb; 103] = [
         target: Target::Node,
     },
     Verb {
+        name: "github_link",
+        summary: "The steps a linked node's approval host relays from its GitHub page, so the owner connects this node there with one sign-in: begin an App's manifest flow, created (this node converts GitHub's code into the App and keeps its key alone), installed, bindings and disconnect. Each step names the page origin, taken only from a page whose owner passkeys this node trusts, and created and installed only for a flow begun for that origin. For this node's operators and a token whose tool list names it.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: false,
+        untrusted: true,
+        output_key: None,
+        summary_text: summary_github_link,
+        cut: no_cut,
+        params: github_link_params,
+        result: github_link_result,
+        target: Target::Node,
+    },
+    Verb {
         name: "os_update",
         summary: "The node's OS update state: the version, channel, check frequency, automatic updates, the last check and update, and the OS's own error kind and update-key trust. Read every 5 minutes; known is false on a node that is not Arca OS.",
         class: VerbClass::L,
@@ -2308,6 +2323,101 @@ fn github_mint_job_params() -> Value {
 
 fn github_mint_job_result() -> Value {
     result(vec![("ok", true, boolean())])
+}
+
+fn summary_github_link(v: &Value) -> String {
+    if let Some(binding) = v["binding"].as_str() {
+        return format!("GitHub connection {binding}");
+    }
+    if let Some(bindings) = v["bindings"].as_array() {
+        return format!("{} GitHub connection(s)", bindings.len());
+    }
+    if v["actionUrl"].is_string() {
+        return format!(
+            "GitHub App flow begun: {}",
+            v["appName"].as_str().unwrap_or("?")
+        );
+    }
+    format!(
+        "GitHub connection {} for {}: {}",
+        v["id"].as_str().unwrap_or("?"),
+        v["account"].as_str().unwrap_or("?"),
+        v["status"].as_str().unwrap_or("?")
+    )
+}
+
+fn github_link_params() -> Value {
+    params(vec![
+        (
+            "step",
+            true,
+            json!({ "description": "begin, created, installed, bindings or disconnect.", "enum": ["begin", "created", "installed", "bindings", "disconnect"], "type": "string" }),
+        ),
+        (
+            "origin",
+            true,
+            json!({ "description": "The page origin the step comes from, which GitHub sends the browser back to: one whose owner passkeys this node trusts.", "maxLength": 300, "minLength": 1, "type": "string" }),
+        ),
+        (
+            "org",
+            false,
+            json!({ "description": "begin: the organisation's login, checked as the page's own form checks it.", "maxLength": 1000, "type": "string" }),
+        ),
+        (
+            "labelSets",
+            false,
+            json!({ "description": "begin: the runners' label sets, each as the person chose it, checked as the page's own form checks them.", "items": { "items": { "maxLength": 1000, "type": "string" }, "maxItems": 100, "type": "array" }, "maxItems": 100, "type": "array" }),
+        ),
+        (
+            "purpose",
+            false,
+            json!({ "description": "begin: runners (the default) or repositories, the workspace repositories App.", "enum": ["runners", "repositories"], "type": "string" }),
+        ),
+        (
+            "by",
+            false,
+            json!({ "description": "Who acts on the page, for this node's GitHub log.", "maxLength": 100, "type": "string" }),
+        ),
+        (
+            "state",
+            false,
+            json!({ "description": "created and installed: the manifest flow's state, as begin answered it.", "maxLength": 100, "type": "string" }),
+        ),
+        (
+            "code",
+            false,
+            json!({ "description": "created: GitHub's one-hour code from the page's return. Never logged or shown.", "maxLength": 200, "type": "string" }),
+        ),
+        (
+            "installationId",
+            false,
+            json!({ "description": "installed: the installation GitHub's return named.", "minimum": 0, "type": "integer" }),
+        ),
+        ("binding", false, github_binding_schema()),
+    ])
+}
+
+fn github_link_result() -> Value {
+    result(vec![
+        ("actionUrl", false, string()),
+        ("manifest", false, string()),
+        ("state", false, string()),
+        ("appName", false, string()),
+        ("installUrl", false, string()),
+        ("binding", false, string()),
+        ("account", false, string()),
+        (
+            "app",
+            false,
+            result(vec![
+                ("slug", false, string()),
+                ("settingsUrl", false, string()),
+            ]),
+        ),
+        ("bindings", false, array(github_binding_record())),
+        ("id", false, string()),
+        ("status", false, string()),
+    ])
 }
 
 fn github_disconnect_params() -> Value {

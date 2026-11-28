@@ -1,6 +1,12 @@
 //! The MCP verbs of the GitHub signer. They start, read and end connections, mint runners and read the audit log. None
 //! returns a key, a grant or a token, but `github_runner_mint` returns a runner's just-in-time configuration, which is
 //! that runner's credential, to any caller with an `operator` token (see `crate::github_signer`).
+//!
+//! `github_link` is the verb a linked node serves its approval host's GitHub page with (see `crate::github_page`): the
+//! page begins an App's manifest flow here, relays GitHub's two returns, lists the connections and disconnects one. The
+//! node converts GitHub's code into the App and its key itself, so the key is made into a file here and never passes
+//! through the page's node. Every step names the page origin it comes from, and the node takes it only from a page whose
+//! owner passkeys it trusts: `approval.origins` (with `trustOwnerKeysFrom`) or an `approval.peerKeys` source's origins.
 
 use std::sync::Arc;
 
@@ -27,6 +33,175 @@ pub const VERBS: [&str; 8] = [
 struct GithubHandler {
     verb: &'static str,
     signer: Signer,
+}
+
+/// The verb a linked node serves its approval host's GitHub page with.
+pub const LINK_VERB: &str = "github_link";
+
+/// `github_link` for `signer`: it takes steps only from a page at one of `origins`, the page origins whose owner passkeys
+/// this node trusts.
+pub fn link_handler(signer: &Signer, origins: Vec<String>) -> Arc<dyn ToolHandler> {
+    Arc::new(LinkHandler {
+        signer: signer.clone(),
+        origins,
+    })
+}
+
+struct LinkHandler {
+    signer: Signer,
+    origins: Vec<String>,
+}
+
+/// The refusal of a step whose flow this node did not begin for the page that sends it.
+fn unknown_flow() -> CallError {
+    CallError::Refused {
+        code: "UnknownFlow".to_string(),
+        message: "This link is unknown or older than an hour. Start again from Arca's GitHub page."
+            .to_string(),
+    }
+}
+
+impl LinkHandler {
+    /// The manifest flow `state`, which this node began for the page at `origin`.
+    fn flow_of<'a>(&self, args: &'a Value, origin: &str) -> Result<&'a str, CallError> {
+        let state = text(args, "state")?;
+        match self.signer.app_flow_origin(state) {
+            Some(begun) if begun == origin => Ok(state),
+            _ => Err(unknown_flow()),
+        }
+    }
+}
+
+impl ToolHandler for LinkHandler {
+    fn call(&self, args: Value, caller: &Caller) -> Result<Value, CallError> {
+        // Reached by naming it: this node's operators, or a token whose list names the verb, which is the relay token
+        // its approval host holds for it. A doctor token with no list (an agent's) does not connect GitHub.
+        let named = caller
+            .tools
+            .as_ref()
+            .is_some_and(|tools| tools.iter().any(|tool| tool == LINK_VERB));
+        if !named && caller.scope < arca_api::Scope::Operator {
+            return Err(CallError::Refused {
+                code: "LinkToken".to_string(),
+                message: format!(
+                    "{LINK_VERB} is for this node's operators and for the relay token whose tool list names it"
+                ),
+            });
+        }
+        let origin = text(&args, "origin")?;
+        if !self.origins.iter().any(|trusted| trusted == origin) {
+            return Err(CallError::Refused {
+                code: "NotApprovalHost".to_string(),
+                message: "this node takes GitHub connections only from its approval host's page, and the page that \
+                          asked is not one whose owner passkeys it trusts (approval.origins with trustOwnerKeysFrom, or \
+                          an approval.peerKeys source's origins): nothing was begun"
+                    .to_string(),
+            });
+        }
+        let by: String = args
+            .get("by")
+            .and_then(Value::as_str)
+            .unwrap_or("page")
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(64)
+            .collect();
+        let by = format!("link:{}:{by}", caller.token_id);
+        match text(&args, "step")? {
+            "begin" => {
+                let org = text(&args, "org")?;
+                let started = if args.get("purpose").and_then(Value::as_str) == Some("repositories")
+                {
+                    self.signer.repository_app_begin(org, origin, &by)
+                } else {
+                    let sets: Vec<Vec<String>> = args
+                        .get("labelSets")
+                        .and_then(Value::as_array)
+                        .map(|sets| {
+                            sets.iter()
+                                .map(|set| {
+                                    set.as_array()
+                                        .map(|labels| {
+                                            labels
+                                                .iter()
+                                                .filter_map(Value::as_str)
+                                                .map(str::to_string)
+                                                .collect()
+                                        })
+                                        .unwrap_or_default()
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    self.signer.app_begin(org, &sets, origin, &by)
+                };
+                let start = started.map_err(|error| refusal(&error))?;
+                let name = serde_json::from_str::<Value>(&start.manifest)
+                    .ok()
+                    .and_then(|manifest| manifest["name"].as_str().map(str::to_string))
+                    .unwrap_or_default();
+                Ok(json!({
+                    "actionUrl": start.action_url,
+                    "manifest": start.manifest,
+                    "state": start.state,
+                    "appName": name,
+                }))
+            }
+            "created" => {
+                let state = self.flow_of(&args, origin)?;
+                let code = text(&args, "code")?;
+                let install = runtime()?
+                    .block_on(self.signer.app_created(code, state))
+                    .map_err(|why| CallError::UntrustedRefused {
+                        code: "NotTaken".to_string(),
+                        message: why,
+                    })?;
+                let binding = self
+                    .signer
+                    .app_flow_binding(state)
+                    .and_then(|id| self.signer.bindings().into_iter().find(|b| b.id == id))
+                    .ok_or_else(unknown_flow)?;
+                let app = binding.app.clone().ok_or_else(unknown_flow)?;
+                let settings = self.signer.inner.http.web(&format!(
+                    "/organizations/{}/settings/apps/{}",
+                    binding.account, app.slug
+                ));
+                Ok(json!({
+                    "installUrl": install,
+                    "binding": binding.id,
+                    "account": binding.account,
+                    "app": { "slug": app.slug, "settingsUrl": settings },
+                }))
+            }
+            "installed" => {
+                let state = self.flow_of(&args, origin)?;
+                let installation = args
+                    .get("installationId")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| {
+                        CallError::Invalid("installationId: a whole number is required".to_string())
+                    })?;
+                let id = runtime()?
+                    .block_on(self.signer.app_installed(installation, Some(state)))
+                    .map_err(|why| CallError::UntrustedRefused {
+                        code: "NotConnected".to_string(),
+                        message: why,
+                    })?;
+                Ok(json!({ "binding": id }))
+            }
+            "bindings" => Ok(json!({ "bindings": json_of(&self.signer.bindings())? })),
+            "disconnect" => {
+                let binding = text(&args, "binding")?;
+                let record = runtime()?
+                    .block_on(self.signer.revoke(binding, &by))
+                    .map_err(|error| refusal(&error))?;
+                json_of(&record)
+            }
+            _ => Err(CallError::Invalid(
+                "step: begin, created, installed, bindings or disconnect".to_string(),
+            )),
+        }
+    }
 }
 
 /// The handlers of the GitHub verbs for `signer`.

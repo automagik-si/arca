@@ -2391,6 +2391,9 @@ arca token mint --scope doctor --id relay-alpha \
   --out /etc/arca/alpha/beta-relay.secret --config /etc/arca/beta.json
 ```
 
+To connect GitHub on the linked kernel from this kernel's GitHub page, add `github_link` to that list ("One prepared
+link, for this node or a linked node").
+
 For a linked kernel on another machine, add `peer_keys_sync` (see [Approving on another machine](#approving-on-another-machine)).
 `token_list` takes `node` too, but it is an `operator` verb and a `doctor` token cannot list it, so through this token it is
 refused `LinkToken`.
@@ -7465,6 +7468,65 @@ says so. Every runner is then minted just in time, one per job: `github_runner_m
 once known, the job. A runner for a scale set is minted only when GitHub says the scale set is in the connection's own
 runner group; another group's scale set is refused (`ScaleSetOutsideGroup`) and the refusal logs the group it is in.
 
+### One prepared link, for this node or a linked node
+
+Whoever prepares the connection sends the owner one link; the owner opens it, signs in with the passkey (once, on the
+page they already use), checks the filled form and clicks one button. Nothing is typed.
+
+```
+https://arca.example.com/approve/github?mode=app&org=acme&labels=self-hosted,linux,x64;gpu
+```
+
+| `mode` | Fields | The form it fills |
+|--------|--------|-------------------|
+| `app` | `org`, `labels` | Arca's App in the organisation (Mode 2): **Continue to GitHub** |
+| `repositories` | `org`, or `repository=<owner>/<name>` (its owner is the organisation) | The workspace repositories App |
+| `push` | `org`, `labels` | Push mode (Mode 3), this node only |
+| `oauth` | `org`, `group`, `labels`, `runners` | The device-code sign-in (Mode 1), this node only |
+
+`labels` holds the label sets with `;` between sets and `,` between the labels of a set (URL-encode spaces). The values
+stay editable on the page and are checked when the form is posted, with the same words a typed form gets; a link never
+skips the passkey sign-in or the click. Opening the link begins nothing.
+
+**A linked node.** Add `node=<name>`, one of the names `arca_status` lists under `approval.linkedHosts`:
+
+```
+https://arca.example.com/approve/github?mode=app&node=beta&org=acme&labels=self-hosted,linux,x64
+```
+
+The page says which node it connects ("You are connecting the linked node beta"), lists that node's connections with
+their Disconnect buttons, and connects it with `app` or `repositories`. GitHub sends the browser back to this page's own
+address; each step goes to the linked node's `github_link` over the link. The linked node converts GitHub's code into
+the App and its key itself, so the key is written on the linked node alone, and `github_bindings` there shows the
+connection. What passes through this node is GitHub's one-hour code, in one relayed call's body: never logged,
+journaled or shown. This node keeps, in memory for an hour, which node each flow belongs to and the App's name.
+
+What the linked node needs, once:
+
+- **Its relay token names `github_link`.** Add `github_link` to the `--tools` of the token this node holds for it in
+  `approval.linkedHosts[].tokenFile` (see [Asking a linked node: `node`](#asking-a-linked-node-node)). `github_link` is for the
+  linked node's operators and for a token whose list names it; a doctor token without a list is refused `LinkToken`.
+- **It trusts this page.** The linked node takes a step only when the page's origin is one whose owner passkeys it
+  trusts: `approval.origins` (with `trustOwnerKeysFrom`) or an `approval.peerKeys` source's `origins`. A page it does
+  not trust is refused `NotApprovalHost` and nothing is begun. `created` and `installed` are taken only for a flow the
+  linked node began for that same origin, within the hour.
+- **It reaches GitHub's API**, as every node that mints runners does.
+
+When something goes wrong, the page says so in plain words:
+
+- A `node` that is not linked: "Not a linked node", naming the linked nodes. Nothing is begun.
+- The linked node does not answer before GitHub is opened: "Nothing was made on GitHub."
+- It does not answer when GitHub sends the browser back after **Create**: GitHub holds the new App (the page names it,
+  `Arca runners xxxxxx`), and nothing of it is stored anywhere. Reload the page within the hour once the node answers
+  and the connection goes on, or delete the App at `https://github.com/organizations/<org>/settings/apps`.
+- It does not answer after **Install**: GitHub holds the App and its installation, and the linked node holds its key
+  with the connection waiting for the install. Reload the page once the node answers to finish, or uninstall and
+  delete the App at the settings page the page links.
+- A linked node that took GitHub's code but could not store the App keeps nothing of it (no key without its
+  connection) and names the App to delete.
+
+Device-code sign-ins and pushed configurations are not relayed: they connect only the node whose page it is.
+
 ### Mode 3: you push the configurations (push mode)
 
 For those who will not give Arca any GitHub permission. The page makes a connection and shows an intake token once.
@@ -7537,6 +7599,7 @@ job attachment and disconnect, with the caller and the time. It holds no credent
 | `github_runner_mint` | operator | One just-in-time runner configuration for a connection's labels |
 | `github_mint_job` | operator | Records which job a minted runner took |
 | `github_disconnect` | operator | Ends a connection (above); destructive, so `confirm: false` refuses it |
+| `github_link` | operator, or a token whose `--tools` names it | The approval host's page connecting this node over the link ("One prepared link" above): `begin`, `created`, `installed`, `bindings`, `disconnect`, each from a page origin this node trusts |
 
 ## Per-job runners: the first real job
 
@@ -7571,7 +7634,9 @@ first real job, and how to read a pool.
    services and tenants from starting (RUNNERS.md says what else that costs).
 4. **The organisation's App connection and its runner group.** Connect the organisation on `/approve/github` with
    "a GitHub App made for you" (Mode 2 above), pick the repositories that may send jobs, and give one label set per size
-   class. The App's runner group, `Arca runners`, holds exactly those repositories. `github_bindings` lists the
+   class. Send the owner one prepared link for it ("One prepared link, for this node or a linked node" above):
+   `/approve/github?mode=app&org=<org>&labels=<set>;<set>`, with `&node=<name>` when the pool runs on a linked node
+   that has no page of its own. The App's runner group, `Arca runners`, holds exactly those repositories. `github_bindings` lists the
    connection's id (`gh-…`), its runner group and its label sets. A device-code or push connection cannot serve a pool.
 5. **`runners.pools` in the node config**, then a kernel restart (a restart ends the jobs running then: do it while
    the queue is quiet):
