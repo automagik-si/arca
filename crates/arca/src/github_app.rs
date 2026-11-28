@@ -516,6 +516,7 @@ impl Signer {
             }),
             installation: None,
             sync_error: None,
+            sync_retry_in_ms: None,
             created_by: flow.caller.clone(),
             created_at: now,
             updated_at: now,
@@ -924,6 +925,7 @@ impl Signer {
         }
         Ok(RunnerGroup {
             name,
+            repositories: None,
             access: Some(access),
             ..group.clone()
         })
@@ -1041,6 +1043,7 @@ impl Signer {
                 name: RUNNER_GROUP_NAME.to_string(),
                 created_by_arca: true,
                 warning: None,
+                repositories: None,
                 access: Some(access),
             });
         }
@@ -1073,6 +1076,7 @@ impl Signer {
                     name,
                     created_by_arca: empty,
                     warning: None,
+                    repositories: None,
                     access: None,
                 };
                 if empty {
@@ -1098,6 +1102,7 @@ impl Signer {
                  plan up.",
                 answer.why()
             )),
+            repositories: None,
             access: Some(GroupAccess::Unknown),
         })
     }
@@ -1604,6 +1609,7 @@ impl Signer {
             app: None,
             installation: None,
             sync_error: None,
+            sync_retry_in_ms: None,
             created_by: caller.to_string(),
             created_at: now,
             updated_at: now,

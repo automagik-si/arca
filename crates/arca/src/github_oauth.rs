@@ -605,6 +605,7 @@ impl Signer {
             app: None,
             installation: None,
             sync_error: None,
+            sync_retry_in_ms: None,
             created_by: flow.created_by.clone(),
             created_at: now,
             updated_at: now,
@@ -731,6 +732,7 @@ impl Signer {
                 created_by_arca,
                 warning,
                 // Arca makes a signed-in connection's group open to every private repository; another it cannot tell.
+                repositories: None,
                 access: Some(if created_by_arca {
                     GroupAccess::AllPrivate
                 } else {
@@ -751,6 +753,7 @@ impl Signer {
                     name: "Default".to_string(),
                     created_by_arca: false,
                     warning: Some(default_warning),
+                    repositories: None,
                     access: Some(GroupAccess::Unknown),
                 });
             self.step(

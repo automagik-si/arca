@@ -1349,18 +1349,28 @@ async fn a_group_arca_did_not_make_is_left_as_it_is_and_arcas_adopted_group_is_o
         ("selected", Some(json!([5])), GroupAccess::Unknown),
         ("all", None, GroupAccess::AllPrivate),
         ("private", None, GroupAccess::Unknown),
+        // N3: no `allows_public_repositories` in GitHub's answer: not known, so not `all-private`.
+        ("all-unsaid", None, GroupAccess::Unknown),
     ] {
         let scratch = Scratch::new();
         let fake = Fake::start("acme").await;
         fake.with(|s| {
             s.repositories.clear();
-            s.groups.push(json!({
+            let mut group = json!({
                 "id": 9,
                 "name": RUNNER_GROUP_NAME,
                 "default": false,
                 "visibility": visibility,
                 "allows_public_repositories": false,
-            }));
+            });
+            if visibility == "all-unsaid" {
+                group["visibility"] = json!("all");
+                group
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("allows_public_repositories");
+            }
+            s.groups.push(group);
             if let Some(list) = repositories.clone() {
                 s.group_repositories = vec![(9, list)];
             }
@@ -1385,7 +1395,10 @@ async fn a_group_arca_did_not_make_is_left_as_it_is_and_arcas_adopted_group_is_o
                 .is_empty(),
             "{visibility}"
         );
-        assert_eq!(fake.group(9).unwrap()["visibility"], visibility);
+        assert_eq!(
+            fake.group(9).unwrap()["visibility"],
+            visibility.trim_end_matches("-unsaid")
+        );
         let group = signer.bindings()[0].runner_group.clone().unwrap();
         assert_eq!(
             (group.id, group.created_by_arca),
@@ -1540,6 +1553,177 @@ async fn the_sign_in_sync_runs_once_and_a_failing_or_hanging_one_does_not_stop_t
         "{:?}",
         binding.sync_error
     );
+}
+
+/// Waits, in steps of 20 ms and for at most five seconds, until `done` holds.
+async fn until(what: &str, mut done: impl FnMut() -> bool) {
+    let started = Instant::now();
+    while !done() {
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{what}: not within five seconds"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// The record Arca 0.45 and older left for an installation that lists no repository: its own group, no access, the group
+/// `selected` on GitHub with `repositories`. Answers the signer reopened on it.
+async fn legacy_record(scratch: &Scratch, fake: &Fake, repositories: Value) -> (Signer, String) {
+    fake.with(|s| s.repositories.clear());
+    let id = installed_app(&signer(scratch, fake), fake).await;
+    narrow_on_github(fake, 20, repositories);
+    let record = scratch.0.join("github/bindings").join(format!("{id}.json"));
+    let mut stored: Value = serde_json::from_str(&fs::read_to_string(&record).unwrap()).unwrap();
+    stored["runnerGroup"]
+        .as_object_mut()
+        .unwrap()
+        .remove("access");
+    fs::write(&record, serde_json::to_string_pretty(&stored).unwrap()).unwrap();
+    fake.with(|s| s.seen.clear());
+    (signer(scratch, fake), id)
+}
+
+/// N1 (1): the live record's first sync fails with a 502; the session's sign-in goes on, the words say when Arca checks
+/// again, and the background retry opens the group with no new sign-in, `refresh` or restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_repair_is_retried_in_the_background_and_opens_the_group_without_a_new_sign_in() {
+    use arca::github_signer::GroupAccess;
+    use arca_runners::Access as _;
+    let scratch = Scratch::new();
+    let fake = Fake::start("acme").await;
+    let (signer, id) = legacy_record(&scratch, &fake, json!([])).await;
+    let signer = signer.with_sync_retry(Duration::from_millis(100), Duration::from_millis(400));
+    fake.with(|s| s.listing = Some((502, json!({ "message": "Bad Gateway" }))));
+    let access = arca::runners::SignerAccess::new(signer.clone());
+    assert_eq!(access.runner_group(&id).await.expect("read"), Some(20));
+    assert_eq!(fake.group(20).unwrap()["visibility"], "selected");
+    let binding = signer.bindings()[0].clone();
+    assert_eq!(binding.group_access(), Some(GroupAccess::Unchecked));
+    let words = binding.group_access_words().unwrap();
+    assert!(words.contains("checks again in about"), "{words}");
+    assert!(!words.contains("next sync"), "{words}");
+
+    // GitHub answers again: the retry opens the group by itself.
+    fake.with(|s| s.listing = None);
+    until("the group opened by the retry", || {
+        fake.group(20).unwrap()["visibility"] == "all"
+    })
+    .await;
+    until("the record checked", || {
+        signer.bindings()[0].group_access() == Some(GroupAccess::AllPrivate)
+    })
+    .await;
+    assert!(signer.bindings()[0].sync_error.is_none());
+}
+
+/// N1 (2): an attempt cut off at the deadline does not count as the sync for ten minutes: the next sign-in syncs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_timed_out_sync_does_not_hold_off_the_next_sign_in() {
+    use arca::github_signer::GroupAccess;
+    use arca_runners::Access as _;
+    let scratch = Scratch::new();
+    let fake = Fake::start("acme").await;
+    let (signer, id) = legacy_record(&scratch, &fake, json!([])).await;
+    // No background retry within the test, so only the next sign-in can sync.
+    let signer = signer
+        .with_sign_in_deadline(Duration::from_millis(300))
+        .with_sync_retry(Duration::from_secs(3600), Duration::from_secs(3600));
+    fake.with(|s| s.listing_delay_ms = 10_000);
+    let access = arca::runners::SignerAccess::new(signer.clone());
+    assert_eq!(access.runner_group(&id).await.expect("read"), Some(20));
+    assert_eq!(
+        signer.bindings()[0].group_access(),
+        Some(GroupAccess::Unchecked)
+    );
+    fake.with(|s| s.listing_delay_ms = 0);
+    assert_eq!(access.runner_group(&id).await.expect("read"), Some(20));
+    assert_eq!(fake.group(20).unwrap()["visibility"], "all");
+    assert_eq!(
+        signer.bindings()[0].group_access(),
+        Some(GroupAccess::AllPrivate)
+    );
+}
+
+/// N1 (3): the retries never run two at once (with sign-ins arriving meanwhile), and stop after a success.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_background_retries_run_one_at_a_time_and_stop_after_a_success() {
+    use arca::github_signer::GroupAccess;
+    use arca_runners::Access as _;
+    let listings = |fake: &Fake| fake.seen("GET", "/api/installation/repositories").len();
+    let scratch = Scratch::new();
+    let fake = Fake::start("acme").await;
+    let (signer, id) = legacy_record(&scratch, &fake, json!([])).await;
+    let signer = signer.with_sync_retry(Duration::from_millis(30), Duration::from_millis(120));
+    fake.with(|s| {
+        s.listing = Some((502, json!({ "message": "Bad Gateway" })));
+        s.listing_delay_ms = 40;
+    });
+    let access = arca::runners::SignerAccess::new(signer.clone());
+    access.runner_group(&id).await.expect("read");
+    for _ in 0..5 {
+        let (a, b) = tokio::join!(access.runner_group(&id), access.runner_group(&id));
+        a.unwrap();
+        b.unwrap();
+    }
+    until("several retries", || listings(&fake) >= 8).await;
+    fake.with(|s| s.listing = None);
+    until("the record checked", || {
+        signer.bindings()[0].group_access() == Some(GroupAccess::AllPrivate)
+    })
+    .await;
+    let after = listings(&fake);
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(listings(&fake), after, "no retry after the success");
+    access.runner_group(&id).await.expect("read");
+    assert_eq!(
+        listings(&fake),
+        after,
+        "and the success holds off the next sign-in"
+    );
+    assert_eq!(
+        fake.with(|s| s.listing_most_at_once),
+        1,
+        "never two at once"
+    );
+}
+
+/// N2: the repair of an old record reads the group first. `selected` with repositories is the owner's own way around
+/// the bug: left as it is, and recorded as selected with those repositories. (`selected` with none is opened: the repair
+/// test above.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_repair_of_an_old_record_keeps_the_owners_own_repositories() {
+    use arca::github_signer::GroupAccess;
+    use arca_runners::Access as _;
+    let scratch = Scratch::new();
+    let fake = Fake::start("acme").await;
+    let (signer, id) = legacy_record(&scratch, &fake, json!([5])).await;
+    arca::runners::SignerAccess::new(signer.clone())
+        .runner_group(&id)
+        .await
+        .expect("read");
+    signer
+        .app_installed(INSTALLATION, None)
+        .await
+        .expect("GitHub's later return");
+    assert!(
+        fake.seen("PATCH", "/api/orgs/acme/actions/runner-groups/20")
+            .is_empty()
+    );
+    assert!(
+        fake.seen(
+            "PUT",
+            "/api/orgs/acme/actions/runner-groups/20/repositories"
+        )
+        .is_empty()
+    );
+    assert_eq!(fake.group(20).unwrap()["visibility"], "selected");
+    assert_eq!(fake.group_repositories(20), Some(json!([5])));
+    let binding = signer.bindings()[0].clone();
+    assert_eq!(binding.group_access(), Some(GroupAccess::Selected));
+    assert!(!binding.open_to_none());
+    let words = binding.group_access_words().unwrap();
+    assert!(words.contains("acme/r5"), "{words}");
 }
 
 // ---- Push mode ----------------------------------------------------------------------------------------------------

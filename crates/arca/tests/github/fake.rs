@@ -103,6 +103,9 @@ pub struct FakeState {
     pub listing: Option<(u16, Value)>,
     /// How long listing the installation's repositories waits before it answers, in milliseconds.
     pub listing_delay_ms: u64,
+    /// Listings of the installation's repositories being answered now, and the most there ever were at once.
+    pub listing_at_once: u64,
+    pub listing_most_at_once: u64,
 }
 
 pub struct Fake {
@@ -165,6 +168,8 @@ impl Fake {
             installation_refusal: None,
             listing: None,
             listing_delay_ms: 0,
+            listing_at_once: 0,
+            listing_most_at_once: 0,
         }));
         let router = Router::new().fallback(serve).with_state(Arc::clone(&state));
         tokio::spawn(async move {
@@ -317,13 +322,22 @@ async fn serve(State(state): State<Arc<Mutex<FakeState>>>, request: Request) -> 
         .await
         .unwrap_or_default();
     let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-    if path == "/api/installation/repositories" {
-        let delay = state.lock().expect("the fake's lock").listing_delay_ms;
+    let listing = path == "/api/installation/repositories";
+    if listing {
+        let delay = {
+            let mut s = state.lock().expect("the fake's lock");
+            s.listing_at_once += 1;
+            s.listing_most_at_once = s.listing_most_at_once.max(s.listing_at_once);
+            s.listing_delay_ms
+        };
         if delay > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
         }
     }
     let mut state = state.lock().expect("the fake's lock");
+    if listing {
+        state.listing_at_once -= 1;
+    }
     state.seen.push(Seen {
         method: method.clone(),
         path: path.clone(),

@@ -44,6 +44,11 @@ const AUDIT_MAX_BYTES: u64 = 8 * 1024 * 1024;
 const OAUTH_APP_FILE: &str = "oauth-app.json";
 /// How long a pool's sign-in waits for the runner group's sync before it goes on with the group as recorded.
 pub const SIGN_IN_SYNC_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+/// After a failed sync the node retries it by itself: first after a minute, then doubling, up to ten minutes.
+pub const SYNC_RETRY: (std::time::Duration, std::time::Duration) = (
+    std::time::Duration::from_secs(60),
+    std::time::Duration::from_secs(600),
+);
 const OAUTH_SECRET_FILE: &str = "oauth-app.secret";
 
 /// How a binding reaches GitHub.
@@ -83,6 +88,10 @@ pub struct RunnerGroup {
     /// What the person should know about it, in words, such as that it is the organisation's default group.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,
+    /// The group's own repositories as read from GitHub, when they are not the installation's (an owner's own way
+    /// around issue 328, kept as it is).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repositories: Option<Vec<String>>,
     /// Which repositories may send jobs to the group, as Arca last set or read it. A record from before Arca kept it
     /// has none; [`Binding::group_access`] then says what it is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -148,6 +157,9 @@ pub struct Binding {
     /// Why the last sync of the runner group failed, in words, until one succeeds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sync_error: Option<String>,
+    /// When a sync failed: how long after it the node's own retry runs (ms).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_retry_in_ms: Option<u64>,
     /// Who made it: a token id, or `page` for the owner's page.
     pub created_by: String,
     pub created_at: u64,
@@ -350,6 +362,8 @@ pub(crate) struct Inner {
     pub(crate) runner_key_bits: usize,
     /// How long a pool's sign-in waits for the runner group's sync.
     pub(crate) sign_in_deadline: std::time::Duration,
+    /// After a failed sync: the first wait before the node's own retry, and the most it doubles to.
+    pub(crate) sync_retry: (std::time::Duration, std::time::Duration),
     pub(crate) state: Mutex<State>,
     /// Held while a line is appended to the audit log, so lines never interleave.
     audit: Mutex<()>,
@@ -403,6 +417,7 @@ impl Signer {
                 clock,
                 runner_key_bits: crate::github_api::RUNNER_KEY_BITS,
                 sign_in_deadline: SIGN_IN_SYNC_DEADLINE,
+                sync_retry: SYNC_RETRY,
                 state: Mutex::new(State {
                     bindings,
                     ..State::default()
@@ -433,6 +448,19 @@ impl Signer {
         Self {
             inner: Arc::new(Inner {
                 sign_in_deadline: deadline,
+                ..inner
+            }),
+        }
+    }
+
+    /// The same signer, retrying a failed sync first after `first`, doubling up to `cap`. Tests use short ones.
+    pub fn with_sync_retry(self, first: std::time::Duration, cap: std::time::Duration) -> Self {
+        let inner = Arc::try_unwrap(self.inner).unwrap_or_else(|_| {
+            panic!("with_sync_retry is called on a fresh signer before it is shared")
+        });
+        Self {
+            inner: Arc::new(Inner {
+                sync_retry: (first, cap),
                 ..inner
             }),
         }
