@@ -220,7 +220,11 @@ async fn read(response: Response) -> (u16, Option<String>, String) {
     let body = axum::body::to_bytes(response.into_body(), 4 << 20)
         .await
         .expect("the body");
-    (status, location, String::from_utf8_lossy(&body).into_owned())
+    (
+        status,
+        location,
+        String::from_utf8_lossy(&body).into_owned(),
+    )
 }
 
 fn query(text: &str) -> HashMap<String, String> {
@@ -243,11 +247,7 @@ fn hidden(body: &str, name: &str) -> String {
 /// The `state` in an address.
 fn state_of(url: &str) -> String {
     let at = url.find("state=").expect("a state") + "state=".len();
-    url[at..]
-        .split('&')
-        .next()
-        .expect("its value")
-        .to_string()
+    url[at..].split('&').next().expect("its value").to_string()
 }
 
 fn assert_no_secret(what: &str, text: &str) {
@@ -310,7 +310,10 @@ async fn a_prepared_app_link_fills_the_form_and_posts_exactly_as_a_typed_one() {
         assert_eq!(status, 200);
         // The values, editable, and one button; the node named in words.
         assert!(body.contains("value=\"acme\""), "{body}");
-        assert!(body.contains(">self-hosted,linux,x64\ngpu</textarea>"), "{body}");
+        assert!(
+            body.contains(">self-hosted,linux,x64\ngpu</textarea>"),
+            "{body}"
+        );
         assert!(body.contains(&format!("action=\"{}\"", github_page::APP_PATH)));
         assert_eq!(submit_buttons(&body), 1, "{body}");
         assert!(body.contains(&format!("this node, {HERE}")), "{body}");
@@ -329,13 +332,19 @@ async fn a_prepared_app_link_fills_the_form_and_posts_exactly_as_a_typed_one() {
         );
 
         // A value the link got wrong is refused in the typed form's own words.
-        let typed = read(github_page::app_start(&rig.ctx(), &query("org=-acme&labels=linux")).await).await;
+        let typed =
+            read(github_page::app_start(&rig.ctx(), &query("org=-acme&labels=linux")).await).await;
         assert_eq!(typed.0, 400);
-        assert!(typed.2.contains("1 to 39 letters, digits and single hyphens"));
+        assert!(
+            typed
+                .2
+                .contains("1 to 39 letters, digits and single hyphens")
+        );
         let q = query("mode=app&org=-acme&labels=linux");
         let (_, _, page) = read(github_page::view(&rig.ctx(), &q).await).await;
         assert!(page.contains("value=\"-acme\""));
-        let linked = read(github_page::app_start(&rig.ctx(), &query("org=-acme&labels=linux")).await).await;
+        let linked =
+            read(github_page::app_start(&rig.ctx(), &query("org=-acme&labels=linux")).await).await;
         assert_eq!(linked.2, typed.2);
 
         // A value is shown as text, never as markup.
@@ -354,32 +363,48 @@ async fn a_prepared_link_fills_the_repository_push_and_sign_in_forms() {
         let rig = Rig::new(&[ORIGIN], &[LINK_VERB]).await;
 
         // The workspace repositories App: the organisation, or a repository whose owner it is.
-        for link in ["mode=repositories&org=acme", "mode=repository&repository=acme%2Fweb"] {
+        for link in [
+            "mode=repositories&org=acme",
+            "mode=repository&repository=acme%2Fweb",
+        ] {
             let (status, _, body) = read(github_page::view(&rig.ctx(), &query(link)).await).await;
             assert_eq!(status, 200);
-            assert!(body.contains("name=\"purpose\" value=\"repositories\""), "{link}: {body}");
+            assert!(
+                body.contains("name=\"purpose\" value=\"repositories\""),
+                "{link}: {body}"
+            );
             assert!(body.contains("value=\"acme\""), "{link}: {body}");
             assert_eq!(submit_buttons(&body), 1, "{link}");
         }
-        let (status, _, body) = read(
-            github_page::app_start(&rig.ctx(), &query("purpose=repositories&org=acme")).await,
-        )
-        .await;
+        let (status, _, body) =
+            read(github_page::app_start(&rig.ctx(), &query("purpose=repositories&org=acme")).await)
+                .await;
         assert_eq!(status, 200, "{body}");
         let manifest: Value = serde_json::from_str(&hidden(&body, "manifest")).unwrap();
-        assert!(manifest["name"].as_str().unwrap().starts_with("Arca repositories"));
+        assert!(
+            manifest["name"]
+                .as_str()
+                .unwrap()
+                .starts_with("Arca repositories")
+        );
 
         // Pushed configurations.
         let q = query("mode=push&org=acme&labels=linux%2Cx64%3Bgpu");
         let (_, _, body) = read(github_page::view(&rig.ctx(), &q).await).await;
-        assert!(body.contains(&format!("action=\"{}\"", github_page::PUSH_PATH)), "{body}");
+        assert!(
+            body.contains(&format!("action=\"{}\"", github_page::PUSH_PATH)),
+            "{body}"
+        );
         assert!(body.contains(">linux,x64\ngpu</textarea>"), "{body}");
         assert_eq!(submit_buttons(&body), 1);
 
         // The sign-in with a code: group, labels and how many runners.
         let q = query("mode=oauth&org=acme&group=ci&labels=linux%2Cx64&runners=3");
         let (_, _, body) = read(github_page::view(&rig.ctx(), &q).await).await;
-        assert!(body.contains(&format!("action=\"{}\"", github_page::DEVICE_PATH)), "{body}");
+        assert!(
+            body.contains(&format!("action=\"{}\"", github_page::DEVICE_PATH)),
+            "{body}"
+        );
         assert!(body.contains("value=\"ci\""), "{body}");
         assert!(body.contains("value=\"linux,x64\""), "{body}");
         assert!(body.contains("value=\"3\""), "{body}");
@@ -402,7 +427,10 @@ async fn a_linked_node_is_connected_from_this_page_and_holds_the_key_alone() {
         let (status, _, body) = read(github_page::view(&rig.ctx(), &q).await).await;
         assert_eq!(status, 200, "{body}");
         assert!(body.contains(&format!("linked node {NODE}")), "{body}");
-        assert!(body.contains(&format!("name=\"node\" value=\"{NODE}\"")), "{body}");
+        assert!(
+            body.contains(&format!("name=\"node\" value=\"{NODE}\"")),
+            "{body}"
+        );
         assert_eq!(submit_buttons(&body), 1);
 
         let state = begin_on_beta(&rig).await;
@@ -415,7 +443,10 @@ async fn a_linked_node_is_connected_from_this_page_and_holds_the_key_alone() {
         let (status, location, body) = installed(&rig, &state).await;
         assert_eq!(status, 303, "{body}");
         let location = location.expect("back to the page");
-        assert!(location.starts_with(&format!("{}?node={NODE}&connected=gh-", github_page::PAGE_PATH)));
+        assert!(location.starts_with(&format!(
+            "{}?node={NODE}&connected=gh-",
+            github_page::PAGE_PATH
+        )));
 
         // Beta holds the connection and its key; alpha holds neither.
         let bindings = rig.beta.bindings();
@@ -423,13 +454,31 @@ async fn a_linked_node_is_connected_from_this_page_and_holds_the_key_alone() {
         let binding = bindings[0].clone();
         assert_eq!(binding.mode, Mode::App);
         assert_eq!(binding.status, Status::Active);
-        assert_eq!(binding.label_sets, vec![vec!["self-hosted".to_string(), "linux".to_string()], vec!["gpu".to_string()]]);
-        assert!(rig.scratch.path("beta/github/keys").join(format!("{}.pem", binding.id)).is_file());
+        assert_eq!(
+            binding.label_sets,
+            vec![
+                vec!["self-hosted".to_string(), "linux".to_string()],
+                vec!["gpu".to_string()]
+            ]
+        );
+        assert!(
+            rig.scratch
+                .path("beta/github/keys")
+                .join(format!("{}.pem", binding.id))
+                .is_file()
+        );
         assert!(rig.alpha.bindings().is_empty());
         assert!(!rig.scratch.path("alpha/github/keys").exists());
         for (path, text) in rig.alpha_files() {
-            assert!(!text.contains("BEGIN RSA"), "{} holds the App's key", path.display());
-            assert_no_secret(&path.display().to_string(), &text);
+            assert!(
+                !text.contains("BEGIN RSA"),
+                "{} holds the App's key",
+                path.display()
+            );
+            // Alpha's own OAuth App secret is its own, set by the rig.
+            if !path.ends_with("github/oauth-app.secret") {
+                assert_no_secret(&path.display().to_string(), &text);
+            }
         }
         for (path, text) in files(&rig.scratch.path("beta/github")) {
             if !path.starts_with(rig.scratch.path("beta/github/keys")) {
@@ -459,16 +508,27 @@ async fn a_linked_node_is_connected_from_this_page_and_holds_the_key_alone() {
         let q = query(&location[location.find('?').unwrap() + 1..]);
         let (_, _, body) = read(github_page::view(&rig.ctx(), &q).await).await;
         assert!(body.contains("Connected"), "{body}");
-        assert!(body.contains(&format!("name=\"binding\" value=\"{}\"", binding.id)), "{body}");
+        assert!(
+            body.contains(&format!("name=\"binding\" value=\"{}\"", binding.id)),
+            "{body}"
+        );
         assert_no_secret("the page", &body);
 
         // Disconnect from the page works on beta.
         let form = query(&format!("node={NODE}&binding={}", binding.id));
         let (status, location, body) = read(github_page::disconnect(&rig.ctx(), &form).await).await;
         assert_eq!(status, 303, "{body}");
-        assert_eq!(location.as_deref(), Some(format!("{}?node={NODE}", github_page::PAGE_PATH).as_str()));
+        assert_eq!(
+            location.as_deref(),
+            Some(format!("{}?node={NODE}", github_page::PAGE_PATH).as_str())
+        );
         assert_eq!(rig.beta.bindings()[0].status, Status::Revoked);
-        assert!(!rig.scratch.path("beta/github/keys").join(format!("{}.pem", binding.id)).exists());
+        assert!(
+            !rig.scratch
+                .path("beta/github/keys")
+                .join(format!("{}.pem", binding.id))
+                .exists()
+        );
     })
     .await
     .expect("the test ends in time");
@@ -510,19 +570,37 @@ async fn a_forged_or_replayed_state_takes_nothing_more() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_node_that_is_not_linked_or_will_not_take_the_token_is_a_plain_error_and_nothing_is_made() {
+async fn a_node_that_is_not_linked_or_will_not_take_the_token_is_a_plain_error_and_nothing_is_made()
+{
     tokio::time::timeout(BOUND, async {
         let rig = Rig::new(&[ORIGIN], &[LINK_VERB]).await;
-        let (status, _, body) = read(github_page::view(&rig.ctx(), &query("mode=app&node=gamma&org=acme")).await).await;
+        let (status, _, body) =
+            read(github_page::view(&rig.ctx(), &query("mode=app&node=gamma&org=acme")).await).await;
         assert_eq!(status, 400, "{body}");
-        assert!(body.contains(NODE), "the refusal names the linked nodes: {body}");
-        assert!(!body.contains("gamma"), "the refusal never echoes the name: {body}");
-        let (status, _, _) = read(github_page::app_start(&rig.ctx(), &query("node=gamma&org=acme&labels=linux")).await).await;
+        assert!(
+            body.contains(NODE),
+            "the refusal names the linked nodes: {body}"
+        );
+        assert!(
+            !body.contains("gamma"),
+            "the refusal never echoes the name: {body}"
+        );
+        let (status, _, _) = read(
+            github_page::app_start(&rig.ctx(), &query("node=gamma&org=acme&labels=linux")).await,
+        )
+        .await;
         assert_eq!(status, 400);
 
         // A relay token whose list does not name github_link: beta refuses it, and GitHub hears nothing.
         let narrow = Rig::new(&[ORIGIN], &["github_bindings"]).await;
-        let (status, _, body) = read(github_page::app_start(&narrow.ctx(), &query(&format!("node={NODE}&org=acme&labels=linux"))).await).await;
+        let (status, _, body) = read(
+            github_page::app_start(
+                &narrow.ctx(),
+                &query(&format!("node={NODE}&org=acme&labels=linux")),
+            )
+            .await,
+        )
+        .await;
         assert_eq!(status, 502, "{body}");
         assert!(body.contains(NODE));
         assert!(rig.fake.with(|s| s.seen.is_empty()));
@@ -544,7 +622,10 @@ async fn a_linked_node_down_before_the_start_makes_nothing_on_github() {
         let form = query(&format!("node={NODE}&org=acme&labels=linux"));
         let (status, _, body) = read(github_page::app_start(&rig.ctx(), &form).await).await;
         assert_eq!(status, 502, "{body}");
-        assert!(body.contains(NODE) && body.contains("Nothing was made on GitHub"), "{body}");
+        assert!(
+            body.contains(NODE) && body.contains("Nothing was made on GitHub"),
+            "{body}"
+        );
         assert!(!body.contains("manifest"));
         assert!(rig.fake.with(|s| s.seen.is_empty()));
     })
@@ -553,7 +634,8 @@ async fn a_linked_node_down_before_the_start_makes_nothing_on_github() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_linked_node_down_at_githubs_return_is_told_what_github_holds_and_nothing_is_half_stored() {
+async fn a_linked_node_down_at_githubs_return_is_told_what_github_holds_and_nothing_is_half_stored()
+{
     tokio::time::timeout(BOUND, async {
         let rig = Rig::new(&[ORIGIN], &[LINK_VERB]).await;
         let state = begin_on_beta(&rig).await;
@@ -562,8 +644,14 @@ async fn a_linked_node_down_at_githubs_return_is_told_what_github_holds_and_noth
         // The App exists on GitHub; nobody took its key.
         let (status, _, body) = created(&rig, &state).await;
         assert_eq!(status, 502, "{body}");
-        assert!(body.contains(&format!("Arca runners {}", &state[..6])), "names the App: {body}");
-        assert!(body.contains("/organizations/acme/settings/apps"), "says where to delete it: {body}");
+        assert!(
+            body.contains(&format!("Arca runners {}", &state[..6])),
+            "names the App: {body}"
+        );
+        assert!(
+            body.contains("/organizations/acme/settings/apps"),
+            "says where to delete it: {body}"
+        );
         assert!(body.contains(NODE));
         assert_no_secret("the page", &body);
         assert_eq!(rig.conversions(), 0);
@@ -583,7 +671,10 @@ async fn a_linked_node_down_at_githubs_return_is_told_what_github_holds_and_noth
         let (status, _, body) = installed(&rig, &state).await;
         assert_eq!(status, 502, "{body}");
         assert!(body.contains(APP_SLUG), "names the App: {body}");
-        assert!(body.contains(&format!("/apps/{APP_SLUG}")), "links to it: {body}");
+        assert!(
+            body.contains(&format!("/apps/{APP_SLUG}")),
+            "links to it: {body}"
+        );
         assert!(body.contains(NODE));
         assert_no_secret("the page", &body);
         assert_eq!(rig.beta.bindings()[0].status, Status::AwaitingInstall);
