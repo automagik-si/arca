@@ -4336,9 +4336,15 @@ Every route of the page, the canvas routes below among them, answers the same wi
 (`/approve/` is `/approve`, `/approve/plans/` is `/approve/plans`): the same handler under the same rules, not a
 redirect, so a POST stays a POST and a query string stays with it. Two slashes, or an encoded one, are no route.
 
-The GETs need no token and admit no `Origin` or the configured one. Apart from the canvas chat POST described below, the
-POSTs admit only the exact configured `Origin` and refuse any other before reading the body. `/mcp` and every other MCP route
-keep refusing every `Origin`.
+The GETs need no token and admit no `Origin` or the configured one. Apart from the canvas chat POST described below and the
+GitHub page's own forms, the POSTs admit only the exact configured `Origin` and refuse any other before reading the body.
+Because every page sends `Referrer-Policy: no-referrer`, a browser posts a form with `Origin: null` even to its own origin;
+the GitHub page's forms that the browser posts itself (`/approve/github/app`, `/push`, `/device`, `/disconnect` and
+`/connections`) also admit `Origin: null`, but only with the browser's `Sec-Fetch-Site: same-origin`,
+`Sec-Fetch-Mode: navigate` and `Sec-Fetch-Dest: document`, which no page script can set: a post from another site, from
+the same site on another port, from a sandboxed frame or from a `data:` page is still refused, and so is a browser that
+sends no Fetch Metadata. A refused request gets a 403 with a short page: "This request did not come from this page. Open
+the page again and press the button there." `/mcp` and every other MCP route keep refusing every `Origin`.
 
 With `approvalOrigin` set, the same page origin also serves the remote canvas at exactly these URLs, each with or
 without one trailing slash: `GET /approve/canvas`

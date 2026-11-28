@@ -2728,7 +2728,7 @@ async fn a_real_browser_presses_each_button_of_the_github_page_for_this_node_and
             .alpha
             .bindings()
             .iter()
-            .any(|binding| binding.id == pushed[0].id)
+            .any(|binding| binding.id == pushed[0].id && binding.status != Status::Revoked)
         {
             assert!(
                 Instant::now() < deadline,
@@ -2748,8 +2748,9 @@ async fn a_real_browser_presses_each_button_of_the_github_page_for_this_node_and
         assert_eq!(href, format!("{origin}{}", github_page::APP_PATH));
         manifest_goes_to_github(&mut chrome);
         assert_eq!(
-            rig.steps().iter().filter(|step| *step == "begin").count(),
-            1
+            rig.waiting_cards(),
+            0,
+            "beta spent the card the passkey approved"
         );
 
         chrome.open(&page("?mode=repositories&node=beta&org=acme"));
@@ -2757,8 +2758,9 @@ async fn a_real_browser_presses_each_button_of_the_github_page_for_this_node_and
         let (href, _) = chrome.until_text("Create the repository App");
         assert_eq!(href, format!("{origin}{}", github_page::APP_PATH));
         assert_eq!(
-            rig.steps().iter().filter(|step| *step == "begin").count(),
-            2
+            rig.waiting_cards(),
+            0,
+            "beta spent the card the passkey approved"
         );
 
         // The linked node's connections, and its Disconnect, approved with the passkey.
@@ -2782,7 +2784,7 @@ async fn a_real_browser_presses_each_button_of_the_github_page_for_this_node_and
             .beta
             .bindings()
             .iter()
-            .any(|binding| binding.id == held.id)
+            .any(|binding| binding.id == held.id && binding.status != Status::Revoked)
         {
             assert!(
                 Instant::now() < deadline,
